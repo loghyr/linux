@@ -22,6 +22,7 @@
 static const struct ffv2_encoder_ops * const ffv2_encoders[] = {
 	&ffv2_encoder_xor_parity,
 	&ffv2_encoder_linux_md,
+	&ffv2_encoder_rs_vandermonde,
 };
 
 const struct ffv2_encoder_ops *ffv2_find_encoder(u32 coding_type)
