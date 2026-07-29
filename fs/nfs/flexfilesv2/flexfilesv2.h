@@ -72,7 +72,7 @@ FFV2_LAYOUT_FROM_HDR(struct pnfs_layout_hdr *lo)
  * slot.  ffv2_file_info4 in the draft is a per-NFS-version tuple; the
  * MDS supplies one entry per version it wants us to attempt.
  */
-struct nfs4_ffv2_ds_version {
+struct nfs4_ffv2_file_info {
 	nfs4_stateid		stateid;
 	struct nfs_fh		fh;
 };
@@ -85,7 +85,7 @@ struct nfs4_ffv2_data_server {
 	struct nfs4_deviceid	devid;
 	u32			efficiency;
 	u32			versions_cnt;
-	struct nfs4_ffv2_ds_version *versions;
+	struct nfs4_ffv2_file_info *versions;
 	u32			flags;
 	/*
 	 * user/group are decoded from the wire as opaque UTF-8 strings.
@@ -139,9 +139,47 @@ FFV2_LSEG(struct pnfs_layout_segment *lseg)
 			    generic_hdr);
 }
 
+/*
+ * Per-NFS-version parameters the MDS advertises for this deviceid.
+ * Corresponds to ff_device_versions4 in the draft, shared verbatim
+ * with the FFv1 wire format.
+ */
+struct nfs4_ffv2_ds_version {
+	u32			version;
+	u32			minor_version;
+	u32			rsize;
+	u32			wsize;
+	bool			tightly_coupled;
+};
+
+/*
+ * In-memory representation of a deviceid.  Wraps the generic
+ * nfs4_deviceid_node and carries the netaddr list resolved to a
+ * struct nfs4_pnfs_ds plus the per-version parameters.  The DS
+ * rpc_clnt is created lazily on first use, matching ffv1.
+ */
+struct nfs4_ffv2_layout_ds {
+	struct nfs4_deviceid_node	id_node;
+	u32				ds_versions_cnt;
+	struct nfs4_ffv2_ds_version	*ds_versions;
+	struct nfs4_pnfs_ds		*ds;
+};
+
+static inline struct nfs4_ffv2_layout_ds *
+FFV2_LAYOUT_DS_FROM_NODE(struct nfs4_deviceid_node *node)
+{
+	return container_of(node, struct nfs4_ffv2_layout_ds, id_node);
+}
+
 /* flexfilesv2xdr.c */
 struct nfs4_ffv2_layout_segment *
 ffv2_decode_layout(struct nfs4_layoutget_res *lgr, gfp_t gfp_flags);
 void ffv2_free_layout_segment(struct nfs4_ffv2_layout_segment *fls);
+
+/* flexfilesv2dev.c */
+struct nfs4_deviceid_node *
+ffv2_alloc_deviceid_node(struct nfs_server *server, struct pnfs_device *pdev,
+			 gfp_t gfp_flags);
+void ffv2_free_deviceid_node(struct nfs4_deviceid_node *node);
 
 #endif /* FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H */
