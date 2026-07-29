@@ -355,6 +355,30 @@ static void ffv2_write_count_stats(struct rpc_task *task, void *data)
 	    &NFS_CLIENT(hdr->inode)->cl_metrics[NFSPROC4_CLNT_WRITE]);
 }
 
+/*
+ * DS-side write completion hook.  On DS-side transport failure set
+ * NFS_IOHDR_RESEND_MDS so ffv2_write_release() reissues the write
+ * against the MDS via pnfs_write_done_resend_to_mds().  Returning
+ * task->tk_status (a negative errno) makes nfs_pgio_result() skip
+ * nfs_set_pgio_error(), which is what we want: the resend will drive
+ * the pages to completion, we do not want the failed DS attempt to
+ * flip the pages to a "completed with error" state that
+ * nfs_write_completion() might interpret as done.
+ *
+ * Per-DS-ioerr tracking for LAYOUTRETURN is a follow-up.
+ */
+static int ffv2_write_done_cb(struct rpc_task *task,
+			      struct nfs_pgio_header *hdr)
+{
+	if (task->tk_status < 0) {
+		if (!test_and_set_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags))
+			pnfs_error_mark_layout_for_return(hdr->inode,
+							  hdr->lseg);
+		return task->tk_status;
+	}
+	return 0;
+}
+
 static void ffv2_write_release(void *data)
 {
 	struct nfs_pgio_header *hdr = data;
@@ -378,6 +402,16 @@ static void ffv2_write_release(void *data)
 		spin_unlock(&fls->fls_ctx_lock);
 	}
 done:
+	/*
+	 * If ffv2_write_done_cb marked this hdr for MDS resend on a DS
+	 * error, actually drive that resend now.  Without this hook the
+	 * RESEND_MDS bit would be set but never consumed, and
+	 * nfs_write_completion would mark the pages as committed --
+	 * silent data loss.  Matches ff_layout_write_release.
+	 */
+	if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
+	    !test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags))
+		hdr->task.tk_status = pnfs_write_done_resend_to_mds(hdr);
 	pnfs_generic_rw_release(data);
 }
 
@@ -506,6 +540,7 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	hdr->args.fh = &fi->fh;
 	hdr->args.stateid = fi->stateid;
 	hdr->mds_offset = hdr->args.offset;
+	hdr->pgio_done_cb = ffv2_write_done_cb;
 
 	/* Override user pages with this mirror's shard pages. */
 	hdr->args.pages  = ctx->shard_pages[mirror_idx];
