@@ -131,6 +131,11 @@ config PNFS_FLEXFILE_LAYOUT
 	depends on NFS_V4
 	default NFS_V4
 
+config PNFS_FLEXFILE_V2_LAYOUT
+	tristate
+	depends on NFS_V4
+	default NFS_V4
+
 config NFS_V4_1_IMPLEMENTATION_ID_DOMAIN
 	string "NFSv4.1 Implementation ID Domain"
 	depends on NFS_V4
