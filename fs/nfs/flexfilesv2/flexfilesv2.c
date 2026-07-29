@@ -261,6 +261,54 @@ static const struct nfs_pageio_ops ffv2_pg_read_ops = {
 	.pg_cleanup	= pnfs_generic_pg_cleanup,
 };
 
+/*
+ * A chunk-encoded lseg (RS/MOJETTE/XOR/LINUX_MD/... anything with
+ * parity) needs k+m parallel writes -- one per data shard plus one
+ * per parity shard -- rather than the mirrored-write fanout FFv1
+ * uses.  PASSTHROUGH alone rides the ordinary NFS I/O path;
+ * REPLICATED remains a chunk encoding despite carrying no parity.
+ */
+static bool ffv2_lseg_is_chunked(const struct nfs4_ffv2_layout_segment *fls)
+{
+	u32 ct;
+
+	if (!fls || fls->mirror_array_cnt == 0 || !fls->mirror_array[0])
+		return false;
+	ct = fls->mirror_array[0]->coding_type;
+	return ct != FFV2_ENCODING_PASSTHROUGH;
+}
+
+static u32
+ffv2_pg_get_mirror_count_write(struct nfs_pageio_descriptor *pgio,
+			       struct nfs_page *req)
+{
+	struct nfs4_ffv2_layout_segment *fls;
+	struct nfs4_ffv2_mirror *mirror;
+
+	if (!pgio->pg_lseg) {
+		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
+						   nfs_req_openctx(req),
+						   req_offset(req),
+						   req->wb_bytes,
+						   IOMODE_RW, false,
+						   nfs_io_gfp_mask());
+		if (IS_ERR(pgio->pg_lseg)) {
+			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+			pgio->pg_lseg = NULL;
+			return 1;
+		}
+	}
+	if (!pgio->pg_lseg)
+		return 1;
+
+	fls = FFV2_LSEG(pgio->pg_lseg);
+	if (!ffv2_lseg_is_chunked(fls))
+		return 1;
+
+	mirror = fls->mirror_array[0];
+	return mirror->protection_data + mirror->protection_parity;
+}
+
 static u32
 ffv2_pg_set_mirror_write(struct nfs_pageio_descriptor *desc, u32 idx)
 {
@@ -277,12 +325,13 @@ ffv2_pg_get_mirror_write(struct nfs_pageio_descriptor *desc, u32 idx)
 }
 
 static const struct nfs_pageio_ops ffv2_pg_write_ops = {
-	.pg_init	= ffv2_pg_init_write,
-	.pg_test	= pnfs_generic_pg_test,
-	.pg_doio	= pnfs_generic_pg_writepages,
-	.pg_get_mirror	= ffv2_pg_get_mirror_write,
-	.pg_set_mirror	= ffv2_pg_set_mirror_write,
-	.pg_cleanup	= pnfs_generic_pg_cleanup,
+	.pg_init		= ffv2_pg_init_write,
+	.pg_test		= pnfs_generic_pg_test,
+	.pg_doio		= pnfs_generic_pg_writepages,
+	.pg_get_mirror_count	= ffv2_pg_get_mirror_count_write,
+	.pg_get_mirror		= ffv2_pg_get_mirror_write,
+	.pg_set_mirror		= ffv2_pg_set_mirror_write,
+	.pg_cleanup		= pnfs_generic_pg_cleanup,
 };
 
 static struct pnfs_layoutdriver_type flexfilesv2_type = {
