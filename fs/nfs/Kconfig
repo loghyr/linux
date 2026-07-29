@@ -134,6 +134,7 @@ config PNFS_FLEXFILE_LAYOUT
 config PNFS_FLEXFILE_V2_LAYOUT
 	tristate
 	depends on NFS_V4
+	select RAID6_PQ
 	default NFS_V4
 
 config NFS_V4_1_IMPLEMENTATION_ID_DOMAIN

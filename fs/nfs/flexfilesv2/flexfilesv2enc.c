@@ -20,9 +20,11 @@
 #include "flexfilesv2.h"
 
 extern const struct ffv2_encoder_ops ffv2_encoder_xor_parity;
+extern const struct ffv2_encoder_ops ffv2_encoder_linux_md;
 
 static const struct ffv2_encoder_ops * const ffv2_encoders[] = {
 	&ffv2_encoder_xor_parity,
+	&ffv2_encoder_linux_md,
 };
 
 const struct ffv2_encoder_ops *ffv2_find_encoder(u32 coding_type)
