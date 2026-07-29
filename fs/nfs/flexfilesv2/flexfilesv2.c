@@ -22,6 +22,9 @@
 #include <linux/nfs_fs.h>
 #include <linux/nfs_page.h>
 
+#include "../internal.h"
+#include "../nfs4trace.h"
+#include "../pnfs.h"
 #include "flexfilesv2.h"
 
 static struct pnfs_layout_hdr *
@@ -162,6 +165,126 @@ ffv2_cancel_io(struct pnfs_layout_segment *lseg)
 	 */
 }
 
+/*
+ * Page-list I/O initialisation.  Fetches a read layout covering the
+ * request, then hands off to the pNFS generic pagelist assembler
+ * (pnfs_generic_pg_readpages via pg_doio).  A subsequent commit adds
+ * ffv2-specific mirror selection here; for now we always fall back
+ * to MDS-inband I/O if LAYOUTGET fails, matching the ffv1 pattern.
+ */
+static void
+ffv2_pg_init_read(struct nfs_pageio_descriptor *pgio, struct nfs_page *req)
+{
+	pnfs_generic_pg_check_layout(pgio, req);
+	if (pgio->pg_lseg && ffv2_avoid_read_on_rw(pgio->pg_lseg)) {
+		pnfs_put_lseg(pgio->pg_lseg);
+		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
+						   nfs_req_openctx(req),
+						   req_offset(req),
+						   req->wb_bytes,
+						   IOMODE_READ, true,
+						   nfs_io_gfp_mask());
+		if (IS_ERR(pgio->pg_lseg)) {
+			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+			pgio->pg_lseg = NULL;
+			return;
+		}
+	}
+	if (!pgio->pg_lseg) {
+		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
+						   nfs_req_openctx(req),
+						   req_offset(req),
+						   req->wb_bytes,
+						   IOMODE_READ,
+						   false,
+						   nfs_io_gfp_mask());
+		if (IS_ERR(pgio->pg_lseg)) {
+			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+			pgio->pg_lseg = NULL;
+			return;
+		}
+	}
+	if (!pgio->pg_lseg)
+		nfs_pageio_reset_read_mds(pgio);
+}
+
+static void
+ffv2_pg_init_write(struct nfs_pageio_descriptor *pgio, struct nfs_page *req)
+{
+	pnfs_generic_pg_check_layout(pgio, req);
+	if (!pgio->pg_lseg) {
+		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
+						   nfs_req_openctx(req),
+						   req_offset(req),
+						   req->wb_bytes,
+						   IOMODE_RW,
+						   false,
+						   nfs_io_gfp_mask());
+		if (IS_ERR(pgio->pg_lseg)) {
+			pgio->pg_error = PTR_ERR(pgio->pg_lseg);
+			pgio->pg_lseg = NULL;
+			return;
+		}
+	}
+	if (!pgio->pg_lseg)
+		nfs_pageio_reset_write_mds(pgio);
+}
+
+/*
+ * Read/write pagelist dispatchers.  These are the entry points the
+ * pNFS core calls once pg_doio has assembled a request batch and
+ * decided to try the layout-managed I/O path.  Returning
+ * PNFS_NOT_ATTEMPTED tells the core to fall back to MDS-inband
+ * I/O -- correct behaviour for a driver that hasn't yet wired
+ * DS-side RPC dispatch.
+ *
+ * A subsequent commit replaces these stubs with real DS dispatch
+ * for the MIRRORED encoding, then extends to RS_VANDERMONDE /
+ * MOJETTE / LINUX_MD_RAID via the ffv2_encoder_ops table.
+ */
+static enum pnfs_try_status
+ffv2_read_pagelist(struct nfs_pgio_header *hdr)
+{
+	return PNFS_NOT_ATTEMPTED;
+}
+
+static enum pnfs_try_status
+ffv2_write_pagelist(struct nfs_pgio_header *hdr, int sync)
+{
+	return PNFS_NOT_ATTEMPTED;
+}
+
+static const struct nfs_pageio_ops ffv2_pg_read_ops = {
+	.pg_init	= ffv2_pg_init_read,
+	.pg_test	= pnfs_generic_pg_test,
+	.pg_doio	= pnfs_generic_pg_readpages,
+	.pg_cleanup	= pnfs_generic_pg_cleanup,
+};
+
+static u32
+ffv2_pg_set_mirror_write(struct nfs_pageio_descriptor *desc, u32 idx)
+{
+	u32 old = desc->pg_mirror_idx;
+
+	desc->pg_mirror_idx = idx;
+	return old;
+}
+
+static struct nfs_pgio_mirror *
+ffv2_pg_get_mirror_write(struct nfs_pageio_descriptor *desc, u32 idx)
+{
+	return &desc->pg_mirrors[idx];
+}
+
+static const struct nfs_pageio_ops ffv2_pg_write_ops = {
+	.pg_init	= ffv2_pg_init_write,
+	.pg_test	= pnfs_generic_pg_test,
+	.pg_doio	= pnfs_generic_pg_writepages,
+	.pg_get_mirror	= ffv2_pg_get_mirror_write,
+	.pg_set_mirror	= ffv2_pg_set_mirror_write,
+	.pg_cleanup	= pnfs_generic_pg_cleanup,
+};
+
 static struct pnfs_layoutdriver_type flexfilesv2_type = {
 	.id			= LAYOUT_FLEX_FILES_V2,
 	.name			= "LAYOUT_FLEX_FILES_V2",
@@ -172,6 +295,10 @@ static struct pnfs_layoutdriver_type flexfilesv2_type = {
 	.free_lseg		= ffv2_free_lseg,
 	.alloc_deviceid_node	= ffv2_alloc_deviceid_node,
 	.free_deviceid_node	= ffv2_free_deviceid_node,
+	.pg_read_ops		= &ffv2_pg_read_ops,
+	.pg_write_ops		= &ffv2_pg_write_ops,
+	.read_pagelist		= ffv2_read_pagelist,
+	.write_pagelist		= ffv2_write_pagelist,
 	.add_lseg		= ffv2_add_lseg,
 	.return_range		= ffv2_return_range,
 	.get_ds_info		= ffv2_get_ds_info,

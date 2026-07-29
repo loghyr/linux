@@ -52,6 +52,8 @@
 #define FFV2_ENCODING_XOR_PARITY		6
 #define FFV2_ENCODING_LINUX_MD_RAID		7
 
+#define FFV2_FLAGS_NO_READ_IO			4u
+
 /*
  * Per-file in-memory layout header.  Wraps the generic pNFS layout
  * header and will grow to carry v2-specific state (encoding family,
@@ -137,6 +139,13 @@ FFV2_LSEG(struct pnfs_layout_segment *lseg)
 {
 	return container_of(lseg, struct nfs4_ffv2_layout_segment,
 			    generic_hdr);
+}
+
+static inline bool
+ffv2_avoid_read_on_rw(struct pnfs_layout_segment *lseg)
+{
+	return lseg->pls_range.iomode == IOMODE_RW &&
+	       (FFV2_LSEG(lseg)->flags & FFV2_FLAGS_NO_READ_IO);
 }
 
 /*
