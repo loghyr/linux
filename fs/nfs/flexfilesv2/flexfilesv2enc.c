@@ -19,12 +19,10 @@
 
 #include "flexfilesv2.h"
 
-/*
- * The array is populated by subsequent commits that add each
- * encoder in turn.  Keeping it empty here isolates the abstraction
- * change from the first encoder implementation.
- */
+extern const struct ffv2_encoder_ops ffv2_encoder_xor_parity;
+
 static const struct ffv2_encoder_ops * const ffv2_encoders[] = {
+	&ffv2_encoder_xor_parity,
 };
 
 const struct ffv2_encoder_ops *ffv2_find_encoder(u32 coding_type)

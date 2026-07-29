@@ -4,4 +4,4 @@
 #
 obj-$(CONFIG_PNFS_FLEXFILE_V2_LAYOUT) += nfs_layout_flexfilesv2.o
 nfs_layout_flexfilesv2-y := flexfilesv2.o flexfilesv2xdr.o flexfilesv2dev.o \
-			    flexfilesv2enc.o
+			    flexfilesv2enc.o flexfilesv2_xor.o
