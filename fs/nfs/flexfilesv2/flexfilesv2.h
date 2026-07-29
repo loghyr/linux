@@ -11,6 +11,7 @@
 #ifndef FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H
 #define FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H
 
+#include <linux/math64.h>
 #include <linux/refcount.h>
 #include <linux/nfs4.h>
 #include "../pnfs.h"
@@ -52,7 +53,20 @@
 #define FFV2_ENCODING_XOR_PARITY		6
 #define FFV2_ENCODING_LINUX_MD_RAID		7
 
+/* ffv2_flags4 values consumed by the initial read/write paths. */
+#define FFV2_FLAGS_NO_IO_THRU_MDS		2u
 #define FFV2_FLAGS_NO_READ_IO			4u
+
+/*
+ * ffv2_striping4 (wire enum): tells the client how per-shard bytes
+ * are placed on the DS backing file.  SPARSE stores each shard at
+ * its file-absolute offset (sparse file with holes for the other
+ * shards); DENSE packs each shard densely at stripe_index *
+ * shard_len (no holes).  The reference server uses DENSE.
+ */
+#define FFV2_STRIPING_NONE			0
+#define FFV2_STRIPING_SPARSE			1
+#define FFV2_STRIPING_DENSE			2
 
 /*
  * Per-file in-memory layout header.  Wraps the generic pNFS layout
@@ -120,6 +134,31 @@ struct nfs4_ffv2_mirror {
 };
 
 /*
+ * Per-stripe write context.  Allocated in pg_init when a chunked
+ * write batch starts; freed after all k+m DS writes complete
+ * (refcount = k+m initially, one drop per write_release).
+ *
+ * Only one chunked stripe can be in flight per lseg; concurrent
+ * writers see fls_stripe_busy already set and fall back to MDS.
+ * Multi-concurrent-stripe support is a follow-up commit.
+ */
+struct ffv2_stripe_ctx {
+	refcount_t			refcnt;
+	u32				k, m;
+	u32				shard_len;
+	u32				pages_per_shard;
+	/*
+	 * shard_pages[i] is a length-pages_per_shard page array;
+	 * per-mirror write_pagelist points hdr->args.pages at
+	 * shard_pages[mirror_idx].
+	 */
+	struct page			***shard_pages;
+	struct mutex			encode_lock;
+	bool				encoded;
+	struct nfs4_ffv2_layout_segment *fls;	/* back-pointer for release */
+};
+
+/*
  * In-memory ffv2 layout segment.  The trailing mirror_array carries
  * per-mirror state; the layout is decoded from wire by
  * flexfilesv2xdr.c and consumed by the read/write path in
@@ -129,6 +168,8 @@ struct nfs4_ffv2_layout_segment {
 	struct pnfs_layout_segment	generic_hdr;
 	u32				flags;
 	u32				stats_collect_hint;
+	atomic_t			fls_stripe_busy;
+	struct ffv2_stripe_ctx		*fls_stripe_ctx;
 	u32				mirror_array_cnt;
 	struct nfs4_ffv2_mirror		*mirror_array[]
 					__counted_by(mirror_array_cnt);
@@ -146,6 +187,16 @@ ffv2_avoid_read_on_rw(struct pnfs_layout_segment *lseg)
 {
 	return lseg->pls_range.iomode == IOMODE_RW &&
 	       (FFV2_LSEG(lseg)->flags & FFV2_FLAGS_NO_READ_IO);
+}
+
+/*
+ * The client must not fall back to MDS proxy I/O when this bit is set.
+ * Marking the layout for return lets a later attempt obtain fresh state.
+ */
+static inline bool
+ffv2_no_fallback_to_mds(struct pnfs_layout_segment *lseg)
+{
+	return FFV2_LSEG(lseg)->flags & FFV2_FLAGS_NO_IO_THRU_MDS;
 }
 
 /*
@@ -217,5 +268,47 @@ struct ffv2_encoder_ops {
 
 /* flexfilesv2enc.c */
 const struct ffv2_encoder_ops *ffv2_find_encoder(u32 coding_type);
+
+/* Per-encoder ops instances, registered in ffv2_encoders[]. */
+extern const struct ffv2_encoder_ops ffv2_encoder_xor_parity;
+extern const struct ffv2_encoder_ops ffv2_encoder_linux_md;
+extern const struct ffv2_encoder_ops ffv2_encoder_rs_vandermonde;
+extern const struct ffv2_encoder_ops ffv2_encoder_mojette_systematic;
+
+/* flexfilesv2_write.c */
+enum pnfs_try_status
+ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync);
+
+/*
+ * Translate a file-absolute byte offset into the DS-side byte
+ * offset for the given mirror geometry, per the wire striping
+ * enum:
+ *
+ *   SPARSE: DS stores each shard at its file-absolute offset with
+ *           holes for the other shards; no translation needed.
+ *   DENSE:  DS packs each shard at stripe_index * shard_len; every
+ *           DS's file grows in lockstep with its share of the
+ *           logical file.  This is what the reference server uses.
+ *   NONE:   unspecified; treat as SPARSE (no translation) to keep
+ *           older servers working.
+ *
+ * shard_len == 0 or a chunked lseg with k == 0 would be a malformed
+ * layout; caller must have already validated those before calling.
+ */
+static inline u64
+ffv2_ds_offset(const struct nfs4_ffv2_mirror *mirror, u64 file_off)
+{
+	u64 stripe_len, stripe_index, dividend;
+	u32 within_shard;
+
+	if (mirror->striping != FFV2_STRIPING_DENSE)
+		return file_off;
+	stripe_len = (u64)mirror->protection_data *
+		     mirror->striping_unit_size;
+	stripe_index = div64_u64(file_off, stripe_len);
+	dividend = file_off;
+	within_shard = do_div(dividend, mirror->striping_unit_size);
+	return stripe_index * mirror->striping_unit_size + within_shard;
+}
 
 #endif /* FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H */

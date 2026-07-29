@@ -248,9 +248,20 @@ ffv2_read_pagelist(struct nfs_pgio_header *hdr)
 	return PNFS_NOT_ATTEMPTED;
 }
 
+static bool ffv2_lseg_is_chunked(const struct nfs4_ffv2_layout_segment *fls);
+
 static enum pnfs_try_status
 ffv2_write_pagelist(struct nfs_pgio_header *hdr, int sync)
 {
+	struct pnfs_layout_segment *lseg = hdr->lseg;
+	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(lseg);
+
+	if (ffv2_lseg_is_chunked(fls))
+		return ffv2_write_pagelist_chunked(hdr, sync);
+	if (ffv2_no_fallback_to_mds(lseg)) {
+		pnfs_error_mark_layout_for_return(hdr->inode, lseg);
+		return PNFS_TRY_AGAIN;
+	}
 	return PNFS_NOT_ATTEMPTED;
 }
 
