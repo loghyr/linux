@@ -46,19 +46,18 @@ ffv2_alloc_lseg(struct pnfs_layout_hdr *lo,
 		struct nfs4_layoutget_res *lgr,
 		gfp_t gfp_flags)
 {
-	/*
-	 * Skeleton: refuse every layout by returning NULL.  The pNFS
-	 * core treats this as LAYOUTGET failure and falls back to
-	 * layoutless I/O.  A subsequent commit will implement XDR
-	 * decode of ffv2_layout4 and return a real lseg.
-	 */
-	return NULL;
+	struct nfs4_ffv2_layout_segment *fls;
+
+	fls = ffv2_decode_layout(lgr, gfp_flags);
+	if (IS_ERR(fls))
+		return ERR_CAST(fls);
+	return &fls->generic_hdr;
 }
 
 static void
 ffv2_free_lseg(struct pnfs_layout_segment *lseg)
 {
-	/* Unreachable while ffv2_alloc_lseg returns NULL. */
+	ffv2_free_layout_segment(FFV2_LSEG(lseg));
 }
 
 static struct pnfs_layoutdriver_type flexfilesv2_type = {

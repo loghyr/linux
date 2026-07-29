@@ -12,7 +12,45 @@
 #define FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H
 
 #include <linux/refcount.h>
+#include <linux/nfs4.h>
 #include "../pnfs.h"
+
+/*
+ * Sanity caps for wire-supplied array lengths.  ffv2_layout4 is
+ * client-parsed from an MDS-authored buffer; every count is
+ * bounds-checked against these before we allocate.
+ */
+#define NFS4_FFV2_MAX_MIRROR_CNT		1024
+#define NFS4_FFV2_MAX_STRIPE_CNT		1024
+#define NFS4_FFV2_MAX_DS_PER_STRIPE		256
+#define NFS4_FFV2_MAX_VERSIONS_PER_DS		8
+
+/*
+ * Reserved sentinel values in the chunk_guard4.cg_client_id space.
+ * A data server rejects either value, so layout decoding must reject
+ * them before the identity reaches a CHUNK operation.
+ */
+#define FFV2_CG_CLIENT_ID_NONE		0u
+#define FFV2_CG_CLIENT_ID_MDS		0xFFFFFFFFu
+
+/*
+ * Encoding-family values on the wire (ffv2_coding_type4 in the
+ * draft XDR).  Per the draft's IANA registry
+ * (draft-haynes-nfsv4-flexfiles-v2, #tbl-coding-types), the
+ * standards-track range is 1..7 contiguous; SNAPRAID_CAUCHY and
+ * ISA_L_RS were removed on 2026-07-30 for StreamScale US 8,683,296
+ * exposure on their SIMD split-table Galois-field multiply.  Kept
+ * as a private #define set rather than a shared enum for now; a
+ * follow-up cross-family header can lift these when a second
+ * consumer needs them.
+ */
+#define FFV2_ENCODING_PASSTHROUGH		1
+#define FFV2_ENCODING_MOJETTE_SYSTEMATIC	2
+#define FFV2_ENCODING_MOJETTE_NON_SYSTEMATIC	3
+#define FFV2_ENCODING_RS_VANDERMONDE		4
+#define FFV2_ENCODING_REPLICATED		5
+#define FFV2_ENCODING_XOR_PARITY		6
+#define FFV2_ENCODING_LINUX_MD_RAID		7
 
 /*
  * Per-file in-memory layout header.  Wraps the generic pNFS layout
@@ -28,5 +66,82 @@ FFV2_LAYOUT_FROM_HDR(struct pnfs_layout_hdr *lo)
 {
 	return container_of(lo, struct nfs4_ffv2_layout, generic_hdr);
 }
+
+/*
+ * One (stateid, filehandle) pair the DS accepts for this data-server
+ * slot.  ffv2_file_info4 in the draft is a per-NFS-version tuple; the
+ * MDS supplies one entry per version it wants us to attempt.
+ */
+struct nfs4_ffv2_ds_version {
+	nfs4_stateid		stateid;
+	struct nfs_fh		fh;
+};
+
+/*
+ * One data server slot within a stripe.  Corresponds to
+ * ffv2_data_server4 in the draft XDR.
+ */
+struct nfs4_ffv2_data_server {
+	struct nfs4_deviceid	devid;
+	u32			efficiency;
+	u32			versions_cnt;
+	struct nfs4_ffv2_ds_version *versions;
+	u32			flags;
+	/*
+	 * user/group are decoded from the wire as opaque UTF-8 strings.
+	 * Kernel-side idmap resolution (to kuid_t/kgid_t) is deferred to
+	 * the follow-up commit that wires DS-side identity.
+	 */
+};
+
+/*
+ * One stripe within a mirror.  Corresponds to ffv2_stripes4.
+ */
+struct nfs4_ffv2_stripe {
+	u32				data_servers_cnt;
+	struct nfs4_ffv2_data_server	*data_servers;
+};
+
+/*
+ * One mirror within an ffv2 layout.  Corresponds to ffv2_mirror4.
+ */
+struct nfs4_ffv2_mirror {
+	u32			coding_type;
+	u32			protection_data;	/* k */
+	u32			protection_parity;	/* m */
+	u32			striping;
+	u32			striping_unit_size;
+	u32			client_id;
+	u32			checksum_algorithm;
+	u32			stripes_cnt;
+	struct nfs4_ffv2_stripe	*stripes;
+};
+
+/*
+ * In-memory ffv2 layout segment.  The trailing mirror_array carries
+ * per-mirror state; the layout is decoded from wire by
+ * flexfilesv2xdr.c and consumed by the read/write path in
+ * subsequent commits.
+ */
+struct nfs4_ffv2_layout_segment {
+	struct pnfs_layout_segment	generic_hdr;
+	u32				flags;
+	u32				stats_collect_hint;
+	u32				mirror_array_cnt;
+	struct nfs4_ffv2_mirror		*mirror_array[]
+					__counted_by(mirror_array_cnt);
+};
+
+static inline struct nfs4_ffv2_layout_segment *
+FFV2_LSEG(struct pnfs_layout_segment *lseg)
+{
+	return container_of(lseg, struct nfs4_ffv2_layout_segment,
+			    generic_hdr);
+}
+
+/* flexfilesv2xdr.c */
+struct nfs4_ffv2_layout_segment *
+ffv2_decode_layout(struct nfs4_layoutget_res *lgr, gfp_t gfp_flags);
+void ffv2_free_layout_segment(struct nfs4_ffv2_layout_segment *fls);
 
 #endif /* FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H */
