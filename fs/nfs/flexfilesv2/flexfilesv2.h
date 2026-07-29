@@ -191,4 +191,31 @@ ffv2_alloc_deviceid_node(struct nfs_server *server, struct pnfs_device *pdev,
 			 gfp_t gfp_flags);
 void ffv2_free_deviceid_node(struct nfs4_deviceid_node *node);
 
+/*
+ * Erasure-encoder plug-in interface.  Each supported coding_type
+ * registers one ffv2_encoder_ops.  The write path calls .encode()
+ * to produce m parity shards from k systematic data shards; the
+ * read path calls .repair() only when a shard is missing (healthy
+ * reads bypass the encoder entirely by fetching from the systematic
+ * slot).
+ *
+ * Buffers are caller-allocated; the encoder does not free them.
+ * data[] and parity[] are indexed by shard number in the ordering
+ * the wire format defines for that coding_type.
+ */
+struct ffv2_encoder_ops {
+	u32			coding_type;
+	const char		*name;
+	int			(*encode)(u32 k, u32 m, u32 shard_len,
+					  const u8 * const *data,
+					  u8 * const *parity);
+	int			(*repair)(u32 k, u32 m, u32 shard_len,
+					  u32 missing_idx,
+					  const u8 * const *surviving,
+					  u8 *reconstructed);
+};
+
+/* flexfilesv2enc.c */
+const struct ffv2_encoder_ops *ffv2_find_encoder(u32 coding_type);
+
 #endif /* FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H */
