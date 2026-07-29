@@ -45,24 +45,24 @@ static int ffv2_xor_encode(u32 k, u32 m, u32 shard_len,
  * mathematically the same operation as encode(), just with the
  * missing slot swapped for the parity slot.
  *
- * surviving[] holds k shards in the natural order: for missing_idx
- * in [0..k-1] it contains the k-1 remaining data shards followed by
- * the parity shard; for missing_idx == k (parity gone) it holds all
- * k data shards.  The caller is responsible for that ordering.
+ * XOR is index-symmetric: the reconstruction result is the same
+ * regardless of which surviving-shard slot maps to which original
+ * index, so surviving_indices is not used here.
  */
 static int ffv2_xor_repair(u32 k, u32 m, u32 shard_len,
-			   u32 missing_idx, const u8 * const *surviving,
-			   u8 *reconstructed)
+			   const u32 *surviving_indices,
+			   const u8 * const *surviving_shards,
+			   u32 missing_idx, u8 *reconstructed)
 {
 	u32 i;
 
 	if (m != 1 || k == 0 || missing_idx > k)
 		return -EINVAL;
 
-	memcpy(reconstructed, surviving[0], shard_len);
+	memcpy(reconstructed, surviving_shards[0], shard_len);
 	for (i = 1; i < k; i++) {
 		u32 j;
-		const u8 *src = surviving[i];
+		const u8 *src = surviving_shards[i];
 
 		for (j = 0; j < shard_len; j++)
 			reconstructed[j] ^= src[j];

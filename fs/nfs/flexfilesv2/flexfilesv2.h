@@ -271,9 +271,19 @@ struct ffv2_encoder_ops {
 	int			(*encode)(u32 k, u32 m, u32 shard_len,
 					  const u8 * const *data,
 					  u8 * const *parity);
+	/*
+	 * Reconstruct shard `missing_idx` (in [0, k+m)) from k surviving
+	 * shards.  surviving_indices[j] is the original position of
+	 * surviving_shards[j] in the full 0..k+m-1 shard vector;
+	 * neither array may contain missing_idx.  Order of surviving
+	 * shards is caller-chosen (but must be consistent across the
+	 * two arrays).  Encoders like XOR that are index-symmetric
+	 * may ignore surviving_indices.
+	 */
 	int			(*repair)(u32 k, u32 m, u32 shard_len,
+					  const u32 *surviving_indices,
+					  const u8 * const *surviving_shards,
 					  u32 missing_idx,
-					  const u8 * const *surviving,
 					  u8 *reconstructed);
 };
 

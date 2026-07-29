@@ -271,10 +271,123 @@ static int ffv2_rs_encode(u32 k, u32 m, u32 shard_len,
 	return 0;
 }
 
+/*
+ * Reconstruct one missing shard from k surviving shards.
+ *
+ * The full (k+m) * k systematic encoding matrix E has identity in
+ * its top k rows (data pass-through) and the parity coefficients in
+ * its bottom m rows.  Let S be the k * k submatrix formed by the k
+ * rows of E corresponding to surviving_indices.  If S is invertible
+ * (which it always is for Vandermonde-derived E with distinct non-
+ * zero eval points), the recovered data shards satisfy
+ *
+ *     D = S^-1 * surviving
+ *
+ * and the coefficient row for reconstructing shard `missing_idx`
+ * from the k surviving shards is:
+ *
+ *     missing_idx  <  k :  coef = row `missing_idx` of  S^-1
+ *     missing_idx  >= k :  coef = parity_matrix[missing_idx-k] * S^-1
+ *
+ * Reconstructed byte b then equals XOR over j of gf_mul(coef[j],
+ * surviving[j][b]) -- the same shape as encode, just with different
+ * coefficients.  Memory footprint is O(k^2) coefficients, not
+ * O(k * shard_len), so this works even for large shards.
+ */
+static int ffv2_rs_repair(u32 k, u32 m, u32 shard_len,
+			  const u32 *surviving_indices,
+			  const u8 * const *surviving_shards,
+			  u32 missing_idx, u8 *reconstructed)
+{
+	u8 *pmat = NULL;
+	u8 *S = NULL, *S_inv = NULL;
+	u8 *coef = NULL;
+	u32 i, j, b;
+	int rc;
+
+	if (k == 0 || m == 0 || k + m > 255 || missing_idx >= k + m)
+		return -EINVAL;
+
+	gf_ensure_ready();
+	pmat = ffv2_rs_build_parity(k, m);
+	if (!pmat)
+		return -ENOMEM;
+
+	S     = kcalloc(k * k, sizeof(u8), GFP_NOFS);
+	S_inv = kcalloc(k * k, sizeof(u8), GFP_NOFS);
+	coef  = kcalloc(k,     sizeof(u8), GFP_NOFS);
+	if (!S || !S_inv || !coef) {
+		rc = -ENOMEM;
+		goto out;
+	}
+
+	/* Assemble S: row i of E for surviving index surviving_indices[i]. */
+	for (i = 0; i < k; i++) {
+		u32 si = surviving_indices[i];
+
+		if (si >= k + m || si == missing_idx) {
+			rc = -EINVAL;
+			goto out;
+		}
+		if (si < k) {
+			/* Row si of the identity: column si is 1, rest 0. */
+			S[i * k + si] = 1;
+		} else {
+			/* Row si-k of the parity submatrix. */
+			u32 pj;
+
+			for (pj = 0; pj < k; pj++)
+				S[i * k + pj] = pmat[(si - k) * k + pj];
+		}
+		/* Corresponding identity row in S_inv for Gauss-Jordan. */
+		S_inv[i * k + i] = 1;
+	}
+
+	rc = gf_invert_square(S, S_inv, k);
+	if (rc)
+		goto out;
+
+	/* Compute coef[j] for j in [0, k). */
+	if (missing_idx < k) {
+		for (j = 0; j < k; j++)
+			coef[j] = S_inv[missing_idx * k + j];
+	} else {
+		u32 pi = missing_idx - k;
+
+		for (j = 0; j < k; j++) {
+			u8 sum = 0;
+
+			for (i = 0; i < k; i++)
+				sum ^= gf_mul(pmat[pi * k + i],
+					      S_inv[i * k + j]);
+			coef[j] = sum;
+		}
+	}
+
+	/* Apply coefficients to reconstruct the missing shard. */
+	memset(reconstructed, 0, shard_len);
+	for (j = 0; j < k; j++) {
+		u8 c = coef[j];
+		const u8 *src = surviving_shards[j];
+
+		if (c == 0)
+			continue;
+		for (b = 0; b < shard_len; b++)
+			reconstructed[b] ^= gf_mul(c, src[b]);
+	}
+	rc = 0;
+
+out:
+	kfree(coef);
+	kfree(S_inv);
+	kfree(S);
+	kfree(pmat);
+	return rc;
+}
+
 const struct ffv2_encoder_ops ffv2_encoder_rs_vandermonde = {
 	.coding_type	= FFV2_ENCODING_RS_VANDERMONDE,
 	.name		= "rs-vandermonde",
 	.encode		= ffv2_rs_encode,
-	/* repair: reuse the same Gauss-Jordan machinery on the
-	 * missing-row subset; deferred to the read-recovery slice. */
+	.repair		= ffv2_rs_repair,
 };
