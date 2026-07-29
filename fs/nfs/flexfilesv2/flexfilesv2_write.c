@@ -68,10 +68,79 @@ static void ffv2_stripe_ctx_put(struct ffv2_stripe_ctx *ctx)
 		return;
 	fls = ctx->fls;
 	if (fls) {
-		fls->fls_stripe_ctx = NULL;
-		atomic_set(&fls->fls_stripe_busy, 0);
+		spin_lock(&fls->fls_ctx_lock);
+		list_del(&ctx->list);
+		spin_unlock(&fls->fls_ctx_lock);
 	}
 	ffv2_stripe_ctx_free(ctx);
+}
+
+/*
+ * Per-pgio-descriptor identifier used as a sibling-mirror key.
+ * hdr->io_completion is set for buffered writeback; hdr->dreq for
+ * O_DIRECT.  Both are shared across mirrors of the same pgio but
+ * differ between distinct writers.  Callers use whichever is
+ * non-NULL; if both are NULL (rare kernel-internal write helpers)
+ * we fall through to a NULL key -- safe because i_rwsem serialises
+ * such writers at inode granularity, so only one is ever in flight
+ * against this lseg at a time.
+ */
+static void *ffv2_writer_key(const struct nfs_pgio_header *hdr)
+{
+	if (hdr->io_completion)
+		return (void *)hdr->io_completion;
+	return (void *)hdr->dreq;
+}
+
+/*
+ * Look up an in-flight stripe context matching (writer_key,
+ * stripe_off) on `fls`; if none exists, install `alloc`.  On
+ * success returns with the refcount already incremented for the
+ * caller (so the caller does not need refcount_inc).
+ *
+ * Keying on the per-pgio writer_key as well as stripe_off ensures
+ * sibling mirrors of the SAME writer share a ctx while a DIFFERENT
+ * writer to the same stripe gets its own ctx.  Sharing across
+ * writers would silently overwrite the second writer's user data
+ * with the first's, since data pages are copied only on the alloc
+ * path.
+ *
+ * `alloc` is the caller-preallocated candidate.  The caller
+ * allocates upfront (before taking the lock) so
+ * ffv2_stripe_ctx_alloc's page-alloc loop stays out of the
+ * spinlock's critical section.
+ */
+static struct ffv2_stripe_ctx *
+ffv2_stripe_ctx_find_or_add(struct nfs4_ffv2_layout_segment *fls,
+			    void *writer_key, u64 stripe_off,
+			    struct ffv2_stripe_ctx *alloc)
+{
+	struct ffv2_stripe_ctx *ctx;
+
+	spin_lock(&fls->fls_ctx_lock);
+	list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
+		if (ctx->writer_key != writer_key ||
+		    ctx->stripe_off != stripe_off)
+			continue;
+		/*
+		 * refcount_inc_not_zero handles the "about to be freed"
+		 * race: if another release just dropped this ctx's ref
+		 * to zero and is inside ffv2_stripe_ctx_put waiting for
+		 * our spinlock to run list_del, we skip past it and
+		 * treat the lookup as a miss.  The blocked _put will
+		 * then complete list_del before we install our new
+		 * candidate.
+		 */
+		if (refcount_inc_not_zero(&ctx->refcnt)) {
+			spin_unlock(&fls->fls_ctx_lock);
+			return ctx;
+		}
+	}
+	alloc->writer_key = writer_key;
+	alloc->stripe_off = stripe_off;
+	list_add(&alloc->list, &fls->fls_ctx_list);
+	spin_unlock(&fls->fls_ctx_lock);
+	return alloc;
 }
 
 static struct ffv2_stripe_ctx *
@@ -88,7 +157,11 @@ ffv2_stripe_ctx_alloc(struct nfs4_ffv2_layout_segment *fls,
 	ctx = kzalloc(sizeof(*ctx), gfp);
 	if (!ctx)
 		return ERR_PTR(-ENOMEM);
-	refcount_set(&ctx->refcnt, k + m);
+	/*
+	 * Refcount is set by the caller after find_or_add resolves the
+	 * winner: the alloc-winner gets 1, then each subsequent-mirror
+	 * lookup inc's via refcount_inc_not_zero.
+	 */
 	ctx->k = k;
 	ctx->m = m;
 	ctx->shard_len = shard_len;
@@ -288,8 +361,23 @@ static void ffv2_write_release(void *data)
 	struct pnfs_layout_segment *lseg = hdr->lseg;
 	struct nfs4_ffv2_layout_segment *fls = lseg ? FFV2_LSEG(lseg) : NULL;
 
-	if (fls)
-		ffv2_stripe_ctx_put(fls->fls_stripe_ctx);
+	if (fls) {
+		struct ffv2_stripe_ctx *ctx;
+		u64 stripe_off = hdr->mds_offset;
+		void *writer_key = ffv2_writer_key(hdr);
+
+		spin_lock(&fls->fls_ctx_lock);
+		list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
+			if (ctx->writer_key != writer_key ||
+			    ctx->stripe_off != stripe_off)
+				continue;
+			spin_unlock(&fls->fls_ctx_lock);
+			ffv2_stripe_ctx_put(ctx);
+			goto done;
+		}
+		spin_unlock(&fls->fls_ctx_lock);
+	}
+done:
 	pnfs_generic_rw_release(data);
 }
 
@@ -337,34 +425,47 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	if (!enc || !enc->encode)
 		return PNFS_NOT_ATTEMPTED;
 
-	if (mirror_idx == 0) {
-		/* First mirror -- take busy gate, allocate, encode. */
-		if (hdr->args.count != k * mirror->striping_unit_size ||
-		    hdr->args.offset % (k * mirror->striping_unit_size))
-			return PNFS_NOT_ATTEMPTED;
-		if (atomic_cmpxchg(&fls->fls_stripe_busy, 0, 1) != 0)
-			return PNFS_NOT_ATTEMPTED;
+	{
+		u64 stripe_bytes = (u64)k * mirror->striping_unit_size;
+		u64 stripe_off;
+		struct ffv2_stripe_ctx *cand, *found;
 
-		ctx = ffv2_stripe_ctx_alloc(fls, k, m,
-					    mirror->striping_unit_size,
-					    nfs_io_gfp_mask());
-		if (IS_ERR(ctx)) {
-			atomic_set(&fls->fls_stripe_busy, 0);
+		if (hdr->args.count != stripe_bytes ||
+		    hdr->args.offset % stripe_bytes)
 			return PNFS_NOT_ATTEMPTED;
+		stripe_off = hdr->args.offset;
+
+		/*
+		 * Preallocate (page-alloc loop is heavy, keep it out of
+		 * the spinlock); publish under lock via find_or_add.
+		 * If someone raced us and registered a ctx for the same
+		 * stripe_off first, we free `cand` and use theirs.
+		 */
+		cand = ffv2_stripe_ctx_alloc(fls, k, m,
+					     mirror->striping_unit_size,
+					     nfs_io_gfp_mask());
+		if (IS_ERR(cand))
+			return PNFS_NOT_ATTEMPTED;
+		refcount_set(&cand->refcnt, 1);
+
+		found = ffv2_stripe_ctx_find_or_add(fls, ffv2_writer_key(hdr),
+						    stripe_off, cand);
+		if (found != cand) {
+			ffv2_stripe_ctx_free(cand);
+			ctx = found;	/* refcount already inc'd */
+		} else {
+			ctx = cand;	/* refcount initialized to 1 above */
+			ffv2_copy_user_to_shards(ctx, hdr);
 		}
-		refcount_set(&ctx->refcnt, 1);
-		ffv2_copy_user_to_shards(ctx, hdr);
-		if (ffv2_ensure_encoded(ctx, enc)) {
-			ffv2_stripe_ctx_free(ctx);
-			atomic_set(&fls->fls_stripe_busy, 0);
-			return PNFS_NOT_ATTEMPTED;
-		}
-		smp_store_release(&fls->fls_stripe_ctx, ctx);
-	} else {
-		ctx = smp_load_acquire(&fls->fls_stripe_ctx);
-		if (!ctx || mirror_idx >= ctx->k + ctx->m)
-			return PNFS_NOT_ATTEMPTED;
-		refcount_inc(&ctx->refcnt);
+	}
+
+	if (ffv2_ensure_encoded(ctx, enc)) {
+		ffv2_stripe_ctx_put(ctx);
+		return PNFS_NOT_ATTEMPTED;
+	}
+	if (mirror_idx >= ctx->k + ctx->m) {
+		ffv2_stripe_ctx_put(ctx);
+		return PNFS_NOT_ATTEMPTED;
 	}
 
 	/* From here on the ctx ref belongs to this dispatch. */

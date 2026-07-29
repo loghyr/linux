@@ -134,16 +134,27 @@ struct nfs4_ffv2_mirror {
 };
 
 /*
- * Per-stripe write context.  Allocated in pg_init when a chunked
- * write batch starts; freed after all k+m DS writes complete
- * (refcount = k+m initially, one drop per write_release).
+ * Per-stripe write context.  Allocated when a chunked write batch
+ * starts for a given (io_completion, stripe_off); freed after all
+ * k+m DS writes for that stripe complete (refcount = k+m initially,
+ * one drop per write_release).
  *
- * Only one chunked stripe can be in flight per lseg; concurrent
- * writers see fls_stripe_busy already set and fall back to MDS.
- * Multi-concurrent-stripe support is a follow-up commit.
+ * The io_completion key ensures that ONLY sibling mirrors of the
+ * SAME writer share a ctx.  A second writer to the same stripe
+ * offset (different pgio descriptor -> different io_completion)
+ * gets its own ctx; joining another writer's ctx would silently
+ * overwrite the second writer's data with the first's, since the
+ * data pages are only copied on the alloc path.
+ *
+ * Multiple ctxes can coexist on fls_ctx_list at once: different
+ * stripes always, and same-stripe/different-writer under
+ * concurrent-writer scenarios.
  */
 struct ffv2_stripe_ctx {
 	refcount_t			refcnt;
+	void				*writer_key;	/* per-pgio key */
+	u64				stripe_off;	/* file-offset key */
+	struct list_head		list;		/* fls->fls_ctx_list */
 	u32				k, m;
 	u32				shard_len;
 	u32				pages_per_shard;
@@ -168,8 +179,8 @@ struct nfs4_ffv2_layout_segment {
 	struct pnfs_layout_segment	generic_hdr;
 	u32				flags;
 	u32				stats_collect_hint;
-	atomic_t			fls_stripe_busy;
-	struct ffv2_stripe_ctx		*fls_stripe_ctx;
+	spinlock_t			fls_ctx_lock;
+	struct list_head		fls_ctx_list;	/* ffv2_stripe_ctx */
 	u32				mirror_array_cnt;
 	struct nfs4_ffv2_mirror		*mirror_array[]
 					__counted_by(mirror_array_cnt);
