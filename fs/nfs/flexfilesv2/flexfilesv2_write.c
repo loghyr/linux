@@ -71,8 +71,47 @@ static void ffv2_stripe_ctx_put(struct ffv2_stripe_ctx *ctx)
 		spin_lock(&fls->fls_ctx_lock);
 		list_del(&ctx->list);
 		spin_unlock(&fls->fls_ctx_lock);
+		wake_up(&fls->fls_ctx_wq);
 	}
 	ffv2_stripe_ctx_free(ctx);
+}
+
+/*
+ * Drop the batch-anchor ref of every ctx still on the lseg's ctx
+ * list.  Called from ffv2_free_layout_segment as an F13 backstop:
+ * a mirror hdr whose alloc failed in pnfs_generic_pg_writepages
+ * leaves its slot in arrivals never satisfied, so the anchor ref
+ * would otherwise pin the ctx (and its shard pages) until module
+ * unload.  Straggler dispatched WRITEs / fetch RPCs hold their own
+ * refs and complete the free.  Safe to call after all lseg
+ * references have drained (the caller is on the free_lseg path).
+ */
+void ffv2_stripe_ctx_list_drain(struct nfs4_ffv2_layout_segment *fls)
+{
+	for (;;) {
+		struct ffv2_stripe_ctx *ctx;
+
+		spin_lock(&fls->fls_ctx_lock);
+		ctx = list_first_entry_or_null(&fls->fls_ctx_list,
+					       struct ffv2_stripe_ctx,
+					       list);
+		if (!ctx || !refcount_inc_not_zero(&ctx->refcnt)) {
+			spin_unlock(&fls->fls_ctx_lock);
+			return;
+		}
+		spin_unlock(&fls->fls_ctx_lock);
+		/*
+		 * Drop the anchor ref this loop borrowed (best-effort
+		 * cleanup for ctxes stuck at arrivals < k+m) plus the
+		 * inspection ref we just took.  Anchors already
+		 * released by their (k+m)-th arrival make the anchor
+		 * put a no-op harmless in that it just decrements a
+		 * refcount that already accounts for outstanding
+		 * dispatched hdrs.
+		 */
+		ffv2_stripe_ctx_put(ctx);
+		ffv2_stripe_ctx_put(ctx);
+	}
 }
 
 /*
@@ -110,37 +149,137 @@ static void *ffv2_writer_key(const struct nfs_pgio_header *hdr)
  * ffv2_stripe_ctx_alloc's page-alloc loop stays out of the
  * spinlock's critical section.
  */
-static struct ffv2_stripe_ctx *
-ffv2_stripe_ctx_find_or_add(struct nfs4_ffv2_layout_segment *fls,
-			    void *writer_key, u64 stripe_off,
-			    struct ffv2_stripe_ctx *alloc)
+/*
+ * Wait-condition helper for the gate.  Returns true when the
+ * outer for(;;) should re-scan: either no ctx with our stripe_off
+ * is on the list, or the first one we see is joinable (same
+ * writer_key, our mirror bit clear, ref still non-zero).  Returns
+ * false while a conflicting ctx is still listed, keeping the
+ * caller asleep on fls_ctx_wq.
+ *
+ * Crucially this re-scans the list under fls_ctx_lock each wake
+ * rather than dereferencing a cached pointer captured before the
+ * sleep -- the pre-wait 'conflict' may have been list_del'd and
+ * freed by the release path that woke us.
+ */
+static bool
+ffv2_stripe_gate_ready(struct nfs4_ffv2_layout_segment *fls,
+		       u64 stripe_off, void *writer_key,
+		       u32 mirror_idx)
 {
 	struct ffv2_stripe_ctx *ctx;
+	bool ready = true;
 
 	spin_lock(&fls->fls_ctx_lock);
 	list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
-		if (ctx->writer_key != writer_key ||
-		    ctx->stripe_off != stripe_off)
+		if (ctx->stripe_off != stripe_off)
 			continue;
 		/*
-		 * refcount_inc_not_zero handles the "about to be freed"
-		 * race: if another release just dropped this ctx's ref
-		 * to zero and is inside ffv2_stripe_ctx_put waiting for
-		 * our spinlock to run list_del, we skip past it and
-		 * treat the lookup as a miss.  The blocked _put will
-		 * then complete list_del before we install our new
-		 * candidate.
+		 * A same-stripe ctx is still listed.  We can make
+		 * progress iff we could join it: same writer, our
+		 * mirror slot still open, and it has not raced to
+		 * zero (a zero-refcount ctx is mid-teardown, its
+		 * list_del + wake is imminent).
 		 */
-		if (refcount_inc_not_zero(&ctx->refcnt)) {
-			spin_unlock(&fls->fls_ctx_lock);
-			return ctx;
-		}
+		ready = ctx->writer_key == writer_key &&
+			!test_bit(mirror_idx, ctx->mirror_seen) &&
+			refcount_read(&ctx->refcnt) > 0;
+		break;
 	}
-	alloc->writer_key = writer_key;
-	alloc->stripe_off = stripe_off;
-	list_add(&alloc->list, &fls->fls_ctx_list);
 	spin_unlock(&fls->fls_ctx_lock);
-	return alloc;
+	return ready;
+}
+
+/*
+ * Gated find-or-add.  Returns the admitted ctx (with refcount
+ * incremented on the caller's behalf) and *is_new set:
+ *   *is_new = true  -> caller is the winner: `alloc` was installed;
+ *                      still needs to fill shard buffers, encode.
+ *                      ctx starts with refcount = 2 (batch anchor +
+ *                      this mirror's dispatch ref).
+ *   *is_new = false -> caller joins existing ctx; refcount was
+ *                      inc'd (via refcount_inc_not_zero).
+ *
+ * On conflict (same stripe_off but different writer_key, or same
+ * writer_key with mirror bit already set) drops the spinlock and
+ * waits on fls->fls_ctx_wq for the conflicting ctx to leave the
+ * list, then retries.  Returns NULL on gate timeout (caller falls
+ * back to MDS).
+ *
+ * The mirror_idx bit gets set atomically with admission so a
+ * concurrent second-batch arrival with the same writer_key detects
+ * the collision immediately.
+ */
+static struct ffv2_stripe_ctx *
+ffv2_stripe_ctx_find_or_add(struct nfs4_ffv2_layout_segment *fls,
+			    void *writer_key, u64 stripe_off,
+			    u32 mirror_idx,
+			    struct ffv2_stripe_ctx *alloc,
+			    bool *is_new)
+{
+	const unsigned long timeout = msecs_to_jiffies(30 * 1000);
+
+	for (;;) {
+		struct ffv2_stripe_ctx *ctx;
+		bool same_writer, saw_conflict = false;
+
+		spin_lock(&fls->fls_ctx_lock);
+		list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
+			if (ctx->stripe_off != stripe_off)
+				continue;
+			same_writer = ctx->writer_key == writer_key;
+			if (same_writer &&
+			    !test_bit(mirror_idx, ctx->mirror_seen) &&
+			    refcount_inc_not_zero(&ctx->refcnt)) {
+				bool drop_anchor;
+
+				__set_bit(mirror_idx, ctx->mirror_seen);
+				ctx->arrivals++;
+				drop_anchor = ctx->arrivals ==
+					      ctx->k + ctx->m;
+				spin_unlock(&fls->fls_ctx_lock);
+				if (drop_anchor)
+					ffv2_stripe_ctx_put(ctx);
+				*is_new = false;
+				return ctx;
+			}
+			/*
+			 * Conflict: different writer, or same writer's
+			 * second batch (mirror bit already set), or
+			 * refcount raced to zero (a release is about to
+			 * list_del + wake).  Sleep on fls_ctx_wq; the
+			 * wait helper re-scans the list on each wake
+			 * rather than dereferencing this pointer.
+			 */
+			saw_conflict = true;
+			break;
+		}
+		if (!saw_conflict) {
+			/* No match, no conflict -> install `alloc`. */
+			alloc->writer_key = writer_key;
+			alloc->stripe_off = stripe_off;
+			alloc->state = FFV2_CTX_ASSEMBLING;
+			bitmap_zero(alloc->mirror_seen,
+				    NFS4_FFV2_MAX_DS_PER_STRIPE);
+			__set_bit(mirror_idx, alloc->mirror_seen);
+			alloc->arrivals = 1;
+			list_add(&alloc->list, &fls->fls_ctx_list);
+			spin_unlock(&fls->fls_ctx_lock);
+			*is_new = true;
+			return alloc;
+		}
+		spin_unlock(&fls->fls_ctx_lock);
+
+		if (!wait_event_timeout(fls->fls_ctx_wq,
+					ffv2_stripe_gate_ready(fls, stripe_off,
+							       writer_key,
+							       mirror_idx),
+					timeout))
+			return NULL;	/* gate timeout -> MDS */
+		/* Loop to re-scan.  Another writer may have installed a
+		 * new same-stripe ctx while we waited; the retry treats
+		 * it exactly like the first pass. */
+	}
 }
 
 static struct ffv2_stripe_ctx *
@@ -323,21 +462,6 @@ static int ffv2_encode_locked(struct ffv2_stripe_ctx *ctx,
 out:
 	kfree(parity);
 	kfree(data);
-	return rc;
-}
-
-static int ffv2_ensure_encoded(struct ffv2_stripe_ctx *ctx,
-			       const struct ffv2_encoder_ops *enc)
-{
-	int rc = 0;
-
-	mutex_lock(&ctx->encode_lock);
-	if (!ctx->encoded) {
-		rc = ffv2_encode_locked(ctx, enc);
-		if (!rc)
-			ctx->encoded = true;
-	}
-	mutex_unlock(&ctx->encode_lock);
 	return rc;
 }
 
@@ -537,35 +661,72 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 
 		/*
 		 * Preallocate (page-alloc loop is heavy, keep it out of
-		 * the spinlock); publish under lock via find_or_add.
-		 * If someone raced us and registered a ctx for the same
-		 * stripe_off first, we free `cand` and use theirs.
+		 * the spinlock); admit under lock via find_or_add.
+		 * refcount = 2 on entry to find_or_add: 1 for the batch
+		 * anchor (dropped by the (k+m)-th arrival), 1 for THIS
+		 * mirror's dispatch ref (returned to the caller).
+		 * Sibling admissions get a single ref each.
 		 */
 		cand = ffv2_stripe_ctx_alloc(fls, k, m,
 					     mirror->striping_unit_size,
 					     nfs_io_gfp_mask());
 		if (IS_ERR(cand))
 			return PNFS_NOT_ATTEMPTED;
-		refcount_set(&cand->refcnt, 1);
+		refcount_set(&cand->refcnt, 2);
 
-		found = ffv2_stripe_ctx_find_or_add(fls, ffv2_writer_key(hdr),
-						    stripe_off, cand);
-		if (found != cand) {
-			ffv2_stripe_ctx_free(cand);
-			ctx = found;	/* refcount already inc'd */
-		} else {
-			ctx = cand;	/* refcount initialized to 1 above */
-			if (!full_stripe)
-				ffv2_zero_shards(ctx);
-			ffv2_copy_user_to_shards_at(ctx, hdr,
-						    (u32)off_in_stripe,
-						    hdr->args.count);
+		{
+			bool is_new = false;
+
+			found = ffv2_stripe_ctx_find_or_add(
+				fls, ffv2_writer_key(hdr), stripe_off,
+				mirror_idx, cand, &is_new);
+			if (!found) {
+				ffv2_stripe_ctx_free(cand);
+				return PNFS_NOT_ATTEMPTED;
+			}
+			if (!is_new) {
+				ffv2_stripe_ctx_free(cand);
+				ctx = found;
+			} else {
+				ctx = cand;
+				if (!full_stripe)
+					ffv2_zero_shards(ctx);
+				ffv2_copy_user_to_shards_at(ctx, hdr,
+							    (u32)off_in_stripe,
+							    hdr->args.count);
+			}
 		}
 	}
 
-	if (ffv2_ensure_encoded(ctx, enc)) {
-		ffv2_stripe_ctx_put(ctx);
-		return PNFS_NOT_ATTEMPTED;
+	{
+		/*
+		 * Serialize encode/state transition under encode_lock.
+		 * First mirror in encodes and flips to READY; siblings
+		 * see READY and skip.  FAILED is sticky: any observer
+		 * puts its dispatch ref and returns NOT_ATTEMPTED so
+		 * all mirrors of this batch fall to MDS (I8, F5, F8).
+		 */
+		int rc_enc = 0;
+
+		mutex_lock(&ctx->encode_lock);
+		if (ctx->state == FFV2_CTX_ASSEMBLING) {
+			rc_enc = enc->encode
+				? ffv2_encode_locked(ctx, enc)
+				: -EOPNOTSUPP;
+			if (rc_enc) {
+				ctx->state = FFV2_CTX_FAILED;
+			} else {
+				ctx->encoded = true;
+				ctx->state = FFV2_CTX_READY;
+			}
+		}
+		if (ctx->state == FFV2_CTX_FAILED)
+			rc_enc = rc_enc ? rc_enc : -EIO;
+		mutex_unlock(&ctx->encode_lock);
+		if (rc_enc) {
+			ffv2_stripe_ctx_put(ctx);
+			return PNFS_NOT_ATTEMPTED;
+		}
 	}
 	if (mirror_idx >= ctx->k + ctx->m) {
 		ffv2_stripe_ctx_put(ctx);

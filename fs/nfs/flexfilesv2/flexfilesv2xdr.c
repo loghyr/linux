@@ -320,9 +320,12 @@ void ffv2_free_layout_segment(struct nfs4_ffv2_layout_segment *fls)
 	/*
 	 * pNFS core guarantees free_lseg fires only after all inflight
 	 * I/O against this lseg drains, so fls_ctx_list must be empty
-	 * here.  WARN keeps the invariant honest for future callers.
+	 * here in the normal case.  Drain any stragglers left behind by
+	 * a mirror whose I/O never arrived: the anchor ref that pins them
+	 * is released by the write path's drain helper; last user's put
+	 * frees.
 	 */
-	WARN_ON_ONCE(!list_empty(&fls->fls_ctx_list));
+	ffv2_stripe_ctx_list_drain(fls);
 	for (i = 0; i < fls->mirror_array_cnt; i++)
 		ffv2_free_mirror(fls->mirror_array[i]);
 	kfree(fls);
@@ -365,6 +368,7 @@ ffv2_decode_layout(struct nfs4_layoutget_res *lgr, gfp_t gfp_flags)
 	fls->mirror_array_cnt = mirror_cnt;
 	spin_lock_init(&fls->fls_ctx_lock);
 	INIT_LIST_HEAD(&fls->fls_ctx_list);
+	init_waitqueue_head(&fls->fls_ctx_wq);
 
 	for (i = 0; i < mirror_cnt; i++) {
 		struct nfs4_ffv2_mirror *m;

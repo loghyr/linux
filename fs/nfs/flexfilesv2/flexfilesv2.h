@@ -150,6 +150,19 @@ struct nfs4_ffv2_mirror {
  * stripes always, and same-stripe/different-writer under
  * concurrent-writer scenarios.
  */
+/*
+ * Batch-visible ctx lifecycle.  Sibling mirrors of one pgio batch
+ * observe these transitions to decide whether to dispatch, join, or
+ * fall back.  Set under encode_lock; single writer of each
+ * transition, arbitrary readers.
+ */
+enum ffv2_ctx_state {
+	FFV2_CTX_ASSEMBLING,	/* initial: shards being zeroed/filled */
+	FFV2_CTX_FETCHING,	/* RMW only: k fetches dispatched */
+	FFV2_CTX_READY,		/* stripe image complete + encoded */
+	FFV2_CTX_FAILED,	/* sticky: mirrors fall back to MDS */
+};
+
 struct ffv2_stripe_ctx {
 	refcount_t			refcnt;
 	void				*writer_key;	/* per-pgio key */
@@ -166,6 +179,18 @@ struct ffv2_stripe_ctx {
 	struct page			***shard_pages;
 	struct mutex			encode_lock;
 	bool				encoded;
+	enum ffv2_ctx_state		state;		/* under encode_lock */
+	/*
+	 * mirror_seen and arrivals both under fls->fls_ctx_lock.
+	 * mirror_seen bit N set when this batch's mirror N is
+	 * admitted; arrivals counts distinct admissions.  A
+	 * same-writer arrival whose bit is already set is a SECOND
+	 * batch into the same stripe -- gate-waits like a
+	 * cross-writer conflict.  arrivals == k+m releases the
+	 * batch-anchor ref (see refcount comment).
+	 */
+	DECLARE_BITMAP(mirror_seen, NFS4_FFV2_MAX_DS_PER_STRIPE);
+	u32				arrivals;
 	struct nfs4_ffv2_layout_segment *fls;	/* back-pointer for release */
 };
 
@@ -181,6 +206,7 @@ struct nfs4_ffv2_layout_segment {
 	u32				stats_collect_hint;
 	spinlock_t			fls_ctx_lock;
 	struct list_head		fls_ctx_list;	/* ffv2_stripe_ctx */
+	wait_queue_head_t		fls_ctx_wq;	/* same-stripe gate */
 	u32				mirror_array_cnt;
 	struct nfs4_ffv2_mirror		*mirror_array[]
 					__counted_by(mirror_array_cnt);
@@ -299,6 +325,7 @@ extern const struct ffv2_encoder_ops ffv2_encoder_mojette_systematic;
 /* flexfilesv2_write.c */
 enum pnfs_try_status
 ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync);
+void ffv2_stripe_ctx_list_drain(struct nfs4_ffv2_layout_segment *fls);
 
 /*
  * Translate a file-absolute byte offset into the DS-side byte
