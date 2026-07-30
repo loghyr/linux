@@ -369,6 +369,7 @@ ffv2_decode_layout(struct nfs4_layoutget_res *lgr, gfp_t gfp_flags)
 	spin_lock_init(&fls->fls_ctx_lock);
 	INIT_LIST_HEAD(&fls->fls_ctx_list);
 	init_waitqueue_head(&fls->fls_ctx_wq);
+	atomic_set(&fls->next_owner_id, 1);
 
 	for (i = 0; i < mirror_cnt; i++) {
 		struct nfs4_ffv2_mirror *m;

@@ -11,10 +11,39 @@
 #ifndef FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H
 #define FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H
 
+#include <linux/atomic.h>
 #include <linux/math64.h>
 #include <linux/refcount.h>
 #include <linux/nfs4.h>
 #include "../pnfs.h"
+
+/*
+ * chunk_guard4 / chunk_owner4 -- wire types shared by every non-
+ * PASSTHROUGH CHUNK operation per draft-haynes-nfsv4-flexfiles-v2-
+ * chunks.  Fields serialize XDR-big-endian on the wire; in-memory
+ * shape here is host-endian and packed at build_chunk_owner time by
+ * subsequent commits.
+ *
+ * cg_client_id is the writer identity the metadata server assigned
+ * to this layout, echoed back on every CHUNK operation.  The data
+ * server compares it against the tsa_client_id it recorded for the
+ * layout stateid and rejects a mismatch with NFS4ERR_BAD_STATEID.
+ * Sourced from ffv2_mirror4.ffv2m_client_id; ffv2_cg_client_id_seed
+ * below is only the fallback for a metadata server that supplies a
+ * reserved sentinel or no identity at all.
+ *
+ * cg_gen_id is a client-side monotonic counter (0-skipping on wrap;
+ * reserved for a possible future CHUNK_GUARD_GEN_NONE sentinel).
+ */
+struct chunk_guard4 {
+	u32	cg_gen_id;
+	u32	cg_client_id;
+};
+
+struct chunk_owner4 {
+	struct chunk_guard4	co_guard;
+	u32			co_id;
+};
 
 /*
  * Sanity caps for wire-supplied array lengths.  ffv2_layout4 is
@@ -222,6 +251,12 @@ struct nfs4_ffv2_layout_segment {
 	spinlock_t			fls_ctx_lock;
 	struct list_head		fls_ctx_list;	/* ffv2_stripe_ctx */
 	wait_queue_head_t		fls_ctx_wq;	/* same-stripe gate */
+	/*
+	 * Per-lseg source of chunk_owner4.co_id.  Seeded to 1 at lseg
+	 * alloc; incremented once per CHUNK_WRITE via ffv2_owner_id_next().
+	 * Consumers land in subsequent commits.
+	 */
+	atomic_t			next_owner_id;
 	u32				mirror_array_cnt;
 	struct nfs4_ffv2_mirror		*mirror_array[]
 					__counted_by(mirror_array_cnt);
@@ -372,6 +407,84 @@ ffv2_ds_offset(const struct nfs4_ffv2_mirror *mirror, u64 file_off)
 	dividend = file_off;
 	within_shard = do_div(dividend, mirror->striping_unit_size);
 	return stripe_index * mirror->striping_unit_size + within_shard;
+}
+
+/*
+ * Client-side chunk-guard state (module scope).
+ *
+ * ffv2_cg_client_id_seed: fallback writer identity, used only when
+ * the layout supplies none -- ffv2m_client_id absent, or set to a
+ * reserved sentinel.  Set once at module init via
+ * ffv2_chunk_guard_init(): sourced from get_random_u32() and, if it
+ * happens to hit either reserved sentinel, rotated to a safe value.
+ * All ffv2 mounts share the one value.
+ *
+ * A layout that supplies an identity always wins: the data server
+ * validates the presented cg_client_id against what the metadata
+ * server registered for the layout stateid, so a locally invented
+ * value would be rejected wherever that binding exists.
+ *
+ * ffv2_cg_gen_id_next_val: monotonic counter incremented per
+ * CHUNK_WRITE via ffv2_cg_gen_id_next().  Seeded to 1; skips 0 on
+ * wrap to keep room for a possible future CHUNK_GUARD_GEN_NONE
+ * sentinel.
+ */
+extern u32 ffv2_cg_client_id_seed;
+extern atomic_t ffv2_cg_gen_id_next_val;
+
+void ffv2_chunk_guard_init(void);
+
+static inline u32 ffv2_cg_client_id(const struct nfs4_ffv2_mirror *mirror)
+{
+	if (mirror && mirror->client_id != FFV2_CG_CLIENT_ID_NONE &&
+	    mirror->client_id != FFV2_CG_CLIENT_ID_MDS)
+		return mirror->client_id;
+	return ffv2_cg_client_id_seed;
+}
+
+static inline u32 ffv2_cg_gen_id_next(void)
+{
+	u32 n = (u32)atomic_inc_return(&ffv2_cg_gen_id_next_val);
+
+	/*
+	 * atomic_inc_return returns the new value.  A wrap from 0xFFFFFFFF
+	 * to 0 lands us on the reserved sentinel; skip past it.  Race-safe:
+	 * a second thread that wraps at the same moment gets a distinct
+	 * value from its own inc_return; both threads walk forward.
+	 */
+	if (unlikely(n == 0))
+		n = (u32)atomic_inc_return(&ffv2_cg_gen_id_next_val);
+	return n;
+}
+
+static inline u32
+ffv2_owner_id_next(struct nfs4_ffv2_layout_segment *fls)
+{
+	u32 n = (u32)atomic_inc_return(&fls->next_owner_id);
+
+	/*
+	 * co_id has no reserved sentinel today, but skip 0 on wrap
+	 * defensively -- a co_id of 0 could collide with the natural
+	 * zero-init of an unwritten kernel struct in tests.
+	 */
+	if (unlikely(n == 0))
+		n = (u32)atomic_inc_return(&fls->next_owner_id);
+	return n;
+}
+
+/*
+ * Build a fresh chunk_owner4 for one CHUNK_WRITE on this lseg.
+ * All three fields advance monotonically; the returned owner
+ * uniquely identifies (this write, this client, this generation).
+ */
+static inline void
+ffv2_build_chunk_owner(struct nfs4_ffv2_layout_segment *fls,
+		       const struct nfs4_ffv2_mirror *mirror,
+		       struct chunk_owner4 *out)
+{
+	out->co_guard.cg_gen_id = ffv2_cg_gen_id_next();
+	out->co_guard.cg_client_id = ffv2_cg_client_id(mirror);
+	out->co_id = ffv2_owner_id_next(fls);
 }
 
 #endif /* FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H */

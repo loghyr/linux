@@ -17,15 +17,41 @@
  * Copyright (c) 2026 Thomas Haynes <loghyr@gmail.com>
  */
 
+#include <linux/atomic.h>
 #include <linux/module.h>
 #include <linux/nfs4.h>
 #include <linux/nfs_fs.h>
 #include <linux/nfs_page.h>
+#include <linux/random.h>
 
 #include "../internal.h"
 #include "../nfs4trace.h"
 #include "../pnfs.h"
 #include "flexfilesv2.h"
+
+/*
+ * See flexfilesv2.h for the semantics of these two.  Definitions
+ * live here so both flexfilesv2.o (this module's core) and any future
+ * kunit test object can link against them via the extern declaration.
+ */
+u32 ffv2_cg_client_id_seed;
+atomic_t ffv2_cg_gen_id_next_val = ATOMIC_INIT(1);
+
+void ffv2_chunk_guard_init(void)
+{
+	u32 seed = get_random_u32();
+
+	/*
+	 * Rotate away from either reserved sentinel; the DS rejects
+	 * either wire value with NFS4ERR_INVAL.  Odds are 2^-31, but
+	 * the check costs one branch.
+	 */
+	if (unlikely(seed == FFV2_CG_CLIENT_ID_NONE))
+		seed = 1;
+	else if (unlikely(seed == FFV2_CG_CLIENT_ID_MDS))
+		seed = FFV2_CG_CLIENT_ID_MDS - 1;
+	ffv2_cg_client_id_seed = seed;
+}
 
 static struct pnfs_layout_hdr *
 ffv2_alloc_layout_hdr(struct inode *inode, gfp_t gfp_flags)
@@ -413,6 +439,7 @@ static int __init nfs4flexfilesv2_init(void)
 {
 	pr_info("%s: NFSv4 Flexfile v2 Layout Driver Registering...\n",
 		__func__);
+	ffv2_chunk_guard_init();
 	return pnfs_register_layoutdriver(&flexfilesv2_type);
 }
 
