@@ -408,10 +408,28 @@ static void ffv2_write_release(void *data)
 	struct pnfs_layout_segment *lseg = hdr->lseg;
 	struct nfs4_ffv2_layout_segment *fls = lseg ? FFV2_LSEG(lseg) : NULL;
 
-	if (fls) {
+	if (fls && fls->mirror_array_cnt > 0 && fls->mirror_array[0]) {
+		struct nfs4_ffv2_mirror *mirror = fls->mirror_array[0];
+		u64 stripe_bytes = (u64)mirror->protection_data *
+				   mirror->striping_unit_size;
 		struct ffv2_stripe_ctx *ctx;
-		u64 stripe_off = hdr->mds_offset;
+		u64 stripe_off;
 		void *writer_key = ffv2_writer_key(hdr);
+
+		/*
+		 * Derive the stripe-aligned key from hdr->mds_offset by
+		 * rounding down; mds_offset itself keeps its
+		 * file-absolute, pre-conversion meaning for
+		 * layoutcommit / RESEND_MDS bookkeeping.  Unaligned
+		 * safe-append / RMW batches would otherwise miss the
+		 * ctx and leak the shard-page arrays until lseg
+		 * teardown.
+		 */
+		if (stripe_bytes)
+			stripe_off = div64_u64(hdr->mds_offset, stripe_bytes) *
+				     stripe_bytes;
+		else
+			stripe_off = hdr->mds_offset;
 
 		spin_lock(&fls->fls_ctx_lock);
 		list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
@@ -480,6 +498,14 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 
 	enc = ffv2_find_encoder(mirror->coding_type);
 	if (!enc || !enc->encode)
+		return PNFS_NOT_ATTEMPTED;
+
+	/*
+	 * Chunked DS-direct is defined only for DENSE striping: SPARSE
+	 * has no natural file-offset home for parity shards, and NONE
+	 * is unspecified.  Anything else falls back to MDS.
+	 */
+	if (mirror->striping != FFV2_STRIPING_DENSE)
 		return PNFS_NOT_ATTEMPTED;
 
 	{
@@ -586,11 +612,17 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	hdr->mds_offset = hdr->args.offset;
 	hdr->pgio_done_cb = ffv2_write_done_cb;
 
-	/* Override user pages with this mirror's shard pages. */
+	/*
+	 * Override user pages with this mirror's shard pages.  The DS
+	 * offset is derived from the stripe-aligned ctx->stripe_off,
+	 * not from the (possibly unaligned) hdr->args.offset -- the
+	 * latter is what ffv2_ds_offset was originally called with and
+	 * that shifts DS placement for any off_in_stripe != 0 batch.
+	 */
 	hdr->args.pages  = ctx->shard_pages[mirror_idx];
 	hdr->args.pgbase = 0;
 	hdr->args.count  = ctx->shard_len;
-	hdr->args.offset = ffv2_ds_offset(mirror, hdr->args.offset);
+	hdr->args.offset = ffv2_ds_offset(mirror, ctx->stripe_off);
 
 	nfs_initiate_pgio(ds_clnt, hdr, hdr->cred,
 			  ds->ds_clp->rpc_ops, &ffv2_write_call_ops_v4,

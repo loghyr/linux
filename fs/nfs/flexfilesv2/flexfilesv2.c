@@ -273,6 +273,48 @@ static const struct nfs_pageio_ops ffv2_pg_read_ops = {
 };
 
 /*
+ * Write-side pg_test.  Same shape as ffv2_pg_test but caps each
+ * batch at the STRIPE boundary (k * striping_unit) rather than the
+ * shard boundary: chunked writes need to see the whole stripe at
+ * once to encode parity, so keeping each hdr contained in one
+ * stripe is a precondition for the RMW / full-stripe / safe-append
+ * decision in ffv2_write_pagelist_chunked.  Batches spanning
+ * multiple stripes still fall back to MDS, but making single-stripe
+ * containment structural (not incidental) narrows the fallback set
+ * substantially for the writeback path where consecutive dirty
+ * pages naturally land in the same stripe.
+ */
+static size_t
+ffv2_pg_test_write(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
+		   struct nfs_page *req)
+{
+	struct nfs4_ffv2_layout_segment *fls;
+	struct nfs4_ffv2_mirror *mirror;
+	size_t size;
+	u64 req_stripe, prev_stripe, in_stripe, stripe_bytes;
+
+	size = pnfs_generic_pg_test(pgio, prev, req);
+	if (!size || !pgio->pg_lseg)
+		return size;
+	fls = FFV2_LSEG(pgio->pg_lseg);
+	if (!ffv2_lseg_is_chunked(fls))
+		return size;
+	mirror = fls->mirror_array[0];
+	stripe_bytes = (u64)mirror->protection_data *
+		       mirror->striping_unit_size;
+	if (!stripe_bytes)
+		return size;
+
+	req_stripe = div64_u64_rem(req_offset(req), stripe_bytes, &in_stripe);
+	if (prev) {
+		prev_stripe = div64_u64(req_offset(prev), stripe_bytes);
+		if (prev_stripe != req_stripe)
+			return 0;
+	}
+	return min_t(size_t, size, stripe_bytes - in_stripe);
+}
+
+/*
  * A chunk-encoded lseg (RS/MOJETTE/XOR/LINUX_MD/... anything with
  * parity) needs k+m parallel writes -- one per data shard plus one
  * per parity shard -- rather than the mirrored-write fanout FFv1
@@ -337,7 +379,7 @@ ffv2_pg_get_mirror_write(struct nfs_pageio_descriptor *desc, u32 idx)
 
 static const struct nfs_pageio_ops ffv2_pg_write_ops = {
 	.pg_init		= ffv2_pg_init_write,
-	.pg_test		= pnfs_generic_pg_test,
+	.pg_test		= ffv2_pg_test_write,
 	.pg_doio		= pnfs_generic_pg_writepages,
 	.pg_get_mirror_count	= ffv2_pg_get_mirror_count_write,
 	.pg_get_mirror		= ffv2_pg_get_mirror_write,
