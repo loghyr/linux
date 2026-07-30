@@ -191,30 +191,53 @@ out_free:
 }
 
 /*
- * Copy the user's data pages (in hdr->args) into the ctx's per-shard
- * page arrays, splitting a contiguous stripe of k*shard_len bytes
- * into k slices of shard_len bytes each.
+ * Zero every byte of every shard buffer in the ctx.  Used before a
+ * partial-stripe write to establish deterministic content for the
+ * bytes the user did not supply (safe only when the untouched
+ * region is entirely beyond current EOF -- see the append-past-EOF
+ * path in ffv2_write_pagelist_chunked).
  */
-static void ffv2_copy_user_to_shards(struct ffv2_stripe_ctx *ctx,
-				     struct nfs_pgio_header *hdr)
+static void ffv2_zero_shards(struct ffv2_stripe_ctx *ctx)
+{
+	u32 i, j;
+
+	for (i = 0; i < ctx->k + ctx->m; i++) {
+		for (j = 0; j < ctx->pages_per_shard; j++) {
+			void *p = kmap_local_page(ctx->shard_pages[i][j]);
+
+			memset(p, 0, PAGE_SIZE);
+			kunmap_local(p);
+		}
+	}
+}
+
+/*
+ * Copy `count` bytes from the user's data pages (in hdr->args) into
+ * the ctx's per-shard page arrays, starting at byte
+ * `dst_off_in_stripe` within the flattened k*shard_len stripe view.
+ * dst_off_in_stripe + count MUST fit within k*shard_len.  For a
+ * full-stripe write the caller passes (0, k*shard_len).
+ */
+static void ffv2_copy_user_to_shards_at(struct ffv2_stripe_ctx *ctx,
+					struct nfs_pgio_header *hdr,
+					u32 dst_off_in_stripe, u32 count)
 {
 	u32 shard, off_in_shard;
-	u32 total = ctx->k * ctx->shard_len;
 	u32 pos = 0;
 	u32 page_idx = 0;
 	u32 page_off = hdr->args.pgbase;
 	struct page **user_pages = hdr->args.pages;
 
-	shard = 0;
-	off_in_shard = 0;
-	while (pos < total) {
+	shard = dst_off_in_stripe / ctx->shard_len;
+	off_in_shard = dst_off_in_stripe % ctx->shard_len;
+	while (pos < count) {
 		u32 in_page = PAGE_SIZE - page_off;
 		u32 in_shard = ctx->shard_len - off_in_shard;
 		struct page *dst_page;
 		u32 dst_page_idx = off_in_shard >> PAGE_SHIFT;
 		u32 dst_off = off_in_shard & (PAGE_SIZE - 1);
 		u32 in_dst_page = PAGE_SIZE - dst_off;
-		u32 chunk = min3(in_page, in_shard, total - pos);
+		u32 chunk = min3(in_page, in_shard, count - pos);
 		void *src, *dst;
 
 		/*
@@ -461,13 +484,30 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 
 	{
 		u64 stripe_bytes = (u64)k * mirror->striping_unit_size;
-		u64 stripe_off;
+		u64 stripe_off, off_in_stripe;
+		bool full_stripe, safe_partial;
 		struct ffv2_stripe_ctx *cand, *found;
 
-		if (hdr->args.count != stripe_bytes ||
-		    hdr->args.offset % stripe_bytes)
+		stripe_off = hdr->args.offset - (hdr->args.offset % stripe_bytes);
+		off_in_stripe = hdr->args.offset - stripe_off;
+		full_stripe = (off_in_stripe == 0 &&
+			       hdr->args.count == stripe_bytes);
+		/*
+		 * Partial-stripe safe-append: the user write is fully
+		 * contained within a single stripe, AND the stripe starts
+		 * at or past current EOF so the un-user-supplied bytes are
+		 * definitively beyond the file and reading them would
+		 * return short.  Zero-filling those bytes then encoding is
+		 * indistinguishable from what a read after this write
+		 * would observe.  Reads of an existing stripe we would
+		 * overwrite need RMW (fetch, modify, encode); that is
+		 * deferred and falls back to MDS below.
+		 */
+		safe_partial = !full_stripe &&
+			       off_in_stripe + hdr->args.count <= stripe_bytes &&
+			       i_size_read(hdr->inode) <= stripe_off;
+		if (!full_stripe && !safe_partial)
 			return PNFS_NOT_ATTEMPTED;
-		stripe_off = hdr->args.offset;
 
 		/*
 		 * Preallocate (page-alloc loop is heavy, keep it out of
@@ -489,7 +529,11 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 			ctx = found;	/* refcount already inc'd */
 		} else {
 			ctx = cand;	/* refcount initialized to 1 above */
-			ffv2_copy_user_to_shards(ctx, hdr);
+			if (!full_stripe)
+				ffv2_zero_shards(ctx);
+			ffv2_copy_user_to_shards_at(ctx, hdr,
+						    (u32)off_in_stripe,
+						    hdr->args.count);
 		}
 	}
 
