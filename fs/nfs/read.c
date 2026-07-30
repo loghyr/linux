@@ -33,7 +33,6 @@
 #define NFSDBG_FACILITY		NFSDBG_PAGECACHE
 
 const struct nfs_pgio_completion_ops nfs_async_read_completion_ops;
-static const struct nfs_rw_ops nfs_rw_read_ops;
 
 static struct kmem_cache *nfs_rdata_cachep;
 
@@ -490,10 +489,11 @@ void nfs_destroy_readpagecache(void)
 	kmem_cache_destroy(nfs_rdata_cachep);
 }
 
-static const struct nfs_rw_ops nfs_rw_read_ops = {
+const struct nfs_rw_ops nfs_rw_read_ops = {
 	.rw_alloc_header	= nfs_readhdr_alloc,
 	.rw_free_header		= nfs_readhdr_free,
 	.rw_done		= nfs_readpage_done,
 	.rw_result		= nfs_readpage_result,
 	.rw_initiate		= nfs_initiate_read,
 };
+EXPORT_SYMBOL_GPL(nfs_rw_read_ops);
