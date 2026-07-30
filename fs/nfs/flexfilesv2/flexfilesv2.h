@@ -41,6 +41,22 @@
 #define FFV2_CHECKSUM_MAX_LEN		64
 
 /*
+ * CHUNK op codes per draft-haynes-nfsv4-flexfiles-v2.  CHUNK_READ,
+ * CHUNK_FINALIZE and CHUNK_COMMIT are added by later commits as they
+ * are wired.
+ */
+#define OP_CHUNK_WRITE			87
+
+/*
+ * Reply-side cap on batched chunks per CHUNK op.  The initial posture
+ * is N=1 chunk per op; the cap sizes the reply arrays defensively so
+ * a malformed or malicious DS reply can't force an unbounded
+ * allocation.  32 leaves room for a batched-N follow-up without
+ * protocol churn.
+ */
+#define FFV2_MAX_CHUNKS_PER_OP		32
+
+/*
  * chunk_guard4 / chunk_owner4 -- wire types shared by every non-
  * PASSTHROUGH CHUNK operation per draft-haynes-nfsv4-flexfiles-v2-
  * chunks.  Fields serialize XDR-big-endian on the wire; in-memory
@@ -516,7 +532,7 @@ ffv2_build_chunk_owner(struct nfs4_ffv2_layout_segment *fls,
  * Compute the checksum of `data` (`len` bytes) under `algo` into
  * `out` (writes `*out_len` bytes -- caller-supplied out MUST have
  * at least FFV2_CHECKSUM_MAX_LEN capacity).  Returns 0 on success,
- * -EOPNOTSUPP if algo isn't K.2-supported (caller falls back to
+ * -EOPNOTSUPP if algo isn't wired here (caller falls back to
  * MDS-inband).
  */
 int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
@@ -526,10 +542,18 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
  * Verify `expected` (`expected_len` bytes) against the freshly-
  * computed checksum of `data` (`len` bytes) under `algo`.  Returns
  * 0 on match, -EBADMSG on mismatch, -EOPNOTSUPP if algo isn't
- * K.2-supported.  Constant-time comparison is not required here --
+ * wired here.  Constant-time comparison is not required here --
  * the checksum is a wire integrity check, not a cryptographic MAC.
  */
 int ffv2_checksum_verify(u32 algo, const void *data, size_t len,
 			 const u8 *expected, size_t expected_len);
+
+/*
+ * flexfilesv2_xdr_chunk.c -- CHUNK_WRITE wire scaffold.  The args /
+ * res / task-data structs and the procinfo declaration live in
+ * flexfilesv2_xdr_chunk.h so that unrelated ffv2 files (encoders,
+ * xor, mojette) don't drag in the SUNRPC + nfs_xdr heavy include
+ * cascade.
+ */
 
 #endif /* FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H */
