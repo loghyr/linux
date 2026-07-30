@@ -18,6 +18,29 @@
 #include "../pnfs.h"
 
 /*
+ * checksum_algorithm4 enum values (checksum4.cs_algorithm on the
+ * wire) per draft-haynes-nfsv4-flexfiles-v2-chunks.  CRC32 and CRC32C
+ * are wired; NONE means "checksum absent" and is used by non-erasure
+ * paths; FLETCHER4 / SHA256 / SHA512 / BLAKE3 are
+ * recognized-and-refused (client falls back to MDS via -EOPNOTSUPP).
+ */
+#define FFV2_CHECKSUM_ALG_NONE		0
+#define FFV2_CHECKSUM_ALG_CRC32		1
+#define FFV2_CHECKSUM_ALG_CRC32C	2
+#define FFV2_CHECKSUM_ALG_FLETCHER4	3
+#define FFV2_CHECKSUM_ALG_SHA256	4
+#define FFV2_CHECKSUM_ALG_SHA512	5
+#define FFV2_CHECKSUM_ALG_BLAKE3	6
+
+/*
+ * Longest supported checksum digest in bytes (SHA512 upper bound
+ * per checksum4.cs_value<64> in the wire XDR).  Buffer sizing for
+ * on-stack checksum output uses this.  For the currently wired
+ * algorithms (CRC32 / CRC32C), 4 bytes always fits.
+ */
+#define FFV2_CHECKSUM_MAX_LEN		64
+
+/*
  * chunk_guard4 / chunk_owner4 -- wire types shared by every non-
  * PASSTHROUGH CHUNK operation per draft-haynes-nfsv4-flexfiles-v2-
  * chunks.  Fields serialize XDR-big-endian on the wire; in-memory
@@ -486,5 +509,27 @@ ffv2_build_chunk_owner(struct nfs4_ffv2_layout_segment *fls,
 	out->co_guard.cg_client_id = ffv2_cg_client_id(mirror);
 	out->co_id = ffv2_owner_id_next(fls);
 }
+
+/* flexfilesv2_checksum.c */
+
+/*
+ * Compute the checksum of `data` (`len` bytes) under `algo` into
+ * `out` (writes `*out_len` bytes -- caller-supplied out MUST have
+ * at least FFV2_CHECKSUM_MAX_LEN capacity).  Returns 0 on success,
+ * -EOPNOTSUPP if algo isn't K.2-supported (caller falls back to
+ * MDS-inband).
+ */
+int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
+			  u8 *out, size_t *out_len);
+
+/*
+ * Verify `expected` (`expected_len` bytes) against the freshly-
+ * computed checksum of `data` (`len` bytes) under `algo`.  Returns
+ * 0 on match, -EBADMSG on mismatch, -EOPNOTSUPP if algo isn't
+ * K.2-supported.  Constant-time comparison is not required here --
+ * the checksum is a wire integrity check, not a cryptographic MAC.
+ */
+int ffv2_checksum_verify(u32 algo, const void *data, size_t len,
+			 const u8 *expected, size_t expected_len);
 
 #endif /* FS_NFS_NFS4FLEXFILES_V2_LAYOUT_H */
