@@ -191,6 +191,21 @@ struct ffv2_stripe_ctx {
 	 */
 	DECLARE_BITMAP(mirror_seen, NFS4_FFV2_MAX_DS_PER_STRIPE);
 	u32				arrivals;
+	/*
+	 * RMW fetch bookkeeping (FETCHING state only).  Initialized
+	 * by ffv2_rmw_fetch_stripe(); the winner atomically decrements
+	 * fetch_pending from k -> 0 across dispatched RPCs and
+	 * dispatch-failure paths (single-point helper); last decrement
+	 * completes fetch_done.  fetch_status carries the first
+	 * negative errno via cmpxchg (first failure wins).  rmw_isize
+	 * is the i_size_read snapshot taken after the state gate but
+	 * before dispatching fetches, used to derive per-shard
+	 * expected byte counts (F6).
+	 */
+	atomic_t			fetch_pending;
+	int				fetch_status;
+	struct completion		fetch_done;
+	u64				rmw_isize;
 	struct nfs4_ffv2_layout_segment *fls;	/* back-pointer for release */
 };
 

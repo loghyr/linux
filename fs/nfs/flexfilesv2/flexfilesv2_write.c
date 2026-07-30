@@ -32,6 +32,7 @@
 #include <linux/nfs4.h>
 #include <linux/nfs_fs.h>
 #include <linux/nfs_page.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/sunrpc/metrics.h>
 
@@ -307,6 +308,9 @@ ffv2_stripe_ctx_alloc(struct nfs4_ffv2_layout_segment *fls,
 	ctx->pages_per_shard = pages_per_shard;
 	ctx->fls = fls;
 	mutex_init(&ctx->encode_lock);
+	init_completion(&ctx->fetch_done);
+	atomic_set(&ctx->fetch_pending, 0);
+	ctx->fetch_status = 0;
 
 	ctx->shard_pages = kcalloc(k + m, sizeof(*ctx->shard_pages), gfp);
 	if (!ctx->shard_pages)
@@ -526,6 +530,373 @@ static int ffv2_write_done_cb(struct rpc_task *task,
 	return 0;
 }
 
+/* ---------- RMW fetch engine ------------------------------------ */
+
+/*
+ * One per shard fetch.  Carried as rpc_task_setup.callback_data so
+ * per-fetch state does not piggyback on nfs_pgio_header fields.
+ * The wrapper outlives the RPC only until its release fires; we
+ * free it there after nfs_pgio_header_free(hdr) and the
+ * single-point decrement helper.
+ */
+struct ffv2_rmw_fetch {
+	struct ffv2_stripe_ctx	*ctx;		/* holds one ctx ref */
+	struct pnfs_layout_segment *lseg;	/* holds one lseg ref --
+						 * pins ctx->fls / shard
+						 * pages against a racing
+						 * free_layout_segment when
+						 * the winner has abandoned
+						 * on gate timeout. */
+	struct nfs_pgio_header	*hdr;
+	u32			shard_idx;
+	u32			expected;	/* bytes DS is expected
+						 * to hold at (stripe_off +
+						 * shard_idx*unit), computed
+						 * from ctx->rmw_isize. */
+	struct nfs_client	*ds_clp;	/* holds one cl_count ref */
+};
+
+/*
+ * Fetch bookkeeping added to the ctx for the FETCHING phase.  The
+ * winner initializes these before dispatching; every fetch's
+ * ffv2_rmw_fetch_done_one() call decrements pending and, on the
+ * last, completes.
+ *
+ * These live on the ctx (not the wrapper) because sibling mirrors
+ * observe the outcome via the ctx state (FETCHING -> READY/FAILED)
+ * and the winner is the sole waiter.
+ */
+static void ffv2_rmw_fetch_done_one(struct ffv2_stripe_ctx *ctx,
+				    int status)
+{
+	if (status < 0)
+		cmpxchg(&ctx->fetch_status, 0, status);
+	if (atomic_dec_and_test(&ctx->fetch_pending))
+		complete(&ctx->fetch_done);
+}
+
+static void ffv2_rmw_fetch_prepare_v4(struct rpc_task *task, void *data)
+{
+	struct ffv2_rmw_fetch *f = data;
+	struct nfs_pgio_header *hdr = f->hdr;
+
+	if (nfs4_setup_sequence(hdr->ds_clp,
+				&hdr->args.seq_args,
+				&hdr->res.seq_res,
+				task))
+		return;
+	rpc_call_start(task);
+}
+
+static void ffv2_rmw_fetch_prepare_v3(struct rpc_task *task, void *data)
+{
+	rpc_call_start(task);
+}
+
+static void ffv2_rmw_fetch_call_done_v4(struct rpc_task *task, void *data)
+{
+	struct ffv2_rmw_fetch *f = data;
+	struct nfs_pgio_header *hdr = f->hdr;
+
+	/*
+	 * Return the session slot UNCONDITIONALLY first: safe when no
+	 * slot was ever acquired (sr_slot short-circuits).  Missing
+	 * this leaks slots on rpc_exit paths and eventually wedges
+	 * every I/O to the DS on slot_tbl_waitq.
+	 */
+	nfs4_sequence_done(task, &hdr->res.seq_res);
+
+	if (task->tk_status < 0)
+		return;
+	/*
+	 * v4 READ decoder sets tk_status = res->count on success
+	 * (nfs4xdr.c: nfs4_xdr_dec_read).  Positive count with a
+	 * shortfall against what the DS is supposed to hold means
+	 * DS is short of authoritative size -- stale attr cache or
+	 * DS damage; either way, encoding zeros over those bytes
+	 * would silently corrupt.  Fail the whole RMW.
+	 */
+	if (hdr->res.count < f->expected) {
+		task->tk_status = -EIO;
+		return;
+	}
+	/* res->count >= expected: good.  Bytes in [count, shard_len)
+	 * remain the pre-zeroed content, sound because the DS holds
+	 * nothing there (either res->eof set or count == shard_len). */
+}
+
+static void ffv2_rmw_fetch_call_done_v3(struct rpc_task *task, void *data)
+{
+	struct ffv2_rmw_fetch *f = data;
+	struct nfs_pgio_header *hdr = f->hdr;
+
+	if (task->tk_status < 0)
+		return;
+	if (hdr->res.count < f->expected) {
+		task->tk_status = -EIO;
+		return;
+	}
+}
+
+static void ffv2_rmw_fetch_release(void *data)
+{
+	struct ffv2_rmw_fetch *f = data;
+	struct nfs_pgio_header *hdr = f->hdr;
+	struct nfs_client *ds_clp = f->ds_clp;
+	struct ffv2_stripe_ctx *ctx = f->ctx;
+	struct pnfs_layout_segment *lseg = f->lseg;
+	int status = hdr->task.tk_status;
+
+	/*
+	 * Free the hdr FIRST (it owns nothing beyond this point) so
+	 * the wrapper's ctx and lseg refs -- our last holds on the
+	 * shard pages against straggler DMA -- are dropped as the
+	 * tail action.  lseg goes AFTER the ctx put: ctx->fls lives
+	 * inside the lseg, so a still-listed straggler ctx must not
+	 * survive its lseg's free.
+	 */
+	nfs_pgio_header_free(hdr);
+	if (ds_clp)
+		nfs_put_client(ds_clp);
+	ffv2_rmw_fetch_done_one(ctx, status);
+	ffv2_stripe_ctx_put(ctx);
+	pnfs_put_lseg(lseg);
+	kfree(f);
+}
+
+static const struct rpc_call_ops ffv2_rmw_fetch_call_ops_v4 = {
+	.rpc_call_prepare	= ffv2_rmw_fetch_prepare_v4,
+	.rpc_call_done		= ffv2_rmw_fetch_call_done_v4,
+	.rpc_release		= ffv2_rmw_fetch_release,
+};
+
+static const struct rpc_call_ops ffv2_rmw_fetch_call_ops_v3 = {
+	.rpc_call_prepare	= ffv2_rmw_fetch_prepare_v3,
+	.rpc_call_done		= ffv2_rmw_fetch_call_done_v3,
+	.rpc_release		= ffv2_rmw_fetch_release,
+};
+
+/*
+ * Build a READ rpc_message from hdr->args/hdr->res and run the RPC
+ * async.  Replaces nfs_initiate_pgio() for the fetch path because
+ * that helper hardcodes callback_data = hdr; we need it to be the
+ * wrapper.  The rest of nfs_initiate_pgio's read-side setup
+ * (rpc_ops->read_setup -> READ proc + seq_args/seq_res init) is
+ * done inline here.
+ */
+static int ffv2_rmw_fetch_initiate(struct ffv2_rmw_fetch *f, u32 version)
+{
+	struct nfs_pgio_header *hdr = f->hdr;
+	struct rpc_message msg = {
+		.rpc_argp	= &hdr->args,
+		.rpc_resp	= &hdr->res,
+		.rpc_cred	= hdr->cred,
+	};
+	struct rpc_task_setup task_setup = {
+		.rpc_client	= f->ds_clp->cl_rpcclient,
+		.task		= &hdr->task,
+		.rpc_message	= &msg,
+		.callback_ops	= version == 3 ? &ffv2_rmw_fetch_call_ops_v3
+					       : &ffv2_rmw_fetch_call_ops_v4,
+		.callback_data	= f,
+		.workqueue	= nfsiod_workqueue,
+		.flags		= RPC_TASK_ASYNC | RPC_TASK_SOFTCONN |
+				  RPC_TASK_SOFT,
+	};
+	struct rpc_task *task;
+
+	f->ds_clp->rpc_ops->read_setup(hdr, &msg);
+	task = rpc_run_task(&task_setup);
+	if (IS_ERR(task))
+		return PTR_ERR(task);
+	rpc_put_task(task);
+	return 0;
+}
+
+/*
+ * Dispatch one shard's fetch, taking the ctx ref + ds_clp ref that
+ * the release will drop.  Returns 0 on successful dispatch (RPC
+ * async in flight, release will call fetch_done_one) or negative
+ * errno on failure to dispatch (caller must call fetch_done_one
+ * itself to keep the pending counter balanced).
+ */
+static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
+			      struct nfs_pgio_header *tmpl,
+			      struct nfs4_ffv2_mirror *mirror, u32 shard_idx)
+{
+	struct nfs4_ffv2_stripe *stripe;
+	struct nfs4_ffv2_data_server *ds_slot;
+	struct nfs4_ffv2_file_info *fi;
+	struct nfs4_deviceid_node *devnode;
+	struct nfs4_ffv2_layout_ds *layout_ds;
+	struct nfs4_pnfs_ds *ds;
+	struct nfs_server *mds_srv = NFS_SERVER(tmpl->inode);
+	struct ffv2_rmw_fetch *f;
+	struct nfs_pgio_header *hdr;
+	u64 shard_file_off;
+	u32 version;
+	int rc;
+
+	if (mirror->stripes_cnt == 0)
+		return -EINVAL;
+	stripe = &mirror->stripes[0];
+	if (shard_idx >= stripe->data_servers_cnt)
+		return -EINVAL;
+	ds_slot = &stripe->data_servers[shard_idx];
+	if (ds_slot->versions_cnt == 0)
+		return -EINVAL;
+	fi = &ds_slot->versions[0];
+
+	devnode = nfs4_find_get_deviceid(mds_srv, &ds_slot->devid,
+					 tmpl->cred, nfs_io_gfp_mask());
+	if (!devnode)
+		return -EIO;
+	layout_ds = FFV2_LAYOUT_DS_FROM_NODE(devnode);
+	ds = layout_ds->ds;
+	if (!ds || layout_ds->ds_versions_cnt == 0) {
+		nfs4_put_deviceid_node(devnode);
+		return -EPROTONOSUPPORT;
+	}
+	version = layout_ds->ds_versions[0].version;
+	if (version != 3 && version != 4) {
+		nfs4_put_deviceid_node(devnode);
+		return -EPROTONOSUPPORT;
+	}
+	rc = nfs4_pnfs_ds_connect(mds_srv, ds, devnode,
+				  NFS_DEF_TCP_TIMEO, 0,
+				  version,
+				  layout_ds->ds_versions[0].minor_version);
+	if (rc || !ds->ds_clp) {
+		nfs4_put_deviceid_node(devnode);
+		return rc ?: -EIO;
+	}
+
+	f = kzalloc(sizeof(*f), GFP_NOFS);
+	/*
+	 * nfs_pgio_header_alloc() -> nfs_readhdr_alloc() is hard-coded
+	 * GFP_KERNEL; this path runs in a writeback / O_DIRECT NOFS
+	 * context (the write hdr's own alloc used nfs_io_gfp_mask()).
+	 * A recursion into the filesystem here can deadlock reclaim on
+	 * the dirty pages this write is trying to drain.
+	 */
+	{
+		unsigned int noflags = memalloc_nofs_save();
+
+		hdr = nfs_pgio_header_alloc(&nfs_rw_read_ops);
+		memalloc_nofs_restore(noflags);
+	}
+	if (!f || !hdr) {
+		kfree(f);
+		if (hdr)
+			nfs_pgio_header_free(hdr);
+		nfs4_put_deviceid_node(devnode);
+		return -ENOMEM;
+	}
+
+	/*
+	 * Per RMW design memo section 3.9: set exactly the fields the
+	 * fetch's own path reads; leave hdr->release, completion_ops,
+	 * mds_ops, io_completion, dreq, lseg untouched -- routing this
+	 * hdr into the generic completion machinery would be wrong.
+	 */
+	hdr->inode = tmpl->inode;
+	hdr->cred = tmpl->cred;
+	hdr->args.fh = &fi->fh;
+	hdr->args.stateid = fi->stateid;
+	hdr->args.pages = ctx->shard_pages[shard_idx];
+	hdr->args.pgbase = 0;
+	hdr->args.count = ctx->shard_len;
+	shard_file_off = ctx->stripe_off +
+			 (u64)shard_idx * mirror->striping_unit_size;
+	hdr->args.offset = ffv2_ds_offset(mirror, ctx->stripe_off);
+	hdr->io_start = shard_file_off;
+	hdr->good_bytes = ctx->shard_len;
+	hdr->res.fattr = &hdr->fattr;
+	nfs_fattr_init(&hdr->fattr);
+	hdr->res.count = 0;
+	hdr->res.eof = 0;
+	hdr->pgio_mirror_idx = shard_idx;
+
+	refcount_inc(&ds->ds_clp->cl_count);
+	hdr->ds_clp = ds->ds_clp;
+	refcount_inc(&ctx->refcnt);
+
+	f->ctx = ctx;
+	f->lseg = pnfs_get_lseg(tmpl->lseg);
+	f->hdr = hdr;
+	f->shard_idx = shard_idx;
+	f->expected = clamp_t(u64,
+		ctx->rmw_isize > shard_file_off ?
+			ctx->rmw_isize - shard_file_off : 0,
+		0, ctx->shard_len);
+	f->ds_clp = ds->ds_clp;
+
+	rc = ffv2_rmw_fetch_initiate(f, version);
+	nfs4_put_deviceid_node(devnode);
+	if (rc) {
+		/* Release will not fire.  Undo the refs we took, free
+		 * scratch, and let the caller run fetch_done_one for
+		 * this shard's slot in the pending counter. */
+		nfs_put_client(ds->ds_clp);
+		refcount_dec(&ctx->refcnt);
+		pnfs_put_lseg(f->lseg);
+		nfs_pgio_header_free(hdr);
+		kfree(f);
+	}
+	return rc;
+}
+
+/*
+ * Sync fetch entry point.  Under FETCHING state (transition made
+ * by the caller under encode_lock), initialize the fetch counters,
+ * dispatch all k shard fetches, and block until the completion
+ * fires.  Returns 0 iff every shard completed successfully with
+ * res->count >= expected.
+ */
+static int ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
+				 struct nfs_pgio_header *tmpl,
+				 struct nfs4_ffv2_mirror *mirror)
+{
+	const unsigned long timeout = msecs_to_jiffies(60 * 1000);
+	u32 dispatched = 0, undispatched = 0;
+	u32 i;
+	int rc;
+
+	atomic_set(&ctx->fetch_pending, ctx->k);
+	ctx->fetch_status = 0;
+	reinit_completion(&ctx->fetch_done);
+	ctx->rmw_isize = i_size_read(tmpl->inode);
+
+	for (i = 0; i < ctx->k; i++) {
+		rc = ffv2_rmw_fetch_one(ctx, tmpl, mirror, i);
+		if (!rc) {
+			dispatched++;
+		} else {
+			cmpxchg(&ctx->fetch_status, 0, rc);
+			undispatched++;
+		}
+	}
+	/*
+	 * Account undispatched slots against pending via the SAME
+	 * single-point helper the RPC release uses.  Every shard
+	 * gets exactly one decrement; the wait always completes.
+	 */
+	for (i = 0; i < undispatched; i++)
+		ffv2_rmw_fetch_done_one(ctx, -EIO);
+
+	if (dispatched > 0 &&
+	    !wait_for_completion_timeout(&ctx->fetch_done, timeout)) {
+		cmpxchg(&ctx->fetch_status, 0, -ETIMEDOUT);
+		/* Straggler RPCs still hold ctx refs and shard pages
+		 * outlive their DMA; last straggler's release runs
+		 * done_one -> complete on the now-abandoned completion
+		 * (harmless). */
+	}
+	return ctx->fetch_status;
+}
+
+/* ---------- end RMW fetch engine -------------------------------- */
+
 static void ffv2_write_release(void *data)
 {
 	struct nfs_pgio_header *hdr = data;
@@ -656,8 +1027,18 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 		safe_partial = !full_stripe &&
 			       off_in_stripe + hdr->args.count <= stripe_bytes &&
 			       i_size_read(hdr->inode) <= stripe_off;
-		if (!full_stripe && !safe_partial)
-			return PNFS_NOT_ATTEMPTED;
+		{
+			bool contained_partial = !full_stripe &&
+				off_in_stripe + hdr->args.count <= stripe_bytes;
+
+			/* RMW partial = contained-in-one-stripe partial
+			 * write that overlaps existing data.  Handled by
+			 * the winner via ffv2_rmw_fetch_stripe() below;
+			 * uneligible cases still fall to MDS. */
+			if (!full_stripe && !safe_partial &&
+			    !contained_partial)
+				return PNFS_NOT_ATTEMPTED;
+		}
 
 		/*
 		 * Preallocate (page-alloc loop is heavy, keep it out of
@@ -688,9 +1069,28 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 				ffv2_stripe_ctx_free(cand);
 				ctx = found;
 			} else {
+				bool need_rmw = !full_stripe && !safe_partial;
+
 				ctx = cand;
-				if (!full_stripe)
-					ffv2_zero_shards(ctx);
+				ffv2_zero_shards(ctx);
+				if (need_rmw) {
+					int rc_fetch;
+
+					mutex_lock(&ctx->encode_lock);
+					ctx->state = FFV2_CTX_FETCHING;
+					mutex_unlock(&ctx->encode_lock);
+
+					rc_fetch = ffv2_rmw_fetch_stripe(
+						ctx, hdr, mirror);
+					if (rc_fetch) {
+						mutex_lock(&ctx->encode_lock);
+						ctx->state = FFV2_CTX_FAILED;
+						mutex_unlock(&ctx->encode_lock);
+						wake_up(&fls->fls_ctx_wq);
+						ffv2_stripe_ctx_put(ctx);
+						return PNFS_NOT_ATTEMPTED;
+					}
+				}
 				ffv2_copy_user_to_shards_at(ctx, hdr,
 							    (u32)off_in_stripe,
 							    hdr->args.count);
@@ -709,7 +1109,8 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 		int rc_enc = 0;
 
 		mutex_lock(&ctx->encode_lock);
-		if (ctx->state == FFV2_CTX_ASSEMBLING) {
+		if (ctx->state == FFV2_CTX_ASSEMBLING ||
+		    ctx->state == FFV2_CTX_FETCHING) {
 			rc_enc = enc->encode
 				? ffv2_encode_locked(ctx, enc)
 				: -EOPNOTSUPP;
@@ -792,6 +1193,16 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	return PNFS_ATTEMPTED;
 
 out_put_ctx:
+	/*
+	 * Sibling dispatch-time failure after some other mirror
+	 * already dispatched: the DS state can be torn until the
+	 * RESEND_MDS-driven inband write lands.  Nudge the MDS to
+	 * schedule a re-encode by marking the layout for return; the
+	 * failing hdr goes to MDS via NOT_ATTEMPTED.  (Full DS-ioerr
+	 * reporting is a follow-up.)
+	 */
+	if (hdr->lseg)
+		pnfs_error_mark_layout_for_return(hdr->inode, hdr->lseg);
 	ffv2_stripe_ctx_put(ctx);
 	return PNFS_NOT_ATTEMPTED;
 }
