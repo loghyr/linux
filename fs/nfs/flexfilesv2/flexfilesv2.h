@@ -124,6 +124,7 @@ struct chunk_owner4 {
 /* ffv2_flags4 values consumed by the initial read/write paths. */
 #define FFV2_FLAGS_NO_IO_THRU_MDS		2u
 #define FFV2_FLAGS_NO_READ_IO			4u
+#define FFV2_FLAGS_ONLY_ONE_WRITER		0x10u
 
 /*
  * ffv2_striping4 (wire enum): tells the client how per-shard bytes
@@ -323,6 +324,21 @@ static inline bool
 ffv2_no_fallback_to_mds(struct pnfs_layout_segment *lseg)
 {
 	return FFV2_LSEG(lseg)->flags & FFV2_FLAGS_NO_IO_THRU_MDS;
+}
+
+/*
+ * True when the MDS has told us we are the exclusive writer for
+ * this layout (draft:2220-2227).  With this bit set, CHUNK_WRITE
+ * MAY carry cwa_guard.check == FALSE; without it, the client MUST
+ * set cwa_guard on every CHUNK_WRITE so chunk_guard4 CAS prevents
+ * cross-writer collisions.  While the guard plumbing is not yet
+ * in place, callers gate the chunked path on this bit and fall
+ * back to MDS otherwise.
+ */
+static inline bool
+ffv2_only_one_writer(struct pnfs_layout_segment *lseg)
+{
+	return FFV2_LSEG(lseg)->flags & FFV2_FLAGS_ONLY_ONE_WRITER;
 }
 
 /*
@@ -545,9 +561,9 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
  * ffv2_checksum_compute (both paths seed at 0 and use the same
  * helper's seed-and-extend contract).
  *
- * Used by the K.2 CHUNK_WRITE dispatch path (patch 3b) to checksum
- * shards that live in the K.1 stripe ctx's shard_pages array without
- * requiring a flat kernel VA.
+ * Used by the CHUNK_WRITE dispatch path to checksum shards that live
+ * in the stripe ctx's shard_pages array without requiring a flat
+ * kernel VA.
  */
 int ffv2_checksum_compute_pages(u32 algo, struct page **pages, u32 pgbase,
 				size_t len, u8 *out, size_t *out_len);
