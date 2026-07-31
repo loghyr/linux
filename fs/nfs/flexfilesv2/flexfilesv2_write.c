@@ -41,6 +41,18 @@
 #include "../pnfs.h"
 #include "flexfilesv2.h"
 
+static inline enum pnfs_try_status
+ffv2_write_fallback_to_mds(struct nfs_pgio_header *hdr)
+{
+	struct pnfs_layout_segment *lseg = hdr->lseg;
+
+	if (ffv2_no_fallback_to_mds(lseg)) {
+		pnfs_error_mark_layout_for_return(hdr->inode, lseg);
+		return PNFS_TRY_AGAIN;
+	}
+	return PNFS_NOT_ATTEMPTED;
+}
+
 static void ffv2_stripe_ctx_free(struct ffv2_stripe_ctx *ctx)
 {
 	u32 i, j;
@@ -970,6 +982,8 @@ static const struct rpc_call_ops ffv2_write_call_ops_v4 = {
  * completion.  A dispatch failure drops the ref inline before
  * returning PNFS_NOT_ATTEMPTED.
  */
+static bool ffv2_chunk_write_dispatch_enabled;
+
 enum pnfs_try_status
 ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 {
@@ -994,6 +1008,8 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	enc = ffv2_find_encoder(mirror->coding_type);
 	if (!enc || !enc->encode)
 		return PNFS_NOT_ATTEMPTED;
+	if (!READ_ONCE(ffv2_chunk_write_dispatch_enabled))
+		return ffv2_write_fallback_to_mds(hdr);
 
 	/*
 	 * Chunked DS-direct is defined only for DENSE striping: SPARSE
