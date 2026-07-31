@@ -539,6 +539,20 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
 			  u8 *out, size_t *out_len);
 
 /*
+ * Page-array variant of ffv2_checksum_compute -- walks `pages`
+ * starting at byte `pgbase` for `len` bytes.  Semantically equivalent
+ * to flattening the range into a linear buffer and calling
+ * ffv2_checksum_compute (both paths seed at 0 and use the same
+ * helper's seed-and-extend contract).
+ *
+ * Used by the K.2 CHUNK_WRITE dispatch path (patch 3b) to checksum
+ * shards that live in the K.1 stripe ctx's shard_pages array without
+ * requiring a flat kernel VA.
+ */
+int ffv2_checksum_compute_pages(u32 algo, struct page **pages, u32 pgbase,
+				size_t len, u8 *out, size_t *out_len);
+
+/*
  * Verify `expected` (`expected_len` bytes) against the freshly-
  * computed checksum of `data` (`len` bytes) under `algo`.  Returns
  * 0 on match, -EBADMSG on mismatch, -EOPNOTSUPP if algo isn't

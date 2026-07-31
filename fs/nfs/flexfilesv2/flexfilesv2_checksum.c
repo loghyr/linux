@@ -25,8 +25,11 @@
 
 #include <linux/crc32.h>
 #include <linux/errno.h>
+#include <linux/highmem.h>
 #include <linux/kernel.h>
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/pagemap.h>
 #include <linux/string.h>
 
 #include "flexfilesv2.h"
@@ -51,7 +54,8 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
 	default:
 		/* Recognized-and-refused vs unknown collapse into a
 		 * single caller-visible signal: this algo isn't wired
-		 * here; caller falls back to MDS. */
+		 * here; caller falls back to MDS.
+		 */
 		return -EOPNOTSUPP;
 	}
 
@@ -62,6 +66,88 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
 	 */
 	memcpy(out, &v, sizeof(v));
 	*out_len = sizeof(v);
+	return 0;
+}
+
+/*
+ * Page-array variant of ffv2_checksum_compute.  Walks `pages` starting
+ * at byte `pgbase` for `len` bytes, kmapping each page fragment and
+ * accumulating the checksum via the underlying helper's seed-first
+ * incremental API.  See include/linux/crc32.h:72,84 -- both crc32_le
+ * and crc32c take a running seed as first arg, so page-by-page
+ * accumulation is bit-exact.
+ *
+ * Preconditions:
+ *   pages       -- array of struct page * with at least ceil((pgbase+len)
+ *                  / PAGE_SIZE) entries.
+ *   pgbase      -- byte offset from pages[0]; may exceed PAGE_SIZE for
+ *                  callers who compute their own page-index offset.
+ *   len         -- total byte length to checksum; 0 is legal (returns
+ *                  the algorithm's seed=0 empty-input checksum for CRC32
+ *                  / CRC32C, i.e. 0).
+ *   out         -- MUST have at least FFV2_CHECKSUM_MAX_LEN capacity.
+ *
+ * Returns 0 on success (*out_len populated), -EOPNOTSUPP for
+ * unsupported algo -- matches the flat-buffer variant's contract for
+ * caller MDS-fallback.
+ *
+ * Semantic equivalence with ffv2_checksum_compute for the same
+ * concatenated byte sequence is a hard invariant.  Both paths seed
+ * at 0 and use the same helper's seed-and-extend contract, so
+ * equivalence follows from the helpers' own documented behavior.
+ */
+int ffv2_checksum_compute_pages(u32 algo, struct page **pages, u32 pgbase,
+				size_t len, u8 *out, size_t *out_len)
+{
+	size_t remaining = len;
+	u32 seed = 0;
+	unsigned int page_idx;
+	unsigned int page_off;
+
+	/* Reject unsupported algo up front to match the flat variant's
+	 * caller contract without doing any page mapping first.
+	 */
+	switch (algo) {
+	case FFV2_CHECKSUM_ALG_CRC32:
+	case FFV2_CHECKSUM_ALG_CRC32C:
+		break;
+	default:
+		return -EOPNOTSUPP;
+	}
+
+	/* Normalize pgbase: the caller may pass a byte offset >=
+	 * PAGE_SIZE (the stripe ctx does not necessarily align shard
+	 * starts).  Advance to the correct page index; residual becomes
+	 * the per-page offset for pages[page_idx].
+	 */
+	page_idx = pgbase >> PAGE_SHIFT;
+	page_off = pgbase & (PAGE_SIZE - 1);
+
+	while (remaining > 0) {
+		size_t chunk = min_t(size_t, remaining, PAGE_SIZE - page_off);
+		void *kaddr = kmap_local_page(pages[page_idx]);
+		const void *src = kaddr + page_off;
+
+		switch (algo) {
+		case FFV2_CHECKSUM_ALG_CRC32:
+			seed = crc32_le(seed, src, chunk);
+			break;
+		case FFV2_CHECKSUM_ALG_CRC32C:
+			seed = crc32c(seed, src, chunk);
+			break;
+		}
+		kunmap_local(kaddr);
+
+		remaining -= chunk;
+		page_idx++;
+		page_off = 0;
+	}
+
+	/* Same host-byte-order emit as ffv2_checksum_compute; caller's
+	 * XDR marshal does the endian conversion.
+	 */
+	memcpy(out, &seed, sizeof(seed));
+	*out_len = sizeof(seed);
 	return 0;
 }
 
