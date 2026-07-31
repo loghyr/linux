@@ -349,7 +349,7 @@ static const struct rpc_call_ops ffv2_chunk_write_call_ops = {
  * retains ownership per the dispatch-failure pattern in
  * ffv2_write_pagelist_chunked.
  */
-static enum pnfs_try_status __maybe_unused
+static enum pnfs_try_status
 ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 				     struct ffv2_stripe_ctx *ctx,
 				     u32 mirror_idx, int sync)
@@ -969,65 +969,14 @@ out:
 }
 
 /*
- * Per-mirror-N write RPC glue.  Symmetric with the read path
- * (ffv2_read_prepare_v4 etc.), with an added release-time drop of
- * the shared stripe-ctx reference.
+ * The earlier plain-WRITE call_ops (ffv2_write_prepare_v4/_v3,
+ * _call_done, _count_stats, _done_cb, _release) and their two
+ * rpc_call_ops tables have been removed.  The chunk-encoded write
+ * path now uses ffv2_chunk_write_call_ops (defined above) via the
+ * extracted ffv2_chunk_write_dispatch_one_mirror helper.  Plain
+ * WRITE to DSes had no chunk-store lifecycle envelope and would
+ * silently accept a per-chunk failure as success.
  */
-static void ffv2_write_prepare_v4(struct rpc_task *task, void *data)
-{
-	struct nfs_pgio_header *hdr = data;
-
-	if (nfs4_setup_sequence(hdr->ds_clp,
-				&hdr->args.seq_args,
-				&hdr->res.seq_res,
-				task))
-		return;
-	rpc_call_start(task);
-}
-
-static void ffv2_write_call_done(struct rpc_task *task, void *data)
-{
-	struct nfs_pgio_header *hdr = data;
-
-	if (test_bit(NFS_IOHDR_REDO, &hdr->flags) &&
-	    task->tk_status == 0) {
-		nfs4_sequence_done(task, &hdr->res.seq_res);
-		return;
-	}
-	hdr->mds_ops->rpc_call_done(task, hdr);
-}
-
-static void ffv2_write_count_stats(struct rpc_task *task, void *data)
-{
-	struct nfs_pgio_header *hdr = data;
-
-	rpc_count_iostats_metrics(task,
-	    &NFS_CLIENT(hdr->inode)->cl_metrics[NFSPROC4_CLNT_WRITE]);
-}
-
-/*
- * DS-side write completion hook.  On DS-side transport failure set
- * NFS_IOHDR_RESEND_MDS so ffv2_write_release() reissues the write
- * against the MDS via pnfs_write_done_resend_to_mds().  Returning
- * task->tk_status (a negative errno) makes nfs_pgio_result() skip
- * nfs_set_pgio_error(), which is what we want: the resend will drive
- * the pages to completion, we do not want the failed DS attempt to
- * flip the pages to a "completed with error" state that
- * nfs_write_completion() might interpret as done.
- *
- * Per-DS-ioerr tracking for LAYOUTRETURN is a follow-up.
- */
-static int ffv2_write_done_cb(struct rpc_task *task,
-			      struct nfs_pgio_header *hdr)
-{
-	if (task->tk_status < 0) {
-		if (!test_and_set_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags))
-			pnfs_error_mark_layout_for_return(hdr->inode,
-							  hdr->lseg);
-		return task->tk_status;
-	}
-	return 0;
-}
 
 /* ---------- RMW fetch engine ------------------------------------ */
 
@@ -1408,67 +1357,6 @@ ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
 
 /* ---------- end RMW fetch engine -------------------------------- */
 
-static void ffv2_write_release(void *data)
-{
-	struct nfs_pgio_header *hdr = data;
-	struct pnfs_layout_segment *lseg = hdr->lseg;
-	struct nfs4_ffv2_layout_segment *fls = lseg ? FFV2_LSEG(lseg) : NULL;
-
-	if (fls && fls->mirror_array_cnt > 0 && fls->mirror_array[0]) {
-		struct nfs4_ffv2_mirror *mirror = fls->mirror_array[0];
-		u64 stripe_bytes = (u64)mirror->protection_data *
-				   mirror->striping_unit_size;
-		struct ffv2_stripe_ctx *ctx;
-		u64 stripe_off;
-		void *writer_key = ffv2_writer_key(hdr);
-
-		/*
-		 * Derive the stripe-aligned key from hdr->mds_offset by
-		 * rounding down; mds_offset itself keeps its
-		 * file-absolute, pre-conversion meaning for
-		 * layoutcommit / RESEND_MDS bookkeeping.  Unaligned
-		 * safe-append / RMW batches would otherwise miss the
-		 * ctx and leak the shard-page arrays until lseg
-		 * teardown.
-		 */
-		if (stripe_bytes)
-			stripe_off = div64_u64(hdr->mds_offset, stripe_bytes) *
-				     stripe_bytes;
-		else
-			stripe_off = hdr->mds_offset;
-
-		spin_lock(&fls->fls_ctx_lock);
-		list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
-			if (ctx->writer_key != writer_key ||
-			    ctx->stripe_off != stripe_off)
-				continue;
-			spin_unlock(&fls->fls_ctx_lock);
-			ffv2_stripe_ctx_put(ctx);
-			goto done;
-		}
-		spin_unlock(&fls->fls_ctx_lock);
-	}
-done:
-	/*
-	 * If ffv2_write_done_cb marked this hdr for MDS resend on a DS
-	 * error, actually drive that resend now.  Without this hook the
-	 * RESEND_MDS bit would be set but never consumed, and
-	 * nfs_write_completion would mark the pages as committed --
-	 * silent data loss.  Matches ff_layout_write_release.
-	 */
-	if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
-	    !test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags))
-		hdr->task.tk_status = pnfs_write_done_resend_to_mds(hdr);
-	pnfs_generic_rw_release(data);
-}
-
-static const struct rpc_call_ops ffv2_write_call_ops_v4 = {
-	.rpc_call_prepare	= ffv2_write_prepare_v4,
-	.rpc_call_done		= ffv2_write_call_done,
-	.rpc_count_stats	= ffv2_write_count_stats,
-	.rpc_release		= ffv2_write_release,
-};
-
 /*
  * Chunk-encoded write dispatch.  Called once per mirror index by
  * pnfs_do_write; pageio processes mirrors sequentially so mirror 0
@@ -1490,19 +1378,10 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(lseg);
 	struct nfs4_ffv2_mirror *mirror = fls->mirror_array[0];
 	struct ffv2_stripe_ctx *ctx;
-	struct nfs4_ffv2_stripe *stripe;
-	struct nfs4_ffv2_data_server *ds_slot;
-	struct nfs4_ffv2_file_info *fi;
-	struct nfs4_deviceid_node *devnode;
-	struct nfs4_ffv2_layout_ds *layout_ds;
-	struct nfs4_pnfs_ds *ds;
-	struct nfs_server *mds_srv = NFS_SERVER(hdr->inode);
-	struct rpc_clnt *ds_clnt;
 	const struct ffv2_encoder_ops *enc;
 	u32 k = mirror->protection_data;
 	u32 m = mirror->protection_parity;
 	u32 mirror_idx = hdr->pgio_mirror_idx;
-	int rc;
 
 	enc = ffv2_find_encoder(mirror->coding_type);
 	if (!enc || !enc->encode)
@@ -1642,65 +1521,32 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 		return ffv2_write_fallback_to_mds(hdr);
 	}
 
-	/* From here on the ctx ref belongs to this dispatch. */
-	if (mirror->stripes_cnt == 0)
-		goto out_put_ctx;
-	stripe = &mirror->stripes[0];
-	if (mirror_idx >= stripe->data_servers_cnt)
-		goto out_put_ctx;
-	ds_slot = &stripe->data_servers[mirror_idx];
-	if (ds_slot->versions_cnt == 0)
-		goto out_put_ctx;
-	fi = &ds_slot->versions[0];
-
-	devnode = nfs4_find_get_deviceid(mds_srv, &ds_slot->devid,
-					 hdr->cred, nfs_io_gfp_mask());
-	if (!devnode)
-		goto out_put_ctx;
-	layout_ds = FFV2_LAYOUT_DS_FROM_NODE(devnode);
-	ds = layout_ds->ds;
-	if (!ds || layout_ds->ds_versions_cnt == 0 ||
-	    layout_ds->ds_versions[0].version != 4) {
-		nfs4_put_deviceid_node(devnode);
-		goto out_put_ctx;
-	}
-
-	rc = nfs4_pnfs_ds_connect(mds_srv, ds, devnode,
-				  NFS_DEF_TCP_TIMEO, 0,
-				  layout_ds->ds_versions[0].version,
-				  layout_ds->ds_versions[0].minor_version);
-	if (rc || !ds->ds_clp) {
-		nfs4_put_deviceid_node(devnode);
-		goto out_put_ctx;
-	}
-	ds_clnt = ds->ds_clp->cl_rpcclient;
-
-	refcount_inc(&ds->ds_clp->cl_count);
-	hdr->ds_clp = ds->ds_clp;
-	hdr->args.fh = &fi->fh;
-	hdr->args.stateid = fi->stateid;
-	hdr->mds_offset = hdr->args.offset;
-	hdr->pgio_done_cb = ffv2_write_done_cb;
-
 	/*
-	 * Override user pages with this mirror's shard pages.  The DS
-	 * offset is derived from the stripe-aligned ctx->stripe_off,
-	 * not from the (possibly unaligned) hdr->args.offset -- the
-	 * latter is what ffv2_ds_offset was originally called with and
-	 * that shifts DS placement for any off_in_stripe != 0 batch.
+	 * From here on the ctx ref belongs to this dispatch.  Hand
+	 * off to the CHUNK_WRITE helper, which resolves ds_slot /
+	 * devnode / ds_clp itself, allocates the wrapper, populates
+	 * args, and runs the private RPC via
+	 * ffv2_chunk_write_procinfo.  On PNFS_ATTEMPTED the wrapper's
+	 * release-cb owns all subsequent teardown (including the
+	 * inherited ctx ref).  On PNFS_NOT_ATTEMPTED the helper has
+	 * unwound its own local refs (devnode, lseg, ds_clp) and left
+	 * ctx to us; drop inline below.
+	 *
+	 * At this commit the temporary gate above short-circuits
+	 * before we reach here, so this call is unreachable from the
+	 * write path in production.  Unit tests reach the helper via
+	 * its extracted-callable form directly.  Patch 5 flips the
+	 * flag and makes this the live wire dispatch.
 	 */
-	hdr->args.pages  = ctx->shard_pages[mirror_idx];
-	hdr->args.pgbase = 0;
-	hdr->args.count  = ctx->shard_len;
-	hdr->args.offset = ffv2_ds_offset(mirror, ctx->stripe_off);
+	{
+		enum pnfs_try_status rc_disp;
 
-	nfs_initiate_pgio(ds_clnt, hdr, hdr->cred,
-			  ds->ds_clp->rpc_ops, &ffv2_write_call_ops_v4,
-			  sync, RPC_TASK_SOFTCONN, NULL);
-	nfs4_put_deviceid_node(devnode);
-	return PNFS_ATTEMPTED;
+		rc_disp = ffv2_chunk_write_dispatch_one_mirror(
+			hdr, ctx, mirror_idx, sync);
+		if (rc_disp == PNFS_ATTEMPTED)
+			return rc_disp;
+	}
 
-out_put_ctx:
 	/*
 	 * Sibling dispatch-time failure after some other mirror
 	 * already dispatched: the DS state can be torn until the
