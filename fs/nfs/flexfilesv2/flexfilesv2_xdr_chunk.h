@@ -1,10 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Private header for the CHUNK_WRITE wire scaffold.  Isolated from
- * flexfilesv2.h so that unrelated ffv2 files (encoders, xor,
- * mojette, ...) don't drag in the nfs_xdr.h + SUNRPC include
- * cascade.  Only files that speak CHUNK_WRITE on the wire (this
- * file's .c and the dispatch path) include this.
+ * Private header for the CHUNK_WRITE and CHUNK_READ wire scaffolds.
+ * Isolated from flexfilesv2.h so that unrelated ffv2 files
+ * (encoders, xor, mojette, ...) don't drag in the nfs_xdr.h +
+ * SUNRPC include cascade.  Only files that speak CHUNK_WRITE /
+ * CHUNK_READ on the wire (this file's .c and the dispatch paths)
+ * include this.
  *
  * Copyright (c) 2026 Thomas Haynes <loghyr@gmail.com>
  */
@@ -105,5 +106,89 @@ struct ffv2_chunk_write_data {
 };
 
 extern const struct rpc_procinfo ffv2_chunk_write_procinfo;
+
+/*
+ * CHUNK_READ4args in-memory form.
+ *
+ * offset is a CHUNK INDEX (u64), NOT bytes -- same units as
+ * cwa_offset on the WRITE side, per draft sec-CHUNK_READ.  count is
+ * a chunk count (u32), NOT bytes; the initial posture always sends 1
+ * (the encoder rejects 0).
+ *
+ * pages/pgbase/pglen point at the caller-supplied reply page vector;
+ * the encoder wires them into rpc_prepare_reply_pages before COMPOUND
+ * emit so the transport lays out the receive buffer with a
+ * head/pages split at the fixed prefix, and the decoder splices
+ * cr_chunk<> bytes onto pages via xdr_read_pages (no memcpy on the
+ * payload path).
+ */
+struct ffv2_chunk_read_args {
+	nfs4_stateid	stateid;
+	u64		offset;		/* chunk INDEX, not bytes */
+	u32		count;		/* chunk COUNT; always 1 for now */
+	struct page	**pages;	/* caller's reply-page vector */
+	u32		pgbase;
+	u32		pglen;		/* bytes of room in pages */
+};
+
+/*
+ * checksum4 in-memory form.  cs_value bytes are stored verbatim from
+ * the wire (already big-endian); the dispatch layer byte-compares
+ * against the same big-endian shape produced by ffv2_checksum_compute.
+ * No client-side algorithm interpretation in the decoder;
+ * algorithm/value_len are stored as-is and cross-checked against the
+ * layout by the caller.
+ */
+struct ffv2_checksum4 {
+	u32		algorithm;
+	u32		value_len;	/* bytes populated in value[] */
+	u8		value[FFV2_CHECKSUM_MAX_LEN];
+};
+
+/* One crr_chunks<> element. */
+struct ffv2_read_chunk4 {
+	struct ffv2_checksum4	checksum;
+	u32			effective_len;	/* bytes valid in payload */
+	struct chunk_owner4	owner;		/* guard-capture source */
+	struct chunk_guard4	guard;		/* per-chunk CAS state */
+	u32			payload_id;	/* always 0 for now */
+	u32			locked;		/* chunk_state_flags4 */
+	u32			status;		/* nfsstat4 */
+	u32			chunk_len;	/* cr_chunk<> wire length */
+};
+
+/*
+ * CHUNK_READ4resok in-memory form.  chunks[] cap is
+ * FFV2_MAX_CHUNKS_PER_OP for defensive allocation sizing; the
+ * decoder currently enforces nchunks in {0, 1}.  nchunks == 0 is the
+ * DS's transient-OOM truncation path with a separately-computed
+ * crr_eof that the caller MUST treat as retry/fallback, not a clean
+ * EOF.
+ */
+struct ffv2_chunk_read_res {
+	struct nfs4_sequence_res seq_res;
+	bool			eof;
+	u32			nchunks;
+	struct ffv2_read_chunk4	chunks[FFV2_MAX_CHUNKS_PER_OP];
+};
+
+/*
+ * Composite task-data struct passed as rpc_message.rpc_argp on the
+ * CHUNK_READ task.  Same shape rationale as ffv2_chunk_write_data:
+ * seq_res is populated by the decoder BEFORE any CHUNK_READ op
+ * status is consulted, so any error reply still yields a well-formed
+ * seq_res that nfs41_sequence_process can use to dispatch its
+ * recovery arms.  NFS4ERR_DELAY maps to -NFS4ERR_DELAY (not
+ * -EAGAIN); the dispatch layer must match on -NFS4ERR_DELAY for its
+ * retry loop.
+ */
+struct ffv2_chunk_read_data {
+	struct nfs4_sequence_args	seq_args;
+	struct ffv2_chunk_read_args	args;
+	struct nfs_fh			fh;
+	struct ffv2_chunk_read_res	res;
+};
+
+extern const struct rpc_procinfo ffv2_chunk_read_procinfo;
 
 #endif /* FS_NFS_NFS4FLEXFILES_V2_XDR_CHUNK_H */

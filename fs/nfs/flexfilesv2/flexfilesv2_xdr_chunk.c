@@ -122,6 +122,86 @@
 	BYTES_TO_U32(FFV2_CHUNK_WRITE_RES_MAXSZ_BYTES)
 
 /*
+ * CHUNK_READ op body (inline; no send-side page splicing):
+ *   op code (4) + stateid (16) + offset (8) + count (4) = 32 bytes
+ */
+#define FFV2_CHUNK_READ_INLINE_ENC_MAXSZ	(4 + NFS4_STATEID_SIZE + 8 + 4)
+
+/*
+ * Total inline args for CHUNK_READ.  Payload lives OUT-of-line
+ * (in the caller's reply pages, via rpc_prepare_reply_pages);
+ * no xdr_write_pages on the send side.
+ */
+#define FFV2_CHUNK_READ_ARGS_MAXSZ_BYTES \
+	(FFV2_COMPOUND_HDR_MAXSZ + FFV2_SEQUENCE_ENC_MAXSZ + \
+	 FFV2_PUTFH_ENC_MAXSZ + FFV2_CHUNK_READ_INLINE_ENC_MAXSZ)
+
+/*
+ * Reply size upper bound for CHUNK_READ resok HEAD area only.
+ * The cr_chunk<> payload bytes go out-of-line into the caller's
+ * pages via xdr_read_pages and are NOT counted here.
+ *
+ *   compound status (4) + tag length (4) + resarray length (4)
+ *   SEQUENCE op hdr (4) + status (4) + sessionid (16) + 20
+ *     (seqid/slotid/highest_slotid/target_highest_slotid/status_flags)
+ *   PUTFH op hdr (4) + status (4)
+ *   CHUNK_READ op hdr (4) + status (4) + resok:
+ *     crr_eof (4) + crr_chunks<> length (4)
+ *     + N * per_chunk_worst_case
+ *
+ * Per-chunk worst case in bytes (allows a future non-CRC32
+ * algorithm at max cs_value = SHA-512 = 64 bytes):
+ *   cs_algorithm (4) + cs_value_len (4) + cs_value (64, pad-free
+ *   at 64) + cr_effective_len (4) + cr_owner (12) + cr_guard (8)
+ *   + cr_payload_id (4) + cr_locked (4)
+ *   + cr_status (4) + cr_chunk<> length (4) = 112
+ * With N capped at FFV2_MAX_CHUNKS_PER_OP.
+ *
+ * Note: the runtime decoder enforces N in {0, 1} and cs_value_len ==
+ * 4, but maxsz stays at the worst case -- undersizing yields hard-
+ * to-diagnose xdr_inline_decode NULLs at first wire test.
+ */
+#define FFV2_CHUNK_READ_RES_MAXSZ_BYTES \
+	((4 + 4 + 4) + \
+	 (4 + 4 + NFS4_MAX_SESSIONID_LEN + 20) + \
+	 (4 + 4) + \
+	 (4 + 4 + 4 + 4 + \
+	  FFV2_MAX_CHUNKS_PER_OP * \
+	  (4 + 4 + FFV2_CHECKSUM_MAX_LEN + 4 + 12 + 8 + 4 + 4 + 4 + 4)))
+
+#define FFV2_CHUNK_READ_ARGS_MAXSZ	\
+	BYTES_TO_U32(FFV2_CHUNK_READ_ARGS_MAXSZ_BYTES)
+#define FFV2_CHUNK_READ_RES_MAXSZ	\
+	BYTES_TO_U32(FFV2_CHUNK_READ_RES_MAXSZ_BYTES)
+
+/*
+ * Fixed prefix (in u32 quads) that the CHUNK_READ decoder actually
+ * expects to consume from head before xdr_read_pages transitions to
+ * the page area.  Passed to rpc_prepare_reply_pages as the hdrsize
+ * argument; sets the head/pages split point on the receive buffer.
+ *
+ * Computed from the known-good shape (nchunks == 1 with a CRC32-
+ * shape checksum4):
+ *   compound (3q) + SEQUENCE resok (11q) + PUTFH resok (2q)
+ *   + CHUNK_READ op hdr (1q) + status (1q)
+ *   + crr_eof (1q) + crr_chunks_len (1q)
+ *   + 1 * (cs_algorithm (1q) + cs_value_len (1q)
+ *          + cs_value bytes (1q; CRC32 = 4 bytes quad-aligned,
+ *            no pad)
+ *          + cr_effective_len (1q) + cr_owner (3q) + cr_guard (2q)
+ *          + cr_payload_id (1q) + cr_locked (1q)
+ *          + cr_status (1q) + cr_chunk_len (1q))
+ *   = 33 quads.
+ *
+ * The corresponding N=0 short-reply (transient-OOM truncation on
+ * the DS side) yields a shorter wire; the xprt fills only what the
+ * wire supplies and the decoder walks nchunks=0 without touching
+ * the trailing quads.  A future batching (N > 1) or non-CRC32
+ * checksum extension MUST rework this constant as a coordinated change.
+ */
+#define FFV2_CHUNK_READ_REPLY_HDR_QUADS		33
+
+/*
  * Reserve space in the XDR stream.  A NULL return from
  * xdr_reserve_space means the calculated p_arglen is under-sized
  * for the encoded compound -- a bug in the maxsz constants above,
@@ -140,7 +220,7 @@ static __be32 *ffv2_reserve_space(struct xdr_stream *xdr, size_t nbytes)
 	__be32 *p = xdr_reserve_space(xdr, nbytes);
 
 	if (unlikely(!p)) {
-		WARN_ONCE(1, "ffv2 CHUNK_WRITE: p_arglen under-sized (%zu bytes)\n",
+		WARN_ONCE(1, "ffv2 CHUNK op: p_arglen under-sized (%zu bytes)\n",
 			  nbytes);
 		return ffv2_reserve_discard;
 	}
@@ -324,6 +404,96 @@ static void ffv2_xdr_enc_chunk_write(struct rpc_rqst *req,
 	req->rq_snd_buf.flags |= XDRBUF_WRITE;
 }
 
+static void ffv2_xdr_enc_chunk_read_op(struct xdr_stream *xdr,
+				       const struct ffv2_chunk_read_args *a)
+{
+	__be32 *p;
+
+	ffv2_xdr_enc_op_hdr(xdr, OP_CHUNK_READ);
+	ffv2_xdr_enc_stateid(xdr, &a->stateid);
+	p = ffv2_reserve_space(xdr, 8 + 4);
+	p = xdr_encode_hyper(p, a->offset);	/* chunk INDEX, not bytes */
+	*p = cpu_to_be32(a->count);		/* chunk COUNT, not bytes */
+}
+
+/*
+ * CHUNK_READ encoder.  Straight compound emit: no send-side page
+ * splicing (the CHUNK_READ body is fixed 32 bytes).  The reply-side
+ * page splice is set up via rpc_prepare_reply_pages BEFORE the
+ * compound emit, with hdrsize pinned to the fixed-prefix quad count
+ * (see FFV2_CHUNK_READ_REPLY_HDR_QUADS).  XDRBUF_READ marks the
+ * receive buffer as file-read destination so RDMA transports use
+ * direct data placement (mirrors CHUNK_WRITE's XDRBUF_WRITE on send;
+ * model: nfs4_xdr_enc_read in fs/nfs/nfs4xdr.c).  Missing this on
+ * RDMA regresses to inline placement (silent perf cliff).
+ *
+ * The .p_encode signature returns void, so this encoder cannot
+ * surface -EINVAL to the caller.  The API-boundary check for
+ * cra_count == 0 belongs in the dispatch entry, before rpc_run_task
+ * submission, where an integer error can be returned.  As last-ditch
+ * defence -- if a zero cra_count reaches this encoder anyway -- emit
+ * an empty COMPOUND (nops=0) so the send path doesn't choke on an
+ * empty xdr_stream.  The server may return NFS4_OK with an empty
+ * resarray; the decoder converts that short-OK reply to -EPROTO via
+ * the short-OK-reply guard.
+ */
+static bool ffv2_xdr_enc_chunk_read_check(const struct ffv2_chunk_read_args *a)
+{
+	/*
+	 * Return true when args are invalid so the caller emits the
+	 * empty-COMPOUND fallback.  WARN_ON_ONCE pinpoints the
+	 * offending call site so the dispatch layer can be fixed to
+	 * filter upstream.
+	 */
+	return WARN_ON_ONCE(a->count == 0);
+}
+
+static void ffv2_xdr_enc_chunk_read(struct rpc_rqst *req,
+				    struct xdr_stream *xdr,
+				    const void *data)
+{
+	const struct ffv2_chunk_read_data *d = data;
+
+	if (ffv2_xdr_enc_chunk_read_check(&d->args)) {
+		/*
+		 * Empty COMPOUND fallback for cra_count == 0.  Server
+		 * may return NFS4_OK with an empty resarray; the
+		 * decoder maps that short-OK to -EPROTO via the
+		 * short-OK-reply guard.  Not the documented -EINVAL
+		 * contract (see encoder comment); 4b must filter
+		 * upstream.
+		 */
+		ffv2_xdr_enc_compound_hdr(xdr, 2, 0);
+		return;
+	}
+
+	/*
+	 * Arrange the reply-page split BEFORE emitting the compound:
+	 * hdrsize (in quads) is the fixed prefix that head must hold,
+	 * then up to pglen bytes of payload land in the caller's
+	 * pages.  See FFV2_CHUNK_READ_REPLY_HDR_QUADS for the
+	 * derivation.  A future rework of the boundary shape must
+	 * update both the constant and the decoder invariants
+	 * together.
+	 */
+	rpc_prepare_reply_pages(req, d->args.pages, d->args.pgbase,
+				d->args.pglen,
+				FFV2_CHUNK_READ_REPLY_HDR_QUADS);
+
+	ffv2_xdr_enc_compound_hdr(xdr, 2, 3);	/* v4.2, 3 ops */
+	ffv2_xdr_enc_sequence(xdr, &d->seq_args);
+	ffv2_xdr_enc_putfh(xdr, &d->fh);
+	ffv2_xdr_enc_chunk_read_op(xdr, &d->args);
+	/*
+	 * Mark the receive buffer as file-read destination so
+	 * RDMA transports use direct data placement.  Matches
+	 * nfs4_xdr_enc_read at fs/nfs/nfs4xdr.c:2607.  TCP
+	 * unaffected; missing this on RDMA regresses to inline
+	 * placement (silent perf cliff, mirrors WRITE-side).
+	 */
+	req->rq_rcv_buf.flags |= XDRBUF_READ;
+}
+
 /* -------------------- decoder -------------------- */
 
 /*
@@ -479,6 +649,18 @@ static int ffv2_xdr_dec_sequence(struct xdr_stream *xdr,
 	res->sr_highest_slotid		= be32_to_cpup(p++);
 	res->sr_target_highest_slotid	= be32_to_cpup(p++);
 	res->sr_status_flags		= be32_to_cpup(p);
+	return 0;
+}
+
+static int ffv2_xdr_dec_chunk_guard(struct xdr_stream *xdr,
+				    struct chunk_guard4 *out)
+{
+	__be32 *p = xdr_inline_decode(xdr, 8);
+
+	if (!p)
+		return -EIO;
+	out->cg_gen_id    = be32_to_cpup(p++);
+	out->cg_client_id = be32_to_cpup(p);
 	return 0;
 }
 
@@ -647,6 +829,275 @@ static int ffv2_xdr_dec_chunk_write(struct rpc_rqst *req,
 	return ffv2_xdr_dec_chunk_write_resok(xdr, d);
 }
 
+/*
+ * Decode a checksum4 (cs_algorithm + cs_value<64>) from the wire
+ * into out.  The current runtime hard-enforces cs_value_len == 4:
+ * the reply-page split set by rpc_prepare_reply_pages is FIXED at
+ * the CRC32 shape; any other value shifts the head/pages boundary
+ * and desyncs the payload split.  The XDR-level opaque<64> upper
+ * bound is also checked as defence in depth before the stricter
+ * gate.  Value bytes are big-endian on the wire; the dispatch layer
+ * byte-compares against the same big-endian shape emitted by
+ * ffv2_checksum_compute (see flexfilesv2_checksum.c).
+ */
+static int ffv2_xdr_dec_checksum4(struct xdr_stream *xdr,
+				  struct ffv2_checksum4 *out)
+{
+	__be32 *p;
+	u32 len;
+
+	p = xdr_inline_decode(xdr, 4 + 4);
+	if (!p)
+		return -EIO;
+	out->algorithm = be32_to_cpup(p++);
+	len = be32_to_cpup(p);
+	/*
+	 * Defence-in-depth: XDR-level opaque<64> upper bound.  The
+	 * stricter gate below rejects everything except exactly 4, but
+	 * keep the wire-spec bound explicit so a future caller can't
+	 * quietly regress it out.
+	 */
+	if (len > FFV2_CHECKSUM_MAX_LEN)
+		return -EPROTO;
+	/*
+	 * Currently cs_value_len MUST be 4 (matches the fixed reply-
+	 * page boundary; also rejects a checksumless-chunk reply).  A
+	 * "skip verify on NONE / len 0" policy becomes live only after
+	 * a coordinated reply-page boundary rework.
+	 */
+	if (len != 4)
+		return -EPROTO;
+	out->value_len = len;
+	p = xdr_inline_decode(xdr, 4);		/* CRC32: 4 bytes, no pad */
+	if (!p)
+		return -EIO;
+	memcpy(out->value, p, 4);
+	return 0;
+}
+
+/*
+ * Decode one read_chunk4 (crr_chunks<> element).  Currently enforces
+ * cr_locked<> / cr_status<> length 0; the reply-page boundary is
+ * fixed at that shape.
+ *
+ * cr_guard is the per-chunk CAS state (cg_gen_id, cg_client_id).
+ * The server may also expose it inside cr_owner.co_guard on older
+ * single-owner shapes; the guard-capture path currently sources
+ * from cr_owner.co_guard for interop.  cr_guard becomes
+ * authoritative once the owner-triple restructure lands and
+ * chunk_owner4 loses its embedded chunk_guard4.
+ *
+ * cr_chunk<> length is stored on out->chunk_len; the payload bytes
+ * themselves are consumed by xdr_read_pages in the enclosing resok
+ * decoder (single call for the resok's one chunk), NOT here.
+ */
+static int ffv2_xdr_dec_read_chunk4(struct xdr_stream *xdr,
+				    struct ffv2_read_chunk4 *out)
+{
+	__be32 *p;
+	int rc;
+
+	rc = ffv2_xdr_dec_checksum4(xdr, &out->checksum);
+	if (rc)
+		return rc;
+
+	p = xdr_inline_decode(xdr, 4);		/* cr_effective_len */
+	if (!p)
+		return -EIO;
+	out->effective_len = be32_to_cpup(p);
+
+	rc = ffv2_xdr_dec_chunk_owner(xdr, &out->owner);
+	if (rc)
+		return rc;
+
+	rc = ffv2_xdr_dec_chunk_guard(xdr, &out->guard);
+	if (rc)
+		return rc;
+
+	p = xdr_inline_decode(xdr, 4);		/* cr_payload_id */
+	if (!p)
+		return -EIO;
+	out->payload_id = be32_to_cpup(p);
+
+	/* cr_locked is an advisory chunk_state_flags4 scalar. */
+	p = xdr_inline_decode(xdr, 4);
+	if (!p)
+		return -EIO;
+	out->locked = be32_to_cpup(p);
+
+	/* cr_status is an nfsstat4 scalar. */
+	p = xdr_inline_decode(xdr, 4);
+	if (!p)
+		return -EIO;
+	out->status = be32_to_cpup(p);
+
+	/*
+	 * cr_chunk<> length prefix.  Payload bytes come out via
+	 * xdr_read_pages in the resok decoder AFTER the chunk loop:
+	 * xdr_read_pages supports one page-based opaque per reply, so
+	 * nchunks is capped at 1 and this length is authoritative for
+	 * that single payload.
+	 */
+	p = xdr_inline_decode(xdr, 4);
+	if (!p)
+		return -EIO;
+	out->chunk_len = be32_to_cpup(p);
+	return 0;
+}
+
+/*
+ * Decode CHUNK_READ4resok into r + splice payload pages.
+ *
+ * Enforcements:
+ *   - crr_nchunks in {0, 1}; > 1 returns -EPROTO before any
+ *     per-chunk decode (reply-page boundary supports one payload).
+ *   - crr_nchunks == 0 is the DS's transient-OOM truncation with an
+ *     independently-computed crr_eof; the decoder succeeds and the
+ *     dispatch layer treats it as retry.
+ *   - When crr_nchunks == 1, cr_effective_len (the caller's view of
+ *     "how many valid bytes") MUST be <= cr_chunk<> length (the
+ *     wire-authoritative SPLICE byte count).  Both are untrusted
+ *     wire input; a malicious or buggy DS setting effective_len to
+ *     0xffffffff with chunk_len == 4096 would tell callers that
+ *     ~4 GiB are valid.  The bound-check runs BEFORE xdr_read_pages
+ *     so no allocation / copy path ever sees a divergent pair.  A
+ *     shorter effective_len (tail-chunk case) is legal; equal is
+ *     the common case; > is -EPROTO.
+ */
+static int ffv2_xdr_dec_chunk_read_resok(struct xdr_stream *xdr,
+					 struct ffv2_chunk_read_res *r)
+{
+	__be32 *p;
+	u32 n;
+
+	p = xdr_inline_decode(xdr, 4 + 4);	/* crr_eof + crr_chunks_len */
+	if (!p)
+		return -EIO;
+	r->eof = !!be32_to_cpup(p++);
+	n = be32_to_cpup(p);
+	/*
+	 * nchunks in {0, 1}.  Reject > 1 before touching per-chunk
+	 * decoders -- allowing a decode past 1 would both violate the
+	 * reply-page split invariant and hand the pages splice below
+	 * an ambiguous per-chunk source.  FFV2_MAX_CHUNKS_PER_OP == 32
+	 * is a batching-follow-up cap, not the current runtime cap.
+	 */
+	if (n > 1)
+		return -EPROTO;
+	r->nchunks = n;
+
+	if (n == 1) {
+		int rc = ffv2_xdr_dec_read_chunk4(xdr, &r->chunks[0]);
+		unsigned int spliced;
+
+		if (rc)
+			return rc;
+
+		/*
+		 * Bound effective_len by chunk_len BEFORE splicing so no
+		 * downstream reader sees a divergent pair.  Both values
+		 * are wire input; a > relation is either DS corruption
+		 * or an attack (chunk_len == 4096, effective_len ==
+		 * 0xffffffff would tell callers that ~4 GiB are valid
+		 * despite only 4 KiB spliced).
+		 */
+		if (r->chunks[0].effective_len > r->chunks[0].chunk_len)
+			return -EPROTO;
+
+		/*
+		 * Splice cr_chunk<> payload bytes into the caller's
+		 * reply pages.  xdr_read_pages consumes the payload
+		 * body (chunk_len bytes plus 0-3 trailing pad bytes)
+		 * from the recv buffer's page area; the pad bytes
+		 * are a cursor advance only, not copied (see
+		 * net/sunrpc/xdr.c:1772-1787 -- nwords =
+		 * XDR_QUADLEN(len)).  No memcpy on this path.
+		 *
+		 * The pages themselves were arranged by
+		 * rpc_prepare_reply_pages in the encoder; the
+		 * receive buffer already carries the payload in the
+		 * page area (transport dropped it there at recv
+		 * time).
+		 */
+		spliced = xdr_read_pages(xdr, r->chunks[0].chunk_len);
+		if (spliced < r->chunks[0].chunk_len)
+			return -EIO;
+	}
+	return 0;
+}
+
+static int ffv2_xdr_dec_chunk_read(struct rpc_rqst *req,
+				   struct xdr_stream *xdr,
+				   void *data)
+{
+	struct ffv2_chunk_read_res *d = data;
+	u32 cstatus, nops, opstatus;
+	int rc;
+
+	/*
+	 * sr_status sentinel = 1 BEFORE header parse.  Matches
+	 * nfs41_sequence_res_init at nfs4proc.c:1019-1024 for the
+	 * "RPC-level error, server may not have processed" path.
+	 * Rationale + citation identical to CHUNK_WRITE decoder.
+	 */
+	d->seq_res.sr_status = 1;
+
+	rc = ffv2_xdr_dec_compound_hdr(xdr, &cstatus, &nops);
+	if (rc)
+		return rc;
+
+	/*
+	 * Short-OK-reply guard: cstatus == NFS4_OK with fewer ops than
+	 * we sent is a server bug per RFC 8881 §16.2.2.  Return -EPROTO
+	 * before nfs4_stat_to_errno(NFS4_OK) == 0 silently reports
+	 * success.  Repeated at every op boundary below.
+	 */
+	if (nops == 0) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_sequence(xdr, &d->seq_res);
+	if (rc)
+		return rc;
+
+	if (nops < 2) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_op_hdr(xdr, OP_PUTFH, &opstatus);
+	if (rc)
+		return rc;
+	if (opstatus != NFS4_OK)
+		return nfs4_stat_to_errno(opstatus);
+
+	if (nops < 3) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_op_hdr(xdr, OP_CHUNK_READ, &opstatus);
+	if (rc)
+		return rc;
+	if (opstatus != NFS4_OK)
+		/*
+		 * NFS4ERR_DELAY maps to -NFS4ERR_DELAY (not -EAGAIN),
+		 * same as CHUNK_WRITE.  The dispatch layer's retry loop
+		 * matches on -NFS4ERR_DELAY per nfs4proc.c.
+		 * NFS4ERR_NOENT is the normal sparse-file-read / no-
+		 * prior-chunk reply; the dispatch layer treats it as
+		 * zero-fill, NOT MDS fallback.  Every other NFS4ERR_
+		 * maps via nfs4_stat_to_errno; unmapped session-range
+		 * codes fall through nfs4err_common.c's default to -stat.
+		 */
+		return nfs4_stat_to_errno(opstatus);
+	return ffv2_xdr_dec_chunk_read_resok(xdr, d);
+}
+
 /* -------------------- procinfo -------------------- */
 
 /*
@@ -675,4 +1126,30 @@ const struct rpc_procinfo ffv2_chunk_write_procinfo = {
 	.p_replen	= FFV2_CHUNK_WRITE_RES_MAXSZ,
 	.p_statidx	= NFSPROC4_CLNT_WRITE,
 	.p_name		= "CHUNK_WRITE",
+};
+
+/*
+ * CHUNK_READ procinfo.  The dispatch site sets
+ * rpc_message.rpc_proc = &ffv2_chunk_read_procinfo and
+ * rpc_message.rpc_argp to a struct ffv2_chunk_read_data instance.
+ *
+ * p_arglen counts inline args only (28 bytes of CHUNK_READ body +
+ * compound / SEQUENCE / PUTFH overhead); no send-side payload.
+ *
+ * p_replen counts the inline-decode buffer ONLY.  Payload bytes
+ * (cr_chunk<>) land in the caller's pages via xdr_read_pages and
+ * are NOT counted here -- rpc_prepare_reply_pages in the encoder
+ * pins the head/pages split at FFV2_CHUNK_READ_REPLY_HDR_QUADS.
+ *
+ * p_statidx = NFSPROC4_CLNT_READ merges CHUNK_READ RPC volume into
+ * the plain-READ metrics counter.
+ */
+const struct rpc_procinfo ffv2_chunk_read_procinfo = {
+	.p_proc		= NFSPROC4_COMPOUND,
+	.p_encode	= ffv2_xdr_enc_chunk_read,
+	.p_decode	= ffv2_xdr_dec_chunk_read,
+	.p_arglen	= FFV2_CHUNK_READ_ARGS_MAXSZ,
+	.p_replen	= FFV2_CHUNK_READ_RES_MAXSZ,
+	.p_statidx	= NFSPROC4_CLNT_READ,
+	.p_name		= "CHUNK_READ",
 };
