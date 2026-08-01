@@ -3,8 +3,8 @@
  * NFSv4 Flexfile Version 2 chunk checksum plumbing.
  *
  * Every non-PASSTHROUGH CHUNK_WRITE carries a per-chunk checksum
- * (checksum4 in the wire XDR).  The MDS advertises the algorithm
- * per mirror at LAYOUTGET time via ffm_checksum_algorithm; every
+ * (checksum4 in the wire XDR).  The MDS advertises the algorithm per
+ * mirror at LAYOUTGET time via ffm_checksum_algorithm; every
  * CHUNK_WRITE uses that algorithm for every chunk it carries.
  *
  * CRC32 and CRC32C are wired here.  Layouts advertising SHA256,
@@ -16,9 +16,27 @@
  * take a starting seed + buffer + length and return the final u32
  * checksum.  No allocation, no context.
  *
- * Wire byte order for the 4-byte checksums is XDR big-endian.  This
- * file returns the raw host-endian value in the first 4 bytes of the
- * output buffer; the caller's XDR emit does the endian conversion.
+ * Interoperability contract with the data-server protocol:
+ *
+ * - CRC32 uses the zlib crc32(0L, data, len) convention, i.e.
+ *   CRC-32/ISO-HDLC with pre-conditioning (initial seed 0xFFFFFFFF)
+ *   and post-conditioning (final XOR with 0xFFFFFFFF).  Kernel's
+ *   crc32_le(0, data, len) is the raw table CRC without either
+ *   conditioning -- it produces a different value for every
+ *   non-empty input.  This file uses crc32_le(~0U, data, len) ^ ~0U
+ *   to match zlib.
+ * - cs_value is packed big-endian (network byte order).  This file
+ *   emits the 4-byte checksum in big-endian order so the caller can
+ *   memcpy it verbatim into the XDR opaque; do not htonl() again in
+ *   the encoder.
+ * - CRC32C uses the same conditioning shape (RFC 3720 iSCSI / NVMe
+ *   convention: pre/post-conditioning by 0xFFFFFFFF, which
+ *   crc32c(~0U, data, len) ^ ~0U produces).
+ *
+ * Known-answer vector: input "123456789" (9 bytes) MUST produce
+ * CRC32 value 0xCBF43926, packed as big-endian bytes
+ * {0xCB, 0xF4, 0x39, 0x26}.  This matches zlib and the CRC-32/ISO-HDLC
+ * entry in the CRC catalogue.
  *
  * Copyright (c) 2026 Thomas Haynes <loghyr@gmail.com>
  */
@@ -41,10 +59,12 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
 
 	switch (algo) {
 	case FFV2_CHECKSUM_ALG_CRC32:
-		v = crc32_le(0, data, len);
+		/* CRC-32/ISO-HDLC: pre/post-condition to match zlib. */
+		v = crc32_le(~0U, data, len) ^ ~0U;
 		break;
 	case FFV2_CHECKSUM_ALG_CRC32C:
-		v = crc32c(0, data, len);
+		/* CRC-32C: same conditioning shape (RFC 3720). */
+		v = crc32c(~0U, data, len) ^ ~0U;
 		break;
 	case FFV2_CHECKSUM_ALG_NONE:
 	case FFV2_CHECKSUM_ALG_FLETCHER4:
@@ -52,7 +72,7 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
 	case FFV2_CHECKSUM_ALG_SHA512:
 	case FFV2_CHECKSUM_ALG_BLAKE3:
 	default:
-		/* Recognized-and-refused vs unknown collapse into a
+		/* Recognized-and-refused and unknown collapse into a
 		 * single caller-visible signal: this algo isn't wired
 		 * here; caller falls back to MDS.
 		 */
@@ -60,11 +80,13 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
 	}
 
 	/*
-	 * Emit the u32 in host order into out[0..3]; the caller's XDR
-	 * marshal will htonl().  Callers see a 4-byte checksum for both
-	 * CRC32 and CRC32C.
+	 * Emit the u32 in big-endian (network byte order) so the caller
+	 * can memcpy the bytes verbatim into the XDR opaque cs_value.
 	 */
-	memcpy(out, &v, sizeof(v));
+	out[0] = (u8)(v >> 24);
+	out[1] = (u8)(v >> 16);
+	out[2] = (u8)(v >> 8);
+	out[3] = (u8)(v);
 	*out_len = sizeof(v);
 	return 0;
 }
@@ -73,34 +95,32 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
  * Page-array variant of ffv2_checksum_compute.  Walks `pages` starting
  * at byte `pgbase` for `len` bytes, kmapping each page fragment and
  * accumulating the checksum via the underlying helper's seed-first
- * incremental API.  See include/linux/crc32.h:72,84 -- both crc32_le
- * and crc32c take a running seed as first arg, so page-by-page
- * accumulation is bit-exact.
+ * incremental API.  Both crc32_le and crc32c take a running seed as
+ * the first argument, so page-by-page accumulation is bit-exact.
  *
  * Preconditions:
- *   pages       -- array of struct page * with at least ceil((pgbase+len)
- *                  / PAGE_SIZE) entries.
- *   pgbase      -- byte offset from pages[0]; may exceed PAGE_SIZE for
- *                  callers who compute their own page-index offset.
- *   len         -- total byte length to checksum; 0 is legal (returns
- *                  the algorithm's seed=0 empty-input checksum for CRC32
- *                  / CRC32C, i.e. 0).
- *   out         -- MUST have at least FFV2_CHECKSUM_MAX_LEN capacity.
+ *   pages   -- array of struct page * with at least
+ *              ceil((pgbase + len) / PAGE_SIZE) entries.
+ *   pgbase  -- byte offset from pages[0]; may exceed PAGE_SIZE for
+ *              callers who compute their own page-index offset.
+ *   len     -- total byte length to checksum; 0 is legal.
+ *   out     -- MUST have at least FFV2_CHECKSUM_MAX_LEN capacity.
  *
  * Returns 0 on success (*out_len populated), -EOPNOTSUPP for
- * unsupported algo -- matches the flat-buffer variant's contract for
- * caller MDS-fallback.
+ * unsupported algo -- matches the flat-buffer variant's contract
+ * for caller MDS-fallback.
  *
  * Semantic equivalence with ffv2_checksum_compute for the same
  * concatenated byte sequence is a hard invariant.  Both paths seed
- * at 0 and use the same helper's seed-and-extend contract, so
- * equivalence follows from the helpers' own documented behavior.
+ * at ~0U (pre-conditioning), use the same helper's seed-and-extend
+ * contract, XOR the accumulated value with ~0U (post-conditioning)
+ * after the last byte, and emit big-endian.
  */
 int ffv2_checksum_compute_pages(u32 algo, struct page **pages, u32 pgbase,
 				size_t len, u8 *out, size_t *out_len)
 {
 	size_t remaining = len;
-	u32 seed = 0;
+	u32 seed;
 	unsigned int page_idx;
 	unsigned int page_off;
 
@@ -114,6 +134,14 @@ int ffv2_checksum_compute_pages(u32 algo, struct page **pages, u32 pgbase,
 	default:
 		return -EOPNOTSUPP;
 	}
+
+	/* Pre-condition the seed to ~0U (CRC-32/ISO-HDLC + RFC 3720
+	 * iSCSI convention).  Post-conditioning by XOR with ~0U happens
+	 * after the accumulation loop.  Both crc32_le and crc32c produce
+	 * the raw polynomial value; the conditioning must be done by the
+	 * caller for zlib / iSCSI compatibility.
+	 */
+	seed = ~0U;
 
 	/* Normalize pgbase: the caller may pass a byte offset >=
 	 * PAGE_SIZE (the stripe ctx does not necessarily align shard
@@ -143,10 +171,12 @@ int ffv2_checksum_compute_pages(u32 algo, struct page **pages, u32 pgbase,
 		page_off = 0;
 	}
 
-	/* Same host-byte-order emit as ffv2_checksum_compute; caller's
-	 * XDR marshal does the endian conversion.
-	 */
-	memcpy(out, &seed, sizeof(seed));
+	/* Post-condition + big-endian emit; matches the flat variant. */
+	seed ^= ~0U;
+	out[0] = (u8)(seed >> 24);
+	out[1] = (u8)(seed >> 16);
+	out[2] = (u8)(seed >> 8);
+	out[3] = (u8)(seed);
 	*out_len = sizeof(seed);
 	return 0;
 }
@@ -161,9 +191,9 @@ int ffv2_checksum_verify(u32 algo, const void *data, size_t len,
 	rc = ffv2_checksum_compute(algo, data, len, computed, &computed_len);
 	if (rc)
 		return rc;
-	if (expected_len != computed_len)
+	if (computed_len != expected_len)
 		return -EBADMSG;
-	if (memcmp(expected, computed, computed_len) != 0)
+	if (memcmp(computed, expected, computed_len) != 0)
 		return -EBADMSG;
 	return 0;
 }
