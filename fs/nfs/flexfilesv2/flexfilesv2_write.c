@@ -472,7 +472,31 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	w->wire.args.chunk_size   = mirror->striping_unit_size;
 	w->wire.args.payload_id   = 0;
 	w->wire.args.flags        = 0;
-	w->wire.args.guard.check  = false;
+
+	/*
+	 * Consume the per-shard captured guard populated by the
+	 * CHUNK_READ done-cb after CRC verification.  When a valid
+	 * capture is available (contained-partial RMW path), send
+	 * cwg_check=TRUE with the captured (gen_id, client_id) pair
+	 * so the DS's CAS rejects with NFS4ERR_DELAY if a concurrent
+	 * writer bumped the generation between our fetch and this
+	 * write.  Otherwise (parity mirrors, full-stripe writes, or
+	 * when the guard slot is still uncaptured), fall back to
+	 * cwg_check=FALSE -- currently gated by ONLY_ONE_WRITER
+	 * upstream so that path stays draft-conforming.
+	 *
+	 * Load-safety: this helper runs under encode_lock (acquired
+	 * by the mirror-arrival branch of ffv2_write_pagelist_chunked),
+	 * and the fetch path's winner-side capture writes .valid +
+	 * .guard while ALSO holding encode_lock.  The mutex
+	 * release/acquire pair provides the required happens-before.
+	 */
+	if (ctx->captured_guard[mirror_idx].valid) {
+		w->wire.args.guard.check = true;
+		w->wire.args.guard.guard = ctx->captured_guard[mirror_idx].guard;
+	} else {
+		w->wire.args.guard.check = false;
+	}
 
 	/* Copy the DS filehandle into the wrapper (bounded, owned). */
 	memcpy(&w->wire.fh, &fi->fh, sizeof(w->wire.fh));
