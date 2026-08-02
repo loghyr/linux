@@ -89,6 +89,28 @@ struct chunk_owner4 {
 };
 
 /*
+ * Per-shard guard slot for the CHUNK_READ dispatch to hand off to
+ * the paired CHUNK_WRITE.  Populated by the CHUNK_READ
+ * .rpc_call_done ONLY on CRC verify SUCCESS -- a guard captured
+ * from unverified data would let the DS's CAS accept corruption
+ * because the guard proves generation identity, not payload
+ * integrity.
+ *
+ * `valid` is cleared alongside the fetch-counter re-arm in
+ * ffv2_rmw_fetch_stripe, so a prior-cycle guard cannot sit stale
+ * in the slot and be read by the paired CHUNK_WRITE.  Array sized
+ * [k+m] on the ctx; parity mirrors (mirror_idx >= k) never fetch,
+ * so their slots stay .valid=false and the paired write ships
+ * cwg_check=FALSE.  chunk_guard4 is a plain value type (two u32s),
+ * so there is no leak concern for a captured-but-never-consumed
+ * guard.
+ */
+struct ffv2_captured_guard {
+	struct chunk_guard4	guard;
+	bool			valid;
+};
+
+/*
  * Sanity caps for wire-supplied array lengths.  ffv2_layout4 is
  * client-parsed from an MDS-authored buffer; every count is
  * bounds-checked against these before we allocate.
@@ -279,6 +301,20 @@ struct ffv2_stripe_ctx {
 	int				fetch_status;
 	struct completion		fetch_done;
 	u64				rmw_isize;
+	/*
+	 * Per-shard captured guard slots.  Sized [k+m], allocated by
+	 * ffv2_stripe_ctx_alloc and cleared to `.valid=false` at ctx
+	 * alloc and at each ffv2_rmw_fetch_stripe re-arm.  Populated by
+	 * ffv2_chunk_read_dispatch_call_done_v4 ONLY on CRC verify
+	 * SUCCESS; consumed by ffv2_chunk_write_dispatch_one_mirror.
+	 *
+	 * Parity mirrors (mirror_idx >= k) never fetch and stay
+	 * .valid=false; the paired write ships cwg_check=FALSE for
+	 * them.  Multi-writer relaxation of the ONLY_ONE_WRITER gate
+	 * needs a parity-guard strategy first (parity chunks have no
+	 * CHUNK_READ to capture from).
+	 */
+	struct ffv2_captured_guard	*captured_guard;
 	struct nfs4_ffv2_layout_segment *fls;	/* back-pointer for release */
 };
 

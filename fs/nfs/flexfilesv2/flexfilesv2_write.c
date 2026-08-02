@@ -556,6 +556,7 @@ static void ffv2_stripe_ctx_free(struct ffv2_stripe_ctx *ctx)
 		}
 		kfree(ctx->shard_pages);
 	}
+	kfree(ctx->captured_guard);
 	kfree(ctx);
 }
 
@@ -810,6 +811,20 @@ ffv2_stripe_ctx_alloc(struct nfs4_ffv2_layout_segment *fls,
 	init_completion(&ctx->fetch_done);
 	atomic_set(&ctx->fetch_pending, 0);
 	ctx->fetch_status = 0;
+	/*
+	 * Per-shard captured guard slots.  kcalloc zeros .valid to
+	 * false for every slot -- correct initial state (no guards
+	 * captured yet; paired writes ship cwg_check=FALSE until a
+	 * CHUNK_READ succeeds AND CRC-verifies).  Sized [k+m] to
+	 * match ffv2_chunk_write_dispatch_one_mirror's mirror_idx
+	 * range (parity mirrors always stay .valid=false).
+	 */
+	ctx->captured_guard = kcalloc(k + m, sizeof(*ctx->captured_guard),
+				      gfp);
+	if (!ctx->captured_guard) {
+		kfree(ctx);
+		return ERR_PTR(-ENOMEM);
+	}
 
 	ctx->shard_pages = kcalloc(k + m, sizeof(*ctx->shard_pages), gfp);
 	if (!ctx->shard_pages)
@@ -1325,6 +1340,14 @@ ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
 	ctx->fetch_status = 0;
 	reinit_completion(&ctx->fetch_done);
 	ctx->rmw_isize = i_size_read(tmpl->inode);
+	/*
+	 * Clear captured_guard[i].valid alongside the fetch-counter
+	 * re-arm.  A prior-cycle guard would otherwise sit stale in
+	 * the slot and be read by the paired CHUNK_WRITE.  Clear all
+	 * k+m for uniformity; parity slots stay .valid=false anyway.
+	 */
+	for (i = 0; i < ctx->k + ctx->m; i++)
+		ctx->captured_guard[i].valid = false;
 
 	for (i = 0; i < ctx->k; i++) {
 		rc = ffv2_rmw_fetch_one(ctx, tmpl, mirror, i);
@@ -1383,8 +1406,8 @@ struct ffv2_chunk_read_fetch {
 	u32			expected;	/* bytes DS is expected to
 						 * hold at this shard's
 						 * (stripe_off + shard_idx *
-						 * unit).  Slice 2 uses this
-						 * for the shortfall check.
+						 * unit); used by the
+						 * shortfall check.
 						 */
 	/*
 	 * cred is BORROWED from the caller's tmpl->cred at dispatch
@@ -1394,6 +1417,12 @@ struct ffv2_chunk_read_fetch {
 	 * put_cred in release.
 	 */
 	const struct cred	*cred;
+	/*
+	 * NFS4ERR_DELAY retry counter.  Bumped in .rpc_call_done
+	 * before rpc_delay + rpc_restart_call_prepare; capped at
+	 * FFV2_CHUNK_READ_MAX_DELAY_ATTEMPTS.
+	 */
+	int			retry_attempts;
 	/*
 	 * Composite task-data.  args / fh / seq_args / seq_res / res
 	 * all live here; the CHUNK_READ procinfo encoder + decoder
@@ -1421,10 +1450,165 @@ static void ffv2_chunk_read_dispatch_prepare_v4(struct rpc_task *task,
 	rpc_call_start(task);
 }
 
+/*
+ * NFS4ERR_DELAY retry parameters.  Linear 100 ms per attempt,
+ * capped at 1 s (unreachable at 5 attempts; kept as headroom for a
+ * future attempt-count raise).  Total budget: 100+200+300+400+500 =
+ * 1.5 s across 5 attempts, comfortably inside the RMW fetch
+ * engine's 60 s wait_for_completion_timeout.
+ *
+ * Uses rpc_restart_call_prepare (NOT rpc_restart_call) so
+ * .rpc_call_prepare re-runs on every restart to re-acquire a
+ * session slot -- plain rpc_restart_call would re-encode the slot
+ * nfs4_sequence_done just freed.
+ */
+#define FFV2_CHUNK_READ_DELAY_BASE_MS		100
+#define FFV2_CHUNK_READ_DELAY_CAP_MS		1000
+#define FFV2_CHUNK_READ_MAX_DELAY_ATTEMPTS	5
+
+/*
+ * CRC verify + guard capture for one CHUNK_READ reply.  Called
+ * only when task->tk_status == 0 AND nchunks == 1 AND
+ * effective_len is within bounds.
+ *
+ * FAIL CLOSED: any algorithm mismatch, unsupported algorithm, or
+ * compute failure returns a negative errno; the guard is NOT
+ * captured on any failure path.  Skipping verification on an
+ * algorithm mismatch would let a DS-controlled algo tag over
+ * unverified bytes capture a guard from garbage.
+ *
+ * Wire-integrity ONLY: a successful return here does NOT certify
+ * against DS bit rot when the server recomputes the checksum on
+ * read; that is a server-side concern.  The client can only
+ * fail-closed on wire flips, which is what this check does.
+ *
+ * Returns 0 on verify success + guard captured, negative errno
+ * on any failure (with .valid untouched -- caller relies on
+ * kzalloc'd/reset false state).
+ */
+static int ffv2_chunk_read_verify_and_capture(struct ffv2_chunk_read_fetch *f)
+{
+	struct nfs4_ffv2_mirror *mirror;
+	struct ffv2_read_chunk4 *chunk = &f->data.res.chunks[0];
+	u8 computed[FFV2_CHECKSUM_MAX_LEN];
+	size_t computed_len;
+	int rc;
+
+	/*
+	 * Layout mirror lookup: shard_idx maps into the layout via
+	 * fls->mirror_array[0]->stripes[0].data_servers[shard_idx].
+	 * The current posture uses a single mirror index (fls_ctx keys
+	 * per-writer, so we're always mirror 0 for this ctx).  We only
+	 * need the mirror's checksum_algorithm for the gate; the actual
+	 * DS lookup already happened at dispatch time.
+	 */
+	mirror = f->ctx->fls->mirror_array[0];
+
+	/*
+	 * Fail-closed gate 1: layout-declared algorithm.  Only CRC32 is
+	 * wired here.  Layouts advertising anything else fall back to
+	 * MDS at dispatch time, but check defensively in case a layout
+	 * slipped past the dispatch gate.
+	 */
+	if (mirror->checksum_algorithm != FFV2_CHECKSUM_ALG_CRC32)
+		return -EBADMSG;
+
+	/*
+	 * Fail-closed gate 2: wire-declared algorithm must match.
+	 * DS-controlled input; a mismatch is either transitional (a
+	 * future server adding CRC32C) or corrupt / attacker-supplied.
+	 * WARN-and-continue is NOT safe here; fail-closed is the
+	 * correct client posture regardless of whether the transition
+	 * is legitimate.
+	 */
+	if (chunk->checksum.algorithm != FFV2_CHECKSUM_ALG_CRC32) {
+		WARN_ONCE(1,
+			  "ffv2 CHUNK_READ: layout CRC32 vs wire algo %u\n",
+			  chunk->checksum.algorithm);
+		return -EBADMSG;
+	}
+
+	/*
+	 * Compute CRC over the spliced payload.
+	 * ffv2_checksum_compute_pages applies zlib CRC-32/ISO-HDLC
+	 * conditioning + big-endian pack.  chunk->chunk_len is the
+	 * wire-authoritative payload byte count (already bounded >=
+	 * effective_len by the decoder and the shortfall check).
+	 */
+	rc = ffv2_checksum_compute_pages(FFV2_CHECKSUM_ALG_CRC32,
+					 f->data.args.pages,
+					 f->data.args.pgbase,
+					 chunk->chunk_len,
+					 computed, &computed_len);
+	if (rc)
+		return rc == -EOPNOTSUPP ? -EBADMSG : rc;
+
+	/*
+	 * Wire cs_value is 4 bytes big-endian by decoder invariant.
+	 * memcmp -- NOT constant-time; this is an integrity check,
+	 * not a MAC.
+	 */
+	if (computed_len != 4 || chunk->checksum.value_len != 4 ||
+	    memcmp(computed, chunk->checksum.value, 4) != 0)
+		return -EBADMSG;
+
+	/*
+	 * Verify success -> capture guard.
+	 * ffv2_chunk_write_dispatch_one_mirror reads
+	 * ctx->captured_guard[mirror_idx].valid and stamps
+	 * cwg_check=TRUE only when true.  Winner-side visibility to
+	 * the paired write comes from the encode_lock release/acquire
+	 * pair.
+	 *
+	 * shard_idx maps 1:1 to mirror_idx for data shards (mirror 0
+	 * with k data + m parity; shard_idx < k ==> mirror_idx ==
+	 * shard_idx).  Parity mirrors are not populated by fetch
+	 * (they have no CHUNK_READ to capture from); their slots stay
+	 * .valid=false.
+	 */
+	f->ctx->captured_guard[f->shard_idx].guard = chunk->owner.co_guard;
+	f->ctx->captured_guard[f->shard_idx].valid = true;
+	return 0;
+}
+
+/*
+ * NFS4ERR_DELAY retry: bump attempt counter, schedule via
+ * rpc_delay + rpc_restart_call_prepare.  Returns true if retry
+ * scheduled (caller returns from done immediately); false if
+ * cap exhausted (caller lets tk_status stay as -NFS4ERR_DELAY
+ * and release drops refs).
+ *
+ * MUST use rpc_restart_call_prepare (NOT rpc_restart_call): the
+ * done above already called nfs4_sequence_done which freed the
+ * slot.  rpc_restart_call restarts at call_start and skips
+ * .rpc_call_prepare, so the retry would encode a freed /
+ * possibly-re-issued slot -> SEQ_MISORDERED or slot-table
+ * corruption on every DELAY.  The _prepare variant restarts at
+ * rpc_prepare_task, which re-invokes .rpc_call_prepare and
+ * re-acquires a slot via nfs4_setup_sequence.
+ */
+static bool ffv2_chunk_read_delay_retry(struct rpc_task *task,
+					struct ffv2_chunk_read_fetch *f)
+{
+	unsigned long delay_ms;
+
+	f->retry_attempts++;
+	if (f->retry_attempts > FFV2_CHUNK_READ_MAX_DELAY_ATTEMPTS)
+		return false;
+	delay_ms = min_t(unsigned long,
+			 f->retry_attempts * FFV2_CHUNK_READ_DELAY_BASE_MS,
+			 FFV2_CHUNK_READ_DELAY_CAP_MS);
+	rpc_delay(task, msecs_to_jiffies(delay_ms));
+	rpc_restart_call_prepare(task);
+	return true;
+}
+
 static void ffv2_chunk_read_dispatch_call_done_v4(struct rpc_task *task,
 						  void *data)
 {
 	struct ffv2_chunk_read_fetch *f = data;
+	struct ffv2_read_chunk4 *chunk;
+	int rc;
 
 	/*
 	 * Return the session slot UNCONDITIONALLY first: safe when no
@@ -1434,17 +1618,85 @@ static void ffv2_chunk_read_dispatch_call_done_v4(struct rpc_task *task,
 	 */
 	nfs4_sequence_done(task, &f->data.res.seq_res);
 
+	if (task->tk_status < 0) {
+		/*
+		 * -NFS4ERR_DELAY: retry via rpc_delay +
+		 * rpc_restart_call_prepare.  The retry runs on rpciod's
+		 * timer path; the winner-side thread is still blocked in
+		 * wait_for_completion_timeout, which covers the full
+		 * retry sequence within one 60 s bound.
+		 */
+		if (task->tk_status == -NFS4ERR_DELAY &&
+		    ffv2_chunk_read_delay_retry(task, f))
+			return;
+		/*
+		 * -NFS4ERR_NOENT: RMW-specific -- no prior chunk in this
+		 * range.  No-op zero-fill: admission's ffv2_zero_shards
+		 * already zeroed the shard page vector under fetch-then-
+		 * overlay resequencing, so set tk_status = 0 and let
+		 * overlay + encode proceed with zeros.  Safe under the
+		 * ffv2_only_one_writer(lseg) gate (no concurrent writer
+		 * can have written the range between this NOENT and the
+		 * paired CHUNK_WRITE).
+		 */
+		if (task->tk_status == -NFS4ERR_NOENT) {
+			task->tk_status = 0;
+			return;
+		}
+		/*
+		 * Every other negative: leave tk_status; release drops
+		 * refs; the RMW engine's cmpxchg records the failure onto
+		 * ctx->fetch_status; ffv2_rmw_fetch_stripe returns that
+		 * status and the caller transitions ctx to
+		 * FFV2_CTX_FAILED and falls back to MDS.
+		 */
+		return;
+	}
+
 	/*
-	 * Minimal done-path -- honour task->tk_status only.  The next
-	 * commit adds the full decision tree:
-	 *   - -NFS4ERR_DELAY: rpc_delay + rpc_restart_call_prepare
-	 *   - -NFS4ERR_NOENT: no-op zero-fill; set tk_status = 0
-	 *   - tk_status == 0 && nchunks == 0: -EIO
-	 *   - tk_status == 0 && effective_len < expected: -EIO
-	 *   - tk_status == 0 && OK: CRC verify + guard capture
-	 * Here the release path drops refs and the RMW engine's cmpxchg
-	 * records tk_status onto ctx->fetch_status.
+	 * task->tk_status == 0.
+	 *
+	 * MUST check nchunks == 0 BEFORE any read of chunks[0].  On a
+	 * nchunks == 0 reply the chunks[0] slot is zero-init from the
+	 * wrapper kzalloc; reading its algorithm would take the
+	 * ffv2_chunk_read_verify_and_capture gate-1 branch (0 !=
+	 * CRC32) and return -EBADMSG -- accidentally correct here but
+	 * semantically wrong (reading uninitialized data).
+	 *
+	 * NFS4_OK + nchunks == 0 is the DS's transient-OOM truncation
+	 * path with a separately-computed crr_eof; do NOT trust
+	 * res.eof as a clean-EOF signal.  Fetch failure -> MDS
+	 * fallback via the RMW engine.
 	 */
+	if (f->data.res.nchunks == 0) {
+		task->tk_status = -EIO;
+		return;
+	}
+
+	chunk = &f->data.res.chunks[0];
+
+	/*
+	 * Shortfall check: DS holds fewer bytes than the authoritative
+	 * size says it must.  A shortfall means stale attr cache or DS
+	 * damage, and encoding zeros over those bytes would silently
+	 * corrupt.  Fail the whole fetch -> MDS fallback.
+	 */
+	if (chunk->effective_len < f->expected) {
+		task->tk_status = -EIO;
+		return;
+	}
+
+	/*
+	 * CRC verify + guard capture.  On failure, tk_status =
+	 * -EBADMSG and .valid stays false (kzalloc + fetch-stripe
+	 * re-arm both clear it); the RMW engine records -EBADMSG on
+	 * fetch_status and treats it as a fetch failure -> retry on a
+	 * different mirror OR MDS fallback via the existing channel.
+	 * No new retry channel is introduced here.
+	 */
+	rc = ffv2_chunk_read_verify_and_capture(f);
+	if (rc)
+		task->tk_status = rc;
 }
 
 static void ffv2_chunk_read_dispatch_release(void *data)
