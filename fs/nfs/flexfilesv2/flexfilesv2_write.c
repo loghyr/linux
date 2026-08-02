@@ -399,8 +399,15 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 		goto out_put_devnode;
 	v  = layout_ds->ds_versions[0].version;
 	mv = layout_ds->ds_versions[0].minor_version;
-	/* Draft :1706-1724: non-PASSTHROUGH mirrors REQUIRE v4.2. */
-	if (v != 4 || mv != 2)
+	/*
+	 * Draft :1706-1724: non-PASSTHROUGH mirrors REQUIRE v4.2.
+	 * Accept v4.2+ (NFSv4 minor versions are additive so any v4.2+
+	 * DS carries the CHUNK op set) to keep symmetry with
+	 * ffv2_chunk_read_fetch_dispatch's `mv >= 2` gate: a strict
+	 * `mv != 2` would let a hypothetical v4.3 DS fetch OK via
+	 * CHUNK_READ but fail the paired CHUNK_WRITE and drop to MDS.
+	 */
+	if (v != 4 || mv < 2)
 		goto out_put_devnode;
 
 	rc = nfs4_pnfs_ds_connect(mds_srv, ds, devnode, NFS_DEF_TCP_TIMEO,
@@ -499,9 +506,10 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	 *      acquire pairs with (2).
 	 *   4. Winner completes encode + READY + mutex_unlock --
 	 *      release semantics.
-	 *   5. Winner returns from ffv2_write_pagelist_chunked and
-	 *      pgio invokes this function on the same thread -- the
-	 *      read happens-after step 3.
+	 *   5. Winner (after the unlock in step 4) continues within
+	 *      the same ffv2_write_pagelist_chunked invocation and
+	 *      calls this function -- the read happens-after step 3
+	 *      on the same task.
 	 *   6. Siblings acquire encode_lock (paired with 4's release),
 	 *      then unlock and reach this function -- writes visible
 	 *      transitively via the mutex chain.
