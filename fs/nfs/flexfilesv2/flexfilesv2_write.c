@@ -2132,8 +2132,6 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
  * completion.  A dispatch failure drops the ref inline before
  * returning PNFS_NOT_ATTEMPTED.
  */
-static bool ffv2_chunk_write_dispatch_enabled;
-
 enum pnfs_try_status
 ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 {
@@ -2149,10 +2147,6 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	enc = ffv2_find_encoder(mirror->coding_type);
 	if (!enc || !enc->encode)
 		return PNFS_NOT_ATTEMPTED;
-
-	/* The FINALIZE + COMMIT tail is added before this path is enabled. */
-	if (!READ_ONCE(ffv2_chunk_write_dispatch_enabled))
-		return ffv2_write_fallback_to_mds(hdr);
 
 	/*
 	 * Chunked DS-direct is defined only for DENSE striping: SPARSE
