@@ -485,11 +485,30 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	 * cwg_check=FALSE -- currently gated by ONLY_ONE_WRITER
 	 * upstream so that path stays draft-conforming.
 	 *
-	 * Load-safety: this helper runs under encode_lock (acquired
-	 * by the mirror-arrival branch of ffv2_write_pagelist_chunked),
-	 * and the fetch path's winner-side capture writes .valid +
-	 * .guard while ALSO holding encode_lock.  The mutex
-	 * release/acquire pair provides the required happens-before.
+	 * Load-safety.  This helper runs POST-encode_lock-unlock, so
+	 * the read is not under the mutex; the happens-before chain
+	 * that makes the writer-side capture visible here is:
+	 *
+	 *   1. The CHUNK_READ .rpc_call_done on rpciod writes .valid +
+	 *      .guard.
+	 *   2. Writer's .rpc_release -> ffv2_rmw_fetch_done_one ->
+	 *      complete(&ctx->fetch_done) -- release semantics.
+	 *   3. The winner (task holding encode_lock in the RMW branch
+	 *      of ffv2_write_pagelist_chunked) returns from
+	 *      wait_for_completion_timeout on ctx->fetch_done --
+	 *      acquire pairs with (2).
+	 *   4. Winner completes encode + READY + mutex_unlock --
+	 *      release semantics.
+	 *   5. Winner returns from ffv2_write_pagelist_chunked and
+	 *      pgio invokes this function on the same thread -- the
+	 *      read happens-after step 3.
+	 *   6. Siblings acquire encode_lock (paired with 4's release),
+	 *      then unlock and reach this function -- writes visible
+	 *      transitively via the mutex chain.
+	 *
+	 * A future multi-writer / parity-guard extension that shares
+	 * captured_guard across threads NOT paired by this fetch
+	 * completion would need to revisit this synchronization.
 	 */
 	if (ctx->captured_guard[mirror_idx].valid) {
 		w->wire.args.guard.check = true;
@@ -846,7 +865,16 @@ ffv2_stripe_ctx_alloc(struct nfs4_ffv2_layout_segment *fls,
 	ctx->captured_guard = kcalloc(k + m, sizeof(*ctx->captured_guard),
 				      gfp);
 	if (!ctx->captured_guard) {
-		kfree(ctx);
+		/*
+		 * Route through ffv2_stripe_ctx_free (rather than a raw
+		 * kfree(ctx)) for consistency with the failure paths
+		 * below.  Free is safe here: shard_pages is still NULL
+		 * and captured_guard is NULL, so the free body reduces
+		 * to kfree(ctx) -- but a future ctx field added between
+		 * kzalloc and this failure point would be missed by the
+		 * raw kfree.
+		 */
+		ffv2_stripe_ctx_free(ctx);
 		return ERR_PTR(-ENOMEM);
 	}
 
@@ -1262,10 +1290,12 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
 	}
 
 	/*
-	 * v4 shards delegate to ffv2_chunk_read_fetch_dispatch, which
-	 * runs CHUNK_READ through the private call_ops (CRC verify +
-	 * guard capture + DELAY retry + NOENT + shortfall gates).  V3
-	 * shards and PASSTHROUGH mirrors continue below on the plain-
+	 * v4.2+ shards delegate to ffv2_chunk_read_fetch_dispatch,
+	 * which runs CHUNK_READ (a v4.2 op) through the private
+	 * call_ops (CRC verify + guard capture + DELAY retry + NOENT
+	 * + shortfall gates).  NFSv4 minor versions are additive so
+	 * v4.3+ DSes would also carry the op if they exist.  V3
+	 * shards and v4.0/4.1 shards continue below on the plain-
 	 * nfs4-read path.
 	 *
 	 * The delegate call redoes ds_slot / devnode / ds_connect
@@ -1275,7 +1305,8 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
 	 * consolidation could pass the already-resolved devnode / ds
 	 * via an extended dispatch signature.
 	 */
-	if (version == 4) {
+	if (version == 4 &&
+	    layout_ds->ds_versions[0].minor_version >= 2) {
 		nfs4_put_deviceid_node(devnode);
 		return ffv2_chunk_read_fetch_dispatch(ctx, tmpl, mirror,
 						      shard_idx, 1);
@@ -1861,12 +1892,16 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 	}
 	version = layout_ds->ds_versions[0].version;
 	/*
-	 * CHUNK_READ is v4-only (v4.2 minorversion is enforced by the
-	 * encoder's compound header).  V3 mirrors stay on the existing
-	 * plain-NFSv4-READ RMW path; the flip site discriminates on
-	 * version and only swaps the v4 dispatch.
+	 * CHUNK_READ is a v4.2 operation (the encoder hard-codes
+	 * minorversion=2 in the compound header).  Enforce version ==
+	 * 4 AND minor_version >= 2 before delegating -- draft
+	 * :1706-1724 requires v4.2 on non-PASSTHROUGH mirrors, and
+	 * NFSv4 minor versions are additive so any v4.2+ DS supports
+	 * the ops we need.  V3 mirrors and v4.0/4.1 DSes take the
+	 * plain-nfs4-read fallback path via -EPROTONOSUPPORT.
 	 */
-	if (version != 4) {
+	if (version != 4 ||
+	    layout_ds->ds_versions[0].minor_version < 2) {
 		nfs4_put_deviceid_node(devnode);
 		return -EPROTONOSUPPORT;
 	}
