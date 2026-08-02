@@ -399,4 +399,66 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 	u64 offset, u32 count,
 	const struct chunk_owner4 *owner);
 
+/*
+ * Post-CHUNK_WRITE writeback context.  Chains FINALIZE -> COMMIT
+ * after a successful CHUNK_WRITE reaches the release-cb hook in
+ * flexfilesv2_write.c.  Owns the hdr / ds_clp / lseg / stripe_ctx
+ * references while the FINALIZE + COMMIT round-trips are in
+ * flight; the standard CHUNK_WRITE cleanup path transfers those
+ * to the wb_ctx and skips its own final release when
+ * ffv2_chunk_wb_start succeeds.
+ *
+ * Ownership discipline:
+ *   - hdr is completed via hdr->completion_ops->completion(hdr)
+ *     from ffv2_chunk_wb_complete_hdr AFTER FINALIZE + COMMIT
+ *     finish (or on any failure that aborts the chain).  Do not
+ *     free hdr elsewhere once wb_start has succeeded.
+ *   - ds_clp is nfs_put_client'd from the same cleanup.  Held for
+ *     the lifetime of the FINALIZE + COMMIT window.
+ *   - lseg is pnfs_put_lseg'd; ctx is ffv2_stripe_ctx_put'd, in
+ *     that order (ctx-before-lseg matches ffv2_chunk_write_release
+ *     ordering rationale).
+ *
+ * The writeverf captured on FINALIZE is compared against the
+ * writeverf returned by COMMIT.  A mismatch means the DS
+ * rebooted between the two ops -- treated as a lost-durability
+ * signal that marks the hdr with an error status.
+ */
+struct nfs_pgio_header;
+struct ffv2_stripe_ctx;
+
+struct ffv2_chunk_wb_ctx {
+	/* Populated by the caller (ffv2_chunk_write_release):     */
+	struct nfs_pgio_header		*hdr;
+	struct nfs_client		*ds_clp;
+	struct pnfs_layout_segment	*lseg;
+	struct ffv2_stripe_ctx		*ctx;
+	const struct cred		*cred;
+	struct nfs_fh			fh;
+	nfs4_stateid			stateid;
+	u64				offset;
+	u32				count;
+	struct chunk_owner4		owner;
+	/* Populated by the FINALIZE completion callback:          */
+	nfs4_verifier			finalize_writeverf;
+	bool				have_finalize_writeverf;
+};
+
+/*
+ * ffv2_chunk_wb_start -- kick off the FINALIZE -> COMMIT chain
+ * against a mirror.  On success (return 0), the chain is running
+ * and the wb_ctx is owned by the callbacks -- caller must NOT
+ * touch it or free it.  On failure, the wb_ctx is untouched;
+ * the caller retains ownership and MUST free it (plus release
+ * hdr / ds_clp / lseg / ctx by its own path -- typically the
+ * caller falls back to the current-behavior release path).
+ *
+ * The COMMIT completion callback drives the final hdr
+ * completion, ds_clp / lseg / ctx release, and wb_ctx free.
+ * hdr's tk_status is set to the COMMIT chain's error status
+ * (0 on success, -EPROTO on writeverf mismatch, propagated
+ * errno on FINALIZE / COMMIT failure).
+ */
+int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb);
+
 #endif /* FS_NFS_NFS4FLEXFILES_V2_XDR_CHUNK_H */

@@ -523,8 +523,8 @@ static void ffv2_xdr_enc_chunk_read(struct rpc_rqst *req,
 		 * may return NFS4_OK with an empty resarray; the
 		 * decoder maps that short-OK to -EPROTO via the
 		 * short-OK-reply guard.  Not the documented -EINVAL
-		 * contract (see encoder comment); 4b must filter
-		 * upstream.
+		 * contract (see encoder comment); the dispatch layer
+		 * must filter upstream.
 		 */
 		ffv2_xdr_enc_compound_hdr(xdr, 2, 0);
 		return;
@@ -592,6 +592,19 @@ static void ffv2_xdr_enc_chunk_finalize_op(struct xdr_stream *xdr,
  */
 static bool ffv2_xdr_enc_chunk_finalize_check(const struct ffv2_chunk_finalize_args *a)
 {
+	/*
+	 * count and cfa_chunks<> length are independent wire fields:
+	 * count is the range count for offset+count, cfa_chunks<>
+	 * lists WHICH owners to transition within that range.  The
+	 * current single-owner-per-op interop shape uses count == 1
+	 * alongside the encoder's hard-coded chunks<> length == 1;
+	 * tightening the guard to reject count != 1 codifies the
+	 * invariant so a dispatch caller that accidentally sets
+	 * count > 1 fires WARN_ON_ONCE with the offending call site.
+	 * When the client adopts batching (count > 1 alongside a
+	 * variable-length chunks<> array), this guard AND the hard-
+	 * coded 1 in the encoder BOTH must flip together.
+	 */
 	return WARN_ON_ONCE(a->count != 1);
 }
 
@@ -605,8 +618,8 @@ static void ffv2_xdr_enc_chunk_finalize(struct rpc_rqst *req,
 		/*
 		 * Empty COMPOUND fallback for cfa_count == 0.  See the
 		 * check-function comment above and the sibling
-		 * CHUNK_READ handling for rationale.  5c dispatch
-		 * MUST filter count == 0 upstream.
+		 * CHUNK_READ handling for rationale.  The dispatch
+		 * layer MUST filter count == 0 upstream.
 		 */
 		ffv2_xdr_enc_compound_hdr(xdr, 2, 0);
 		return;
@@ -662,8 +675,8 @@ static void ffv2_xdr_enc_chunk_commit(struct rpc_rqst *req,
 	if (ffv2_xdr_enc_chunk_commit_check(&d->args)) {
 		/*
 		 * Empty COMPOUND fallback for cca_count == 0.  See
-		 * CHUNK_FINALIZE's encoder for the rationale; 5c must
-		 * filter upstream.
+		 * CHUNK_FINALIZE's encoder for the rationale; the
+		 * dispatch layer must filter upstream.
 		 */
 		ffv2_xdr_enc_compound_hdr(xdr, 2, 0);
 		return;

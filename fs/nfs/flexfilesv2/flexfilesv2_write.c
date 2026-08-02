@@ -280,6 +280,75 @@ fail:
  *      ctx-before-lseg because ctx->fls back-references lseg.
  *   8. kfree(wrapper) -- LAST.
  */
+/*
+ * On success, transfer ownership of hdr / ds_clp / lseg / ctx
+ * from the dispatch wrapper `w` to a fresh ffv2_chunk_wb_ctx
+ * and start the FINALIZE -> COMMIT chain (see
+ * flexfilesv2_lifecycle.c).  wb_start's completion path owns
+ * the final hdr completion + ds_clp put + lseg / ctx release.
+ *
+ * Returns true on successful hand-off (caller MUST skip the
+ * standard cleanup path).  Returns false on any failure to
+ * hand off (kzalloc / dispatch); the caller falls through to
+ * the standard release path with the wb_ctx already freed.
+ */
+static bool ffv2_chunk_write_release_hand_off_wb(
+	struct ffv2_chunk_write_dispatch *w)
+{
+	struct nfs_pgio_header *hdr = w->hdr;
+	struct ffv2_chunk_wb_ctx *wb;
+	int rc;
+
+	wb = kzalloc_obj(*wb, GFP_NOFS);
+	if (!wb) {
+		/*
+		 * Hand-off failure at the alloc step must NOT let the
+		 * write complete as "n bytes durable" -- the wire write
+		 * succeeded but FINALIZE never ran, so the DS chunk is
+		 * orphaned and would be GC'd, producing silent data loss
+		 * on a subsequent read of the same offset.  Surface the
+		 * failure via nfs_set_pgio_error (which
+		 * nfs_write_completion actually consumes -- tk_status
+		 * alone is ignored on the private CHUNK path because we
+		 * bypass pnfs_ld_write_done) AND mark the lseg for
+		 * return so the layout refreshes on retry.
+		 */
+		nfs_set_pgio_error(hdr, -ENOMEM, hdr->args.offset);
+		hdr->task.tk_status = -ENOMEM;
+		pnfs_error_mark_layout_for_return(hdr->inode, w->lseg);
+		return false;
+	}
+
+	wb->hdr = hdr;
+	wb->ds_clp = hdr->ds_clp;
+	wb->lseg = w->lseg;
+	wb->ctx = w->ctx;
+	wb->cred = hdr->cred;
+	wb->fh = w->wire.fh;
+	wb->stateid = w->wire.args.stateid;
+	wb->offset = w->wire.args.offset;
+	wb->count = 1;
+	wb->owner = w->wire.res.owners[0];
+
+	rc = ffv2_chunk_wb_start(wb);
+	if (rc) {
+		/* wb_start does NOT take ownership on failure; free the
+		 * wb_ctx and let the caller fall through to its standard
+		 * cleanup path.  Same rationale as the kzalloc-fail arm
+		 * above -- surface the failure to userspace via
+		 * nfs_set_pgio_error (nfs_write_completion consumes
+		 * NFS_IOHDR_ERROR / hdr->error, NOT the tk_status write)
+		 * AND mark the lseg for return.
+		 */
+		kfree(wb);
+		nfs_set_pgio_error(hdr, rc, hdr->args.offset);
+		hdr->task.tk_status = rc;
+		pnfs_error_mark_layout_for_return(hdr->inode, w->lseg);
+		return false;
+	}
+	return true;
+}
+
 static void ffv2_chunk_write_release(void *data)
 {
 	struct ffv2_chunk_write_dispatch *w = data;
@@ -316,6 +385,24 @@ static void ffv2_chunk_write_release(void *data)
 	if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
 	    !test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags))
 		hdr->task.tk_status = pnfs_write_done_resend_to_mds(hdr);
+
+	/*
+	 * Try to transfer to the FINALIZE -> COMMIT chain on real
+	 * success (not RESEND_MDS, not tk_status != 0). When the
+	 * RESEND_MDS path fires, or on hand-off failure (kzalloc /
+	 * dispatch), fall through to the standard cleanup path below.
+	 */
+	if (!test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
+	    hdr->task.tk_status == 0 &&
+	    ffv2_chunk_write_release_hand_off_wb(w)) {
+		/* Ownership transferred; the wb-chain's terminal
+		 * callback owns nfs_put_client / hdr completion /
+		 * lseg + ctx release.  Just free the dispatch
+		 * wrapper here.
+		 */
+		kfree(w);
+		return;
+	}
 
 	/* Put ds_clp BEFORE the completion chain frees hdr.
 	 * pnfs_generic_rw_release at pnfs_nfs.c:24-30 has the same

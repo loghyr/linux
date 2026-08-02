@@ -33,10 +33,21 @@
 #include <linux/sunrpc/sched.h>
 
 #include "../internal.h"
+#include "../iostat.h"
 #include "../nfs4_fs.h"
 #include "../pnfs.h"
 #include "flexfilesv2.h"
 #include "flexfilesv2_xdr_chunk.h"
+
+/* Forward declarations for the wb-chain callbacks. */
+static void
+ffv2_chunk_wb_finalize_done(void *arg, int status,
+			    const nfs4_verifier *wv);
+static void
+ffv2_chunk_wb_commit_done(void *arg, int status,
+			  const nfs4_verifier *wv);
+static void ffv2_chunk_wb_complete_hdr(struct ffv2_chunk_wb_ctx *wb,
+				       int status);
 
 /* ------------------------------------------------------------------ */
 /* CHUNK_FINALIZE dispatch                                            */
@@ -365,4 +376,246 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 	}
 	rpc_put_task(task);
 	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Writeback chain: FINALIZE -> COMMIT after CHUNK_WRITE              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Final cleanup after the FINALIZE -> COMMIT chain terminates
+ * (successfully or with an error).  Runs the deferred hdr
+ * completion + ds_clp / lseg / ctx release that
+ * ffv2_chunk_write_release skipped when it transferred
+ * ownership to the wb_ctx.
+ *
+ * status is the wb-chain's terminal status: 0 on success
+ * (both FINALIZE and COMMIT returned NFS4_OK AND writeverfs
+ * matched), a mapped errno otherwise.  Stamped onto
+ * hdr->task.tk_status so the write completion chain reports
+ * the error to userspace rather than silent success on a
+ * FINALIZE / COMMIT failure.
+ *
+ * Ordering: nfs_put_client BEFORE hdr completion (matches
+ * pnfs_generic_rw_release at pnfs_nfs.c:24-30).  ctx_put
+ * BEFORE lseg_put (matches ffv2_chunk_write_release ordering:
+ * ctx->fls back-references lseg).  kfree(wb) LAST.
+ */
+static void ffv2_chunk_wb_complete_hdr(struct ffv2_chunk_wb_ctx *wb,
+				       int status)
+{
+	struct nfs_pgio_header *hdr = wb->hdr;
+
+	if (status) {
+		/*
+		 * The chunked write path bypasses pnfs_ld_write_done
+		 * (and therefore nfs_pgio_result), so stamping
+		 * hdr->task.tk_status alone is NOT consumed by the
+		 * nfs_write_completion loop at write.c:923 -- it
+		 * reads NFS_IOHDR_ERROR + hdr->error + hdr->good_bytes,
+		 * which are set only by nfs_set_pgio_error.  Without
+		 * this call, a FINALIZE / COMMIT failure returns
+		 * write() as "n bytes durable" even though the DS
+		 * chunk is orphaned -- silent data loss.
+		 *
+		 * pos = hdr->args.offset: the byte offset of THIS
+		 * pgio-header (matches nfs_pgio_result's call at
+		 * pagelist.c:862).  nfs_set_pgio_error clamps
+		 * good_bytes to zero for the failing header and
+		 * sets NFS_IOHDR_ERROR + hdr->error so the
+		 * completion loop marks pages with the failure via
+		 * nfs_mapping_set_error.  Also keep the tk_status
+		 * write for observability (traces, WARN triggers).
+		 */
+		nfs_set_pgio_error(hdr, status, hdr->args.offset);
+		if (hdr->task.tk_status == 0)
+			hdr->task.tk_status = status;
+	}
+
+	nfs_put_client(wb->ds_clp);
+	hdr->completion_ops->completion(hdr);
+	/* hdr is now freed; do not touch. */
+
+	ffv2_stripe_ctx_put(wb->ctx);
+	pnfs_put_lseg(wb->lseg);
+	kfree(wb);
+}
+
+/*
+ * FINALIZE completion callback.  Fires from the FINALIZE
+ * dispatch's release-cb exactly once.  On success, captures
+ * the writeverf and chains to COMMIT.  On failure, marks the
+ * lseg for return (any DS-observed lifecycle failure
+ * invalidates the current pNFS state, same rationale as
+ * ffv2_chunk_write_call_done at flexfilesv2_write.c:180-190)
+ * and completes hdr with the propagated errno.
+ *
+ * On COMMIT dispatch failure (kzalloc / rpc_run_task IS_ERR),
+ * complete_hdr fires directly with the dispatch errno --
+ * commit_done will NOT fire in that case.
+ */
+static void ffv2_chunk_wb_finalize_done(void *arg, int status,
+					const nfs4_verifier *wv)
+{
+	struct ffv2_chunk_wb_ctx *wb = arg;
+	struct ffv2_chunk_lifecycle_ctx commit_ctx;
+	int rc;
+
+	if (status) {
+		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
+		ffv2_chunk_wb_complete_hdr(wb, status);
+		return;
+	}
+
+	if (WARN_ON_ONCE(!wv)) {
+		/* Contract violation: dispatch reported success but
+		 * omitted the writeverf.  Fail closed.
+		 */
+		ffv2_chunk_wb_complete_hdr(wb, -EPROTO);
+		return;
+	}
+
+	memcpy(&wb->finalize_writeverf, wv, sizeof(wb->finalize_writeverf));
+	wb->have_finalize_writeverf = true;
+
+	commit_ctx.ds_clp = wb->ds_clp;
+	commit_ctx.lseg = wb->lseg;
+	commit_ctx.complete_arg = wb;
+	commit_ctx.complete = ffv2_chunk_wb_commit_done;
+
+	rc = ffv2_chunk_commit_dispatch_one_mirror(&commit_ctx,
+			wb->cred, &wb->fh, &wb->stateid,
+			wb->offset, wb->count, &wb->owner);
+	if (rc) {
+		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
+		ffv2_chunk_wb_complete_hdr(wb, rc);
+	}
+	/* Otherwise commit_done fires eventually; do not touch wb. */
+}
+
+/*
+ * COMMIT completion callback.  Fires from the COMMIT
+ * dispatch's release-cb exactly once.  Compares the COMMIT
+ * writeverf against the one FINALIZE returned; a mismatch
+ * means the DS rebooted between the two ops and FINALIZE's
+ * durability guarantee is no longer valid.  Treated as -EPROTO for
+ * now; a follow-up commit will map this to a proper retry hook.
+ */
+static void ffv2_chunk_wb_commit_done(void *arg, int status,
+				      const nfs4_verifier *wv)
+{
+	struct ffv2_chunk_wb_ctx *wb = arg;
+
+	if (status) {
+		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
+		ffv2_chunk_wb_complete_hdr(wb, status);
+		return;
+	}
+
+	if (WARN_ON_ONCE(!wv) || !wb->have_finalize_writeverf) {
+		ffv2_chunk_wb_complete_hdr(wb, -EPROTO);
+		return;
+	}
+
+	if (memcmp(wv, &wb->finalize_writeverf,
+		   sizeof(wb->finalize_writeverf)) != 0) {
+		/* DS reboot between FINALIZE and COMMIT: mark the
+		 * layout for return so LAYOUTGET-fresh picks up a
+		 * clean state.  A follow-up commit will replace this
+		 * -EPROTO with a proper retry hook.
+		 */
+		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
+		ffv2_chunk_wb_complete_hdr(wb, -EPROTO);
+		return;
+	}
+
+	ffv2_chunk_wb_complete_hdr(wb, 0);
+}
+
+/*
+ * ffv2_chunk_wb_start -- guard/stateid consumer sync between the
+ * CHUNK_WRITE hand-off and the FINALIZE / COMMIT dispatch.
+ *
+ * The wb_ctx passed here must be populated by the CHUNK_WRITE
+ * release-cb hand-off (ffv2_chunk_write_release_hand_off_wb in
+ * flexfilesv2_write.c) from the CHUNK_WRITE dispatch's wire fields.
+ * The consumer chain is:
+ *
+ *   CHUNK_WRITE dispatch (flexfilesv2_write.c):
+ *     w->wire.args.stateid  = fi->stateid           (layout stateid)
+ *     w->wire.args.offset   = chunk_index
+ *     w->wire.args.owner    = client-picked chunk_owner4
+ *   CHUNK_WRITE completion:
+ *     w->wire.res.owners[0] = DS-recorded chunk_owner4 (guard-
+ *                             consumer source, same shape as
+ *                             w->wire.args.owner on a successful
+ *                             write per the single-owner-per-op
+ *                             contract)
+ *
+ *   hand-off wb_ctx:
+ *     wb->stateid           = w->wire.args.stateid (layout stateid)
+ *     wb->offset            = w->wire.args.offset  (same chunk index)
+ *     wb->owner             = w->wire.res.owners[0] (DS-recorded)
+ *     wb->count             = 1                   (single-owner invariant)
+ *
+ *   FINALIZE / COMMIT dispatch (this file):
+ *     cfa_stateid / cca_stateid = wb->stateid (same layout stateid
+ *                                              the DS's trust table
+ *                                              accepted for
+ *                                              CHUNK_WRITE)
+ *     cfa_chunks[0] / cca_chunks[0] = wb->owner (identifies which
+ *                                                PENDING chunk to
+ *                                                transition)
+ *
+ * Every WARN_ON_ONCE here is defence-in-depth against an accidental
+ * drift in the hand-off (e.g., a caller populating wb_ctx from a
+ * non-CHUNK_WRITE source).  The CHUNK_WRITE call_done already
+ * rejects the res.nblocks != 1 shape that would leave res.owners[0]
+ * undefined; these asserts catch it if the code shape ever regresses.
+ */
+int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
+{
+	struct ffv2_chunk_lifecycle_ctx finalize_ctx;
+
+	if (WARN_ON_ONCE(!wb || !wb->hdr || !wb->ds_clp))
+		return -EINVAL;
+
+	/* Single-owner invariant: matches the encoders'
+	 * WARN_ON_ONCE(count != 1) and the CHUNK_WRITE res.nblocks ==
+	 * 1 check.  Assert here so any future hand-off that thinks it
+	 * can batch trips the warning at the transition site rather
+	 * than at the encoder.
+	 */
+	if (WARN_ON_ONCE(wb->count != 1))
+		return -EINVAL;
+
+	/* Layout stateid must be present -- CHUNK_WRITE couldn't
+	 * have reached hand-off without one (fi->stateid was the
+	 * cwa_stateid the DS's trust table validated).  A zero
+	 * stateid here would mean the hand-off populated wb from
+	 * an anonymous / uninitialised source.  Trip the assert
+	 * before wire time to keep the diagnostic close to the
+	 * source of the drift.
+	 */
+	if (WARN_ON_ONCE(wb->stateid.type == NFS4_SPECIAL_STATEID_TYPE))
+		return -EINVAL;
+
+	/* Cred must be present for the RPC layer (msg.rpc_cred);
+	 * missing here would fall through to whatever
+	 * rpc_new_task's cred fallback picks, silently violating
+	 * the "same credentials as CHUNK_WRITE used" contract that
+	 * lets the DS attribute the FINALIZE / COMMIT to the same
+	 * client.  Fail closed.
+	 */
+	if (WARN_ON_ONCE(!wb->cred))
+		return -EINVAL;
+
+	finalize_ctx.ds_clp = wb->ds_clp;
+	finalize_ctx.lseg = wb->lseg;
+	finalize_ctx.complete_arg = wb;
+	finalize_ctx.complete = ffv2_chunk_wb_finalize_done;
+
+	return ffv2_chunk_finalize_dispatch_one_mirror(&finalize_ctx,
+			wb->cred, &wb->fh, &wb->stateid,
+			wb->offset, wb->count, &wb->owner);
 }
