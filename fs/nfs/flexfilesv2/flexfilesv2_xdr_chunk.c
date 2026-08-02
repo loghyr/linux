@@ -211,6 +211,33 @@
 	BYTES_TO_U32(FFV2_CHUNK_FINALIZE_RES_MAXSZ_BYTES)
 
 /*
+ * CHUNK_COMMIT op body + reply.  Wire shape mirrors CHUNK_FINALIZE
+ * verbatim (see the sizing block above); the constants are
+ * duplicated rather than aliased so a future asymmetry (e.g.
+ * COMMIT gaining a durability-hint field, or FINALIZE losing
+ * writeverf) can diverge without a rename churn.  Values are
+ * identical today.
+ */
+#define FFV2_CHUNK_COMMIT_INLINE_ENC_MAXSZ \
+	(4 + NFS4_STATEID_SIZE + 8 + 4 + 4 + FFV2_MAX_CHUNKS_PER_OP * 12)
+
+#define FFV2_CHUNK_COMMIT_ARGS_MAXSZ_BYTES \
+	(FFV2_COMPOUND_HDR_MAXSZ + FFV2_SEQUENCE_ENC_MAXSZ + \
+	 FFV2_PUTFH_ENC_MAXSZ + FFV2_CHUNK_COMMIT_INLINE_ENC_MAXSZ)
+
+#define FFV2_CHUNK_COMMIT_RES_MAXSZ_BYTES \
+	((4 + 4 + 4) + \
+	 (4 + 4 + NFS4_MAX_SESSIONID_LEN + 20) + \
+	 (4 + 4) + \
+	 (4 + 4 + NFS4_VERIFIER_SIZE + \
+	  (4 + FFV2_MAX_CHUNKS_PER_OP * 4)))
+
+#define FFV2_CHUNK_COMMIT_ARGS_MAXSZ	\
+	BYTES_TO_U32(FFV2_CHUNK_COMMIT_ARGS_MAXSZ_BYTES)
+#define FFV2_CHUNK_COMMIT_RES_MAXSZ	\
+	BYTES_TO_U32(FFV2_CHUNK_COMMIT_RES_MAXSZ_BYTES)
+
+/*
  * Fixed prefix (in u32 quads) that the CHUNK_READ decoder actually
  * expects to consume from head before xdr_read_pages transitions to
  * the page area.  Passed to rpc_prepare_reply_pages as the hdrsize
@@ -592,6 +619,63 @@ static void ffv2_xdr_enc_chunk_finalize(struct rpc_rqst *req,
 	/* No XDRBUF_READ / XDRBUF_WRITE flag: FINALIZE is a
 	 * metadata-only op with no bulk payload on either
 	 * direction; RDMA direct data placement does not apply. */
+}
+
+/*
+ * CHUNK_COMMIT op body (all inline; no page splicing).  Emits:
+ *   op code + cca_stateid + cca_offset + cca_count + cca_chunks<> (1 entry)
+ * Wire shape mirrors CHUNK_FINALIZE verbatim; the encoder is
+ * intentionally not shared with FINALIZE so a future asymmetry
+ * (e.g., COMMIT gaining a durability-hint field) doesn't force a
+ * rename churn on the shared helper.
+ */
+static void ffv2_xdr_enc_chunk_commit_op(struct xdr_stream *xdr,
+					 const struct ffv2_chunk_commit_args *a)
+{
+	__be32 *p;
+
+	ffv2_xdr_enc_op_hdr(xdr, OP_CHUNK_COMMIT);
+	ffv2_xdr_enc_stateid(xdr, &a->stateid);
+	p = ffv2_reserve_space(xdr, 8 + 4 + 4);
+	p = xdr_encode_hyper(p, a->offset);	/* chunk INDEX, not bytes */
+	*p++ = cpu_to_be32(a->count);
+	*p = cpu_to_be32(1);			/* cca_chunks<> length == 1 */
+	ffv2_xdr_enc_chunk_owner(xdr, &a->owner);
+}
+
+/*
+ * Zero-count contract: same fallback as CHUNK_FINALIZE.  5c
+ * dispatch MUST filter cca_count == 0 upstream; the WARN_ON_ONCE
+ * pinpoints the offending call site if it ever slips through.
+ */
+static bool ffv2_xdr_enc_chunk_commit_check(const struct ffv2_chunk_commit_args *a)
+{
+	return WARN_ON_ONCE(a->count != 1);
+}
+
+static void ffv2_xdr_enc_chunk_commit(struct rpc_rqst *req,
+				      struct xdr_stream *xdr,
+				      const void *data)
+{
+	const struct ffv2_chunk_commit_data *d = data;
+
+	if (ffv2_xdr_enc_chunk_commit_check(&d->args)) {
+		/*
+		 * Empty COMPOUND fallback for cca_count == 0.  See
+		 * CHUNK_FINALIZE's encoder for the rationale; 5c must
+		 * filter upstream.
+		 */
+		ffv2_xdr_enc_compound_hdr(xdr, 2, 0);
+		return;
+	}
+
+	ffv2_xdr_enc_compound_hdr(xdr, 2, 3);	/* v4.2, 3 ops */
+	ffv2_xdr_enc_sequence(xdr, &d->seq_args);
+	ffv2_xdr_enc_putfh(xdr, &d->fh);
+	ffv2_xdr_enc_chunk_commit_op(xdr, &d->args);
+	/* No XDRBUF_READ / XDRBUF_WRITE flag: COMMIT is a
+	 * metadata-only durability barrier with no bulk payload;
+	 * RDMA direct data placement does not apply. */
 }
 
 /* -------------------- decoder -------------------- */
@@ -1074,6 +1158,97 @@ static int ffv2_xdr_dec_chunk_finalize(struct rpc_rqst *req,
 }
 
 /*
+ * CHUNK_COMMIT4resok decoder.  Wire shape mirrors
+ * CHUNK_FINALIZE4resok exactly: ccr_writeverf (8 bytes) +
+ * ccr_status<> (length-prefixed nfsstat4 array).  Same
+ * defence-in-depth cap on the per-chunk array length as FINALIZE.
+ */
+static int ffv2_xdr_dec_chunk_commit_resok(struct xdr_stream *xdr,
+					   struct ffv2_chunk_commit_res *r)
+{
+	__be32 *p;
+	u32 n, i;
+
+	/* ccr_writeverf (8 bytes) */
+	p = xdr_inline_decode(xdr, NFS4_VERIFIER_SIZE);
+	if (!p)
+		return -EIO;
+	memcpy(&r->writeverf, p, NFS4_VERIFIER_SIZE);
+
+	/* ccr_status<> */
+	p = xdr_inline_decode(xdr, 4);
+	if (!p)
+		return -EIO;
+	n = be32_to_cpup(p);
+	if (n > FFV2_MAX_CHUNKS_PER_OP)
+		return -EPROTO;
+	r->nstatus = n;
+	for (i = 0; i < n; i++) {
+		p = xdr_inline_decode(xdr, 4);
+		if (!p)
+			return -EIO;
+		r->status[i] = be32_to_cpup(p);
+	}
+	return 0;
+}
+
+/*
+ * CHUNK_COMMIT full-compound decoder.  Same walk shape as
+ * ffv2_xdr_dec_chunk_finalize: unconditional SEQUENCE decode,
+ * short-OK-reply guard at every op boundary, -EPROTO on a short OK
+ * compound.
+ */
+static int ffv2_xdr_dec_chunk_commit(struct rpc_rqst *req,
+				     struct xdr_stream *xdr,
+				     void *data)
+{
+	struct ffv2_chunk_commit_res *d = data;
+	u32 cstatus, nops, opstatus;
+	int rc;
+
+	d->seq_res.sr_status = 1;
+
+	rc = ffv2_xdr_dec_compound_hdr(xdr, &cstatus, &nops);
+	if (rc)
+		return rc;
+
+	if (nops == 0) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_sequence(xdr, &d->seq_res);
+	if (rc)
+		return rc;
+
+	if (nops < 2) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_op_hdr(xdr, OP_PUTFH, &opstatus);
+	if (rc)
+		return rc;
+	if (opstatus != NFS4_OK)
+		return nfs4_stat_to_errno(opstatus);
+
+	if (nops < 3) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_op_hdr(xdr, OP_CHUNK_COMMIT, &opstatus);
+	if (rc)
+		return rc;
+	if (opstatus != NFS4_OK)
+		return nfs4_stat_to_errno(opstatus);
+	return ffv2_xdr_dec_chunk_commit_resok(xdr, d);
+}
+
+/*
  * Decode one read_chunk4 (crr_chunks<> element).  Currently enforces
  * cr_locked<> / cr_status<> length 0; the reply-page boundary is
  * fixed at that shape.
@@ -1379,4 +1554,33 @@ const struct rpc_procinfo ffv2_chunk_finalize_procinfo = {
 	.p_replen	= FFV2_CHUNK_FINALIZE_RES_MAXSZ,
 	.p_statidx	= NFSPROC4_CLNT_WRITE,
 	.p_name		= "CHUNK_FINALIZE",
+};
+
+/*
+ * CHUNK_COMMIT procinfo.  Caller (5c dispatch) sets
+ * rpc_message.rpc_proc = &ffv2_chunk_commit_procinfo and
+ * rpc_message.rpc_argp = &ffv2_chunk_commit_data instance.
+ *
+ * p_arglen counts inline args only (COMMIT carries stateid +
+ * offset + count + single-entry chunks<>; all fits in the head).
+ *
+ * p_replen counts the inline reply: writeverf + status<> length
+ * + N * status entries, capped at FFV2_MAX_CHUNKS_PER_OP.  No
+ * out-of-line payload.
+ *
+ * p_statidx = NFSPROC4_CLNT_COMMIT: COMMIT is the durability-
+ * barrier op, symmetric with the plain-NFSv4 COMMIT it inherits
+ * from.  Attributing it to the COMMIT bucket keeps the metrics
+ * separable from FINALIZE (which attributes to WRITE) so
+ * operator dashboards can distinguish "write landed but not yet
+ * durable" from "write is durable end-to-end".
+ */
+const struct rpc_procinfo ffv2_chunk_commit_procinfo = {
+	.p_proc		= NFSPROC4_COMPOUND,
+	.p_encode	= ffv2_xdr_enc_chunk_commit,
+	.p_decode	= ffv2_xdr_dec_chunk_commit,
+	.p_arglen	= FFV2_CHUNK_COMMIT_ARGS_MAXSZ,
+	.p_replen	= FFV2_CHUNK_COMMIT_RES_MAXSZ,
+	.p_statidx	= NFSPROC4_CLNT_COMMIT,
+	.p_name		= "CHUNK_COMMIT",
 };

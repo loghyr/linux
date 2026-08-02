@@ -272,4 +272,54 @@ struct ffv2_chunk_finalize_data {
 
 extern const struct rpc_procinfo ffv2_chunk_finalize_procinfo;
 
+/*
+ * CHUNK_COMMIT4args in-memory form.  Shape mirrors
+ * CHUNK_FINALIZE4args verbatim; the only wire differences are the
+ * op number (78 vs 80) and the field-prefix convention (cca_ vs
+ * cfa_).  Same single-owner-per-op interop shape as FINALIZE.
+ *
+ * Called after CHUNK_FINALIZE by the dispatch layer to transition
+ * FINALIZED -> COMMITTED on the DS with a durability barrier
+ * (matches the plain-WRITE + COMMIT pairing on the NFSv4.1 side,
+ * adapted to the CHUNK op family).
+ */
+struct ffv2_chunk_commit_args {
+	nfs4_stateid		stateid;
+	u64			offset;		/* chunk INDEX, not bytes */
+	u32			count;		/* chunk COUNT, always 1 */
+	struct chunk_owner4	owner;
+};
+
+/*
+ * CHUNK_COMMIT4resok in-memory form.  Wire shape mirrors
+ * CHUNK_FINALIZE4resok exactly.  The writeverf pair (returned by
+ * both FINALIZE and COMMIT) lets the client detect a DS reboot
+ * between the two ops; the dispatch layer compares the two
+ * verifiers and treats a mismatch as a lost-durability signal that
+ * MUST invalidate the FINALIZE and retry.
+ */
+struct ffv2_chunk_commit_res {
+	struct nfs4_sequence_res seq_res;
+	nfs4_verifier		writeverf;
+	u32			nstatus;
+	u32			status[FFV2_MAX_CHUNKS_PER_OP];
+};
+
+/*
+ * Composite task-data struct passed as rpc_message.rpc_argp on the
+ * CHUNK_COMMIT task.  Same rationale as ffv2_chunk_finalize_data:
+ * seq_res is populated BEFORE any CHUNK_COMMIT op status is
+ * consulted, NFS4ERR_DELAY maps to -NFS4ERR_DELAY (not -EAGAIN),
+ * and the dispatch layer must match on -NFS4ERR_DELAY for its retry
+ * loop.
+ */
+struct ffv2_chunk_commit_data {
+	struct nfs4_sequence_args	seq_args;
+	struct ffv2_chunk_commit_args	args;
+	struct nfs_fh			fh;
+	struct ffv2_chunk_commit_res	res;
+};
+
+extern const struct rpc_procinfo ffv2_chunk_commit_procinfo;
+
 #endif /* FS_NFS_NFS4FLEXFILES_V2_XDR_CHUNK_H */
