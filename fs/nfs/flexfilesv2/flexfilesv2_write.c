@@ -1261,6 +1261,26 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
 		return rc ?: -EIO;
 	}
 
+	/*
+	 * v4 shards delegate to ffv2_chunk_read_fetch_dispatch, which
+	 * runs CHUNK_READ through the private call_ops (CRC verify +
+	 * guard capture + DELAY retry + NOENT + shortfall gates).  V3
+	 * shards and PASSTHROUGH mirrors continue below on the plain-
+	 * nfs4-read path.
+	 *
+	 * The delegate call redoes ds_slot / devnode / ds_connect
+	 * lookup internally.  These are idempotent (find_get hits the
+	 * cache; ds_connect early-outs when already connected) so the
+	 * double-lookup is a one-time-per-shard cost.  A future
+	 * consolidation could pass the already-resolved devnode / ds
+	 * via an extended dispatch signature.
+	 */
+	if (version == 4) {
+		nfs4_put_deviceid_node(devnode);
+		return ffv2_chunk_read_fetch_dispatch(ctx, tmpl, mirror,
+						      shard_idx, 1);
+	}
+
 	f = kzalloc(sizeof(*f), GFP_NOFS);
 	/*
 	 * nfs_pgio_header_alloc() -> nfs_readhdr_alloc() is hard-coded
@@ -1345,13 +1365,24 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
  * res->count >= expected.
  */
 /*
- * Contained-partial RMW is off pending guard plumbing: the entry
- * function short-circuits before reaching this fetch path.  The
- * machinery is retained for the follow-up commit that lands guard
- * support and for unit tests that reach the helper directly.
+ * Contained-partial RMW live entry point.  Guard plumbing is in
+ * place (ffv2_chunk_write_dispatch_one_mirror consumes
+ * ctx->captured_guard[mirror_idx]).  ffv2_rmw_fetch_one now
+ * discriminates on DS version and delegates v4 shards to
+ * ffv2_chunk_read_fetch_dispatch (CHUNK_READ); v3 shards stay on
+ * the plain-nfs4-read path.
+ *
+ * The caller (ffv2_write_pagelist_chunked's contained-partial
+ * branch) holds ctx->encode_lock across the fetch: the winner takes
+ * encode_lock, transitions ASSEMBLING -> FETCHING, calls this, and
+ * on return overlays user bytes + encodes + transitions to READY
+ * (or sticky FAILED before unlock on any error).  Siblings block on
+ * mutex_lock(encode_lock) naturally.
+ *
+ * Production reachability remains on the safe fallback path until
+ * the FINALIZE / COMMIT correctness tail is available.
  */
-static int __maybe_unused
-ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
+static int ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
 		      struct nfs_pgio_header *tmpl,
 		      struct nfs4_ffv2_mirror *mirror)
 {
@@ -1416,10 +1447,10 @@ ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
  * stays for v3 fallback and legacy paths).  The CHUNK_READ reply
  * shape and CRC-verify / guard-capture policy differ enough from
  * plain NFSv4 READ that overloading the shared call_ops with a
- * runtime discriminator would be error-prone.  This commit ships
- * the wrapper struct + call_ops + entry function; the next commit
- * adds CRC verify + guard capture + DELAY retry + NOENT + shortfall
- * gates into the done callback.
+ * runtime discriminator would be error-prone.  ffv2_rmw_fetch_one
+ * discriminates on version and delegates v4 shards to
+ * ffv2_chunk_read_fetch_dispatch; v3 shards stay on the existing
+ * plain-nfs4-read path.
  */
 
 struct ffv2_chunk_read_fetch {
@@ -2017,8 +2048,9 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	{
 		u64 stripe_bytes = (u64)k * mirror->striping_unit_size;
 		u64 stripe_off, off_in_stripe;
-		bool full_stripe, safe_partial;
+		bool full_stripe, safe_partial, contained_partial;
 		struct ffv2_stripe_ctx *cand, *found;
+		int rc_enc = 0;
 
 		stripe_off = hdr->args.offset - (hdr->args.offset % stripe_bytes);
 		off_in_stripe = hdr->args.offset - stripe_off;
@@ -2031,23 +2063,30 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 		 * definitively beyond the file and reading them would
 		 * return short.  Zero-filling those bytes then encoding is
 		 * indistinguishable from what a read after this write
-		 * would observe.  Reads of an existing stripe we would
-		 * overwrite need RMW (fetch, modify, encode); that is
-		 * deferred and falls back to MDS below.
+		 * would observe.
 		 */
 		safe_partial = !full_stripe &&
 			       off_in_stripe + hdr->args.count <= stripe_bytes &&
 			       i_size_read(hdr->inode) <= stripe_off;
 		/*
-		 * Contained-partial RMW is off pending guard plumbing.
-		 * A contained-partial write that overlaps existing data
-		 * needs guard-based CAS to safely detect a concurrent
-		 * winner between fetch and CHUNK_WRITE; without that,
-		 * a write-hole would be silently accepted.  Full-stripe
-		 * and safe-append (contained + at/past EOF) still
-		 * qualify -- neither needs a predecessor read.
+		 * Contained-partial RMW: user write fully contained
+		 * within a single stripe (off_in_stripe + count <=
+		 * stripe_bytes), and overlaps existing data (i_size >
+		 * stripe_off).  Requires fetch-then-overlay via
+		 * ffv2_rmw_fetch_stripe; the paired CHUNK_WRITEs ship
+		 * cwg_check=TRUE with the CRC-verified captured guards
+		 * so the DS's CAS catches concurrent-writer races.
+		 *
+		 * Stripe-spanning writes (off_in_stripe + count >
+		 * stripe_bytes) KEEP the MDS fallback -- the ctx
+		 * represents ONE stripe (ctx->stripe_off, k shards), and
+		 * admitting a spanning write would confuse the single-
+		 * stripe fetch engine.
 		 */
-		if (!full_stripe && !safe_partial)
+		contained_partial = !full_stripe && !safe_partial &&
+				    off_in_stripe + hdr->args.count <=
+				    stripe_bytes;
+		if (!full_stripe && !safe_partial && !contained_partial)
 			return ffv2_write_fallback_to_mds(hdr);
 
 		/*
@@ -2080,35 +2119,116 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 				ctx = found;
 			} else {
 				ctx = cand;
+				/*
+				 * Admission-time zero + optional user copy.
+				 * For full-stripe / safe-append: user bytes
+				 * go straight into the shards.  For
+				 * contained-partial RMW: DEFER
+				 * ffv2_copy_user_to_shards_at until AFTER
+				 * the fetch -- the fetch DMAs full shard_len
+				 * into the same pages and an admission-time
+				 * user copy would be clobbered by the
+				 * predecessor DS data.  ffv2_zero_shards
+				 * stays for both paths so bytes beyond
+				 * `expected` remain pre-zeroed (NOENT is a
+				 * no-op memset because the shard is already
+				 * zero).
+				 */
 				ffv2_zero_shards(ctx);
-				ffv2_copy_user_to_shards_at(ctx, hdr,
-							    (u32)off_in_stripe,
-							    hdr->args.count);
+				if (!contained_partial)
+					ffv2_copy_user_to_shards_at(ctx, hdr,
+						(u32)off_in_stripe,
+						hdr->args.count);
 			}
 		}
-	}
 
-	{
 		/*
-		 * Serialize encode/state transition under encode_lock.
-		 * First mirror in encodes and flips to READY; siblings
-		 * see READY and skip.  FAILED is sticky: any observer
-		 * puts its dispatch ref and returns NOT_ATTEMPTED so
-		 * all mirrors of this batch fall to MDS (I8, F5, F8).
+		 * Serialize encode / state transition under encode_lock:
+		 * HELD across the synchronous fetch for contained-
+		 * partial RMW batches.  Siblings blocking on mutex_lock
+		 * see READY (winner succeeded) or FAILED (winner failed)
+		 * naturally on acquire; they never observe FETCHING at
+		 * the encode gate because the winner holds the lock
+		 * across the entire transition.
+		 *
+		 * FAILED is sticky: any observer puts its dispatch ref
+		 * and returns NOT_ATTEMPTED, so all mirrors of this
+		 * batch fall to MDS.
 		 */
-		int rc_enc = 0;
-
 		mutex_lock(&ctx->encode_lock);
-		if (ctx->state == FFV2_CTX_ASSEMBLING ||
-		    ctx->state == FFV2_CTX_FETCHING) {
-			rc_enc = enc->encode
-				? ffv2_encode_locked(ctx, enc)
-				: -EOPNOTSUPP;
-			if (rc_enc) {
-				ctx->state = FFV2_CTX_FAILED;
+		/*
+		 * Encode-gate predicate.  FETCHING is a TRANSIENT state
+		 * that only exists while the winner holds this same
+		 * mutex, so siblings that acquire the lock ALWAYS observe
+		 * READY or FAILED here -- never FETCHING.  A sibling
+		 * observing state != ASSEMBLING (either READY skip-encode
+		 * or FAILED fallback) skips the encode work below
+		 * entirely.  Retain a WARN-guarded defensive check that
+		 * the transient never leaks past the mutex; that would
+		 * indicate a spec violation.
+		 */
+		WARN_ON_ONCE(ctx->state == FFV2_CTX_FETCHING);
+		if (ctx->state == FFV2_CTX_ASSEMBLING) {
+			if (contained_partial) {
+				/*
+				 * Transition ASSEMBLING -> FETCHING, run
+				 * the synchronous fetch while HOLDING
+				 * encode_lock (bounded by the fetch
+				 * engine's 60 s wait_for_completion_timeout).
+				 * RPC callbacks do NOT acquire encode_lock,
+				 * so no lock-cycle through the fetch
+				 * release path.  On success: overlay user
+				 * bytes onto fetched shards, encode,
+				 * transition to READY.  On any failure:
+				 * sticky FAILED before unlock.
+				 */
+				int rc_fetch;
+
+				ctx->state = FFV2_CTX_FETCHING;
+				rc_fetch = ffv2_rmw_fetch_stripe(ctx, hdr,
+								 mirror);
+				if (rc_fetch) {
+					ctx->state = FFV2_CTX_FAILED;
+					rc_enc = rc_fetch;
+				} else {
+					/*
+					 * Fetch-then-overlay: user bytes
+					 * overlay predecessor from DS.
+					 * The winner uses ITS OWN hdr's
+					 * off_in_stripe + count -- same
+					 * across all mirrors of the batch
+					 * (pgio-coalesced), so equivalent
+					 * to the is_new mirror's copy for
+					 * full-stripe/safe-append.
+					 */
+					ffv2_copy_user_to_shards_at(ctx, hdr,
+						(u32)off_in_stripe,
+						hdr->args.count);
+					rc_enc = enc->encode
+						? ffv2_encode_locked(ctx, enc)
+						: -EOPNOTSUPP;
+					if (rc_enc) {
+						ctx->state = FFV2_CTX_FAILED;
+					} else {
+						ctx->encoded = true;
+						ctx->state = FFV2_CTX_READY;
+					}
+				}
 			} else {
-				ctx->encoded = true;
-				ctx->state = FFV2_CTX_READY;
+				/*
+				 * Full-stripe / safe-append: no fetch;
+				 * user bytes already in shards from
+				 * admission-time copy.  Encode directly.
+				 */
+				rc_enc = enc->encode
+					? ffv2_encode_locked(ctx, enc)
+					: -EOPNOTSUPP;
+				if (rc_enc) {
+					ctx->state = FFV2_CTX_FAILED;
+				} else {
+					ctx->encoded = true;
+					ctx->state = FFV2_CTX_READY;
+				}
 			}
 		}
 		if (ctx->state == FFV2_CTX_FAILED)
