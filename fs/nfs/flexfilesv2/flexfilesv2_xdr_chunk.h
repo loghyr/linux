@@ -322,4 +322,81 @@ struct ffv2_chunk_commit_data {
 
 extern const struct rpc_procinfo ffv2_chunk_commit_procinfo;
 
+/*
+ * Lifecycle-op dispatch entry points.  Called by the
+ * FINALIZE-then-COMMIT sequencing after a successful CHUNK_WRITE
+ * reaches the release-cb hook.
+ *
+ * The caller supplies a ffv2_chunk_lifecycle_ctx with a
+ * completion callback that fires exactly once from the
+ * dispatch's release-cb, on either success (task->tk_status ==
+ * 0 and the DS returned NFS4_OK) or failure (any error path).
+ * The callback receives the mapped errno (0 for success) and,
+ * on success only, the DS's writeverf; on failure writeverf is
+ * NULL and the caller MUST NOT dereference it.
+ *
+ * Ownership: the caller retains the nfs_client reference on
+ * ds_clp for the lifetime of the dispatch (dispatch does NOT
+ * take an additional ref).  The caller MUST NOT free ds_clp
+ * until the completion callback has fired.  This matches the
+ * ffv2_chunk_write_dispatch pattern in flexfilesv2_write.c
+ * where hdr->ds_clp lives on the pgio_header.
+ */
+struct nfs_client;
+struct pnfs_layout_segment;
+
+struct ffv2_chunk_lifecycle_ctx {
+	struct nfs_client		*ds_clp;
+	/*
+	 * lseg is carried through to the completion callback: FINALIZE
+	 * / COMMIT error paths need to mark the layout for return via
+	 * pnfs_error_mark_layout_for_return (matches the
+	 * ffv2_chunk_write_call_done pattern in flexfilesv2_write.c).
+	 * The dispatch itself does not read lseg; it is a caller-set
+	 * forward that the completion callback is free to consume.
+	 */
+	struct pnfs_layout_segment	*lseg;
+	/* Completion callback: fires exactly once from release-cb.
+	 * status == 0 on success; writeverf non-NULL on success
+	 * ONLY (points into a wrapper-owned buffer valid only
+	 * until the callback returns; caller must copy if it
+	 * needs to compare across FINALIZE vs COMMIT).
+	 */
+	void				*complete_arg;
+	void				(*complete)(void *arg, int status,
+					   const nfs4_verifier *writeverf);
+};
+
+/*
+ * ffv2_chunk_finalize_dispatch_one_mirror -- dispatch a
+ * CHUNK_FINALIZE against a single DS mirror.  Non-blocking:
+ * returns 0 on successful async dispatch (completion callback
+ * will fire) or negative errno on failure to dispatch (caller
+ * must NOT wait for the completion callback -- it will not
+ * fire in that case).
+ *
+ * Non-static within the ffv2 module -- NOT EXPORT_SYMBOL_GPL.
+ * No out-of-module consumer exists or is planned.
+ */
+int ffv2_chunk_finalize_dispatch_one_mirror(
+	struct ffv2_chunk_lifecycle_ctx *ctx,
+	const struct cred *cred,
+	const struct nfs_fh *fh,
+	const nfs4_stateid *stateid,
+	u64 offset, u32 count,
+	const struct chunk_owner4 *owner);
+
+/*
+ * ffv2_chunk_commit_dispatch_one_mirror -- dispatch a
+ * CHUNK_COMMIT against a single DS mirror.  Semantics mirror
+ * FINALIZE.  Same callback ownership rules.
+ */
+int ffv2_chunk_commit_dispatch_one_mirror(
+	struct ffv2_chunk_lifecycle_ctx *ctx,
+	const struct cred *cred,
+	const struct nfs_fh *fh,
+	const nfs4_stateid *stateid,
+	u64 offset, u32 count,
+	const struct chunk_owner4 *owner);
+
 #endif /* FS_NFS_NFS4FLEXFILES_V2_XDR_CHUNK_H */

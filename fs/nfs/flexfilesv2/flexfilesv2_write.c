@@ -65,11 +65,10 @@ ffv2_write_fallback_to_mds(struct nfs_pgio_header *hdr)
 	return PNFS_NOT_ATTEMPTED;
 }
 
-/* ffv2_stripe_ctx_put is defined further down; forward-declare for
- * the CHUNK_WRITE dispatch below, which references it in the
- * release-cb ref-drop sequence and the dispatch-failure undo path.
+/* ffv2_stripe_ctx_put is defined further down and declared in
+ * flexfilesv2.h (flexfilesv2_lifecycle.c also calls it).  The
+ * CHUNK_WRITE dispatch below references it before the definition.
  */
-static void ffv2_stripe_ctx_put(struct ffv2_stripe_ctx *ctx);
 
 /* --- CHUNK_WRITE private dispatch --------------------------------
  *
@@ -611,7 +610,7 @@ static void ffv2_stripe_ctx_free(struct ffv2_stripe_ctx *ctx)
 	kfree(ctx);
 }
 
-static void ffv2_stripe_ctx_put(struct ffv2_stripe_ctx *ctx)
+void ffv2_stripe_ctx_put(struct ffv2_stripe_ctx *ctx)
 {
 	struct nfs4_ffv2_layout_segment *fls;
 
