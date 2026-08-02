@@ -7,8 +7,16 @@
  * mirror at LAYOUTGET time via ffm_checksum_algorithm; every
  * CHUNK_WRITE uses that algorithm for every chunk it carries.
  *
- * CRC32 and CRC32C are wired here.  Layouts advertising SHA256,
- * SHA512, FLETCHER4 or BLAKE3 return -EOPNOTSUPP; the client falls
+ * CRC32 is wired here.  CRC32C is deferred until the data-server
+ * implementation supports storing and validating it: accepting a
+ * wire algo tag of CRC32C would let the client compute a CRC32C
+ * over received bytes and successfully "verify" against a
+ * matching-but-freshly-computed CRC that was never actually stored
+ * at CHUNK_WRITE time -- a silent-corruption hazard analogous to
+ * bit-rot laundering.  The compute path is preserved as a comment
+ * so it can be re-enabled atomically once the server side lands.
+ * Layouts advertising CRC32C, SHA256, SHA512, FLETCHER4, or BLAKE3
+ * return -EOPNOTSUPP; the client falls
  * back to MDS-inband writes via the pNFS core's standard error path.
  * Additional algorithms are follow-up work.
  *
@@ -29,9 +37,11 @@
  *   emits the 4-byte checksum in big-endian order so the caller can
  *   memcpy it verbatim into the XDR opaque; do not htonl() again in
  *   the encoder.
- * - CRC32C uses the same conditioning shape (RFC 3720 iSCSI / NVMe
- *   convention: pre/post-conditioning by 0xFFFFFFFF, which
- *   crc32c(~0U, data, len) ^ ~0U produces).
+ * - CRC32C would use the same conditioning shape (RFC 3720 iSCSI /
+ *   NVMe convention: pre/post-conditioning by 0xFFFFFFFF, which
+ *   crc32c(~0U, data, len) ^ ~0U produces).  The server side does
+ *   not yet implement CRC32C storage; the compute path here is
+ *   gated with -EOPNOTSUPP until it does.
  *
  * Known-answer vector: input "123456789" (9 bytes) MUST produce
  * CRC32 value 0xCBF43926, packed as big-endian bytes
@@ -63,9 +73,21 @@ int ffv2_checksum_compute(u32 algo, const void *data, size_t len,
 		v = crc32_le(~0U, data, len) ^ ~0U;
 		break;
 	case FFV2_CHECKSUM_ALG_CRC32C:
-		/* CRC-32C: same conditioning shape (RFC 3720). */
-		v = crc32c(~0U, data, len) ^ ~0U;
-		break;
+		/*
+		 * The server side does not yet implement CRC32C storage.
+		 * Enabling client-side CRC32C compute here would let a
+		 * wire algo=CRC32C reply from a broken or rogue DS pass
+		 * verification against bytes that were never CRC32C-
+		 * checked at store time.  Refuse via -EOPNOTSUPP; the
+		 * caller falls back to MDS.  Re-enable the commented-out
+		 * compute atomically with the server-side support.
+		 *
+		 * Future impl (RFC 3720 iSCSI convention, same shape as
+		 * CRC32):
+		 *     v = crc32c(~0U, data, len) ^ ~0U;
+		 *     break;
+		 */
+		return -EOPNOTSUPP;
 	case FFV2_CHECKSUM_ALG_NONE:
 	case FFV2_CHECKSUM_ALG_FLETCHER4:
 	case FFV2_CHECKSUM_ALG_SHA256:
@@ -125,11 +147,12 @@ int ffv2_checksum_compute_pages(u32 algo, struct page **pages, u32 pgbase,
 	unsigned int page_off;
 
 	/* Reject unsupported algo up front to match the flat variant's
-	 * caller contract without doing any page mapping first.
+	 * caller contract without doing any page mapping first.  CRC32C
+	 * is refused with -EOPNOTSUPP pending server-side support,
+	 * matching the flat-variant gate above.
 	 */
 	switch (algo) {
 	case FFV2_CHECKSUM_ALG_CRC32:
-	case FFV2_CHECKSUM_ALG_CRC32C:
 		break;
 	default:
 		return -EOPNOTSUPP;
@@ -160,9 +183,12 @@ int ffv2_checksum_compute_pages(u32 algo, struct page **pages, u32 pgbase,
 		case FFV2_CHECKSUM_ALG_CRC32:
 			seed = crc32_le(seed, src, chunk);
 			break;
-		case FFV2_CHECKSUM_ALG_CRC32C:
-			seed = crc32c(seed, src, chunk);
-			break;
+		/*
+		 * CRC32C case would be
+		 *     seed = crc32c(seed, src, chunk);
+		 * Gated at the top switch above until server-side
+		 * support lands.
+		 */
 		}
 		kunmap_local(kaddr);
 
