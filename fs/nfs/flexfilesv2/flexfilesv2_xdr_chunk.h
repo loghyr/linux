@@ -191,4 +191,27 @@ struct ffv2_chunk_read_data {
 
 extern const struct rpc_procinfo ffv2_chunk_read_procinfo;
 
+/*
+ * CHUNK_READ dispatch entry.  Called once per data shard by the
+ * contained-partial RMW branch of ffv2_write_pagelist_chunked once
+ * that branch is enabled.
+ *
+ * count MUST be 1; count == 0 returns -EINVAL WITHOUT touching
+ * ctx->fetch_pending (the caller owns the RMW fetch counter on
+ * dispatch failures).  Returns 0 on successful async dispatch (the
+ * release path calls ffv2_rmw_fetch_done_one) or a negative errno on
+ * failure to dispatch (the caller must call ffv2_rmw_fetch_done_one
+ * itself).
+ *
+ * Non-static within the ffv2 module -- NOT EXPORT_SYMBOL_GPL.  No
+ * out-of-module consumer exists.
+ */
+struct ffv2_stripe_ctx;
+struct nfs_pgio_header;
+struct nfs4_ffv2_mirror;
+int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
+				   struct nfs_pgio_header *tmpl,
+				   struct nfs4_ffv2_mirror *mirror,
+				   u32 shard_idx, u32 count);
+
 #endif /* FS_NFS_NFS4FLEXFILES_V2_XDR_CHUNK_H */

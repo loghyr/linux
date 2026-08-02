@@ -1357,6 +1357,333 @@ ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
 
 /* ---------- end RMW fetch engine -------------------------------- */
 
+/* ---------- CHUNK_READ dispatch scaffold ------------------------
+ *
+ * No live caller yet.  A later commit wires
+ * ffv2_chunk_read_fetch_dispatch() as the v4 fetch RPC for the
+ * contained-partial RMW branch of ffv2_write_pagelist_chunked once
+ * the FFV2_CTX_FETCHING state machine and guard consumer land
+ * together.
+ *
+ * Design: parallel wrapper to the existing RMW fetch engine (which
+ * stays for v3 fallback and legacy paths).  The CHUNK_READ reply
+ * shape and CRC-verify / guard-capture policy differ enough from
+ * plain NFSv4 READ that overloading the shared call_ops with a
+ * runtime discriminator would be error-prone.  This commit ships
+ * the wrapper struct + call_ops + entry function; the next commit
+ * adds CRC verify + guard capture + DELAY retry + NOENT + shortfall
+ * gates into the done callback.
+ */
+
+struct ffv2_chunk_read_fetch {
+	struct ffv2_stripe_ctx	*ctx;		/* holds one ctx ref */
+	struct pnfs_layout_segment *lseg;	/* holds one lseg ref */
+	struct nfs_client	*ds_clp;	/* holds one cl_count ref */
+	u32			shard_idx;
+	u32			expected;	/* bytes DS is expected to
+						 * hold at this shard's
+						 * (stripe_off + shard_idx *
+						 * unit).  Slice 2 uses this
+						 * for the shortfall check.
+						 */
+	/*
+	 * cred is BORROWED from the caller's tmpl->cred at dispatch
+	 * time.  SunRPC takes its own cred ref inside
+	 * rpc_task_set_rpc_message and releases it at task teardown;
+	 * the async tail rides that ref.  No get_cred at dispatch; no
+	 * put_cred in release.
+	 */
+	const struct cred	*cred;
+	/*
+	 * Composite task-data.  args / fh / seq_args / seq_res / res
+	 * all live here; the CHUNK_READ procinfo encoder + decoder
+	 * consume it via rpc_message.rpc_argp.
+	 */
+	struct ffv2_chunk_read_data data;
+	/*
+	 * Embedded rpc_task, matching the nfs_pgio_header hdr->task
+	 * pattern.  The RPC core snapshots tk_flags before invoking
+	 * .rpc_release and a caller-supplied task never carries
+	 * RPC_TASK_DYNAMIC, so kfree(wrapper) inside .rpc_release is
+	 * safe.
+	 */
+	struct rpc_task		task;
+};
+
+static void ffv2_chunk_read_dispatch_prepare_v4(struct rpc_task *task,
+						void *data)
+{
+	struct ffv2_chunk_read_fetch *f = data;
+
+	if (nfs4_setup_sequence(f->ds_clp, &f->data.seq_args,
+				&f->data.res.seq_res, task))
+		return;
+	rpc_call_start(task);
+}
+
+static void ffv2_chunk_read_dispatch_call_done_v4(struct rpc_task *task,
+						  void *data)
+{
+	struct ffv2_chunk_read_fetch *f = data;
+
+	/*
+	 * Return the session slot UNCONDITIONALLY first: safe when no
+	 * slot was ever acquired (sr_slot short-circuits).  Missing
+	 * this leaks slots per rpc_exit paths and eventually wedges
+	 * every I/O to the DS on slot_tbl_waitq.
+	 */
+	nfs4_sequence_done(task, &f->data.res.seq_res);
+
+	/*
+	 * Minimal done-path -- honour task->tk_status only.  The next
+	 * commit adds the full decision tree:
+	 *   - -NFS4ERR_DELAY: rpc_delay + rpc_restart_call_prepare
+	 *   - -NFS4ERR_NOENT: no-op zero-fill; set tk_status = 0
+	 *   - tk_status == 0 && nchunks == 0: -EIO
+	 *   - tk_status == 0 && effective_len < expected: -EIO
+	 *   - tk_status == 0 && OK: CRC verify + guard capture
+	 * Here the release path drops refs and the RMW engine's cmpxchg
+	 * records tk_status onto ctx->fetch_status.
+	 */
+}
+
+static void ffv2_chunk_read_dispatch_release(void *data)
+{
+	struct ffv2_chunk_read_fetch *f = data;
+	struct ffv2_stripe_ctx *ctx = f->ctx;
+	struct pnfs_layout_segment *lseg = f->lseg;
+	struct nfs_client *ds_clp = f->ds_clp;
+	int status = f->task.tk_status;
+
+	/*
+	 * Release ordering:
+	 *   1. read tk_status from embedded task FIRST (before any
+	 *      drop that could free the wrapper).
+	 *   2. drop DS client ref before touching ctx / lseg (same
+	 *      order the RMW fetch engine uses).
+	 *   3. decrement the RMW engine's fetch_pending via the
+	 *      single-point helper; this is the only fetch site that
+	 *      calls ffv2_rmw_fetch_done_one -- the entry-gate
+	 *      short-exit does NOT (the caller owns the counter on
+	 *      dispatch-failure paths).
+	 *   4. ctx put BEFORE lseg put (ctx->fls lives inside the
+	 *      lseg; a still-listed straggler ctx must not survive
+	 *      its lseg's free).
+	 *   5. kfree wrapper last.  No put_cred (borrow pattern).
+	 */
+	if (ds_clp)
+		nfs_put_client(ds_clp);
+	ffv2_rmw_fetch_done_one(ctx, status);
+	ffv2_stripe_ctx_put(ctx);
+	pnfs_put_lseg(lseg);
+	kfree(f);
+}
+
+static const struct rpc_call_ops ffv2_chunk_read_dispatch_call_ops_v4 = {
+	.rpc_call_prepare	= ffv2_chunk_read_dispatch_prepare_v4,
+	.rpc_call_done		= ffv2_chunk_read_dispatch_call_done_v4,
+	.rpc_release		= ffv2_chunk_read_dispatch_release,
+};
+
+/*
+ * Public entry point: dispatch one shard's CHUNK_READ, taking the
+ * ctx / lseg / ds_clp refs that the release will drop.  Returns 0
+ * on successful dispatch (RPC async in flight, release will call
+ * fetch_done_one) or a negative errno on failure to dispatch (the
+ * caller must call fetch_done_one itself to keep the pending counter
+ * balanced).
+ *
+ * count MUST be 1; count == 0 returns -EINVAL without touching
+ * fetch_pending (the caller owns the counter on early-exit dispatch
+ * failures).  This guard belongs at the dispatch entry because the
+ * .p_encode void signature cannot surface -EINVAL from within the
+ * encoder itself.
+ *
+ * Non-static: prototype in flexfilesv2_xdr_chunk.h so the RMW fetch
+ * engine can call it once the flip site is wired.  NOT
+ * EXPORT_SYMBOL_GPL -- ffv2-module-internal consumers only.
+ */
+int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
+				   struct nfs_pgio_header *tmpl,
+				   struct nfs4_ffv2_mirror *mirror,
+				   u32 shard_idx, u32 count)
+{
+	struct nfs4_ffv2_stripe *stripe;
+	struct nfs4_ffv2_data_server *ds_slot;
+	struct nfs4_ffv2_file_info *fi;
+	struct nfs4_deviceid_node *devnode;
+	struct nfs4_ffv2_layout_ds *layout_ds;
+	struct nfs4_pnfs_ds *ds;
+	struct nfs_server *mds_srv = NFS_SERVER(tmpl->inode);
+	struct ffv2_chunk_read_fetch *f;
+	struct rpc_message msg;
+	struct rpc_task_setup task_setup;
+	struct rpc_task *task;
+	u64 shard_file_off, chunk_index;
+	u32 version;
+	int rc;
+
+	/*
+	 * Entry gate: cra_count == 0 -> -EINVAL WITHOUT touching
+	 * fetch_pending.  The RMW fetch engine's undispatched loop
+	 * owns the counter on dispatch failures; a dispatch-entry
+	 * decrement would double-decrement (silent corruption).
+	 */
+	if (WARN_ON_ONCE(count == 0))
+		return -EINVAL;
+
+	if (mirror->stripes_cnt == 0)
+		return -EINVAL;
+	stripe = &mirror->stripes[0];
+	if (shard_idx >= stripe->data_servers_cnt)
+		return -EINVAL;
+	ds_slot = &stripe->data_servers[shard_idx];
+	if (ds_slot->versions_cnt == 0)
+		return -EINVAL;
+	fi = &ds_slot->versions[0];
+
+	devnode = nfs4_find_get_deviceid(mds_srv, &ds_slot->devid,
+					 tmpl->cred, nfs_io_gfp_mask());
+	if (!devnode)
+		return -EIO;
+	layout_ds = FFV2_LAYOUT_DS_FROM_NODE(devnode);
+	ds = layout_ds->ds;
+	if (!ds || layout_ds->ds_versions_cnt == 0) {
+		nfs4_put_deviceid_node(devnode);
+		return -EPROTONOSUPPORT;
+	}
+	version = layout_ds->ds_versions[0].version;
+	/*
+	 * CHUNK_READ is v4-only (v4.2 minorversion is enforced by the
+	 * encoder's compound header).  V3 mirrors stay on the existing
+	 * plain-NFSv4-READ RMW path; the flip site discriminates on
+	 * version and only swaps the v4 dispatch.
+	 */
+	if (version != 4) {
+		nfs4_put_deviceid_node(devnode);
+		return -EPROTONOSUPPORT;
+	}
+	rc = nfs4_pnfs_ds_connect(mds_srv, ds, devnode,
+				  NFS_DEF_TCP_TIMEO, 0, version,
+				  layout_ds->ds_versions[0].minor_version);
+	if (rc || !ds->ds_clp) {
+		nfs4_put_deviceid_node(devnode);
+		return rc ?: -EIO;
+	}
+
+	/*
+	 * Wrapper alloc: nfs_io_gfp_mask() matches the stripe-ctx
+	 * allocation shape.  memalloc_nofs_save/restore protects
+	 * this path in writeback / O_DIRECT NOFS context, where an
+	 * allocator reclaim recursion into the fs could deadlock on
+	 * the dirty pages this write is trying to drain.
+	 */
+	{
+		unsigned int noflags = memalloc_nofs_save();
+
+		f = kzalloc(sizeof(*f), nfs_io_gfp_mask());
+		memalloc_nofs_restore(noflags);
+	}
+	if (!f) {
+		nfs4_put_deviceid_node(devnode);
+		return -ENOMEM;
+	}
+
+	/* Populate ffv2_chunk_read_data. */
+	f->data.args.stateid = fi->stateid;
+	/*
+	 * cra_offset is a CHUNK INDEX (not bytes).  ffv2_ds_offset
+	 * returns the DS-side byte offset for stripe_off under this
+	 * mirror's striping geometry; divide by striping_unit_size to
+	 * get the chunk index the DS expects.  Under DENSE striping
+	 * the same chunk index applies to every shard's DS (each shard
+	 * has its own DS filehandle, but the chunk index within that
+	 * DS's file is stripe_index).
+	 */
+	shard_file_off = ctx->stripe_off +
+			 (u64)shard_idx * mirror->striping_unit_size;
+	chunk_index = ffv2_ds_offset(mirror, ctx->stripe_off);
+	if (mirror->striping_unit_size != 0)
+		chunk_index /= mirror->striping_unit_size;
+	f->data.args.offset = chunk_index;
+	f->data.args.count = count;			/* always 1 */
+	f->data.args.pages = ctx->shard_pages[shard_idx];
+	f->data.args.pgbase = 0;
+	f->data.args.pglen = ctx->shard_len;
+	/*
+	 * Copy DS filehandle into the wrapper's fh slot (the caller's
+	 * fi may outlive the RPC because the lseg ref pins the layout,
+	 * but a local copy is cheaper than reasoning about that on
+	 * every field access).
+	 */
+	memcpy(&f->data.fh, &fi->fh, sizeof(f->data.fh));
+	nfs4_init_sequence(ds->ds_clp, &f->data.seq_args,
+			   &f->data.res.seq_res,
+			   0, 0);
+
+	/*
+	 * Wrapper fields: refs first (they own their targets from
+	 * this point), then borrowed cred, then expected byte count.
+	 */
+	refcount_inc(&ds->ds_clp->cl_count);
+	refcount_inc(&ctx->refcnt);
+	f->ctx = ctx;
+	f->lseg = pnfs_get_lseg(tmpl->lseg);
+	f->ds_clp = ds->ds_clp;
+	f->shard_idx = shard_idx;
+	f->cred = tmpl->cred;
+	f->expected = clamp_t(u64,
+		ctx->rmw_isize > shard_file_off ?
+			ctx->rmw_isize - shard_file_off : 0,
+		0, ctx->shard_len);
+
+	/*
+	 * Build rpc_task_setup inline so the ops struct is referenced
+	 * from this compilation unit even with no live caller yet
+	 * (-Wunused-function under W=1 would fire on the static
+	 * call_ops struct otherwise).  RPC_TASK_ASYNC + SOFTCONN +
+	 * SOFT matches the existing RMW fetch initiate path.
+	 */
+	msg = (struct rpc_message){
+		.rpc_proc	= &ffv2_chunk_read_procinfo,
+		.rpc_argp	= &f->data,
+		.rpc_resp	= &f->data.res,
+		.rpc_cred	= f->cred,
+	};
+	task_setup = (struct rpc_task_setup){
+		.rpc_client	= f->ds_clp->cl_rpcclient,
+		.task		= &f->task,
+		.rpc_message	= &msg,
+		.callback_ops	= &ffv2_chunk_read_dispatch_call_ops_v4,
+		.callback_data	= f,
+		.workqueue	= nfsiod_workqueue,
+		.flags		= RPC_TASK_ASYNC | RPC_TASK_SOFTCONN |
+				  RPC_TASK_SOFT,
+	};
+
+	task = rpc_run_task(&task_setup);
+	nfs4_put_deviceid_node(devnode);
+	if (IS_ERR(task)) {
+		/*
+		 * Release will NOT fire.  Undo the refs we took, free the
+		 * wrapper, and let the caller run fetch_done_one for this
+		 * shard's slot in the pending counter.  Raw refcount_dec
+		 * on ctx (not ffv2_stripe_ctx_put) because the caller
+		 * still holds its own ctx ref, so this dec cannot be the
+		 * last.
+		 */
+		nfs_put_client(ds->ds_clp);
+		refcount_dec(&ctx->refcnt);
+		pnfs_put_lseg(f->lseg);
+		kfree(f);
+		return PTR_ERR(task);
+	}
+	rpc_put_task(task);
+	return 0;
+}
+
+/* ---------- end CHUNK_READ dispatch scaffold -------------------- */
+
 /*
  * Chunk-encoded write dispatch.  Called once per mirror index by
  * pnfs_do_write; pageio processes mirrors sequentially so mirror 0
