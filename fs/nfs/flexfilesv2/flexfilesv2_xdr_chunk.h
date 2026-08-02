@@ -214,4 +214,62 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 				   struct nfs4_ffv2_mirror *mirror,
 				   u32 shard_idx, u32 count);
 
+/*
+ * CHUNK_FINALIZE4args in-memory form.
+ *
+ * stateid is the layout stateid (draft authorization contract).
+ * The DS's chunk_lifecycle_check_stateid() bypasses the trust-table
+ * check on the anonymous stateid; the dispatch layer passes the
+ * file's layout stateid captured at LAYOUTGET time.
+ *
+ * offset is a CHUNK INDEX (u64), NOT bytes -- same units as
+ * cwa_offset / cra_offset on the WRITE / READ sides.  count is a
+ * chunk count (u32).  The current single-owner-per-op shape sends
+ * nchunks == 1; nchunks > 1 is a future batching slice.
+ *
+ * The owner triple names WHICH prior CHUNK_WRITE this FINALIZE
+ * refers to.
+ */
+struct ffv2_chunk_finalize_args {
+	nfs4_stateid		stateid;
+	u64			offset;		/* chunk INDEX, not bytes */
+	u32			count;		/* chunk COUNT, always 1 */
+	struct chunk_owner4	owner;
+};
+
+/*
+ * CHUNK_FINALIZE4resok in-memory form.  writeverf lets the client
+ * detect a DS reboot between FINALIZE and COMMIT (matches
+ * CHUNK_WRITE4resok::writeverf semantics).  Per-chunk status is
+ * a bounded array capped at FFV2_MAX_CHUNKS_PER_OP for defensive
+ * allocation sizing; nstatus reports the actual N the DS returned
+ * (expected 1 for single-owner requests).
+ */
+struct ffv2_chunk_finalize_res {
+	struct nfs4_sequence_res seq_res;
+	nfs4_verifier		writeverf;
+	u32			nstatus;
+	u32			status[FFV2_MAX_CHUNKS_PER_OP];
+};
+
+/*
+ * Composite task-data struct passed as rpc_message.rpc_argp on the
+ * CHUNK_FINALIZE task.  Same shape rationale as
+ * ffv2_chunk_write_data / ffv2_chunk_read_data: seq_res is populated
+ * by the decoder BEFORE any CHUNK_FINALIZE op status is consulted,
+ * so any error reply still yields a well-formed seq_res that
+ * nfs41_sequence_process can use for its recovery arms.
+ * NFS4ERR_DELAY maps to -NFS4ERR_DELAY (not -EAGAIN); the dispatch
+ * layer must match on -NFS4ERR_DELAY for its retry-with-backoff
+ * loop.
+ */
+struct ffv2_chunk_finalize_data {
+	struct nfs4_sequence_args	seq_args;
+	struct ffv2_chunk_finalize_args	args;
+	struct nfs_fh			fh;
+	struct ffv2_chunk_finalize_res	res;
+};
+
+extern const struct rpc_procinfo ffv2_chunk_finalize_procinfo;
+
 #endif /* FS_NFS_NFS4FLEXFILES_V2_XDR_CHUNK_H */

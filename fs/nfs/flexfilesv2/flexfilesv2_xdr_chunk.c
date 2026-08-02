@@ -175,6 +175,42 @@
 	BYTES_TO_U32(FFV2_CHUNK_READ_RES_MAXSZ_BYTES)
 
 /*
+ * CHUNK_FINALIZE op body (all inline; no page splicing):
+ *   op code (4) + stateid (16) + offset (8) + count (4)
+ *   + chunks<> length (4) + N * chunk_owner4 (12) = 36 + 12N bytes
+ *
+ * N capped at FFV2_MAX_CHUNKS_PER_OP; the current single-owner-
+ * per-op shape sends N == 1.
+ */
+#define FFV2_CHUNK_FINALIZE_INLINE_ENC_MAXSZ \
+	(4 + NFS4_STATEID_SIZE + 8 + 4 + 4 + FFV2_MAX_CHUNKS_PER_OP * 12)
+
+#define FFV2_CHUNK_FINALIZE_ARGS_MAXSZ_BYTES \
+	(FFV2_COMPOUND_HDR_MAXSZ + FFV2_SEQUENCE_ENC_MAXSZ + \
+	 FFV2_PUTFH_ENC_MAXSZ + FFV2_CHUNK_FINALIZE_INLINE_ENC_MAXSZ)
+
+/*
+ * Reply size upper bound for CHUNK_FINALIZE:
+ *   compound status (4) + tag length (4) + resarray length (4) = 12
+ *   SEQUENCE op hdr (4) + status (4) + sessionid (16) + 20     = 44
+ *   PUTFH op hdr (4) + status (4)                              = 8
+ *   CHUNK_FINALIZE op hdr (4) + status (4) + resok:
+ *     cfr_writeverf (8) + cfr_status<> length (4) + N * 4
+ *   With N capped at FFV2_MAX_CHUNKS_PER_OP.
+ */
+#define FFV2_CHUNK_FINALIZE_RES_MAXSZ_BYTES \
+	((4 + 4 + 4) + \
+	 (4 + 4 + NFS4_MAX_SESSIONID_LEN + 20) + \
+	 (4 + 4) + \
+	 (4 + 4 + NFS4_VERIFIER_SIZE + \
+	  (4 + FFV2_MAX_CHUNKS_PER_OP * 4)))
+
+#define FFV2_CHUNK_FINALIZE_ARGS_MAXSZ	\
+	BYTES_TO_U32(FFV2_CHUNK_FINALIZE_ARGS_MAXSZ_BYTES)
+#define FFV2_CHUNK_FINALIZE_RES_MAXSZ	\
+	BYTES_TO_U32(FFV2_CHUNK_FINALIZE_RES_MAXSZ_BYTES)
+
+/*
  * Fixed prefix (in u32 quads) that the CHUNK_READ decoder actually
  * expects to consume from head before xdr_read_pages transitions to
  * the page area.  Passed to rpc_prepare_reply_pages as the hdrsize
@@ -492,6 +528,70 @@ static void ffv2_xdr_enc_chunk_read(struct rpc_rqst *req,
 	 * placement (silent perf cliff, mirrors WRITE-side).
 	 */
 	req->rq_rcv_buf.flags |= XDRBUF_READ;
+}
+
+/*
+ * CHUNK_FINALIZE op body (all inline; no page splicing).  Emits:
+ *   op code + cfa_stateid + cfa_offset + cfa_count + cfa_chunks<> (1
+ *   entry)
+ *
+ * The single-entry chunk_owner4 array is the current single-owner-
+ * per-op interop shape; N > 1 batching is a future extension.
+ */
+static void ffv2_xdr_enc_chunk_finalize_op(struct xdr_stream *xdr,
+					   const struct ffv2_chunk_finalize_args *a)
+{
+	__be32 *p;
+
+	ffv2_xdr_enc_op_hdr(xdr, OP_CHUNK_FINALIZE);
+	ffv2_xdr_enc_stateid(xdr, &a->stateid);
+	p = ffv2_reserve_space(xdr, 8 + 4 + 4);
+	p = xdr_encode_hyper(p, a->offset);	/* chunk INDEX, not bytes */
+	*p++ = cpu_to_be32(a->count);
+	*p = cpu_to_be32(1);			/* cfa_chunks<> length == 1 */
+	ffv2_xdr_enc_chunk_owner(xdr, &a->owner);
+}
+
+/*
+ * Zero-count contract, mirroring CHUNK_READ: p_encode returns void
+ * so this encoder cannot surface -EINVAL to the caller.  The
+ * API-boundary check for count == 0 belongs in the dispatch layer,
+ * before rpc_run_task submission, where an integer error can be
+ * returned.  Last-ditch defence: emit an empty COMPOUND (nops=0)
+ * so the send path doesn't choke on an empty xdr_stream.  The
+ * server may then return NFS4_OK with an empty resarray; the
+ * decoder converts that short-OK reply to -EPROTO via the short-
+ * OK-reply guard.
+ */
+static bool ffv2_xdr_enc_chunk_finalize_check(const struct ffv2_chunk_finalize_args *a)
+{
+	return WARN_ON_ONCE(a->count != 1);
+}
+
+static void ffv2_xdr_enc_chunk_finalize(struct rpc_rqst *req,
+					struct xdr_stream *xdr,
+					const void *data)
+{
+	const struct ffv2_chunk_finalize_data *d = data;
+
+	if (ffv2_xdr_enc_chunk_finalize_check(&d->args)) {
+		/*
+		 * Empty COMPOUND fallback for cfa_count == 0.  See the
+		 * check-function comment above and the sibling
+		 * CHUNK_READ handling for rationale.  5c dispatch
+		 * MUST filter count == 0 upstream.
+		 */
+		ffv2_xdr_enc_compound_hdr(xdr, 2, 0);
+		return;
+	}
+
+	ffv2_xdr_enc_compound_hdr(xdr, 2, 3);	/* v4.2, 3 ops */
+	ffv2_xdr_enc_sequence(xdr, &d->seq_args);
+	ffv2_xdr_enc_putfh(xdr, &d->fh);
+	ffv2_xdr_enc_chunk_finalize_op(xdr, &d->args);
+	/* No XDRBUF_READ / XDRBUF_WRITE flag: FINALIZE is a
+	 * metadata-only op with no bulk payload on either
+	 * direction; RDMA direct data placement does not apply. */
 }
 
 /* -------------------- decoder -------------------- */
@@ -876,6 +976,104 @@ static int ffv2_xdr_dec_checksum4(struct xdr_stream *xdr,
 }
 
 /*
+ * CHUNK_FINALIZE4resok decoder.
+ *   cfr_writeverf (8 bytes) + cfr_status<> (length-prefixed array
+ *   of nfsstat4).
+ *
+ * Reject any per-chunk array length > FFV2_MAX_CHUNKS_PER_OP as
+ * defence-in-depth against a malformed reply; the reply-size upper
+ * bound already caps allocation via p_replen, but the decoder must
+ * not iterate past the cap either.
+ */
+static int ffv2_xdr_dec_chunk_finalize_resok(struct xdr_stream *xdr,
+					     struct ffv2_chunk_finalize_res *r)
+{
+	__be32 *p;
+	u32 n, i;
+
+	/* cfr_writeverf (8 bytes) */
+	p = xdr_inline_decode(xdr, NFS4_VERIFIER_SIZE);
+	if (!p)
+		return -EIO;
+	memcpy(&r->writeverf, p, NFS4_VERIFIER_SIZE);
+
+	/* cfr_status<> */
+	p = xdr_inline_decode(xdr, 4);
+	if (!p)
+		return -EIO;
+	n = be32_to_cpup(p);
+	if (n > FFV2_MAX_CHUNKS_PER_OP)
+		return -EPROTO;
+	r->nstatus = n;
+	for (i = 0; i < n; i++) {
+		p = xdr_inline_decode(xdr, 4);
+		if (!p)
+			return -EIO;
+		r->status[i] = be32_to_cpup(p);
+	}
+	return 0;
+}
+
+/*
+ * CHUNK_FINALIZE full-compound decoder.  Same walk-and-early-exit
+ * shape as ffv2_xdr_dec_chunk_write: unconditional SEQUENCE decode
+ * to keep the slot lifetime honest, then per-op-hdr walk with a
+ * short-OK-reply guard at every boundary.  A short-OK compound on
+ * FINALIZE is a server bug that MUST reject with -EPROTO, not
+ * silently convert to 0-status "success" via
+ * nfs4_stat_to_errno(NFS4_OK).
+ */
+static int ffv2_xdr_dec_chunk_finalize(struct rpc_rqst *req,
+				       struct xdr_stream *xdr,
+				       void *data)
+{
+	struct ffv2_chunk_finalize_res *d = data;
+	u32 cstatus, nops, opstatus;
+	int rc;
+
+	d->seq_res.sr_status = 1;
+
+	rc = ffv2_xdr_dec_compound_hdr(xdr, &cstatus, &nops);
+	if (rc)
+		return rc;
+
+	if (nops == 0) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_sequence(xdr, &d->seq_res);
+	if (rc)
+		return rc;
+
+	if (nops < 2) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_op_hdr(xdr, OP_PUTFH, &opstatus);
+	if (rc)
+		return rc;
+	if (opstatus != NFS4_OK)
+		return nfs4_stat_to_errno(opstatus);
+
+	if (nops < 3) {
+		if (cstatus == NFS4_OK)
+			return -EPROTO;
+		return nfs4_stat_to_errno(cstatus);
+	}
+
+	rc = ffv2_xdr_dec_op_hdr(xdr, OP_CHUNK_FINALIZE, &opstatus);
+	if (rc)
+		return rc;
+	if (opstatus != NFS4_OK)
+		return nfs4_stat_to_errno(opstatus);
+	return ffv2_xdr_dec_chunk_finalize_resok(xdr, d);
+}
+
+/*
  * Decode one read_chunk4 (crr_chunks<> element).  Currently enforces
  * cr_locked<> / cr_status<> length 0; the reply-page boundary is
  * fixed at that shape.
@@ -1152,4 +1350,33 @@ const struct rpc_procinfo ffv2_chunk_read_procinfo = {
 	.p_replen	= FFV2_CHUNK_READ_RES_MAXSZ,
 	.p_statidx	= NFSPROC4_CLNT_READ,
 	.p_name		= "CHUNK_READ",
+};
+
+/*
+ * CHUNK_FINALIZE procinfo.  Caller (5c dispatch) sets
+ * rpc_message.rpc_proc = &ffv2_chunk_finalize_procinfo and
+ * rpc_message.rpc_argp = &ffv2_chunk_finalize_data instance.
+ *
+ * p_arglen counts inline args only: no send-side payload
+ * (FINALIZE carries stateid + offset + count + single-entry
+ * chunks<> array; all fits in the head).
+ *
+ * p_replen counts the inline reply: writeverf + status<> length
+ * + N * status entries, capped at FFV2_MAX_CHUNKS_PER_OP.  No
+ * out-of-line payload; nothing lands in caller pages.
+ *
+ * p_statidx = NFSPROC4_CLNT_WRITE: FINALIZE is a mutating
+ * lifecycle op that commits the prior CHUNK_WRITE's PENDING
+ * state to FINALIZED.  Attributing it to the write-side metrics
+ * bucket matches the "which client-visible operation caused
+ * this RPC" attribution rule that CHUNK_WRITE already uses.
+ */
+const struct rpc_procinfo ffv2_chunk_finalize_procinfo = {
+	.p_proc		= NFSPROC4_COMPOUND,
+	.p_encode	= ffv2_xdr_enc_chunk_finalize,
+	.p_decode	= ffv2_xdr_dec_chunk_finalize,
+	.p_arglen	= FFV2_CHUNK_FINALIZE_ARGS_MAXSZ,
+	.p_replen	= FFV2_CHUNK_FINALIZE_RES_MAXSZ,
+	.p_statidx	= NFSPROC4_CLNT_WRITE,
+	.p_name		= "CHUNK_FINALIZE",
 };

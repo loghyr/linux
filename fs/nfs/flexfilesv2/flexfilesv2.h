@@ -45,9 +45,10 @@
 #define FFV2_CHECKSUM_MAX_LEN		64
 
 /*
- * CHUNK op codes per draft-haynes-nfsv4-flexfiles-v2.  CHUNK_FINALIZE
- * and CHUNK_COMMIT are added by later commits as they are wired.
+ * CHUNK op codes per draft-haynes-nfsv4-flexfiles-v2.
  */
+#define OP_CHUNK_COMMIT			78
+#define OP_CHUNK_FINALIZE		80
 #define OP_CHUNK_READ			83
 #define OP_CHUNK_WRITE			87
 
