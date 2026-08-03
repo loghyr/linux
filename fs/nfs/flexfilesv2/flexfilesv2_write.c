@@ -2178,16 +2178,16 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 		return ffv2_write_fallback_to_mds(hdr);
 
 	/*
-	 * Chunked dispatch is currently limited to exclusive-writer
-	 * layouts.  Draft :2220-2227 requires cwa_guard.check=TRUE on
-	 * every CHUNK_WRITE unless FFV2_FLAGS_ONLY_ONE_WRITER is set;
-	 * the guard plumbing that would let this client send a real
-	 * guard on non-exclusive layouts is not yet in place, so
-	 * decline every layout that permits concurrent writers rather
-	 * than sending a draft-non-conforming cwa_guard.check=FALSE.
+	 * Guard validation is performed by the data server.  The
+	 * CHUNK_WRITE encoder ships cwg_check=TRUE uniformly (captured
+	 * guard when valid, {0,0} sentinel otherwise), which is the
+	 * draft-conforming envelope regardless of writer count; the DS
+	 * decides accept vs NFS4ERR_DELAY from its own guard state.
+	 * Empty-chunk first-writes accept immediately (the DS's CAS
+	 * short-circuits on !prev); non-empty mismatches will be
+	 * retried via RMW-refresh once the classify + retry loop is
+	 * in place.
 	 */
-	if (!ffv2_only_one_writer(lseg))
-		return ffv2_write_fallback_to_mds(hdr);
 
 	{
 		u64 stripe_bytes = (u64)k * mirror->striping_unit_size;
