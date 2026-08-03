@@ -604,11 +604,32 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	 * captured_guard across threads NOT paired by this fetch
 	 * completion would need to revisit this synchronization.
 	 */
+	/*
+	 * Always ship cwg_check=TRUE.  The two shard categories that
+	 * lack a captured guard -- full-stripe / fresh writes to EMPTY
+	 * chunks (data or parity) and parity mirrors before a pre-
+	 * write CHUNK_READ populates their guard slot -- send the
+	 * {0,0} sentinel.
+	 *
+	 * The DS's CAS short-circuits on !prev (empty chunk), so a
+	 * first-write with any guard proceeds without version
+	 * comparison.  A non-empty chunk with a mismatching sentinel
+	 * gets NFS4ERR_DELAY; a follow-up commit classifies that and
+	 * retries with a fresh CHUNK_READ.  draft sec-write_chunk_guard4
+	 * permits this: check=TRUE is the draft-conforming envelope
+	 * regardless of guard contents (the DS decides accept vs delay
+	 * based on prev + guard).
+	 *
+	 * With this uniform-encode in place, the ONLY_ONE_WRITER
+	 * dispatch gate at the top of ffv2_write_pagelist_chunked is
+	 * dropped by a follow-up commit.
+	 */
+	w->wire.args.guard.check = true;
 	if (ctx->captured_guard[mirror_idx].valid) {
-		w->wire.args.guard.check = true;
 		w->wire.args.guard.guard = ctx->captured_guard[mirror_idx].guard;
 	} else {
-		w->wire.args.guard.check = false;
+		w->wire.args.guard.guard.cg_gen_id = 0;
+		w->wire.args.guard.guard.cg_client_id = 0;
 	}
 
 	/* Copy the DS filehandle into the wrapper (bounded, owned). */
