@@ -128,6 +128,7 @@ void nfs_set_pgio_error(struct nfs_pgio_header *hdr, int error, loff_t pos)
 			hdr->error = error;
 	}
 }
+EXPORT_SYMBOL_GPL(nfs_set_pgio_error);
 
 static inline struct nfs_page *nfs_page_alloc(void)
 {

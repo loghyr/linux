@@ -778,6 +778,7 @@ void nfs4_init_sequence(struct nfs_client *clp,
 	res->sr_slot = NULL;
 	res->sr_slot_ops = clp->cl_mvops->sequence_slot_ops;
 }
+EXPORT_SYMBOL_GPL(nfs4_init_sequence);
 
 static void nfs41_release_slot(struct nfs4_slot *slot)
 {
