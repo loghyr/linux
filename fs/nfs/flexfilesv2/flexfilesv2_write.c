@@ -83,8 +83,8 @@ ffv2_write_fallback_to_mds(struct nfs_pgio_header *hdr)
  * ffv2_chunk_write_data (wire args + wire res + SEQUENCE) is passed
  * as rpc_message.rpc_argp so the wire encoder / decoder is unchanged;
  * the wrapper is passed as callback_data so the release-cb can drop
- * ctx / lseg refs.  hdr->ds_clp is dropped by the release-cb reading
- * hdr->ds_clp directly BEFORE the completion chain frees hdr
+ * ctx / lseg refs.  The DS client ref is per shard (w->ds_clp) and
+ * is dropped by the release-cb BEFORE the completion chain frees hdr
  * (matches pnfs_generic_rw_release ordering in fs/nfs/pnfs_nfs.c).
  *
  * The wrapping approach is required because the on-wire data struct
@@ -95,9 +95,15 @@ struct ffv2_chunk_write_dispatch {
 	struct ffv2_stripe_ctx		*ctx;
 	struct pnfs_layout_segment	*lseg;
 	struct nfs_pgio_header		*hdr;
-	/* ds_clp lives on hdr->ds_clp; released via nfs_put_client
-	 * in the release-cb BEFORE the completion chain frees hdr.
+	/*
+	 * Per-shard RPC state.  NOT hdr->task / hdr->ds_clp: a stripe
+	 * dispatches k+m shards to k+m distinct data servers from one
+	 * header, and neither the header's embedded rpc_task nor its
+	 * single ds_clp can be shared across them.  Mirrors the
+	 * CHUNK_READ fetch wrapper, which is already per-shard.
 	 */
+	struct rpc_task			task;
+	struct nfs_client		*ds_clp;
 };
 
 /*
@@ -109,9 +115,8 @@ struct ffv2_chunk_write_dispatch {
 static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
 {
 	struct ffv2_chunk_write_dispatch *w = data;
-	struct nfs_pgio_header *hdr = w->hdr;
 
-	nfs4_setup_sequence(hdr->ds_clp, &w->wire.seq_args,
+	nfs4_setup_sequence(w->ds_clp, &w->wire.seq_args,
 			    &w->wire.res.seq_res,
 			    task);
 }
@@ -272,7 +277,7 @@ fail:
  *   4. REDO-gated pnfs_write_done_resend_to_mds.  Under
  *      NO_IO_THRU_MDS the done-cb never sets RESEND_MDS, so this
  *      call is dead in that case.
- *   5. nfs_put_client(hdr->ds_clp) BEFORE the completion chain --
+ *   5. nfs_put_client(w->ds_clp) BEFORE the completion chain --
  *      matches pnfs_generic_rw_release order in fs/nfs/pnfs_nfs.c.
  *   6. hdr->completion_ops->completion(hdr) -- frees hdr; MUST NOT
  *      reference hdr after this.
@@ -320,7 +325,7 @@ static bool ffv2_chunk_write_release_hand_off_wb(
 	}
 
 	wb->hdr = hdr;
-	wb->ds_clp = hdr->ds_clp;
+	wb->ds_clp = w->ds_clp;
 	wb->lseg = w->lseg;
 	wb->ctx = w->ctx;
 	wb->cred = hdr->cred;
@@ -355,6 +360,16 @@ static void ffv2_chunk_write_release(void *data)
 	struct nfs_pgio_header *hdr = w->hdr;
 	struct ffv2_stripe_ctx *ctx = w->ctx;
 	struct pnfs_layout_segment *lseg = w->lseg;
+
+	/*
+	 * The RPC ran on w->task, so hdr->task.tk_status is untouched
+	 * by it.  Fold this shard's status in before anything below
+	 * reads it; first error wins.  With one shard per header this
+	 * is a plain copy, and it stays correct once a stripe
+	 * dispatches k+m shards into the same header.
+	 */
+	if (hdr->task.tk_status == 0 && w->task.tk_status != 0)
+		hdr->task.tk_status = w->task.tk_status;
 
 	/*
 	 * Copy result fields + credit accounting ONLY on real success.
@@ -410,7 +425,7 @@ static void ffv2_chunk_write_release(void *data)
 	 * once at dispatch; needs exactly one release-cb put
 	 * regardless of MDS-resend firing.
 	 */
-	nfs_put_client(hdr->ds_clp);
+	nfs_put_client(w->ds_clp);
 	hdr->completion_ops->completion(hdr);
 	/* hdr is now freed; do not touch. */
 
@@ -502,26 +517,29 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 		goto out_put_devnode;
 	ds_clnt = ds->ds_clp->cl_rpcclient;
 
-	/* Step 5: ds_clp ref + set hdr->ds_clp.  Dropped by
-	 * release-cb via nfs_put_client(hdr->ds_clp) BEFORE the
-	 * completion chain.  Single ref taken, single ref put.
+	/* Step 5: allocate the wrapper.  It must exist before any
+	 * reference below is taken, because the wrapper is where those
+	 * references are recorded and where the unwind path reads them
+	 * back from.
 	 */
-	refcount_inc(&ds->ds_clp->cl_count);
-	hdr->ds_clp = ds->ds_clp;
-
-	/* Step 6: lseg ref; the release-cb balances it. */
-	pnfs_get_lseg(lseg);
-
-	/* Step 7: no fresh ctx ref -- the caller's ref is INHERITED
-	 * by this dispatch on success.
-	 */
-
-	/* Step 8: allocate wrapper. */
 	w = kzalloc(sizeof(*w), nfs_io_gfp_mask());
 	if (!w)
-		goto out_undo_refs;
+		goto out_put_devnode;
 
-	/* Wrapper is now owned by the release-cb once rpc_run_task
+	/* Step 6: ds_clp ref, held per shard.  Dropped by the
+	 * release-cb via nfs_put_client(w->ds_clp).  Single ref
+	 * taken, single ref put, one pair per shard.
+	 */
+	refcount_inc(&ds->ds_clp->cl_count);
+	w->ds_clp = ds->ds_clp;
+
+	/* Step 7: lseg ref; the release-cb balances it. */
+	pnfs_get_lseg(lseg);
+
+	/* Step 8: no fresh ctx ref -- the caller's ref is INHERITED
+	 * by this dispatch on success.
+	 *
+	 * Wrapper is now owned by the release-cb once rpc_run_task
 	 * succeeds; back-pointers first so the release-cb sees a
 	 * fully populated wrapper.
 	 */
@@ -547,7 +565,7 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 					 w->wire.args.checksum_bytes,
 					 &csum_len);
 	if (rc)
-		goto out_free_wrapper;
+		goto out_undo_refs;
 	w->wire.args.checksum_algo = mirror->checksum_algorithm;
 	w->wire.args.checksum_len  = csum_len;
 
@@ -644,7 +662,7 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	 * CHUNK_READ path calls nfs4_init_sequence for the same
 	 * reason; do the same here.
 	 */
-	nfs4_init_sequence(hdr->ds_clp, &w->wire.seq_args,
+	nfs4_init_sequence(w->ds_clp, &w->wire.seq_args,
 			   &w->wire.res.seq_res,
 			   0, 0);
 
@@ -660,7 +678,7 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 
 	memset(&task_setup, 0, sizeof(task_setup));
 	task_setup.rpc_client   = ds_clnt;
-	task_setup.task         = &hdr->task;
+	task_setup.task         = &w->task;
 	task_setup.rpc_message  = &msg;
 	task_setup.callback_ops = &ffv2_chunk_write_call_ops;
 	task_setup.callback_data = w;
@@ -671,11 +689,11 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	task = rpc_run_task(&task_setup);
 	if (IS_ERR(task)) {
 		/* Defensive: rpc_new_task only allocates when
-		 * task_setup.task is NULL, and we always pass &hdr->task,
+		 * task_setup.task is NULL, and we always pass &w->task,
 		 * so rpc_run_task cannot currently return ERR_PTR.  Kept
 		 * against upstream shape drift.
 		 */
-		goto out_free_wrapper;
+		goto out_undo_refs;
 	}
 	rpc_put_task(task);
 
@@ -683,15 +701,13 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	nfs4_put_deviceid_node(devnode);
 	return PNFS_ATTEMPTED;
 
-out_free_wrapper:
-	kfree(w);
 out_undo_refs:
 	/* Undo in reverse of steps 5-8.  ctx ref NOT dropped here:
 	 * the caller retains ownership on dispatch failure.
 	 */
 	pnfs_put_lseg(lseg);
-	nfs_put_client(hdr->ds_clp);
-	hdr->ds_clp = NULL;
+	nfs_put_client(w->ds_clp);
+	kfree(w);
 out_put_devnode:
 	nfs4_put_deviceid_node(devnode);
 	return ffv2_write_fallback_to_mds(hdr);
