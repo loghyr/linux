@@ -64,6 +64,12 @@ struct ffv2_chunk_finalize_dispatch {
 	struct ffv2_chunk_finalize_data	wire;
 	struct ffv2_chunk_lifecycle_ctx	ctx;
 	/*
+	 * Own the rpc_task rather than letting rpc_new_task allocate
+	 * one.  See ffv2_chunk_finalize_dispatch_one_mirror for why
+	 * that allocation cannot be allowed to fail here.
+	 */
+	struct rpc_task			task;
+	/*
 	 * Snapshot of task->tk_status captured at the tail of
 	 * call_done, so release-cb can propagate the exact errno
 	 * (transport failure, per-chunk NFS4ERR_*, etc.) without
@@ -235,6 +241,18 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 	msg.rpc_resp = &d->wire.res;
 	task_setup.rpc_client = ctx->ds_clp->cl_rpcclient;
 	task_setup.callback_data = d;
+	/*
+	 * Supplying the task is what makes the IS_ERR arm below safe.
+	 * With task_setup.task NULL, rpc_new_task() allocates one, and
+	 * on allocation failure it runs rpc_release_calldata() -- our
+	 * release callback -- before returning ERR_PTR.  The callback
+	 * would then report success to the caller (rpc_status is still
+	 * the kzalloc'd 0, because call_done never ran) with a zeroed
+	 * writeverf, and free the wrapper that the arm below frees
+	 * again.  An embedded task cannot fail to allocate, so the arm
+	 * stays genuinely dead.
+	 */
+	task_setup.task = &d->task;
 
 	task = rpc_run_task(&task_setup);
 	if (IS_ERR(task)) {
@@ -262,6 +280,7 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 struct ffv2_chunk_commit_dispatch {
 	struct ffv2_chunk_commit_data	wire;
 	struct ffv2_chunk_lifecycle_ctx	ctx;
+	struct rpc_task			task;		/* see FINALIZE wrapper */
 	int				rpc_status;	/* see FINALIZE wrapper */
 };
 
@@ -367,6 +386,8 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 	msg.rpc_resp = &d->wire.res;
 	task_setup.rpc_client = ctx->ds_clp->cl_rpcclient;
 	task_setup.callback_data = d;
+	/* Embedded task, for the reason given in the FINALIZE dispatch. */
+	task_setup.task = &d->task;
 
 	task = rpc_run_task(&task_setup);
 	if (IS_ERR(task)) {
@@ -380,6 +401,7 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 struct ffv2_chunk_rollback_dispatch {
 	struct ffv2_chunk_rollback_data	wire;
 	struct ffv2_chunk_lifecycle_ctx	ctx;
+	struct rpc_task			task;
 	int				rpc_status;
 };
 
@@ -473,6 +495,7 @@ ffv2_chunk_rollback_dispatch_one_mirror(struct ffv2_chunk_lifecycle_ctx *ctx,
 	msg.rpc_resp = &d->wire.res;
 	task_setup.rpc_client = ctx->ds_clp->cl_rpcclient;
 	task_setup.callback_data = d;
+	task_setup.task = &d->task;
 	task = rpc_run_task(&task_setup);
 	if (IS_ERR(task)) {
 		kfree(d);
