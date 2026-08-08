@@ -73,38 +73,150 @@ ffv2_write_fallback_to_mds(struct nfs_pgio_header *hdr)
 /* --- CHUNK_WRITE private dispatch --------------------------------
  *
  * Wrapper struct + private rpc_call_ops + extracted per-mirror
- * dispatch helper. The caller remains on the safe fallback path
- * until the FINALIZE + COMMIT tail is present.
+ * dispatch helper.
  */
 
 /*
- * Composite wrapper carrying the CHUNK_WRITE wire composite plus
- * back-pointers the private release-cb needs.  The inner
+ * One shard of a stripe write: the CHUNK_WRITE wire composite plus
+ * the RPC state and the back-pointer its callbacks need.  The inner
  * ffv2_chunk_write_data (wire args + wire res + SEQUENCE) is passed
  * as rpc_message.rpc_argp so the wire encoder / decoder is unchanged;
- * the wrapper is passed as callback_data so the release-cb can drop
- * ctx / lseg refs.  The DS client ref is per shard (w->ds_clp) and
- * is dropped by the release-cb BEFORE the completion chain frees hdr
- * (matches pnfs_generic_rw_release ordering in fs/nfs/pnfs_nfs.c).
- *
- * The wrapping approach is required because the on-wire data struct
- * (in flexfilesv2_xdr_chunk.h) has no back-pointer fields.
+ * this struct is passed as callback_data.  The wrapping is required
+ * because the on-wire data struct (in flexfilesv2_xdr_chunk.h) has no
+ * back-pointer fields.
  */
+struct ffv2_stripe_write;
+
 struct ffv2_chunk_write_dispatch {
 	struct ffv2_chunk_write_data	wire;
-	struct ffv2_stripe_ctx		*ctx;
-	struct pnfs_layout_segment	*lseg;
-	struct nfs_pgio_header		*hdr;
+	struct ffv2_stripe_write	*sw;	/* parent; never NULL */
 	/*
 	 * Per-shard RPC state.  NOT hdr->task / hdr->ds_clp: a stripe
 	 * dispatches k+m shards to k+m distinct data servers from one
 	 * header, and neither the header's embedded rpc_task nor its
 	 * single ds_clp can be shared across them.  Mirrors the
 	 * CHUNK_READ fetch wrapper, which is already per-shard.
+	 *
+	 * ds_clp holds a reference owned by the parent and released
+	 * when the parent is freed.
 	 */
 	struct rpc_task			task;
 	struct nfs_client		*ds_clp;
+	bool				landed;
 };
+
+/*
+ * One per pgio header: the stripe write, and the owner of everything
+ * the shards share.  The shards are embedded, so a shard callback can
+ * always reach the parent, and the parent cannot be freed while any
+ * callback can still name it.
+ *
+ * Completion runs in two phases, because a CHUNK_FINALIZE and a
+ * CHUNK_COMMIT each address exactly one chunk on one data server:
+ *
+ *      k+m CHUNK_WRITEs
+ *        -> writes_pending reaches 0
+ *        -> on success, fan out k+m FINALIZE -> COMMIT chains
+ *        -> chains_pending reaches 0
+ *        -> stamp the header and complete it
+ *
+ * Letting each shard trigger the existing chain instead would
+ * finalize one chunk and leave the rest PENDING for the server to
+ * reclaim, which is silent data loss.  A failure anywhere in phase
+ * one skips phase two entirely: the stripe is not durable, so
+ * finalizing any part of it is wrong.
+ *
+ * References.  Every reference is taken by, and released by, a named
+ * party; the last one out frees the struct along with the ctx, lseg
+ * and per-shard data server references it owns:
+ *
+ *   take                              drop
+ *   ----                              ----
+ *   allocation, held by the           the dispatching thread, before
+ *   dispatching thread                it returns
+ *   each launched shard               that shard's rpc_release
+ *   each launched writeback chain     that chain's terminal callback
+ *
+ * Neither completion tail releases anything.  The table above is the
+ * whole story, and a tail that also dropped would double-drop
+ * against it as soon as a tail can run on a thread that still holds
+ * a reference of its own -- which is every tail, since a tail only
+ * ever runs from inside a callback that is holding one.
+ *
+ * At this commit the mirror machinery still hands the layout driver
+ * one shard per header, so nr_shards is 1 and both barriers fire on
+ * the single shard.  The flip to k+m shards per header changes the
+ * initializers and the dispatch loop, not this shape.
+ */
+struct ffv2_stripe_write {
+	struct nfs_pgio_header		*hdr;	/* borrowed */
+	struct pnfs_layout_segment	*lseg;	/* referenced */
+	struct ffv2_stripe_ctx		*ctx;	/* referenced */
+
+	refcount_t			sw_ref;
+	atomic_t			writes_pending;
+	atomic_t			chains_pending;
+	int				status;	/* first error wins */
+
+	u32				nr_shards;
+	struct ffv2_chunk_write_dispatch disp[];
+};
+
+static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw);
+
+/*
+ * Record a shard's or a chain's failure.  First error wins: a later
+ * failure tells us nothing the first one did not, and the first is
+ * the one with a plausible causal story.
+ */
+static void ffv2_stripe_write_set_status(struct ffv2_stripe_write *sw,
+					 int status)
+{
+	if (status)
+		cmpxchg(&sw->status, 0, status);
+}
+
+static void ffv2_stripe_write_free(struct ffv2_stripe_write *sw)
+{
+	u32 i;
+
+	for (i = 0; i < sw->nr_shards; i++)
+		if (sw->disp[i].ds_clp)
+			nfs_put_client(sw->disp[i].ds_clp);
+
+	/*
+	 * ctx before lseg: ctx->fls back-references the lseg.  ctx is
+	 * NULL when the dispatch failed before it took ownership, in
+	 * which case the caller still holds that reference.
+	 */
+	if (sw->ctx)
+		ffv2_stripe_ctx_put(sw->ctx);
+	pnfs_put_lseg(sw->lseg);
+	kfree(sw);
+}
+
+static void ffv2_stripe_write_put(struct ffv2_stripe_write *sw)
+{
+	if (refcount_dec_and_test(&sw->sw_ref))
+		ffv2_stripe_write_free(sw);
+}
+
+/*
+ * Retire n writeback chains that were never launched, by counting
+ * them as completed.  Without this the phase-two barrier never
+ * reaches zero, the header is never completed, and the write hangs
+ * for the life of the mount.
+ *
+ * atomic_sub_and_test rather than a loop of atomic_dec_and_test: the
+ * chains already in flight may drain concurrently, so a loop could
+ * carry the counter past zero and leave it negative.
+ */
+static void ffv2_stripe_write_chains_retire(struct ffv2_stripe_write *sw,
+					    u32 n)
+{
+	if (n && atomic_sub_and_test(n, &sw->chains_pending))
+		ffv2_stripe_write_complete(sw);
+}
 
 /*
  * .rpc_call_prepare: allocate a session slot.  nfs4_setup_sequence
@@ -154,17 +266,16 @@ static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
  *   - Set NFS_IOHDR_RESEND_MDS ONLY when the layout permits MDS
  *     proxy, and return: the resend owns the outcome from there.
  *   - With FFV2_FLAGS_NO_IO_THRU_MDS set the draft (:2198-2203)
- *     forbids the resend, so the header terminates here.  Normalize
- *     an unmapped NFS4ERR_* status to an errno, then record the
- *     failure with nfs_set_pgio_error so the generic write
- *     completion sees it -- tk_status alone is not enough.  The
- *     release-cb's guarded pnfs_write_done_resend_to_mds never
- *     fires on this path.
+ *     forbids the resend, so the write terminates here.  Normalize
+ *     an unmapped NFS4ERR_* status to an errno so the completion
+ *     tail has something it can report to userspace.  The tail's
+ *     guarded pnfs_write_done_resend_to_mds never fires on this
+ *     path.
  */
 static void ffv2_chunk_write_call_done(struct rpc_task *task, void *data)
 {
 	struct ffv2_chunk_write_dispatch *w = data;
-	struct nfs_pgio_header *hdr = w->hdr;
+	struct nfs_pgio_header *hdr = w->sw->hdr;
 	struct ffv2_chunk_write_res *res = &w->wire.res;
 
 	/*
@@ -206,6 +317,7 @@ static void ffv2_chunk_write_call_done(struct rpc_task *task, void *data)
 				: -EPROTO;	/* impossible for 1-chunk op */
 			goto fail;
 		}
+		w->landed = true;
 		/* Happy path: retained res fields (block_activated[0],
 		 * owners[0], writeverf) will be consumed by the patch-5
 		 * FINALIZE tail.  The temporary early-return path does not
@@ -237,201 +349,248 @@ fail:
 		task->tk_status = -EIO;
 
 	/*
-	 * Propagate into the header.  tk_status alone is not read by
-	 * nfs_write_completion(): it tests NFS_IOHDR_ERROR, hdr->error
-	 * and hdr->good_bytes, all of which only nfs_set_pgio_error()
-	 * sets.  Without this call the failed write takes the success
-	 * branch -- pages queued for COMMIT against an unpopulated
-	 * writeverf, which mismatches and redirties them, and for
-	 * O_DIRECT the bytes are reported to userspace as written.
-	 * Same reasoning and same call as the FINALIZE / COMMIT tail in
-	 * ffv2_chunk_wb_complete_hdr().
+	 * Reporting the failure on the header is the completion tail's
+	 * job, not this callback's: the header covers the whole stripe
+	 * and only the tail knows whether any shard failed.  The
+	 * release callback folds this status into the stripe write, and
+	 * the tail turns it into nfs_set_pgio_error() -- which is what
+	 * nfs_write_completion() actually reads, tk_status alone being
+	 * ignored on this path.
 	 */
-	nfs_set_pgio_error(hdr, task->tk_status, hdr->args.offset);
 }
 
 /*
- * .rpc_release: hoist hdr-derived pointers to locals BEFORE the
- * completion chain frees hdr.  Sequence:
+ * Start one shard's FINALIZE -> COMMIT chain (see
+ * flexfilesv2_lifecycle.c).  The wb_ctx borrows hdr / ds_clp / lseg
+ * from the stripe write and pins it with a reference that the
+ * chain's terminal callback drops; it owns none of them itself.
  *
- *   1. Save locals (hdr, ctx, lseg -- ds_clp accessed via hdr one
- *      final time before completion).
- *   2. On success, copy wire.res fields into hdr BEFORE the
- *      completion chain fires.  Without this, nfs_writehdr_alloc's
- *      zero-init leaves hdr->verf.committed == NFS_UNSTABLE, so
- *      nfs_write_completion marks every request for commit with a
- *      zero verifier.  Guarded on !RESEND_MDS:
- *      pnfs_write_done_resend_to_mds re-encodes with fresh state and
- *      overwrites whatever's here.  The guard alone does not protect
- *      the failure path: skipping the copy still leaves committed ==
- *      NFS_UNSTABLE, which still selects that commit branch.  What
- *      keeps a failed write out of it is the nfs_set_pgio_error in
- *      ffv2_chunk_write_call_done's failure tail.
- *   3. On success, credit NFSIOS_SERVERWRITTENBYTES with the shard
- *      bytes accepted at this DS.  The normal write-done chain does
- *      this via nfs_writeback_done; the private path bypasses that
- *      chain, so mountstats would otherwise under-report every
- *      successful CHUNK_WRITE.  Counts shard bytes because
- *      res->count is what the DS accepted -- the (k+m)-mirror
- *      aggregation is the caller's concern.
- *   4. REDO-gated pnfs_write_done_resend_to_mds.  Under
- *      NO_IO_THRU_MDS the done-cb never sets RESEND_MDS, so this
- *      call is dead in that case.
- *   5. nfs_put_client(w->ds_clp) BEFORE the completion chain --
- *      matches pnfs_generic_rw_release order in fs/nfs/pnfs_nfs.c.
- *   6. hdr->completion_ops->completion(hdr) -- frees hdr; MUST NOT
- *      reference hdr after this.
- *   7. ffv2_stripe_ctx_put(ctx) then pnfs_put_lseg(lseg) --
- *      ctx-before-lseg because ctx->fls back-references lseg.
- *   8. kfree(wrapper) -- LAST.
+ * Returns 0 once the chain is running, or an errno if it never
+ * started, in which case the wb_ctx has already been freed.
  */
-/*
- * On success, transfer ownership of hdr / ds_clp / lseg / ctx
- * from the dispatch wrapper `w` to a fresh ffv2_chunk_wb_ctx
- * and start the FINALIZE -> COMMIT chain (see
- * flexfilesv2_lifecycle.c).  wb_start's completion path owns
- * the final hdr completion + ds_clp put + lseg / ctx release.
- *
- * Returns true on successful hand-off (caller MUST skip the
- * standard cleanup path).  Returns false on any failure to
- * hand off (kzalloc / dispatch); the caller falls through to
- * the standard release path with the wb_ctx already freed.
- */
-static bool ffv2_chunk_write_release_hand_off_wb(
-	struct ffv2_chunk_write_dispatch *w)
+static int ffv2_chunk_write_hand_off_wb(struct ffv2_chunk_write_dispatch *w)
 {
-	struct nfs_pgio_header *hdr = w->hdr;
+	struct ffv2_stripe_write *sw = w->sw;
 	struct ffv2_chunk_wb_ctx *wb;
 	int rc;
 
 	wb = kzalloc_obj(*wb, GFP_NOFS);
-	if (!wb) {
-		/*
-		 * Hand-off failure at the alloc step must NOT let the
-		 * write complete as "n bytes durable" -- the wire write
-		 * succeeded but FINALIZE never ran, so the DS chunk is
-		 * orphaned and would be GC'd, producing silent data loss
-		 * on a subsequent read of the same offset.  Surface the
-		 * failure via nfs_set_pgio_error (which
-		 * nfs_write_completion actually consumes -- tk_status
-		 * alone is ignored on the private CHUNK path because we
-		 * bypass pnfs_ld_write_done) AND mark the lseg for
-		 * return so the layout refreshes on retry.
-		 */
-		nfs_set_pgio_error(hdr, -ENOMEM, hdr->args.offset);
-		hdr->task.tk_status = -ENOMEM;
-		pnfs_error_mark_layout_for_return(hdr->inode, w->lseg);
-		return false;
-	}
+	if (!wb)
+		return -ENOMEM;
 
-	wb->hdr = hdr;
+	wb->sw = sw;
+	wb->hdr = sw->hdr;
 	wb->ds_clp = w->ds_clp;
-	wb->lseg = w->lseg;
-	wb->ctx = w->ctx;
-	wb->cred = hdr->cred;
+	wb->lseg = sw->lseg;
+	wb->cred = sw->hdr->cred;
 	wb->fh = w->wire.fh;
 	wb->stateid = w->wire.args.stateid;
 	wb->offset = w->wire.args.offset;
 	wb->count = 1;
 	wb->owner = w->wire.res.owners[0];
 
+	/*
+	 * Taken before the chain can run, dropped by its terminal
+	 * callback.  The caller still holds a reference of its own, so
+	 * the undo below cannot be the last one.
+	 */
+	refcount_inc(&sw->sw_ref);
+
 	rc = ffv2_chunk_wb_start(wb);
 	if (rc) {
-		/* wb_start does NOT take ownership on failure; free the
-		 * wb_ctx and let the caller fall through to its standard
-		 * cleanup path.  Same rationale as the kzalloc-fail arm
-		 * above -- surface the failure to userspace via
-		 * nfs_set_pgio_error (nfs_write_completion consumes
-		 * NFS_IOHDR_ERROR / hdr->error, NOT the tk_status write)
-		 * AND mark the lseg for return.
-		 */
+		/* wb_start takes ownership only on success. */
+		refcount_dec(&sw->sw_ref);
 		kfree(wb);
-		nfs_set_pgio_error(hdr, rc, hdr->args.offset);
-		hdr->task.tk_status = rc;
-		pnfs_error_mark_layout_for_return(hdr->inode, w->lseg);
-		return false;
+		return rc;
 	}
-	return true;
+	return 0;
 }
 
-static void ffv2_chunk_write_release(void *data)
+static void ffv2_chunk_write_rollback_done(void *arg, int status,
+					   const nfs4_verifier *writeverf)
 {
-	struct ffv2_chunk_write_dispatch *w = data;
-	struct nfs_pgio_header *hdr = w->hdr;
-	struct ffv2_stripe_ctx *ctx = w->ctx;
-	struct pnfs_layout_segment *lseg = w->lseg;
+	struct ffv2_stripe_write *sw = arg;
 
-	/*
-	 * The RPC ran on w->task, so hdr->task.tk_status is untouched
-	 * by it.  Fold this shard's status in before anything below
-	 * reads it; first error wins.  With one shard per header this
-	 * is a plain copy, and it stays correct once a stripe
-	 * dispatches k+m shards into the same header.
-	 */
-	if (hdr->task.tk_status == 0 && w->task.tk_status != 0)
-		hdr->task.tk_status = w->task.tk_status;
+	if (status)
+		clear_bit(NFS_IOHDR_RESEND_MDS, &sw->hdr->flags);
+	ffv2_stripe_write_chain_done(sw, status);
+}
 
-	/*
-	 * Copy result fields + credit accounting ONLY on real success.
-	 * The tk_status guard is required because the "layout permits
-	 * MDS proxy" path correctly skips setting RESEND_MDS under
-	 * FFV2_FLAGS_NO_IO_THRU_MDS on failure -- but !RESEND_MDS alone
-	 * then also selects the NO_IO_THRU_MDS failure path.  Copying
-	 * unpopulated wire fields there would write a zero writeverf +
-	 * NFS_UNSTABLE committed into hdr, triggering
-	 * nfs_write_completion's commit loop against a zero verifier.
-	 *
-	 * Skipping the copy is necessary but not sufficient: an
-	 * untouched hdr->verf.committed is also NFS_UNSTABLE, so the
-	 * same commit branch is selected either way.  The failure tail
-	 * in ffv2_chunk_write_call_done calls nfs_set_pgio_error, which
-	 * is what actually diverts a failed write to the error branch.
-	 */
-	if (!test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
-	    hdr->task.tk_status == 0) {
-		hdr->res.count = w->wire.args.payload_len;
-		memcpy(&hdr->verf.verifier, &w->wire.res.writeverf,
-		       sizeof(hdr->verf.verifier));
-		hdr->verf.committed = w->wire.res.committed;
-		nfs_add_stats(hdr->inode, NFSIOS_SERVERWRITTENBYTES,
-			      hdr->res.count);
+static void ffv2_stripe_write_rollback(struct ffv2_stripe_write *sw)
+{
+	u32 i;
+
+	for (i = 0; i < sw->nr_shards; i++) {
+		struct ffv2_chunk_write_dispatch *w = &sw->disp[i];
+		struct ffv2_chunk_lifecycle_ctx ctx = {
+			.ds_clp = w->ds_clp,
+			.lseg = sw->lseg,
+			.complete_arg = sw,
+			.complete = ffv2_chunk_write_rollback_done,
+		};
+		int rc;
+
+		if (!w->landed) {
+			ffv2_stripe_write_chains_retire(sw, 1);
+			continue;
+		}
+		refcount_inc(&sw->sw_ref);
+		rc = ffv2_chunk_rollback_dispatch_one_mirror(&ctx, sw->hdr->cred,
+			&w->wire.fh, &w->wire.args.stateid,
+			w->wire.args.offset, 1, &w->wire.res.owners[0], 1);
+		if (rc) {
+			clear_bit(NFS_IOHDR_RESEND_MDS, &sw->hdr->flags);
+			ffv2_stripe_write_chain_done(sw, rc);
+		}
 	}
+}
 
-	if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
-	    !test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags))
-		hdr->task.tk_status = pnfs_write_done_resend_to_mds(hdr);
+/*
+ * Phase-one barrier tail: every CHUNK_WRITE has completed.  On
+ * success, fan out one FINALIZE -> COMMIT chain per shard; the
+ * phase-two tail runs when the last of them completes.
+ *
+ * Runs from the last shard's rpc_release, which still holds that
+ * shard's reference for the duration.  A dispatch that launches no
+ * shard at all never gets here: it leaves the header untouched for
+ * ffv2_write_fallback_to_mds(), and writes_pending stays where it
+ * started.
+ */
+static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
+{
+	u32 i;
 
 	/*
-	 * Try to transfer to the FINALIZE -> COMMIT chain on real
-	 * success (not RESEND_MDS, not tk_status != 0). When the
-	 * RESEND_MDS path fires, or on hand-off failure (kzalloc /
-	 * dispatch), fall through to the standard cleanup path below.
+	 * A failed stripe is not durable, so finalizing any shard of it
+	 * is wrong.  Roll back every shard that accepted its CHUNK_WRITE
+	 * before completing the header or resending through the MDS.
 	 */
-	if (!test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
-	    hdr->task.tk_status == 0 &&
-	    ffv2_chunk_write_release_hand_off_wb(w)) {
-		/* Ownership transferred; the wb-chain's terminal
-		 * callback owns nfs_put_client / hdr completion /
-		 * lseg + ctx release.  Just free the dispatch
-		 * wrapper here.
-		 */
-		kfree(w);
+	if (sw->status ||
+	    test_bit(NFS_IOHDR_RESEND_MDS, &sw->hdr->flags)) {
+		ffv2_stripe_write_rollback(sw);
 		return;
 	}
 
-	/* Put ds_clp BEFORE the completion chain frees hdr.
-	 * pnfs_generic_rw_release at pnfs_nfs.c:24-30 has the same
-	 * order.  Unconditional: original hdr's ds_clp ref was taken
-	 * once at dispatch; needs exactly one release-cb put
-	 * regardless of MDS-resend firing.
-	 */
-	nfs_put_client(w->ds_clp);
+	for (i = 0; i < sw->nr_shards; i++) {
+		int rc = ffv2_chunk_write_hand_off_wb(&sw->disp[i]);
+
+		if (rc) {
+			/*
+			 * The wire write landed but this chunk will never
+			 * be finalized, so the server will reclaim it: the
+			 * write must not report "n bytes durable" or a
+			 * later read of the same offset returns a hole.
+			 * Mark the layout for return so a retry gets fresh
+			 * state, then count the chains that never launched
+			 * as completed -- otherwise the phase-two barrier
+			 * never fires and the header never completes.
+			 */
+			ffv2_stripe_write_set_status(sw, rc);
+			pnfs_error_mark_layout_for_return(sw->hdr->inode,
+							  sw->lseg);
+			ffv2_stripe_write_chains_retire(sw,
+							sw->nr_shards - i);
+			return;
+		}
+	}
+}
+
+/*
+ * Phase-two barrier tail: the stripe is finished, one way or the
+ * other.  The only place the header is stamped and completed.
+ *
+ * Releases nothing: every reference belongs to the party that took
+ * it, and this tail can run on a thread that still holds one.
+ */
+static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw)
+{
+	struct nfs_pgio_header *hdr = sw->hdr;
+
+	if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
+	    !test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags)) {
+		hdr->task.tk_status = pnfs_write_done_resend_to_mds(hdr);
+	} else if (sw->status) {
+		/*
+		 * nfs_write_completion() reads NFS_IOHDR_ERROR,
+		 * hdr->error and hdr->good_bytes, none of which
+		 * tk_status sets -- and this path bypasses
+		 * pnfs_ld_write_done(), so nothing else will set them
+		 * either.  Without this call a failed write takes the
+		 * success branch: pages queued for COMMIT against an
+		 * unpopulated writeverf, and for O_DIRECT the bytes
+		 * reported to userspace as written.
+		 */
+		nfs_set_pgio_error(hdr, sw->status, hdr->args.offset);
+		if (hdr->task.tk_status == 0)
+			hdr->task.tk_status = sw->status;
+	} else {
+		/*
+		 * Stamping FILE_SYNC is not bookkeeping.  A header left
+		 * at NFS_UNSTABLE takes nfs_write_completion()'s
+		 * need-commit branch, and pnfs_mark_request_commit()
+		 * dereferences cinfo->ds -- which is NULL here, because
+		 * flexfiles v2 registers no pNFS commit operations and
+		 * ffv2_get_ds_info() returns NULL.  The chain has
+		 * already confirmed durability at every data server, so
+		 * FILE_SYNC is also the truth.
+		 *
+		 * res.count is the shard payload while one shard covers
+		 * the header; aggregating it over a full stripe comes
+		 * with the k+m dispatch.
+		 */
+		hdr->res.count = sw->disp[0].wire.args.payload_len;
+		hdr->verf.committed = NFS_FILE_SYNC;
+		memcpy(&hdr->verf.verifier, &sw->disp[0].wire.res.writeverf,
+		       sizeof(hdr->verf.verifier));
+	}
+
 	hdr->completion_ops->completion(hdr);
 	/* hdr is now freed; do not touch. */
+}
 
-	ffv2_stripe_ctx_put(ctx);
-	pnfs_put_lseg(lseg);
-	kfree(w);
+/*
+ * Terminal callback of one shard's FINALIZE -> COMMIT chain, called
+ * from flexfilesv2_lifecycle.c.
+ */
+void ffv2_stripe_write_chain_done(struct ffv2_stripe_write *sw, int status)
+{
+	ffv2_stripe_write_set_status(sw, status);
+	ffv2_stripe_write_chains_retire(sw, 1);
+	ffv2_stripe_write_put(sw);
+}
+
+/*
+ * .rpc_release: fold this shard's outcome into the stripe write and
+ * drop the shard's reference.  Nothing here touches the header
+ * beyond the per-shard byte credit -- the header belongs to the
+ * completion tails, which run once for the whole stripe.
+ */
+static void ffv2_chunk_write_release(void *data)
+{
+	struct ffv2_chunk_write_dispatch *w = data;
+	struct ffv2_stripe_write *sw = w->sw;
+
+	/*
+	 * The RPC ran on w->task, not on hdr->task, so this is the only
+	 * place this shard's status is visible.
+	 */
+	ffv2_stripe_write_set_status(sw, w->task.tk_status);
+
+	/*
+	 * Credit the bytes this data server accepted.  The normal
+	 * write-done chain does this via nfs_writeback_done; the
+	 * private CHUNK path bypasses that chain, so mountstats would
+	 * otherwise under-report every successful CHUNK_WRITE.  Per
+	 * shard, because that is what each server actually wrote.
+	 */
+	if (w->task.tk_status == 0)
+		nfs_add_stats(sw->hdr->inode, NFSIOS_SERVERWRITTENBYTES,
+			      w->wire.args.payload_len);
+
+	if (atomic_dec_and_test(&sw->writes_pending))
+		ffv2_stripe_write_phase1(sw);
+
+	ffv2_stripe_write_put(sw);
 }
 
 static const struct rpc_call_ops ffv2_chunk_write_call_ops = {
@@ -441,12 +600,11 @@ static const struct rpc_call_ops ffv2_chunk_write_call_ops = {
 };
 
 /*
- * Extracted per-mirror dispatch helper. The write path calls it once
- * the FINALIZE + COMMIT tail is available.
+ * Extracted per-mirror dispatch helper.
  *
  * Preconditions: caller has already established `ctx` for
  * `mirror_idx` -- the ctx ref belongs to the caller and is
- * INHERITED by the wrapper on success.  On failure the caller
+ * INHERITED by the stripe write on success.  On failure the caller
  * retains ownership per the dispatch-failure pattern in
  * ffv2_write_pagelist_chunked.
  */
@@ -466,7 +624,8 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	struct nfs4_pnfs_ds *ds;
 	struct nfs_server *mds_srv = NFS_SERVER(hdr->inode);
 	struct rpc_clnt *ds_clnt;
-	struct ffv2_chunk_write_dispatch *w = NULL;
+	struct ffv2_stripe_write *sw = NULL;
+	struct ffv2_chunk_write_dispatch *w;
 	struct rpc_message msg;
 	struct rpc_task_setup task_setup;
 	struct rpc_task *task;
@@ -517,35 +676,38 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 		goto out_put_devnode;
 	ds_clnt = ds->ds_clp->cl_rpcclient;
 
-	/* Step 5: allocate the wrapper.  It must exist before any
-	 * reference below is taken, because the wrapper is where those
-	 * references are recorded and where the unwind path reads them
-	 * back from.
+	/* Step 5: allocate the stripe write and its shards.  It must
+	 * exist before any reference below is taken, because it is
+	 * where those references are recorded and where the unwind path
+	 * reads them back from.  One shard for now.
 	 */
-	w = kzalloc(sizeof(*w), nfs_io_gfp_mask());
-	if (!w)
+	sw = kzalloc(struct_size(sw, disp, 1), nfs_io_gfp_mask());
+	if (!sw)
 		goto out_put_devnode;
+	sw->nr_shards = 1;
+	sw->hdr = hdr;
+	sw->lseg = lseg;
+	refcount_set(&sw->sw_ref, 1);	/* this thread's, dropped below */
+	atomic_set(&sw->writes_pending, sw->nr_shards);
+	atomic_set(&sw->chains_pending, sw->nr_shards);
 
-	/* Step 6: ds_clp ref, held per shard.  Dropped by the
-	 * release-cb via nfs_put_client(w->ds_clp).  Single ref
-	 * taken, single ref put, one pair per shard.
+	w = &sw->disp[0];
+	w->sw = sw;
+
+	/* Step 6: ds_clp ref, one per shard, released when the stripe
+	 * write is freed.
 	 */
 	refcount_inc(&ds->ds_clp->cl_count);
 	w->ds_clp = ds->ds_clp;
 
-	/* Step 7: lseg ref; the release-cb balances it. */
+	/* Step 7: lseg ref, balanced by the stripe write's free. */
 	pnfs_get_lseg(lseg);
 
 	/* Step 8: no fresh ctx ref -- the caller's ref is INHERITED
-	 * by this dispatch on success.
-	 *
-	 * Wrapper is now owned by the release-cb once rpc_run_task
-	 * succeeds; back-pointers first so the release-cb sees a
-	 * fully populated wrapper.
+	 * here, and only once the dispatch is committed to succeeding.
+	 * Until then sw->ctx stays NULL so the unwind path below leaves
+	 * the caller's reference alone.
 	 */
-	w->ctx  = ctx;
-	w->lseg = lseg;
-	w->hdr  = hdr;
 
 	/* Step 9: shard-page payload. */
 	w->wire.args.pages       = ctx->shard_pages[mirror_idx];
@@ -686,6 +848,15 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	task_setup.flags        = RPC_TASK_ASYNC | RPC_TASK_SOFTCONN |
 				  RPC_TASK_SOFT;
 
+	/*
+	 * The shard's own reference, and the point at which the ctx
+	 * reference is inherited.  Both have to be in place before the
+	 * RPC can run, because the release callback may fire the moment
+	 * rpc_run_task hands the task to the workqueue.
+	 */
+	refcount_inc(&sw->sw_ref);
+	sw->ctx = ctx;
+
 	task = rpc_run_task(&task_setup);
 	if (IS_ERR(task)) {
 		/* Defensive: rpc_new_task only allocates when
@@ -693,21 +864,25 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 		 * so rpc_run_task cannot currently return ERR_PTR.  Kept
 		 * against upstream shape drift.
 		 */
+		sw->ctx = NULL;
+		refcount_dec(&sw->sw_ref);
 		goto out_undo_refs;
 	}
 	rpc_put_task(task);
 
 	/* Devnode ref was synchronous; drop before returning. */
 	nfs4_put_deviceid_node(devnode);
+	ffv2_stripe_write_put(sw);	/* this thread's reference */
 	return PNFS_ATTEMPTED;
 
 out_undo_refs:
-	/* Undo in reverse of steps 5-8.  ctx ref NOT dropped here:
-	 * the caller retains ownership on dispatch failure.
+	/*
+	 * No shard was launched, so no completion tail runs and the
+	 * header is left to the caller's fallback path.  sw->ctx is
+	 * NULL, so the caller keeps its ctx reference; everything else
+	 * taken above is released with the struct.
 	 */
-	pnfs_put_lseg(lseg);
-	nfs_put_client(w->ds_clp);
-	kfree(w);
+	ffv2_stripe_write_put(sw);
 out_put_devnode:
 	nfs4_put_deviceid_node(devnode);
 	return ffv2_write_fallback_to_mds(hdr);
@@ -1541,8 +1716,7 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
  * (or sticky FAILED before unlock on any error).  Siblings block on
  * mutex_lock(encode_lock) naturally.
  *
- * Production reachability remains on the safe fallback path until
- * the FINALIZE / COMMIT correctness tail is available.
+ * The FINALIZE / COMMIT correctness tail is active for this path.
  */
 static int ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
 		      struct nfs_pgio_header *tmpl,
@@ -2181,9 +2355,22 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	u32 m = mirror->protection_parity;
 	u32 mirror_idx = hdr->pgio_mirror_idx;
 
+	/*
+	 * No encoder for this layout's encoding family.  Route through
+	 * the fallback helper rather than returning PNFS_NOT_ATTEMPTED
+	 * directly: pnfs_do_write turns a bare PNFS_NOT_ATTEMPTED into
+	 * pnfs_write_through_mds(), and when the layout carries
+	 * FFV2_FLAGS_NO_IO_THRU_MDS the client MUST NOT proxy I/O
+	 * through the metadata server.  The helper honours that flag,
+	 * marking the layout for return and asking for a fresh one
+	 * instead.
+	 *
+	 * Reachable today for MIRRORED and MOJETTE_NON_SYSTEMATIC,
+	 * neither of which this client has an encoder for.
+	 */
 	enc = ffv2_find_encoder(mirror->coding_type);
 	if (!enc || !enc->encode)
-		return PNFS_NOT_ATTEMPTED;
+		return ffv2_write_fallback_to_mds(hdr);
 
 	/*
 	 * Chunked DS-direct is defined only for DENSE striping: SPARSE
@@ -2407,19 +2594,13 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	/*
 	 * From here on the ctx ref belongs to this dispatch.  Hand
 	 * off to the CHUNK_WRITE helper, which resolves ds_slot /
-	 * devnode / ds_clp itself, allocates the wrapper, populates
-	 * args, and runs the private RPC via
-	 * ffv2_chunk_write_procinfo.  On PNFS_ATTEMPTED the wrapper's
-	 * release-cb owns all subsequent teardown (including the
-	 * inherited ctx ref).  On PNFS_NOT_ATTEMPTED the helper has
-	 * unwound its own local refs (devnode, lseg, ds_clp) and left
-	 * ctx to us; drop inline below.
-	 *
-	 * At this commit the temporary gate above short-circuits
-	 * before we reach here, so this call is unreachable from the
-	 * write path in production.  Unit tests reach the helper via
-	 * its extracted-callable form directly.  Patch 5 flips the
-	 * flag and makes this the live wire dispatch.
+	 * devnode / ds_clp itself, allocates the stripe write,
+	 * populates args, and runs the private RPC via
+	 * ffv2_chunk_write_procinfo.  On PNFS_ATTEMPTED the stripe
+	 * write owns all subsequent teardown (including the inherited
+	 * ctx ref).  On PNFS_NOT_ATTEMPTED the helper has unwound its
+	 * own local refs (devnode, lseg, ds_clp) and left ctx to us;
+	 * drop inline below.
 	 */
 	{
 		enum pnfs_try_status rc_disp;

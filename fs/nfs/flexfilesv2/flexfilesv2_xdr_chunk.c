@@ -237,6 +237,18 @@
 #define FFV2_CHUNK_COMMIT_RES_MAXSZ	\
 	BYTES_TO_U32(FFV2_CHUNK_COMMIT_RES_MAXSZ_BYTES)
 
+#define FFV2_CHUNK_ROLLBACK_INLINE_ENC_MAXSZ \
+	(4 + NFS4_STATEID_SIZE + 8 + 4 + 4 + FFV2_MAX_CHUNKS_PER_OP * 16)
+#define FFV2_CHUNK_ROLLBACK_ARGS_MAXSZ_BYTES \
+	(FFV2_COMPOUND_HDR_MAXSZ + FFV2_SEQUENCE_ENC_MAXSZ + \
+	 FFV2_PUTFH_ENC_MAXSZ + FFV2_CHUNK_ROLLBACK_INLINE_ENC_MAXSZ)
+#define FFV2_CHUNK_ROLLBACK_RES_MAXSZ_BYTES \
+	FFV2_CHUNK_COMMIT_RES_MAXSZ_BYTES
+#define FFV2_CHUNK_ROLLBACK_ARGS_MAXSZ \
+	BYTES_TO_U32(FFV2_CHUNK_ROLLBACK_ARGS_MAXSZ_BYTES)
+#define FFV2_CHUNK_ROLLBACK_RES_MAXSZ \
+	BYTES_TO_U32(FFV2_CHUNK_ROLLBACK_RES_MAXSZ_BYTES)
+
 /*
  * Fixed prefix (in u32 quads) that the CHUNK_READ decoder actually
  * expects to consume from head before xdr_read_pages transitions to
@@ -689,6 +701,40 @@ static void ffv2_xdr_enc_chunk_commit(struct rpc_rqst *req,
 	/* No XDRBUF_READ / XDRBUF_WRITE flag: COMMIT is a
 	 * metadata-only durability barrier with no bulk payload;
 	 * RDMA direct data placement does not apply. */
+}
+
+static void
+ffv2_xdr_enc_chunk_rollback_op(struct xdr_stream *xdr,
+				const struct ffv2_chunk_rollback_args *a)
+{
+	__be32 *p;
+	u32 i;
+
+	ffv2_xdr_enc_op_hdr(xdr, OP_CHUNK_ROLLBACK);
+	ffv2_xdr_enc_stateid(xdr, &a->stateid);
+	p = ffv2_reserve_space(xdr, 8 + 4 + 4);
+	p = xdr_encode_hyper(p, a->offset);
+	*p++ = cpu_to_be32(a->count);
+	*p = cpu_to_be32(a->nowners);
+	for (i = 0; i < a->nowners; i++)
+		ffv2_xdr_enc_chunk_owner(xdr, &a->owners[i]);
+}
+
+static void ffv2_xdr_enc_chunk_rollback(struct rpc_rqst *req,
+					struct xdr_stream *xdr,
+					const void *data)
+{
+	const struct ffv2_chunk_rollback_data *d = data;
+
+	if (WARN_ON_ONCE(!d->args.count || !d->args.nowners ||
+			 d->args.nowners > FFV2_MAX_CHUNKS_PER_OP)) {
+		ffv2_xdr_enc_compound_hdr(xdr, 2, 0);
+		return;
+	}
+	ffv2_xdr_enc_compound_hdr(xdr, 2, 3);
+	ffv2_xdr_enc_sequence(xdr, &d->seq_args);
+	ffv2_xdr_enc_putfh(xdr, &d->fh);
+	ffv2_xdr_enc_chunk_rollback_op(xdr, &d->args);
 }
 
 /* -------------------- decoder -------------------- */
@@ -1261,10 +1307,71 @@ static int ffv2_xdr_dec_chunk_commit(struct rpc_rqst *req,
 	return ffv2_xdr_dec_chunk_commit_resok(xdr, d);
 }
 
+static int
+ffv2_xdr_dec_chunk_rollback_resok(struct xdr_stream *xdr,
+				  struct ffv2_chunk_rollback_res *r)
+{
+	__be32 *p;
+	u32 i, n;
+
+	p = xdr_inline_decode(xdr, NFS4_VERIFIER_SIZE);
+	if (!p)
+		return -EIO;
+	memcpy(&r->writeverf, p, NFS4_VERIFIER_SIZE);
+	p = xdr_inline_decode(xdr, 4);
+	if (!p)
+		return -EIO;
+	n = be32_to_cpup(p);
+	if (n > FFV2_MAX_CHUNKS_PER_OP)
+		return -EPROTO;
+	r->nstatus = n;
+	for (i = 0; i < n; i++) {
+		p = xdr_inline_decode(xdr, 4);
+		if (!p)
+			return -EIO;
+		r->status[i] = be32_to_cpup(p);
+	}
+	return 0;
+}
+
+static int ffv2_xdr_dec_chunk_rollback(struct rpc_rqst *req,
+				       struct xdr_stream *xdr, void *data)
+{
+	struct ffv2_chunk_rollback_res *d = data;
+	u32 cstatus, nops, opstatus;
+	int rc;
+
+	d->seq_res.sr_status = 1;
+	rc = ffv2_xdr_dec_compound_hdr(xdr, &cstatus, &nops);
+	if (rc)
+		return rc;
+	if (!nops)
+		return cstatus == NFS4_OK ? -EPROTO :
+			nfs4_stat_to_errno(cstatus);
+	rc = ffv2_xdr_dec_sequence(xdr, &d->seq_res);
+	if (rc)
+		return rc;
+	if (nops < 2)
+		return cstatus == NFS4_OK ? -EPROTO :
+			nfs4_stat_to_errno(cstatus);
+	rc = ffv2_xdr_dec_op_hdr(xdr, OP_PUTFH, &opstatus);
+	if (rc)
+		return rc;
+	if (opstatus != NFS4_OK)
+		return nfs4_stat_to_errno(opstatus);
+	if (nops < 3)
+		return cstatus == NFS4_OK ? -EPROTO :
+			nfs4_stat_to_errno(cstatus);
+	rc = ffv2_xdr_dec_op_hdr(xdr, OP_CHUNK_ROLLBACK, &opstatus);
+	if (rc)
+		return rc;
+	if (opstatus != NFS4_OK)
+		return nfs4_stat_to_errno(opstatus);
+	return ffv2_xdr_dec_chunk_rollback_resok(xdr, d);
+}
+
 /*
- * Decode one read_chunk4 (crr_chunks<> element).  Currently enforces
- * cr_locked<> / cr_status<> length 0; the reply-page boundary is
- * fixed at that shape.
+ * Decode one read_chunk4 (crr_chunks<> element).
  *
  * cr_guard is the per-chunk CAS state (cg_gen_id, cg_client_id).
  * The server may also expose it inside cr_owner.co_guard on older
@@ -1596,4 +1703,14 @@ const struct rpc_procinfo ffv2_chunk_commit_procinfo = {
 	.p_replen	= FFV2_CHUNK_COMMIT_RES_MAXSZ,
 	.p_statidx	= NFSPROC4_CLNT_COMMIT,
 	.p_name		= "CHUNK_COMMIT",
+};
+
+const struct rpc_procinfo ffv2_chunk_rollback_procinfo = {
+	.p_proc		= NFSPROC4_COMPOUND,
+	.p_encode	= ffv2_xdr_enc_chunk_rollback,
+	.p_decode	= ffv2_xdr_dec_chunk_rollback,
+	.p_arglen	= FFV2_CHUNK_ROLLBACK_ARGS_MAXSZ,
+	.p_replen	= FFV2_CHUNK_ROLLBACK_RES_MAXSZ,
+	.p_statidx	= NFSPROC4_CLNT_WRITE,
+	.p_name		= "CHUNK_ROLLBACK",
 };

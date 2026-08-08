@@ -322,6 +322,30 @@ struct ffv2_chunk_commit_data {
 
 extern const struct rpc_procinfo ffv2_chunk_commit_procinfo;
 
+struct ffv2_chunk_rollback_args {
+	nfs4_stateid		stateid;
+	u64			offset;
+	u32			count;
+	u32			nowners;
+	struct chunk_owner4	owners[FFV2_MAX_CHUNKS_PER_OP];
+};
+
+struct ffv2_chunk_rollback_res {
+	struct nfs4_sequence_res seq_res;
+	nfs4_verifier		writeverf;
+	u32			nstatus;
+	u32			status[FFV2_MAX_CHUNKS_PER_OP];
+};
+
+struct ffv2_chunk_rollback_data {
+	struct nfs4_sequence_args seq_args;
+	struct ffv2_chunk_rollback_args args;
+	struct nfs_fh		fh;
+	struct ffv2_chunk_rollback_res res;
+};
+
+extern const struct rpc_procinfo ffv2_chunk_rollback_procinfo;
+
 /*
  * Lifecycle-op dispatch entry points.  Called by the
  * FINALIZE-then-COMMIT sequencing after a successful CHUNK_WRITE
@@ -399,40 +423,48 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 	u64 offset, u32 count,
 	const struct chunk_owner4 *owner);
 
+int
+ffv2_chunk_rollback_dispatch_one_mirror(struct ffv2_chunk_lifecycle_ctx *ctx,
+					const struct cred *cred,
+	const struct nfs_fh *fh,
+	const nfs4_stateid *stateid,
+	u64 offset, u32 count,
+	const struct chunk_owner4 *owners, u32 nowners);
+
 /*
- * Post-CHUNK_WRITE writeback context.  Chains FINALIZE -> COMMIT
- * after a successful CHUNK_WRITE reaches the release-cb hook in
- * flexfilesv2_write.c.  Owns the hdr / ds_clp / lseg / stripe_ctx
- * references while the FINALIZE + COMMIT round-trips are in
- * flight; the standard CHUNK_WRITE cleanup path transfers those
- * to the wb_ctx and skips its own final release when
- * ffv2_chunk_wb_start succeeds.
+ * Post-CHUNK_WRITE writeback context.  Chains FINALIZE -> COMMIT for
+ * one shard of a stripe write, started from the phase-one completion
+ * tail in flexfilesv2_write.c once every CHUNK_WRITE of the stripe
+ * has succeeded.
  *
- * Ownership discipline:
- *   - hdr is completed via hdr->completion_ops->completion(hdr)
- *     from ffv2_chunk_wb_complete_hdr AFTER FINALIZE + COMMIT
- *     finish (or on any failure that aborts the chain).  Do not
- *     free hdr elsewhere once wb_start has succeeded.
- *   - ds_clp is nfs_put_client'd from the same cleanup.  Held for
- *     the lifetime of the FINALIZE + COMMIT window.
- *   - lseg is pnfs_put_lseg'd; ctx is ffv2_stripe_ctx_put'd, in
- *     that order (ctx-before-lseg matches ffv2_chunk_write_release
- *     ordering rationale).
+ * Ownership discipline: the wb_ctx owns nothing but itself.  hdr,
+ * ds_clp and lseg are all borrowed from the parent stripe write,
+ * which the chain pins with a reference taken at hand-off.
+ * The terminal callback reports the chain's status back via
+ * ffv2_stripe_write_chain_done() -- which drops that reference and,
+ * when it is the last chain to finish, completes the header -- and
+ * then frees the wb_ctx.  A single chain therefore never completes
+ * the header itself: a stripe is durable only once every shard has
+ * been finalized.
  *
  * The writeverf captured on FINALIZE is compared against the
- * writeverf returned by COMMIT.  A mismatch means the DS
+ * writeverf returned by COMMIT.  A mismatch means the data server
  * rebooted between the two ops -- treated as a lost-durability
- * signal that marks the hdr with an error status.
+ * signal reported as an error status for the stripe.
  */
 struct nfs_pgio_header;
-struct ffv2_stripe_ctx;
+struct ffv2_stripe_write;
+
+void ffv2_stripe_write_chain_done(struct ffv2_stripe_write *sw, int status);
 
 struct ffv2_chunk_wb_ctx {
-	/* Populated by the caller (ffv2_chunk_write_release):     */
+	/* Populated by the caller (the phase-one completion tail).
+	 * Every pointer here is borrowed from sw.
+	 */
+	struct ffv2_stripe_write	*sw;
 	struct nfs_pgio_header		*hdr;
 	struct nfs_client		*ds_clp;
 	struct pnfs_layout_segment	*lseg;
-	struct ffv2_stripe_ctx		*ctx;
 	const struct cred		*cred;
 	struct nfs_fh			fh;
 	nfs4_stateid			stateid;
@@ -446,18 +478,14 @@ struct ffv2_chunk_wb_ctx {
 
 /*
  * ffv2_chunk_wb_start -- kick off the FINALIZE -> COMMIT chain
- * against a mirror.  On success (return 0), the chain is running
- * and the wb_ctx is owned by the callbacks -- caller must NOT
- * touch it or free it.  On failure, the wb_ctx is untouched;
- * the caller retains ownership and MUST free it (plus release
- * hdr / ds_clp / lseg / ctx by its own path -- typically the
- * caller falls back to the current-behavior release path).
+ * for one shard.  On success (return 0), the chain is running and
+ * the wb_ctx is owned by the callbacks -- caller must NOT touch it
+ * or free it.  On failure, the wb_ctx is untouched; the caller
+ * retains ownership and MUST free it.
  *
- * The COMMIT completion callback drives the final hdr
- * completion, ds_clp / lseg / ctx release, and wb_ctx free.
- * hdr's tk_status is set to the COMMIT chain's error status
- * (0 on success, -EPROTO on writeverf mismatch, propagated
- * errno on FINALIZE / COMMIT failure).
+ * The chain's terminal status (0 on success, -EPROTO on writeverf
+ * mismatch, the propagated errno on FINALIZE / COMMIT failure)
+ * reaches the stripe write via ffv2_stripe_write_chain_done().
  */
 int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb);
 

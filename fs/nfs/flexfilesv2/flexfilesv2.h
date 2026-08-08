@@ -50,6 +50,7 @@
 #define OP_CHUNK_COMMIT			78
 #define OP_CHUNK_FINALIZE		80
 #define OP_CHUNK_READ			83
+#define OP_CHUNK_ROLLBACK		85
 #define OP_CHUNK_WRITE			87
 
 /*
