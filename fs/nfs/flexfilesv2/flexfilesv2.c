@@ -183,12 +183,14 @@ static void
 ffv2_cancel_io(struct pnfs_layout_segment *lseg)
 {
 	/*
-	 * ffv1 cancels outstanding DS RPCs here so they don't try
-	 * to complete against a torn-down lseg.  ffv2 has no
-	 * outstanding-RPC tracking yet (read/write not wired), so
-	 * this is a no-op; the callback exists so the pNFS core's
-	 * layout-recall path has a symbol to jump to.
+	 * In-flight RPCs are left to complete: they hold their own
+	 * references and their completion tails do not care that the
+	 * layout is going away.  What must stop is new work -- close
+	 * the segment to further stripe claims and wake anyone waiting
+	 * for one, so a waiter does not acquire a stripe on a layout
+	 * that is being torn down.
 	 */
+	ffv2_claim_close(FFV2_LSEG(lseg));
 }
 
 /*
@@ -362,7 +364,6 @@ ffv2_pg_get_mirror_count_write(struct nfs_pageio_descriptor *pgio,
 			       struct nfs_page *req)
 {
 	struct nfs4_ffv2_layout_segment *fls;
-	struct nfs4_ffv2_mirror *mirror;
 
 	if (!pgio->pg_lseg) {
 		pgio->pg_lseg = pnfs_update_layout(pgio->pg_inode,
@@ -384,10 +385,34 @@ ffv2_pg_get_mirror_count_write(struct nfs_pageio_descriptor *pgio,
 	if (!ffv2_lseg_is_chunked(fls))
 		return 1;
 
-	mirror = fls->mirror_array[0];
-	return mirror->protection_data + mirror->protection_parity;
+	/*
+	 * One, even for a k+m encoding.  The pgio mirror machinery
+	 * expresses replication: every mirror is handed the same bytes,
+	 * and the generic layer builds one header per mirror from an
+	 * identical page list.  Erasure coding needs k+m *different*
+	 * payloads that share a single encode of one stripe, which no
+	 * arrangement of mirrors can describe -- the shards only exist
+	 * after the stripe is assembled, and assembling it needs all the
+	 * user bytes at once.
+	 *
+	 * So the layout driver takes the whole stripe in a single header
+	 * and dispatches the k+m CHUNK_WRITEs itself.  filelayout, the
+	 * only other in-tree striping driver, runs mirror_count == 1 for
+	 * the same reason.
+	 */
+	return 1;
 }
 
+/*
+ * Per-mirror routing.  pg_get_mirror_count only sizes the mirror
+ * array; the generic layer resolves "which mirror is current"
+ * through this pair.  Without them nfs_pgio_get_mirror returns
+ * &desc->pg_mirrors[0] for every index and
+ * nfs_pgio_set_current_mirror is a no-op (fs/nfs/pagelist.c), so a
+ * chunked lseg queues all k+m shard requests onto mirror 0's list
+ * and only mirror 0 is ever dispatched.  Same pair as
+ * ff_layout_pg_write_ops.
+ */
 static u32
 ffv2_pg_set_mirror_write(struct nfs_pageio_descriptor *desc, u32 idx)
 {

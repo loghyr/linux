@@ -675,6 +675,12 @@ static void ffv2_xdr_enc_chunk_commit_op(struct xdr_stream *xdr,
  */
 static bool ffv2_xdr_enc_chunk_commit_check(const struct ffv2_chunk_commit_args *a)
 {
+	/*
+	 * Same invariant as CHUNK_FINALIZE's check: current interop
+	 * shape is count == 1 alongside hard-coded chunks<>len == 1;
+	 * see the FINALIZE encoder for the rationale and the
+	 * flip-both-together contract for future batching.
+	 */
 	return WARN_ON_ONCE(a->count != 1);
 }
 
@@ -981,6 +987,9 @@ static int ffv2_xdr_dec_chunk_write(struct rpc_rqst *req,
 				    struct xdr_stream *xdr,
 				    void *data)
 {
+	/* rpc_resp is the res struct, not the composite -- see
+	 * ffv2_chunk_write_res on why seq_res leads it.
+	 */
 	struct ffv2_chunk_write_res *d = data;
 	u32 cstatus, nops, opstatus;
 	int rc;
@@ -1170,6 +1179,7 @@ static int ffv2_xdr_dec_chunk_finalize(struct rpc_rqst *req,
 				       struct xdr_stream *xdr,
 				       void *data)
 {
+	/* rpc_resp is the res struct -- see ffv2_chunk_write_res. */
 	struct ffv2_chunk_finalize_res *d = data;
 	u32 cstatus, nops, opstatus;
 	int rc;
@@ -1261,6 +1271,7 @@ static int ffv2_xdr_dec_chunk_commit(struct rpc_rqst *req,
 				     struct xdr_stream *xdr,
 				     void *data)
 {
+	/* rpc_resp is the res struct -- see ffv2_chunk_write_res. */
 	struct ffv2_chunk_commit_res *d = data;
 	u32 cstatus, nops, opstatus;
 	int rc;
@@ -1523,6 +1534,7 @@ static int ffv2_xdr_dec_chunk_read(struct rpc_rqst *req,
 				   struct xdr_stream *xdr,
 				   void *data)
 {
+	/* rpc_resp is the res struct -- see ffv2_chunk_write_res. */
 	struct ffv2_chunk_read_res *d = data;
 	u32 cstatus, nops, opstatus;
 	int rc;

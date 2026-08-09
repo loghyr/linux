@@ -157,6 +157,14 @@ struct ffv2_stripe_write {
 	atomic_t			writes_pending;
 	atomic_t			chains_pending;
 	int				status;	/* first error wins */
+	/*
+	 * Set by any shard whose failure the layout permits retrying
+	 * through the metadata server.  Not NFS_IOHDR_RESEND_MDS: that
+	 * flag lives on the header, but the decision is made per shard,
+	 * so with k+m shards in flight one shard's clear would erase
+	 * another's set and the tail would read whichever raced last.
+	 */
+	atomic_t			resend_mds;
 
 	u32				nr_shards;
 	struct ffv2_chunk_write_dispatch disp[];
@@ -228,8 +236,7 @@ static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
 {
 	struct ffv2_chunk_write_dispatch *w = data;
 
-	nfs4_setup_sequence(w->ds_clp, &w->wire.seq_args,
-			    &w->wire.res.seq_res,
+	nfs4_setup_sequence(w->ds_clp, &w->wire.seq_args, &w->wire.res.seq_res,
 			    task);
 }
 
@@ -263,8 +270,10 @@ static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
  *     RPC-time, per-chunk, or op-shape -- invalidates the current
  *     pNFS state; without the mark, every subsequent write reuses
  *     the same lseg and repeats the fallback forever.
- *   - Set NFS_IOHDR_RESEND_MDS ONLY when the layout permits MDS
- *     proxy, and return: the resend owns the outcome from there.
+ *   - Ask for a metadata-server resend ONLY when the layout permits
+ *     that proxy, and return: the resend owns the outcome from there.
+ *     The request is recorded on the stripe rather than the header,
+ *     because it is decided per shard.
  *   - With FFV2_FLAGS_NO_IO_THRU_MDS set the draft (:2198-2203)
  *     forbids the resend, so the write terminates here.  Normalize
  *     an unmapped NFS4ERR_* status to an errno so the completion
@@ -292,11 +301,6 @@ static void ffv2_chunk_write_call_done(struct rpc_task *task, void *data)
 	if (w->wire.res.seq_res.sr_slot)
 		nfs4_sequence_done(task, &w->wire.res.seq_res);
 
-	/* Defensive: re-decide from scratch on this attempt.  Ffv1
-	 * pattern at flexfilelayout.c:1811 clears then reconsiders.
-	 */
-	clear_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags);
-
 	if (task->tk_status == 0) {
 		if (res->nblocks != 1) {
 			task->tk_status = -EPROTO;
@@ -320,15 +324,14 @@ static void ffv2_chunk_write_call_done(struct rpc_task *task, void *data)
 		w->landed = true;
 		/* Happy path: retained res fields (block_activated[0],
 		 * owners[0], writeverf) will be consumed by the patch-5
-		 * FINALIZE tail.  The temporary early-return path does not
-		 * reach them from the write path.
+		 * FINALIZE tail.
 		 */
 		return;
 	}
 fail:
 	pnfs_error_mark_layout_for_return(hdr->inode, hdr->lseg);
 	if (!ffv2_no_fallback_to_mds(hdr->lseg)) {
-		set_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags);
+		atomic_set(&w->sw->resend_mds, 1);
 		return;
 	}
 
@@ -412,7 +415,7 @@ static void ffv2_chunk_write_rollback_done(void *arg, int status,
 	struct ffv2_stripe_write *sw = arg;
 
 	if (status)
-		clear_bit(NFS_IOHDR_RESEND_MDS, &sw->hdr->flags);
+		atomic_set(&sw->resend_mds, 0);
 	ffv2_stripe_write_chain_done(sw, status);
 }
 
@@ -439,7 +442,7 @@ static void ffv2_stripe_write_rollback(struct ffv2_stripe_write *sw)
 			&w->wire.fh, &w->wire.args.stateid,
 			w->wire.args.offset, 1, &w->wire.res.owners[0], 1);
 		if (rc) {
-			clear_bit(NFS_IOHDR_RESEND_MDS, &sw->hdr->flags);
+			atomic_set(&sw->resend_mds, 0);
 			ffv2_stripe_write_chain_done(sw, rc);
 		}
 	}
@@ -465,8 +468,7 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 	 * is wrong.  Roll back every shard that accepted its CHUNK_WRITE
 	 * before completing the header or resending through the MDS.
 	 */
-	if (sw->status ||
-	    test_bit(NFS_IOHDR_RESEND_MDS, &sw->hdr->flags)) {
+	if (sw->status || atomic_read(&sw->resend_mds)) {
 		ffv2_stripe_write_rollback(sw);
 		return;
 	}
@@ -506,7 +508,7 @@ static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw)
 {
 	struct nfs_pgio_header *hdr = sw->hdr;
 
-	if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags) &&
+	if (atomic_read(&sw->resend_mds) &&
 	    !test_and_set_bit(NFS_IOHDR_REDO, &hdr->flags)) {
 		hdr->task.tk_status = pnfs_write_done_resend_to_mds(hdr);
 	} else if (sw->status) {
@@ -534,14 +536,28 @@ static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw)
 		 * already confirmed durability at every data server, so
 		 * FILE_SYNC is also the truth.
 		 *
-		 * res.count is the shard payload while one shard covers
-		 * the header; aggregating it over a full stripe comes
-		 * with the k+m dispatch.
+		 * res.count is the user bytes this header carried, not
+		 * the wire bytes: a stripe ships k+m shards of padded,
+		 * encoded data, and reporting that as the write length
+		 * would overstate it by the parity and the padding.
 		 */
-		hdr->res.count = sw->disp[0].wire.args.payload_len;
+		hdr->res.count = hdr->args.count;
 		hdr->verf.committed = NFS_FILE_SYNC;
 		memcpy(&hdr->verf.verifier, &sw->disp[0].wire.res.writeverf,
 		       sizeof(hdr->verf.verifier));
+
+		/*
+		 * Report the logical end of write to the metadata server.
+		 * It cannot derive it: a k+m stripe leaves each data
+		 * server holding a fraction of the bytes, so the size it
+		 * reflects back from them is short by that factor.  Take
+		 * the extent from args, which is file-relative and covers
+		 * the whole stripe; res.count is one shard's payload.
+		 * FFv1 sets layoutcommit from its write-done path for the
+		 * same reason.
+		 */
+		pnfs_set_layoutcommit(hdr->inode, hdr->lseg,
+				      hdr->mds_offset + (loff_t)hdr->args.count);
 	}
 
 	hdr->completion_ops->completion(hdr);
@@ -600,20 +616,20 @@ static const struct rpc_call_ops ffv2_chunk_write_call_ops = {
 };
 
 /*
- * Extracted per-mirror dispatch helper.
+ * Launch shard `idx` of the stripe write.  Resolves that shard's data
+ * server, fills in its wire arguments from the already-encoded stripe,
+ * and runs the CHUNK_WRITE.
  *
- * Preconditions: caller has already established `ctx` for
- * `mirror_idx` -- the ctx ref belongs to the caller and is
- * INHERITED by the stripe write on success.  On failure the caller
- * retains ownership per the dispatch-failure pattern in
- * ffv2_write_pagelist_chunked.
+ * Returns 0 with the RPC in flight and a reference on sw taken for it,
+ * or an errno with nothing launched and no reference taken -- in which
+ * case the caller owns the accounting for this shard, because a
+ * release callback that would have done it will never run.
  */
-static enum pnfs_try_status
-ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
-				     struct ffv2_stripe_ctx *ctx,
-				     u32 mirror_idx, int sync)
+static int ffv2_shard_launch(struct ffv2_stripe_write *sw, u32 idx)
 {
-	struct pnfs_layout_segment *lseg = hdr->lseg;
+	struct nfs_pgio_header *hdr = sw->hdr;
+	struct ffv2_stripe_ctx *ctx = sw->ctx;
+	struct pnfs_layout_segment *lseg = sw->lseg;
 	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(lseg);
 	struct nfs4_ffv2_mirror *mirror = fls->mirror_array[0];
 	struct nfs4_ffv2_stripe *stripe;
@@ -624,26 +640,24 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	struct nfs4_pnfs_ds *ds;
 	struct nfs_server *mds_srv = NFS_SERVER(hdr->inode);
 	struct rpc_clnt *ds_clnt;
-	struct ffv2_stripe_write *sw = NULL;
-	struct ffv2_chunk_write_dispatch *w;
+	struct ffv2_chunk_write_dispatch *w = &sw->disp[idx];
 	struct rpc_message msg;
 	struct rpc_task_setup task_setup;
 	struct rpc_task *task;
 	size_t csum_len;
-	int rc;
+	int rc = 0;	/* the early exits below jump past every assignment */
 	u32 v, mv;
+	u32 mirror_idx = idx;
 
-	(void)sync;	/* CHUNK_WRITE is always FILE_SYNC4. */
-
-	/* Step 1: verify mirror_idx in range. */
+	/* Step 1: verify the shard index has a data server. */
 	if (mirror->stripes_cnt == 0)
-		return ffv2_write_fallback_to_mds(hdr);
+		return -EINVAL;
 	stripe = &mirror->stripes[0];
 	if (mirror_idx >= stripe->data_servers_cnt)
-		return ffv2_write_fallback_to_mds(hdr);
+		return -EINVAL;
 	ds_slot = &stripe->data_servers[mirror_idx];
 	if (ds_slot->versions_cnt == 0)
-		return ffv2_write_fallback_to_mds(hdr);
+		return -EINVAL;
 	fi = &ds_slot->versions[0];
 
 	/* Step 2-4: acquire devnode (synchronous, released before
@@ -652,7 +666,7 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	devnode = nfs4_find_get_deviceid(mds_srv, &ds_slot->devid,
 					 hdr->cred, nfs_io_gfp_mask());
 	if (!devnode)
-		return ffv2_write_fallback_to_mds(hdr);
+		return -EIO;
 	layout_ds = FFV2_LAYOUT_DS_FROM_NODE(devnode);
 	ds = layout_ds->ds;
 	if (!ds || layout_ds->ds_versions_cnt == 0)
@@ -676,38 +690,12 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 		goto out_put_devnode;
 	ds_clnt = ds->ds_clp->cl_rpcclient;
 
-	/* Step 5: allocate the stripe write and its shards.  It must
-	 * exist before any reference below is taken, because it is
-	 * where those references are recorded and where the unwind path
-	 * reads them back from.  One shard for now.
-	 */
-	sw = kzalloc(struct_size(sw, disp, 1), nfs_io_gfp_mask());
-	if (!sw)
-		goto out_put_devnode;
-	sw->nr_shards = 1;
-	sw->hdr = hdr;
-	sw->lseg = lseg;
-	refcount_set(&sw->sw_ref, 1);	/* this thread's, dropped below */
-	atomic_set(&sw->writes_pending, sw->nr_shards);
-	atomic_set(&sw->chains_pending, sw->nr_shards);
-
-	w = &sw->disp[0];
-	w->sw = sw;
-
-	/* Step 6: ds_clp ref, one per shard, released when the stripe
-	 * write is freed.
+	/* Step 5: ds_clp ref, one per shard, released when the stripe
+	 * write is freed.  Recorded before anything can fail so the
+	 * unwind below has a single shape.
 	 */
 	refcount_inc(&ds->ds_clp->cl_count);
 	w->ds_clp = ds->ds_clp;
-
-	/* Step 7: lseg ref, balanced by the stripe write's free. */
-	pnfs_get_lseg(lseg);
-
-	/* Step 8: no fresh ctx ref -- the caller's ref is INHERITED
-	 * here, and only once the dispatch is committed to succeeding.
-	 * Until then sw->ctx stays NULL so the unwind path below leaves
-	 * the caller's reference alone.
-	 */
 
 	/* Step 9: shard-page payload. */
 	w->wire.args.pages       = ctx->shard_pages[mirror_idx];
@@ -824,15 +812,18 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 	 * CHUNK_READ path calls nfs4_init_sequence for the same
 	 * reason; do the same here.
 	 */
-	nfs4_init_sequence(w->ds_clp, &w->wire.seq_args,
-			   &w->wire.res.seq_res,
+	nfs4_init_sequence(w->ds_clp, &w->wire.seq_args, &w->wire.res.seq_res,
 			   0, 0);
-
-	/* Step 17: commit-bucket hint mirroring the FFv1 pattern. */
-	hdr->ds_commit_idx = mirror_idx;
 
 	/* Step 18-19: build rpc_message + rpc_task_setup + run. */
 	memset(&msg, 0, sizeof(msg));
+	/*
+	 * argp and resp must land on the structs whose first member is
+	 * the SEQUENCE args / res -- nfs41_assign_slot casts them
+	 * directly when it hands a freed slot to a parked task.  Same
+	 * pairing as .rpc_argp = &hdr->args / .rpc_resp = &hdr->res on
+	 * the plain-NFSv4.1 path.
+	 */
 	msg.rpc_argp    = &w->wire;
 	msg.rpc_resp    = &w->wire.res;
 	msg.rpc_cred    = hdr->cred;
@@ -849,13 +840,11 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 				  RPC_TASK_SOFT;
 
 	/*
-	 * The shard's own reference, and the point at which the ctx
-	 * reference is inherited.  Both have to be in place before the
-	 * RPC can run, because the release callback may fire the moment
-	 * rpc_run_task hands the task to the workqueue.
+	 * The shard's own reference, taken before the RPC can run
+	 * because the release callback may fire the moment rpc_run_task
+	 * hands the task to the workqueue.
 	 */
 	refcount_inc(&sw->sw_ref);
-	sw->ctx = ctx;
 
 	task = rpc_run_task(&task_setup);
 	if (IS_ERR(task)) {
@@ -864,28 +853,110 @@ ffv2_chunk_write_dispatch_one_mirror(struct nfs_pgio_header *hdr,
 		 * so rpc_run_task cannot currently return ERR_PTR.  Kept
 		 * against upstream shape drift.
 		 */
-		sw->ctx = NULL;
 		refcount_dec(&sw->sw_ref);
+		rc = PTR_ERR(task);
 		goto out_undo_refs;
 	}
 	rpc_put_task(task);
 
 	/* Devnode ref was synchronous; drop before returning. */
 	nfs4_put_deviceid_node(devnode);
-	ffv2_stripe_write_put(sw);	/* this thread's reference */
-	return PNFS_ATTEMPTED;
+	return 0;
 
 out_undo_refs:
 	/*
-	 * No shard was launched, so no completion tail runs and the
-	 * header is left to the caller's fallback path.  sw->ctx is
-	 * NULL, so the caller keeps its ctx reference; everything else
-	 * taken above is released with the struct.
+	 * Nothing launched for this shard.  Drop the data server
+	 * reference here rather than leaving it to the free path: the
+	 * caller may still launch later shards, so the stripe write
+	 * lives on and this slot must not keep a reference to a server
+	 * it never talked to.
 	 */
-	ffv2_stripe_write_put(sw);
+	nfs_put_client(w->ds_clp);
+	w->ds_clp = NULL;
 out_put_devnode:
 	nfs4_put_deviceid_node(devnode);
-	return ffv2_write_fallback_to_mds(hdr);
+	return rc ? rc : -EIO;
+}
+
+/*
+ * Retire n shards that were never launched, by counting them as
+ * completed.  The mirror of ffv2_stripe_write_chains_retire, and
+ * needed for the same reason: a launch that stops part way through
+ * leaves writes_pending short of zero, so the phase-one barrier never
+ * fires, the header is never completed, and the write hangs for the
+ * life of the mount.
+ */
+static void ffv2_stripe_write_writes_retire(struct ffv2_stripe_write *sw,
+					    u32 n)
+{
+	if (n && atomic_sub_and_test(n, &sw->writes_pending))
+		ffv2_stripe_write_phase1(sw);
+}
+
+/*
+ * Dispatch one whole stripe: allocate the stripe write and launch its
+ * k+m CHUNK_WRITEs from this single header.
+ *
+ * On PNFS_ATTEMPTED the header belongs to the completion tails and the
+ * caller must not touch it -- including when no shard actually
+ * launched.  That is deliberate: a launch failure is a failure of this
+ * write, not a reason to hand the request back for re-dispatch.
+ * Returning PNFS_TRY_AGAIN here would re-enter this path with the same
+ * layout and the same failing data server, which is the retry cycle
+ * the stripe rework exists to remove.  The un-launched shards are
+ * counted as completed-with-error instead, so the barriers fire and
+ * the tail reports the error on the header exactly once.
+ *
+ * The only path that does not take the header is the allocation
+ * failure below, which happens before anything is in flight; the
+ * caller unwinds it like any other pre-dispatch failure.
+ */
+static enum pnfs_try_status
+ffv2_stripe_write_dispatch(struct nfs_pgio_header *hdr,
+			   struct ffv2_stripe_ctx *ctx, int sync)
+{
+	struct pnfs_layout_segment *lseg = hdr->lseg;
+	struct ffv2_stripe_write *sw;
+	u32 nr = ctx->k + ctx->m;
+	u32 i;
+
+	(void)sync;	/* CHUNK_WRITE is always FILE_SYNC4. */
+
+	sw = kzalloc(struct_size(sw, disp, nr), nfs_io_gfp_mask());
+	if (!sw)
+		return PNFS_NOT_ATTEMPTED;
+
+	sw->nr_shards = nr;
+	sw->hdr = hdr;
+	sw->lseg = lseg;
+	sw->ctx = ctx;			/* the caller's ref, inherited */
+	refcount_set(&sw->sw_ref, 1);	/* this thread's, dropped below */
+	atomic_set(&sw->writes_pending, nr);
+	atomic_set(&sw->chains_pending, nr);
+	pnfs_get_lseg(lseg);
+	for (i = 0; i < nr; i++)
+		sw->disp[i].sw = sw;
+
+	/*
+	 * Commit-bucket hint.  Flexfiles v2 registers no pNFS commit
+	 * operations, so nothing consumes it; a stripe has no single
+	 * bucket to name in any case.
+	 */
+	hdr->ds_commit_idx = 0;
+
+	for (i = 0; i < nr; i++) {
+		int rc = ffv2_shard_launch(sw, i);
+
+		if (rc) {
+			ffv2_stripe_write_set_status(sw, rc);
+			pnfs_error_mark_layout_for_return(hdr->inode, lseg);
+			ffv2_stripe_write_writes_retire(sw, nr - i);
+			break;
+		}
+	}
+
+	ffv2_stripe_write_put(sw);	/* this thread's reference */
+	return PNFS_ATTEMPTED;
 }
 
 static void ffv2_stripe_ctx_free(struct ffv2_stripe_ctx *ctx)
@@ -909,6 +980,17 @@ static void ffv2_stripe_ctx_free(struct ffv2_stripe_ctx *ctx)
 	kfree(ctx);
 }
 
+/*
+ * Releasing the last reference unlinks the context, which is what
+ * releases the stripe: ownership lasts exactly as long as the context
+ * is on the list.  Every path that claims a stripe therefore unclaims
+ * it simply by dropping its reference, on success and on every error.
+ *
+ * wake_up_all, not wake_up: waiters are queued on one wait queue per
+ * layout segment but are each waiting for a different stripe, so
+ * waking only one could rouse a waiter for an unrelated stripe and
+ * leave the one that could now proceed asleep.
+ */
 void ffv2_stripe_ctx_put(struct ffv2_stripe_ctx *ctx)
 {
 	struct nfs4_ffv2_layout_segment *fls;
@@ -920,216 +1002,116 @@ void ffv2_stripe_ctx_put(struct ffv2_stripe_ctx *ctx)
 		spin_lock(&fls->fls_ctx_lock);
 		list_del(&ctx->list);
 		spin_unlock(&fls->fls_ctx_lock);
-		wake_up(&fls->fls_ctx_wq);
+		wake_up_all(&fls->fls_ctx_wq);
 	}
 	ffv2_stripe_ctx_free(ctx);
 }
 
 /*
- * Drop the batch-anchor ref of every ctx still on the lseg's ctx
- * list.  Called from ffv2_free_layout_segment as an F13 backstop:
- * a mirror hdr whose alloc failed in pnfs_generic_pg_writepages
- * leaves its slot in arrivals never satisfied, so the anchor ref
- * would otherwise pin the ctx (and its shard pages) until module
- * unload.  Straggler dispatched WRITEs / fetch RPCs hold their own
- * refs and complete the free.  Safe to call after all lseg
- * references have drained (the caller is on the free_lseg path).
+ * Stop accepting stripe claims on this segment, and wake every waiter
+ * so nobody sleeps on a stripe whose owner completes after the recall.
+ * In-flight work is untouched: it holds its own references and its
+ * completion tails do not care that the layout is going away.
+ */
+void ffv2_claim_close(struct nfs4_ffv2_layout_segment *fls)
+{
+	spin_lock(&fls->fls_ctx_lock);
+	fls->fls_claim_closed = true;
+	spin_unlock(&fls->fls_ctx_lock);
+	wake_up_all(&fls->fls_ctx_wq);
+}
+
+/*
+ * Claim the stripe at `stripe_off` by installing `cand` on the layout
+ * segment's list.  A stripe has at most one owner.
+ *
+ * This replaces the old sibling rendezvous, which had to count k+m
+ * arrivals because the shards of one stripe came from k+m separate
+ * callers.  One caller now brings the whole stripe, so a second caller
+ * for the same stripe is not a sibling to wait for -- it is a
+ * conflicting writer to serialise against.  That is a mutex over a
+ * stripe rather than a barrier across mirrors, and it cannot livelock
+ * the way an arrival count could, because completion no longer depends
+ * on anyone else turning up.
+ *
+ * Returns cand on success, or NULL with *closed false if the stripe is
+ * already owned, true if the segment no longer accepts claims.
+ */
+static struct ffv2_stripe_ctx *
+ffv2_stripe_claim(struct nfs4_ffv2_layout_segment *fls, u64 stripe_off,
+		  struct ffv2_stripe_ctx *cand, bool *closed)
+{
+	struct ffv2_stripe_ctx *ctx;
+
+	spin_lock(&fls->fls_ctx_lock);
+	if (fls->fls_claim_closed) {
+		spin_unlock(&fls->fls_ctx_lock);
+		*closed = true;
+		return NULL;
+	}
+	list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
+		if (ctx->stripe_off == stripe_off) {
+			spin_unlock(&fls->fls_ctx_lock);
+			return NULL;
+		}
+	}
+	cand->stripe_off = stripe_off;
+	/*
+	 * Explicit, not inherited from the kzalloc.  If FFV2_CTX_*
+	 * were ever reordered so ASSEMBLING stopped being zero, the
+	 * encode gate below would be skipped, rc_enc would stay 0, and
+	 * k+m unencoded shards would ship -- all-zero parity that the
+	 * data server accepts and that only fails at reconstruction.
+	 */
+	cand->state = FFV2_CTX_ASSEMBLING;
+	list_add(&cand->list, &fls->fls_ctx_list);
+	spin_unlock(&fls->fls_ctx_lock);
+	return cand;
+}
+
+/*
+ * Wait predicate: stop waiting once the stripe is free, or once the
+ * segment stops accepting claims at all.  Re-scans under the lock and
+ * never holds a pointer to another writer's context across the lock
+ * drop -- the context it saw may be unlinked and freed the instant the
+ * lock is released.
+ */
+static bool ffv2_stripe_wait_done(struct nfs4_ffv2_layout_segment *fls,
+				  u64 stripe_off)
+{
+	struct ffv2_stripe_ctx *ctx;
+	bool done = true;
+
+	spin_lock(&fls->fls_ctx_lock);
+	if (!fls->fls_claim_closed) {
+		list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
+			if (ctx->stripe_off == stripe_off) {
+				done = false;
+				break;
+			}
+		}
+	}
+	spin_unlock(&fls->fls_ctx_lock);
+	return done;
+}
+
+/*
+ * Called from ffv2_free_layout_segment.  Nothing should be linked
+ * here: a stripe context is owned by the stripe write that claimed
+ * it, and that write holds a reference on this layout segment, so the
+ * segment cannot reach its free path while any context is still on
+ * the list.
+ *
+ * Anything left is a leaked claim.  Warn rather than free it -- the
+ * owner may still hold a pointer, and dropping a reference it did not
+ * take would free the context underneath a live writer.  (This used
+ * to drop two references per context, releasing the batch anchor that
+ * the k+m arrival rendezvous relied on; with one header owning the
+ * whole stripe there is no anchor to release.)
  */
 void ffv2_stripe_ctx_list_drain(struct nfs4_ffv2_layout_segment *fls)
 {
-	for (;;) {
-		struct ffv2_stripe_ctx *ctx;
-
-		spin_lock(&fls->fls_ctx_lock);
-		ctx = list_first_entry_or_null(&fls->fls_ctx_list,
-					       struct ffv2_stripe_ctx,
-					       list);
-		if (!ctx || !refcount_inc_not_zero(&ctx->refcnt)) {
-			spin_unlock(&fls->fls_ctx_lock);
-			return;
-		}
-		spin_unlock(&fls->fls_ctx_lock);
-		/*
-		 * Drop the anchor ref this loop borrowed (best-effort
-		 * cleanup for ctxes stuck at arrivals < k+m) plus the
-		 * inspection ref we just took.  Anchors already
-		 * released by their (k+m)-th arrival make the anchor
-		 * put a no-op harmless in that it just decrements a
-		 * refcount that already accounts for outstanding
-		 * dispatched hdrs.
-		 */
-		ffv2_stripe_ctx_put(ctx);
-		ffv2_stripe_ctx_put(ctx);
-	}
-}
-
-/*
- * Per-pgio-descriptor identifier used as a sibling-mirror key.
- * hdr->io_completion is set for buffered writeback; hdr->dreq for
- * O_DIRECT.  Both are shared across mirrors of the same pgio but
- * differ between distinct writers.  Callers use whichever is
- * non-NULL; if both are NULL (rare kernel-internal write helpers)
- * we fall through to a NULL key -- safe because i_rwsem serialises
- * such writers at inode granularity, so only one is ever in flight
- * against this lseg at a time.
- */
-static void *ffv2_writer_key(const struct nfs_pgio_header *hdr)
-{
-	if (hdr->io_completion)
-		return (void *)hdr->io_completion;
-	return (void *)hdr->dreq;
-}
-
-/*
- * Look up an in-flight stripe context matching (writer_key,
- * stripe_off) on `fls`; if none exists, install `alloc`.  On
- * success returns with the refcount already incremented for the
- * caller (so the caller does not need refcount_inc).
- *
- * Keying on the per-pgio writer_key as well as stripe_off ensures
- * sibling mirrors of the SAME writer share a ctx while a DIFFERENT
- * writer to the same stripe gets its own ctx.  Sharing across
- * writers would silently overwrite the second writer's user data
- * with the first's, since data pages are copied only on the alloc
- * path.
- *
- * `alloc` is the caller-preallocated candidate.  The caller
- * allocates upfront (before taking the lock) so
- * ffv2_stripe_ctx_alloc's page-alloc loop stays out of the
- * spinlock's critical section.
- */
-/*
- * Wait-condition helper for the gate.  Returns true when the
- * outer for(;;) should re-scan: either no ctx with our stripe_off
- * is on the list, or the first one we see is joinable (same
- * writer_key, our mirror bit clear, ref still non-zero).  Returns
- * false while a conflicting ctx is still listed, keeping the
- * caller asleep on fls_ctx_wq.
- *
- * Crucially this re-scans the list under fls_ctx_lock each wake
- * rather than dereferencing a cached pointer captured before the
- * sleep -- the pre-wait 'conflict' may have been list_del'd and
- * freed by the release path that woke us.
- */
-static bool
-ffv2_stripe_gate_ready(struct nfs4_ffv2_layout_segment *fls,
-		       u64 stripe_off, void *writer_key,
-		       u32 mirror_idx)
-{
-	struct ffv2_stripe_ctx *ctx;
-	bool ready = true;
-
-	spin_lock(&fls->fls_ctx_lock);
-	list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
-		if (ctx->stripe_off != stripe_off)
-			continue;
-		/*
-		 * A same-stripe ctx is still listed.  We can make
-		 * progress iff we could join it: same writer, our
-		 * mirror slot still open, and it has not raced to
-		 * zero (a zero-refcount ctx is mid-teardown, its
-		 * list_del + wake is imminent).
-		 */
-		ready = ctx->writer_key == writer_key &&
-			!test_bit(mirror_idx, ctx->mirror_seen) &&
-			refcount_read(&ctx->refcnt) > 0;
-		break;
-	}
-	spin_unlock(&fls->fls_ctx_lock);
-	return ready;
-}
-
-/*
- * Gated find-or-add.  Returns the admitted ctx (with refcount
- * incremented on the caller's behalf) and *is_new set:
- *   *is_new = true  -> caller is the winner: `alloc` was installed;
- *                      still needs to fill shard buffers, encode.
- *                      ctx starts with refcount = 2 (batch anchor +
- *                      this mirror's dispatch ref).
- *   *is_new = false -> caller joins existing ctx; refcount was
- *                      inc'd (via refcount_inc_not_zero).
- *
- * On conflict (same stripe_off but different writer_key, or same
- * writer_key with mirror bit already set) drops the spinlock and
- * waits on fls->fls_ctx_wq for the conflicting ctx to leave the
- * list, then retries.  Returns NULL on gate timeout (caller falls
- * back to MDS).
- *
- * The mirror_idx bit gets set atomically with admission so a
- * concurrent second-batch arrival with the same writer_key detects
- * the collision immediately.
- */
-static struct ffv2_stripe_ctx *
-ffv2_stripe_ctx_find_or_add(struct nfs4_ffv2_layout_segment *fls,
-			    void *writer_key, u64 stripe_off,
-			    u32 mirror_idx,
-			    struct ffv2_stripe_ctx *alloc,
-			    bool *is_new)
-{
-	const unsigned long timeout = msecs_to_jiffies(30 * 1000);
-
-	for (;;) {
-		struct ffv2_stripe_ctx *ctx;
-		bool same_writer, saw_conflict = false;
-
-		spin_lock(&fls->fls_ctx_lock);
-		list_for_each_entry(ctx, &fls->fls_ctx_list, list) {
-			if (ctx->stripe_off != stripe_off)
-				continue;
-			same_writer = ctx->writer_key == writer_key;
-			if (same_writer &&
-			    !test_bit(mirror_idx, ctx->mirror_seen) &&
-			    refcount_inc_not_zero(&ctx->refcnt)) {
-				bool drop_anchor;
-
-				__set_bit(mirror_idx, ctx->mirror_seen);
-				ctx->arrivals++;
-				drop_anchor = ctx->arrivals ==
-					      ctx->k + ctx->m;
-				spin_unlock(&fls->fls_ctx_lock);
-				if (drop_anchor)
-					ffv2_stripe_ctx_put(ctx);
-				*is_new = false;
-				return ctx;
-			}
-			/*
-			 * Conflict: different writer, or same writer's
-			 * second batch (mirror bit already set), or
-			 * refcount raced to zero (a release is about to
-			 * list_del + wake).  Sleep on fls_ctx_wq; the
-			 * wait helper re-scans the list on each wake
-			 * rather than dereferencing this pointer.
-			 */
-			saw_conflict = true;
-			break;
-		}
-		if (!saw_conflict) {
-			/* No match, no conflict -> install `alloc`. */
-			alloc->writer_key = writer_key;
-			alloc->stripe_off = stripe_off;
-			alloc->state = FFV2_CTX_ASSEMBLING;
-			bitmap_zero(alloc->mirror_seen,
-				    NFS4_FFV2_MAX_DS_PER_STRIPE);
-			__set_bit(mirror_idx, alloc->mirror_seen);
-			alloc->arrivals = 1;
-			list_add(&alloc->list, &fls->fls_ctx_list);
-			spin_unlock(&fls->fls_ctx_lock);
-			*is_new = true;
-			return alloc;
-		}
-		spin_unlock(&fls->fls_ctx_lock);
-
-		if (!wait_event_timeout(fls->fls_ctx_wq,
-					ffv2_stripe_gate_ready(fls, stripe_off,
-							       writer_key,
-							       mirror_idx),
-					timeout))
-			return NULL;	/* gate timeout -> MDS */
-		/* Loop to re-scan.  Another writer may have installed a
-		 * new same-stripe ctx while we waited; the retry treats
-		 * it exactly like the first pass.
-		 */
-	}
+	WARN_ON_ONCE(!list_empty(&fls->fls_ctx_list));
 }
 
 static struct ffv2_stripe_ctx *
@@ -2264,8 +2246,7 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 	 * every field access).
 	 */
 	memcpy(&f->data.fh, &fi->fh, sizeof(f->data.fh));
-	nfs4_init_sequence(ds->ds_clp, &f->data.seq_args,
-			   &f->data.res.seq_res,
+	nfs4_init_sequence(ds->ds_clp, &f->data.seq_args, &f->data.res.seq_res,
 			   0, 0);
 
 	/*
@@ -2351,9 +2332,9 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	struct nfs4_ffv2_mirror *mirror = fls->mirror_array[0];
 	struct ffv2_stripe_ctx *ctx;
 	const struct ffv2_encoder_ops *enc;
+	int rc_fail = -EIO;
 	u32 k = mirror->protection_data;
 	u32 m = mirror->protection_parity;
-	u32 mirror_idx = hdr->pgio_mirror_idx;
 
 	/*
 	 * No encoder for this layout's encoding family.  Route through
@@ -2437,57 +2418,85 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 			return ffv2_write_fallback_to_mds(hdr);
 
 		/*
-		 * Preallocate (page-alloc loop is heavy, keep it out of
-		 * the spinlock); admit under lock via find_or_add.
-		 * refcount = 2 on entry to find_or_add: 1 for the batch
-		 * anchor (dropped by the (k+m)-th arrival), 1 for THIS
-		 * mirror's dispatch ref (returned to the caller).
-		 * Sibling admissions get a single ref each.
+		 * Preallocate outside the lock (the page-alloc loop is
+		 * heavy), then claim the stripe.  A single reference: this
+		 * header owns the stripe for as long as it holds it, and
+		 * dropping the last reference is what releases it.
 		 */
 		cand = ffv2_stripe_ctx_alloc(fls, k, m,
 					     mirror->striping_unit_size,
 					     nfs_io_gfp_mask());
 		if (IS_ERR(cand))
 			return ffv2_write_fallback_to_mds(hdr);
-		refcount_set(&cand->refcnt, 2);
+		refcount_set(&cand->refcnt, 1);
 
-		{
-			bool is_new = false;
+		/*
+		 * Wait for a conflicting writer rather than failing.  No
+		 * timeout, and that is load-bearing: an owner always
+		 * reaches its completion in bounded time, because every
+		 * shard carries RPC_TASK_SOFT and the read-modify-write
+		 * fetch is capped, so a waiter cannot wait forever.  Having
+		 * no deadline is what removes the PNFS_TRY_AGAIN re-entry
+		 * that made this path cycle.  If a future change introduces
+		 * an owner path that is not bounded, this argument breaks
+		 * and the timeout has to come back.
+		 *
+		 * Killable rather than uninterruptible: a data server
+		 * connect runs synchronously inside the claimed window and
+		 * follows hard-mount semantics, so a waiter can legitimately
+		 * be here longer than the hung-task detector's patience.
+		 */
+		for (;;) {
+			bool closed = false;
 
-			found = ffv2_stripe_ctx_find_or_add(
-				fls, ffv2_writer_key(hdr), stripe_off,
-				mirror_idx, cand, &is_new);
-			if (!found) {
+			found = ffv2_stripe_claim(fls, stripe_off, cand,
+						  &closed);
+			if (found)
+				break;
+			if (closed) {
+				/*
+				 * The segment is being recalled.  Nothing is
+				 * claimed and nothing launched, so hand the
+				 * header back for a fresh layout rather than
+				 * writing against one the server is taking
+				 * away.
+				 */
 				ffv2_stripe_ctx_free(cand);
 				return ffv2_write_fallback_to_mds(hdr);
 			}
-			if (!is_new) {
-				ffv2_stripe_ctx_free(cand);
-				ctx = found;
-			} else {
-				ctx = cand;
+			if (wait_event_killable(fls->fls_ctx_wq,
+						ffv2_stripe_wait_done(fls,
+								stripe_off))) {
 				/*
-				 * Admission-time zero + optional user copy.
-				 * For full-stripe / safe-append: user bytes
-				 * go straight into the shards.  For
-				 * contained-partial RMW: DEFER
-				 * ffv2_copy_user_to_shards_at until AFTER
-				 * the fetch -- the fetch DMAs full shard_len
-				 * into the same pages and an admission-time
-				 * user copy would be clobbered by the
-				 * predecessor DS data.  ffv2_zero_shards
-				 * stays for both paths so bytes beyond
-				 * `expected` remain pre-zeroed (NOENT is a
-				 * no-op memset because the shard is already
-				 * zero).
+				 * Killed while waiting.  Nothing was claimed
+				 * and nothing launched, so -- as on the
+				 * out_fail_claimed path -- completing the
+				 * header here is ours to do; no release
+				 * callback exists to do it for us.
 				 */
-				ffv2_zero_shards(ctx);
-				if (!contained_partial)
-					ffv2_copy_user_to_shards_at(ctx, hdr,
-						(u32)off_in_stripe,
-						hdr->args.count);
+				ffv2_stripe_ctx_free(cand);
+				nfs_set_pgio_error(hdr, -ERESTARTSYS,
+						   hdr->args.offset);
+				hdr->completion_ops->completion(hdr);
+				/* hdr is now freed; do not touch. */
+				return PNFS_ATTEMPTED;
 			}
 		}
+		ctx = cand;
+
+		/*
+		 * Zero the shards, and for everything except a
+		 * read-modify-write copy the user bytes in now.  The RMW
+		 * copy is deferred until after the fetch, which DMAs a full
+		 * shard into these same pages and would otherwise overwrite
+		 * it with predecessor data.  The zeroing applies either way,
+		 * so bytes past `expected` stay pre-zeroed.
+		 */
+		ffv2_zero_shards(ctx);
+		if (!contained_partial)
+			ffv2_copy_user_to_shards_at(ctx, hdr,
+						    (u32)off_in_stripe,
+						    hdr->args.count);
 
 		/*
 		 * Serialize encode / state transition under encode_lock:
@@ -2582,47 +2591,49 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 			rc_enc = rc_enc ? rc_enc : -EIO;
 		mutex_unlock(&ctx->encode_lock);
 		if (rc_enc) {
-			ffv2_stripe_ctx_put(ctx);
-			return ffv2_write_fallback_to_mds(hdr);
+			rc_fail = rc_enc;
+			goto out_fail_claimed;
 		}
 	}
-	if (mirror_idx >= ctx->k + ctx->m) {
-		ffv2_stripe_ctx_put(ctx);
-		return ffv2_write_fallback_to_mds(hdr);
-	}
 
 	/*
-	 * From here on the ctx ref belongs to this dispatch.  Hand
-	 * off to the CHUNK_WRITE helper, which resolves ds_slot /
-	 * devnode / ds_clp itself, allocates the stripe write,
-	 * populates args, and runs the private RPC via
-	 * ffv2_chunk_write_procinfo.  On PNFS_ATTEMPTED the stripe
-	 * write owns all subsequent teardown (including the inherited
-	 * ctx ref).  On PNFS_NOT_ATTEMPTED the helper has unwound its
-	 * own local refs (devnode, lseg, ds_clp) and left ctx to us;
-	 * drop inline below.
+	 * From here on the stripe context belongs to the dispatch, which
+	 * launches all k+m shards from this one header.  On
+	 * PNFS_ATTEMPTED the header belongs to the completion tails and
+	 * must not be touched again.
 	 */
-	{
-		enum pnfs_try_status rc_disp;
+	if (ffv2_stripe_write_dispatch(hdr, ctx, sync) == PNFS_ATTEMPTED)
+		return PNFS_ATTEMPTED;
+	rc_fail = -ENOMEM;	/* the only non-ATTEMPTED return it has */
 
-		rc_disp = ffv2_chunk_write_dispatch_one_mirror(
-			hdr, ctx, mirror_idx, sync);
-		if (rc_disp == PNFS_ATTEMPTED)
-			return rc_disp;
-	}
-
+out_fail_claimed:
 	/*
-	 * Sibling dispatch-time failure after some other mirror
-	 * already dispatched: the DS state can be torn until the
-	 * fallback path takes over.  Always mark the layout for
-	 * return here (DS-layer failures invalidate layout state
-	 * independent of MDS-fallback eligibility); then let the
-	 * helper decide PNFS_NOT_ATTEMPTED vs PNFS_TRY_AGAIN based
-	 * on the no-MDS-fallback policy.  Both actions are
-	 * idempotent when the helper also fires mark-for-return.
+	 * Failed while holding the stripe, before anything was in
+	 * flight.  Release it -- dropping the last reference unlinks the
+	 * context and wakes any conflicting writer -- and report the
+	 * error on the header.
+	 *
+	 * PNFS_ATTEMPTED, not NOT_ATTEMPTED and not TRY_AGAIN.  The write
+	 * was attempted and it failed.  Either of the other two hands the
+	 * request back for re-dispatch against the same layout, which is
+	 * the cycle this path exists to avoid -- and under
+	 * FFV2_FLAGS_NO_IO_THRU_MDS the metadata server route is
+	 * forbidden anyway, so there is nowhere else for it to go.
+	 *
+	 * PNFS_ATTEMPTED also means pnfs_do_write() does nothing further:
+	 * completing the header is ours.  No RPC was launched here, so no
+	 * release callback will ever run and neither barrier tail fires;
+	 * without the explicit completion below the requests stay under
+	 * writeback and the write hangs in folio_wait_writeback for the
+	 * life of the mount -- the very failure this rework removes.
+	 * Unclaim first: once the header is completed it may be freed,
+	 * and a waiter woken by the unclaim must not see a half-torn-down
+	 * owner.
 	 */
-	if (hdr->lseg)
-		pnfs_error_mark_layout_for_return(hdr->inode, hdr->lseg);
+	pnfs_error_mark_layout_for_return(hdr->inode, lseg);
 	ffv2_stripe_ctx_put(ctx);
-	return ffv2_write_fallback_to_mds(hdr);
+	nfs_set_pgio_error(hdr, rc_fail, hdr->args.offset);
+	hdr->completion_ops->completion(hdr);
+	/* hdr is now freed; do not touch. */
+	return PNFS_ATTEMPTED;
 }

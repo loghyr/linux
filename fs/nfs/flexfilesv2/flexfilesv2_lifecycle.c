@@ -237,6 +237,14 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 	nfs4_init_sequence(ctx->ds_clp, &d->wire.seq_args,
 			   &d->wire.res.seq_res, 0, 0);
 
+	/*
+	 * argp and resp must land on the structs whose first member is
+	 * the SEQUENCE args / res -- nfs41_assign_slot casts them
+	 * directly when it hands a freed slot to a parked task.  Passing
+	 * the dispatch wrapper for both, as this did, put neither at
+	 * offset 0: the handoff scribbled the slot pointer over
+	 * args.stateid and the task never saw the slot it was given.
+	 */
 	msg.rpc_argp = &d->wire;
 	msg.rpc_resp = &d->wire.res;
 	task_setup.rpc_client = ctx->ds_clp->cl_rpcclient;

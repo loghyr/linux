@@ -67,9 +67,17 @@ struct ffv2_chunk_write_args {
  * CHUNK_WRITE4resok in-memory form.  Reply-array bounds are
  * FFV2_MAX_CHUNKS_PER_OP to cap malformed-reply allocations;
  * nblocks reports the actual N the DS returned.
+ *
+ * seq_res MUST stay the first member.  nfs41_assign_slot
+ * (fs/nfs/nfs4session.c) hands a freed slot to a parked task by
+ * casting rpc_resp straight to struct nfs4_sequence_res, exactly as
+ * struct nfs_pgio_res does for the plain-NFSv4.1 path.  Move it and
+ * the handoff writes the slot pointer over the reply body instead,
+ * the task never sees the slot it was given, and the slot is lost
+ * from the table for good.
  */
 struct ffv2_chunk_write_res {
-	struct nfs4_sequence_res	seq_res;
+	struct nfs4_sequence_res	seq_res;	/* MUST be first */
 	u32				count;
 	u32				committed;
 	nfs4_verifier			writeverf;
@@ -99,6 +107,11 @@ struct ffv2_chunk_write_res {
  * retry state machine must match -NFS4ERR_DELAY, not -EAGAIN.
  */
 struct ffv2_chunk_write_data {
+	/*
+	 * seq_args MUST stay the first member, for the argp half of
+	 * the same nfs41_assign_slot cast described above
+	 * ffv2_chunk_write_res.  rpc_resp points at .res, not here.
+	 */
 	struct nfs4_sequence_args	seq_args;
 	struct ffv2_chunk_write_args	args;
 	struct nfs_fh			fh;
@@ -166,6 +179,7 @@ struct ffv2_read_chunk4 {
  * EOF.
  */
 struct ffv2_chunk_read_res {
+	/* MUST be first -- see ffv2_chunk_write_res. */
 	struct nfs4_sequence_res seq_res;
 	bool			eof;
 	u32			nchunks;
@@ -183,6 +197,7 @@ struct ffv2_chunk_read_res {
  * retry loop.
  */
 struct ffv2_chunk_read_data {
+	/* MUST be first -- see ffv2_chunk_write_data. */
 	struct nfs4_sequence_args	seq_args;
 	struct ffv2_chunk_read_args	args;
 	struct nfs_fh			fh;
@@ -246,6 +261,7 @@ struct ffv2_chunk_finalize_args {
  * (expected 1 for single-owner requests).
  */
 struct ffv2_chunk_finalize_res {
+	/* MUST be first -- see ffv2_chunk_write_res. */
 	struct nfs4_sequence_res seq_res;
 	nfs4_verifier		writeverf;
 	u32			nstatus;
@@ -264,6 +280,7 @@ struct ffv2_chunk_finalize_res {
  * loop.
  */
 struct ffv2_chunk_finalize_data {
+	/* MUST be first -- see ffv2_chunk_write_data. */
 	struct nfs4_sequence_args	seq_args;
 	struct ffv2_chunk_finalize_args	args;
 	struct nfs_fh			fh;
@@ -299,6 +316,7 @@ struct ffv2_chunk_commit_args {
  * MUST invalidate the FINALIZE and retry.
  */
 struct ffv2_chunk_commit_res {
+	/* MUST be first -- see ffv2_chunk_write_res. */
 	struct nfs4_sequence_res seq_res;
 	nfs4_verifier		writeverf;
 	u32			nstatus;
@@ -314,6 +332,7 @@ struct ffv2_chunk_commit_res {
  * loop.
  */
 struct ffv2_chunk_commit_data {
+	/* MUST be first -- see ffv2_chunk_write_data. */
 	struct nfs4_sequence_args	seq_args;
 	struct ffv2_chunk_commit_args	args;
 	struct nfs_fh			fh;

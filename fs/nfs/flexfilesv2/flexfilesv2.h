@@ -334,6 +334,16 @@ struct nfs4_ffv2_layout_segment {
 	struct list_head		fls_ctx_list;	/* ffv2_stripe_ctx */
 	wait_queue_head_t		fls_ctx_wq;	/* same-stripe gate */
 	/*
+	 * Set when this segment is being recalled or cancelled.  New
+	 * stripe claims are refused from that point on: writing against
+	 * a layout the server is taking back should ask for a fresh one
+	 * rather than keep using this one.  Guarded by fls_ctx_lock;
+	 * setting it wakes fls_ctx_wq, because a waiter blocked on a
+	 * stripe whose owner finishes after the recall would otherwise
+	 * sleep until some unrelated stripe was released.
+	 */
+	bool				fls_claim_closed;
+	/*
 	 * Per-lseg source of chunk_owner4.co_id.  Seeded to 1 at lseg
 	 * alloc; incremented once per CHUNK_WRITE via ffv2_owner_id_next().
 	 * Consumers land in subsequent commits.
@@ -472,6 +482,7 @@ extern const struct ffv2_encoder_ops ffv2_encoder_mojette_systematic;
 /* flexfilesv2_write.c */
 enum pnfs_try_status
 ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync);
+void ffv2_claim_close(struct nfs4_ffv2_layout_segment *fls);
 void ffv2_stripe_ctx_list_drain(struct nfs4_ffv2_layout_segment *fls);
 void ffv2_stripe_ctx_put(struct ffv2_stripe_ctx *ctx);
 
@@ -532,6 +543,15 @@ extern atomic_t ffv2_cg_gen_id_next_val;
 
 void ffv2_chunk_guard_init(void);
 
+/*
+ * Writer identity to stamp on a CHUNK operation for @mirror.
+ *
+ * The reserved sentinels are not identities: a client MUST NOT
+ * present either, and a metadata server that leaves ffv2m_client_id
+ * at one of them has told us nothing.  Fall back to the module seed
+ * there rather than putting a value on the wire that the data server
+ * is required to reject.
+ */
 static inline u32 ffv2_cg_client_id(const struct nfs4_ffv2_mirror *mirror)
 {
 	if (mirror && mirror->client_id != FFV2_CG_CLIENT_ID_NONE &&
