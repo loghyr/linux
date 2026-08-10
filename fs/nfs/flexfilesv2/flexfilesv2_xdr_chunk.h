@@ -227,6 +227,17 @@ extern const struct rpc_procinfo ffv2_chunk_read_procinfo;
 #define FFV2_CHUNK_READ_MAX_DELAY_ATTEMPTS	5
 
 /*
+ * How many times one CHUNK_WRITE shard may re-read its chunk guard
+ * after the data server rejects it with NFS4ERR_DELAY.  Each attempt
+ * costs a round trip and the whole stripe sits inside the fetch
+ * engine's 60 s bound, so this is deliberately small: a guard that is
+ * still stale after a few refreshes means real write contention, and
+ * falling back to the metadata server is the better answer than
+ * spinning.
+ */
+#define FFV2_CHUNK_WRITE_MAX_GUARD_REFRESH	3
+
+/*
  * CHUNK_READ dispatch entry.  Called once per data shard by the
  * contained-partial RMW branch of ffv2_write_pagelist_chunked once
  * that branch is enabled.
@@ -238,16 +249,26 @@ extern const struct rpc_procinfo ffv2_chunk_read_procinfo;
  * failure to dispatch (the caller must call ffv2_rmw_fetch_done_one
  * itself).
  *
+ * refresh_for is NULL for the read-modify-write engine, which owns
+ * ctx->fetch_pending.  A non-NULL value marks a guard refresh issued
+ * on behalf of a CHUNK_WRITE the data server rejected: that counter is
+ * not armed on this path, so the release wakes the parked write
+ * instead of decrementing it, and the payload lands in scratch pages
+ * rather than the shard pages, which still hold the encoded bytes the
+ * write is sending.
+ *
  * Non-static within the ffv2 module -- NOT EXPORT_SYMBOL_GPL.  No
  * out-of-module consumer exists.
  */
 struct ffv2_stripe_ctx;
 struct nfs_pgio_header;
 struct nfs4_ffv2_mirror;
+struct ffv2_chunk_write_dispatch;
 int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 				   struct nfs_pgio_header *tmpl,
 				   struct nfs4_ffv2_mirror *mirror,
-				   u32 shard_idx, u32 count);
+				   u32 shard_idx, u32 count,
+				   struct ffv2_chunk_write_dispatch *refresh_for);
 
 /*
  * CHUNK_FINALIZE4args in-memory form.

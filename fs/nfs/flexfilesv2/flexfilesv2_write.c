@@ -104,8 +104,42 @@ struct ffv2_chunk_write_dispatch {
 	 */
 	struct rpc_task			task;
 	struct nfs_client		*ds_clp;
+	/*
+	 * Index of this shard within the stripe, and the same index
+	 * into ctx->captured_guard[].  Carried explicitly rather than
+	 * derived from (w - sw->disp) so the guard-refresh path can
+	 * name its slot without pointer arithmetic.
+	 */
+	u32				mirror_idx;
+	/*
+	 * NFS4ERR_DELAY guard-refresh counter.  Bumped each time the
+	 * data server rejects this shard's guard and we re-read it;
+	 * capped at FFV2_CHUNK_WRITE_MAX_GUARD_REFRESH.
+	 */
+	u32				guard_refreshes;
 	bool				landed;
 };
+
+/*
+ * Parking queue for a CHUNK_WRITE awaiting its guard refresh.  The
+ * write task sleeps here between rpc_restart_call_prepare() and the
+ * refreshing CHUNK_READ's release, so the restart cannot re-encode
+ * before the new guard has landed.  Module-global rather than
+ * per-stripe: an rpc_wait_queue is not free to set up and tear down,
+ * and the queue only ever holds tasks that are individually woken by
+ * name.
+ */
+static struct rpc_wait_queue ffv2_guard_refresh_wq;
+
+void ffv2_guard_refresh_init(void)
+{
+	rpc_init_wait_queue(&ffv2_guard_refresh_wq, "ffv2_guard_refresh");
+}
+
+void ffv2_guard_refresh_exit(void)
+{
+	rpc_destroy_wait_queue(&ffv2_guard_refresh_wq);
+}
 
 /*
  * One per pgio header: the stripe write, and the owner of everything
@@ -173,6 +207,8 @@ struct ffv2_stripe_write {
 };
 
 static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw);
+static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
+					   struct ffv2_chunk_write_dispatch *w);
 
 /*
  * Record a shard's or a chain's failure.  First error wins: a later
@@ -237,6 +273,27 @@ static void ffv2_stripe_write_chains_retire(struct ffv2_stripe_write *sw,
 static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
 {
 	struct ffv2_chunk_write_dispatch *w = data;
+	struct ffv2_captured_guard *slot =
+		&w->sw->ctx->captured_guard[w->mirror_idx];
+
+	/*
+	 * Take the guard from its slot on every pass, not just the
+	 * first.  On the initial dispatch this reproduces what the
+	 * dispatch helper already encoded; after a refresh it picks up
+	 * the value the data server just gave us, which is the whole
+	 * point of restarting through .rpc_call_prepare rather than
+	 * re-encoding by hand.  cwg_check stays TRUE either way, and a
+	 * slot with nothing in it sends the {0,0} sentinel that an
+	 * empty chunk accepts.
+	 */
+	w->wire.args.guard.check = true;
+	if (slot->valid) {
+		w->wire.args.guard.guard = slot->guard;
+	} else {
+		w->wire.args.guard.guard.cg_gen_id = 0;
+	}
+	w->wire.args.guard.guard.cg_client_id =
+		ffv2_cg_client_id(w->sw->ctx->fls->mirror_array[0]);
 
 	nfs4_setup_sequence(w->ds_clp, &w->wire.seq_args, &w->wire.res.seq_res,
 			    task);
@@ -307,6 +364,9 @@ static void ffv2_chunk_write_call_done(struct rpc_task *task, void *data)
 			task->tk_status = -EPROTO;
 			goto fail;
 		}
+		if (res->block_status[0] == FFV2_NFS4ERR_CHUNK_GUARDED &&
+		    ffv2_chunk_write_guard_refresh(task, w))
+			return;
 		if (res->block_status[0] != NFS4_OK) {
 			task->tk_status =
 				nfs4_stat_to_errno(res->block_status[0]);
@@ -782,23 +842,19 @@ static int ffv2_shard_launch(struct ffv2_stripe_write *sw, u32 idx)
 	 * The DS's CAS short-circuits on !prev (empty chunk), so a
 	 * first-write with any guard proceeds without version
 	 * comparison.  A non-empty chunk with a mismatching sentinel
-	 * gets NFS4ERR_DELAY; a follow-up commit classifies that and
-	 * retries with a fresh CHUNK_READ.  draft sec-write_chunk_guard4
-	 * permits this: check=TRUE is the draft-conforming envelope
-	 * regardless of guard contents (the DS decides accept vs delay
-	 * based on prev + guard).
+	 * gets NFS4ERR_DELAY, which ffv2_chunk_write_call_done answers
+	 * by re-reading the guard and restarting this write.  draft
+	 * sec-write_chunk_guard4 permits this: check=TRUE is the
+	 * draft-conforming envelope regardless of guard contents (the
+	 * DS decides accept vs delay based on prev + guard).
 	 *
-	 * With this uniform-encode in place, the ONLY_ONE_WRITER
-	 * dispatch gate at the top of ffv2_write_pagelist_chunked is
-	 * dropped by a follow-up commit.
+	 * The guard value itself is stamped by ffv2_chunk_write_prepare
+	 * rather than here, so a write restarted through
+	 * .rpc_call_prepare picks up a refreshed guard without this
+	 * helper running again.  Record which slot this shard owns;
+	 * prepare reads it on every pass.
 	 */
-	w->wire.args.guard.check = true;
-	if (ctx->captured_guard[mirror_idx].valid) {
-		w->wire.args.guard.guard = ctx->captured_guard[mirror_idx].guard;
-	} else {
-		w->wire.args.guard.guard.cg_gen_id = 0;
-		w->wire.args.guard.guard.cg_client_id = 0;
-	}
+	w->mirror_idx = mirror_idx;
 
 	/* Copy the DS filehandle into the wrapper (bounded, owned). */
 	memcpy(&w->wire.fh, &fi->fh, sizeof(w->wire.fh));
@@ -1613,7 +1669,7 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
 	    layout_ds->ds_versions[0].minor_version >= 2) {
 		nfs4_put_deviceid_node(devnode);
 		return ffv2_chunk_read_fetch_dispatch(ctx, tmpl, mirror,
-						      shard_idx, 1);
+						      shard_idx, 1, NULL);
 	}
 
 	/*
@@ -1857,6 +1913,26 @@ struct ffv2_chunk_read_fetch {
 	 * FFV2_CHUNK_READ_MAX_DELAY_ATTEMPTS.
 	 */
 	int			retry_attempts;
+	/*
+	 * Guard-refresh mode.  NULL for the read-modify-write engine.
+	 * Non-NULL names the CHUNK_WRITE parked on
+	 * ffv2_guard_refresh_wq waiting for this read's guard, and
+	 * switches the release from decrementing fetch_pending (not
+	 * armed on this path) to waking that write.
+	 */
+	struct ffv2_chunk_write_dispatch *refresh_for;
+	/*
+	 * Payload landing pages for a guard refresh, owned here and
+	 * freed by the release.  A refresh CANNOT read into
+	 * ctx->shard_pages[shard_idx]: those hold the encoded bytes
+	 * the parked CHUNK_WRITE is still sending, and overwriting
+	 * them with predecessor data would corrupt the write this
+	 * refresh exists to complete.  The bytes that land here are
+	 * discarded; only the guard is wanted.  CHUNK_HEADER_READ
+	 * would make the whole allocation unnecessary.
+	 */
+	struct page		**scratch;
+	u32			scratch_pages;
 	/*
 	 * Composite task-data.  args / fh / seq_args / seq_res / res
 	 * all live here; the CHUNK_READ procinfo encoder + decoder
@@ -2126,6 +2202,112 @@ static void ffv2_chunk_read_dispatch_call_done_v4(struct rpc_task *task,
 		task->tk_status = rc;
 }
 
+/*
+ * Re-read one shard's chunk guard and restart its CHUNK_WRITE with it.
+ *
+ * Returns true when the retry is under way and the caller must return
+ * immediately: the task has been restarted and parked, so the failure
+ * path below it must not run.  Returns false when the attempt budget
+ * is spent, leaving tk_status alone so the caller fails the shard as
+ * it always did.
+ *
+ * The task is restarted BEFORE it is parked.  rpc_restart_call_prepare
+ * sets the next action to re-run .rpc_call_prepare, which is what
+ * re-encodes the guard; rpc_sleep_on then holds the task there until
+ * the refresh completes.  Ordering matters -- parking without
+ * restarting would resume a task whose next action is still to
+ * complete, and restarting without parking would race the re-encode
+ * against the refresh.
+ *
+ * Because the task restarts rather than completes, its .rpc_release
+ * does not run, so writes_pending is untouched and the stripe's
+ * phase-one barrier still sees exactly one pending write per shard.
+ */
+static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
+					   struct ffv2_chunk_write_dispatch *w)
+{
+	struct ffv2_stripe_write *sw = w->sw;
+	struct ffv2_stripe_ctx *ctx = sw->ctx;
+	struct nfs4_ffv2_mirror *mirror;
+	int rc;
+
+	if (w->guard_refreshes >= FFV2_CHUNK_WRITE_MAX_GUARD_REFRESH)
+		return false;
+	w->guard_refreshes++;
+
+	if (WARN_ON_ONCE(!ctx->fls || !ctx->fls->mirror_array))
+		return false;
+	mirror = ctx->fls->mirror_array[0];
+
+	/*
+	 * Drop the rejected guard before asking for a new one.  If the
+	 * refresh fails to capture, the retry must fall back to the
+	 * sentinel rather than resend the value the server just told us
+	 * was wrong.
+	 */
+	ctx->captured_guard[w->mirror_idx].valid = false;
+
+	/* Keep the parked write wrapper alive until the refresh releases. */
+	refcount_inc(&sw->sw_ref);
+	rpc_restart_call_prepare(task);
+	rpc_sleep_on(&ffv2_guard_refresh_wq, task, NULL);
+
+	rc = ffv2_chunk_read_fetch_dispatch(ctx, sw->hdr, mirror,
+					    w->mirror_idx, 1, w);
+	if (rc) {
+		/*
+		 * Nothing was dispatched, so no release will fire and
+		 * nothing else can wake this task.  Wake it here; the
+		 * retry proceeds with the sentinel and either succeeds
+		 * against a now-empty chunk or spends another attempt.
+		 */
+		rpc_wake_up_queued_task(&ffv2_guard_refresh_wq, task);
+		ffv2_stripe_write_put(sw);
+	}
+	return true;
+}
+
+/*
+ * Scratch payload pages for a guard refresh.  See the `scratch`
+ * comment on struct ffv2_chunk_read_fetch for why the shard pages
+ * cannot be used.  Returns 0 with f->scratch populated, or -ENOMEM
+ * with nothing allocated.
+ */
+static int ffv2_chunk_read_alloc_scratch(struct ffv2_chunk_read_fetch *f,
+					 u32 npages)
+{
+	u32 i;
+
+	f->scratch = kcalloc(npages, sizeof(*f->scratch), nfs_io_gfp_mask());
+	if (!f->scratch)
+		return -ENOMEM;
+	for (i = 0; i < npages; i++) {
+		f->scratch[i] = alloc_page(nfs_io_gfp_mask());
+		if (!f->scratch[i]) {
+			while (i-- > 0)
+				__free_page(f->scratch[i]);
+			kfree(f->scratch);
+			f->scratch = NULL;
+			return -ENOMEM;
+		}
+	}
+	f->scratch_pages = npages;
+	return 0;
+}
+
+static void ffv2_chunk_read_free_scratch(struct ffv2_chunk_read_fetch *f)
+{
+	u32 i;
+
+	if (!f->scratch)
+		return;
+	for (i = 0; i < f->scratch_pages; i++)
+		__free_page(f->scratch[i]);
+	kfree(f->scratch);
+	f->scratch = NULL;
+	f->scratch_pages = 0;
+}
+
 static void ffv2_chunk_read_dispatch_release(void *data)
 {
 	struct ffv2_chunk_read_fetch *f = data;
@@ -2152,7 +2334,27 @@ static void ffv2_chunk_read_dispatch_release(void *data)
 	 */
 	if (ds_clp)
 		nfs_put_client(ds_clp);
-	ffv2_rmw_fetch_done_one(ctx, status);
+	if (f->refresh_for) {
+		struct ffv2_stripe_write *sw = f->refresh_for->sw;
+
+		/*
+		 * Guard refresh: wake the parked CHUNK_WRITE instead of
+		 * touching fetch_pending, which belongs to the RMW engine
+		 * and is not armed here.  The wake is unconditional --
+		 * every refresh outcome must produce exactly one, or the
+		 * write sleeps until the stripe's 60 s bound.  A refresh
+		 * that captured nothing leaves the slot invalid, and the
+		 * retry re-sends the sentinel: correct if the chunk has
+		 * since become empty, and otherwise spends one more of a
+		 * bounded number of attempts.
+		 */
+		ffv2_chunk_read_free_scratch(f);
+		rpc_wake_up_queued_task(&ffv2_guard_refresh_wq,
+					&f->refresh_for->task);
+		ffv2_stripe_write_put(sw);
+	} else {
+		ffv2_rmw_fetch_done_one(ctx, status);
+	}
 	ffv2_stripe_ctx_put(ctx);
 	pnfs_put_lseg(lseg);
 	kfree(f);
@@ -2185,7 +2387,8 @@ static const struct rpc_call_ops ffv2_chunk_read_dispatch_call_ops_v4 = {
 int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 				   struct nfs_pgio_header *tmpl,
 				   struct nfs4_ffv2_mirror *mirror,
-				   u32 shard_idx, u32 count)
+				   u32 shard_idx, u32 count,
+				   struct ffv2_chunk_write_dispatch *refresh_for)
 {
 	struct nfs4_ffv2_stripe *stripe;
 	struct nfs4_ffv2_data_server *ds_slot;
@@ -2290,7 +2493,23 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 		chunk_index /= mirror->striping_unit_size;
 	f->data.args.offset = chunk_index;
 	f->data.args.count = count;			/* always 1 */
-	f->data.args.pages = ctx->shard_pages[shard_idx];
+	/*
+	 * A guard refresh lands in its own pages: ctx->shard_pages[]
+	 * still holds the encoded bytes the parked CHUNK_WRITE is
+	 * sending, and this reply would overwrite them.
+	 */
+	if (refresh_for) {
+		rc = ffv2_chunk_read_alloc_scratch(f, ctx->pages_per_shard);
+		if (rc) {
+			kfree(f);
+			nfs4_put_deviceid_node(devnode);
+			return rc;
+		}
+		f->refresh_for = refresh_for;
+		f->data.args.pages = f->scratch;
+	} else {
+		f->data.args.pages = ctx->shard_pages[shard_idx];
+	}
 	f->data.args.pgbase = 0;
 	f->data.args.pglen = ctx->shard_len;
 	/*
@@ -2370,6 +2589,7 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 		nfs_put_client(ds->ds_clp);
 		refcount_dec(&ctx->refcnt);
 		pnfs_put_lseg(f->lseg);
+		ffv2_chunk_read_free_scratch(f);
 		kfree(f);
 		return PTR_ERR(task);
 	}

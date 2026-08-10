@@ -537,6 +537,14 @@ extern atomic_t ffv2_cg_gen_id_next_val;
 void ffv2_chunk_guard_init(void);
 
 /*
+ * Set up / tear down the wait queue that parks a CHUNK_WRITE while its
+ * chunk guard is re-read after an NFS4ERR_DELAY.  Module-scope, so the
+ * module init/exit own the lifetime.
+ */
+void ffv2_guard_refresh_init(void);
+void ffv2_guard_refresh_exit(void);
+
+/*
  * Writer identity to stamp on a CHUNK operation for @mirror.
  *
  * The reserved sentinels are not identities: a client MUST NOT

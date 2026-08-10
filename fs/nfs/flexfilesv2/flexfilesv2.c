@@ -950,6 +950,7 @@ static int __init nfs4flexfilesv2_init(void)
 	pr_info("%s: NFSv4 Flexfile v2 Layout Driver Registering...\n",
 		__func__);
 	ffv2_chunk_guard_init();
+	ffv2_guard_refresh_init();
 	return pnfs_register_layoutdriver(&flexfilesv2_type);
 }
 
@@ -958,6 +959,7 @@ static void __exit nfs4flexfilesv2_exit(void)
 	pr_info("%s: NFSv4 Flexfile v2 Layout Driver Unregistering...\n",
 		__func__);
 	pnfs_unregister_layoutdriver(&flexfilesv2_type);
+	ffv2_guard_refresh_exit();
 }
 
 MODULE_ALIAS("nfs-layouttype4-6");
