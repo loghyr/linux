@@ -97,12 +97,12 @@ static void ffv2_chunk_finalize_prepare(struct rpc_task *task, void *data)
 }
 
 /*
- * .rpc_call_done: return the session slot unconditionally
- * first (the CHUNK_FINALIZE decoder guarantees sr_status is
- * populated on every exit path via the sr_status = 1 sentinel;
- * missing this leaks slots on rpc_exit and wedges the
- * session).  Then classify the outcome so the release-cb sees
- * a coherent task->tk_status:
+ * .rpc_call_done: return the session slot first, and stop if the
+ * sequence layer restarted the call (the CHUNK_FINALIZE decoder
+ * guarantees sr_status is populated on every exit path via the
+ * sr_status = 1 sentinel; missing the slot return leaks slots on
+ * rpc_exit and wedges the session).  Then classify the outcome so
+ * the release-cb sees a coherent task->tk_status:
  *
  *   - task->tk_status != 0: RPC-time failure, transport /
  *     session / etc.  Propagate as-is.
@@ -119,7 +119,14 @@ static void ffv2_chunk_finalize_call_done(struct rpc_task *task, void *data)
 	struct ffv2_chunk_finalize_dispatch *d = data;
 	struct ffv2_chunk_finalize_res *res = &d->wire.res;
 
-	nfs4_sequence_done(task, &d->wire.res.seq_res);
+	/*
+	 * Stop if the sequence layer restarted the call: it clears
+	 * tk_status, so the shape check below would read an undecoded
+	 * reply, see nstatus == 0 and snapshot -EPROTO as this shard's
+	 * outcome.
+	 */
+	if (!nfs4_sequence_done(task, &d->wire.res.seq_res))
+		return;
 
 	if (task->tk_status == 0) {
 		if (res->nstatus != 1)
@@ -305,7 +312,9 @@ static void ffv2_chunk_commit_call_done(struct rpc_task *task, void *data)
 	struct ffv2_chunk_commit_dispatch *d = data;
 	struct ffv2_chunk_commit_res *res = &d->wire.res;
 
-	nfs4_sequence_done(task, &d->wire.res.seq_res);
+	/* Same restart bail-out as the FINALIZE call_done above. */
+	if (!nfs4_sequence_done(task, &d->wire.res.seq_res))
+		return;
 
 	if (task->tk_status == 0) {
 		if (res->nstatus != 1)

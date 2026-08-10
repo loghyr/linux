@@ -413,11 +413,15 @@ static void ffv2_shard_read_call_done(struct rpc_task *task, void *data)
 	int rc;
 
 	/*
-	 * Return the session slot unconditionally and first: harmless
-	 * when none was acquired, and skipping it on an rpc_exit path
+	 * Return the session slot first, and stop if the sequence layer
+	 * restarted the call: it clears tk_status, so the nchunks check
+	 * below would read an undecoded reply and fail the read with
+	 * -EIO instead of letting the retry run.  Harmless when no slot
+	 * was acquired, and skipping the slot return on an rpc_exit path
 	 * leaks a slot per failed read until the data server wedges.
 	 */
-	nfs4_sequence_done(task, &r->data.res.seq_res);
+	if (!nfs4_sequence_done(task, &r->data.res.seq_res))
+		return;
 
 	if (task->tk_status < 0) {
 		unsigned long delay_ms;

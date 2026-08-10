@@ -243,12 +243,13 @@ static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
 }
 
 /*
- * .rpc_call_done: return the session slot unconditionally first
- * (3a decoder guarantees sr_status populated per every exit
- * path; missing this leaks slots on rpc_exit and wedges the
- * session).  Then re-decide the failure disposition based on
- * this attempt's outcome: clear the stale bit, apply per-chunk
- * validation on success, or jump to the failure tail.
+ * .rpc_call_done: return the session slot first, and stop if the
+ * sequence layer restarted the call (3a decoder guarantees
+ * sr_status populated per every exit path; missing the slot
+ * return leaks slots on rpc_exit and wedges the session).  Then
+ * re-decide the failure disposition based on this attempt's
+ * outcome: clear the stale bit, apply per-chunk validation on
+ * success, or jump to the failure tail.
  *
  * Per-chunk validation per draft sec-CHUNK_WRITE :9062-9107 +
  * :9058-9070 short-write disposition:
@@ -290,18 +291,16 @@ static void ffv2_chunk_write_call_done(struct rpc_task *task, void *data)
 	struct ffv2_chunk_write_res *res = &w->wire.res;
 
 	/*
-	 * Guard nfs4_sequence_done against a NULL sr_slot.
-	 * .rpc_call_prepare invokes nfs4_setup_sequence which populates
-	 * seq_res.sr_slot only on successful slot allocation; on some
-	 * early failure paths (session teardown mid-flight, setup
-	 * returning without a slot) the res stays zeroed from kzalloc
-	 * and .rpc_call_done still fires unconditionally.
-	 * nfs4_sequence_done would then dereference sr_slot at offset
-	 * 8 (sr_slot->table) and page-fault.  FFv1's flexfilelayout.c
-	 * conditionalizes the same call for the same reason.
+	 * Return the session slot, and honour the verdict: a zero return
+	 * means nfs41_sequence_process already restarted the task with
+	 * tk_status cleared, so the res fields below describe a reply
+	 * that was never decoded.  Safe when no slot was ever acquired --
+	 * nfs4_sequence_done short-circuits to 1 on a NULL sr_slot
+	 * (nfs4proc.c:1053).  Skipping it leaks a slot on rpc_exit paths
+	 * and eventually wedges the data server's session.
 	 */
-	if (w->wire.res.seq_res.sr_slot)
-		nfs4_sequence_done(task, &w->wire.res.seq_res);
+	if (!nfs4_sequence_done(task, &w->wire.res.seq_res))
+		return;
 
 	if (task->tk_status == 0) {
 		if (res->nblocks != 1) {
@@ -1406,12 +1405,16 @@ static void ffv2_rmw_fetch_call_done_v4(struct rpc_task *task, void *data)
 	struct nfs_pgio_header *hdr = f->hdr;
 
 	/*
-	 * Return the session slot UNCONDITIONALLY first: safe when no
-	 * slot was ever acquired (sr_slot short-circuits).  Missing
-	 * this leaks slots on rpc_exit paths and eventually wedges
-	 * every I/O to the DS on slot_tbl_waitq.
+	 * Return the session slot first, and stop if the sequence layer
+	 * restarted the call: it clears tk_status, and the shortfall
+	 * check below would then read hdr->res.count from a reply that
+	 * was never decoded and fail the RMW with -EIO.  Safe when no
+	 * slot was ever acquired (sr_slot short-circuits).  Missing the
+	 * slot return leaks slots on rpc_exit paths and eventually
+	 * wedges every I/O to the DS on slot_tbl_waitq.
 	 */
-	nfs4_sequence_done(task, &hdr->res.seq_res);
+	if (!nfs4_sequence_done(task, &hdr->res.seq_res))
+		return;
 
 	if (task->tk_status < 0)
 		return;
@@ -1970,12 +1973,15 @@ static void ffv2_chunk_read_dispatch_call_done_v4(struct rpc_task *task,
 	int rc;
 
 	/*
-	 * Return the session slot UNCONDITIONALLY first: safe when no
-	 * slot was ever acquired (sr_slot short-circuits).  Missing
-	 * this leaks slots per rpc_exit paths and eventually wedges
+	 * Return the session slot first, and stop if the sequence layer
+	 * restarted the call -- it clears tk_status, and everything
+	 * below reads a reply that was never decoded.  Safe when no slot
+	 * was ever acquired (sr_slot short-circuits).  Missing the slot
+	 * return leaks slots per rpc_exit paths and eventually wedges
 	 * every I/O to the DS on slot_tbl_waitq.
 	 */
-	nfs4_sequence_done(task, &f->data.res.seq_res);
+	if (!nfs4_sequence_done(task, &f->data.res.seq_res))
+		return;
 
 	if (task->tk_status < 0) {
 		/*
