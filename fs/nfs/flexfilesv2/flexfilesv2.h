@@ -248,10 +248,13 @@ struct nfs4_ffv2_mirror {
  * concurrent-writer scenarios.
  */
 /*
- * Batch-visible ctx lifecycle.  Sibling mirrors of one pgio batch
- * observe these transitions to decide whether to dispatch, join, or
- * fall back.  Set under encode_lock; single writer of each
- * transition, arbitrary readers.
+ * Stripe-context lifecycle.  One header owns a stripe from claim to
+ * completion, so these transitions have a single observer rather than
+ * k+m siblings watching to decide whether to dispatch or join.  They
+ * remain a state machine because the read-modify-write fetch is
+ * asynchronous: the owner leaves ASSEMBLING for FETCHING and comes
+ * back to READY or FAILED on the fetch completion, not inline.  Set
+ * under encode_lock.
  */
 enum ffv2_ctx_state {
 	FFV2_CTX_ASSEMBLING,	/* initial: shards being zeroed/filled */
@@ -262,32 +265,20 @@ enum ffv2_ctx_state {
 
 struct ffv2_stripe_ctx {
 	refcount_t			refcnt;
-	void				*writer_key;	/* per-pgio key */
 	u64				stripe_off;	/* file-offset key */
 	struct list_head		list;		/* fls->fls_ctx_list */
 	u32				k, m;
 	u32				shard_len;
 	u32				pages_per_shard;
 	/*
-	 * shard_pages[i] is a length-pages_per_shard page array;
-	 * per-mirror write_pagelist points hdr->args.pages at
-	 * shard_pages[mirror_idx].
+	 * shard_pages[i] is a length-pages_per_shard page array holding
+	 * shard i of the encoded stripe.  The owning header points each
+	 * dispatch's args.pages at one of them in turn.
 	 */
 	struct page			***shard_pages;
 	struct mutex			encode_lock;
 	bool				encoded;
 	enum ffv2_ctx_state		state;		/* under encode_lock */
-	/*
-	 * mirror_seen and arrivals both under fls->fls_ctx_lock.
-	 * mirror_seen bit N set when this batch's mirror N is
-	 * admitted; arrivals counts distinct admissions.  A
-	 * same-writer arrival whose bit is already set is a SECOND
-	 * batch into the same stripe -- gate-waits like a
-	 * cross-writer conflict.  arrivals == k+m releases the
-	 * batch-anchor ref (see refcount comment).
-	 */
-	DECLARE_BITMAP(mirror_seen, NFS4_FFV2_MAX_DS_PER_STRIPE);
-	u32				arrivals;
 	/*
 	 * RMW fetch bookkeeping (FETCHING state only).  Initialized
 	 * by ffv2_rmw_fetch_stripe(); the winner atomically decrements

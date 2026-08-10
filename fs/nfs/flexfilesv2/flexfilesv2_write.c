@@ -6,21 +6,23 @@
  * batch expands to k+m parallel DS writes: k data-shard slices of
  * the stripe, m parity-shard buffers produced by the encoder.
  *
- * The mirror-fanout at the pageio layer gives us k+m per-mirror
- * hdrs "for free": pg_get_mirror_count_write returns k+m and the
- * generic pgio path duplicates the request across N mirrors.  Our
- * per-mirror ffv2_write_pagelist():
- *   1. Reaches the shared stripe context stashed on the lseg.
- *   2. First mirror to arrive under encode_lock does the encode.
- *   3. Overrides hdr->args.pages with its shard's private page
- *      array, so the RPC WRITE ships shard bytes -- not user pages.
- *   4. Dispatches the WRITE via nfs_initiate_pgio.
+ * One header covers a whole stripe and issues all k+m writes from
+ * it.  ffv2_write_pagelist_chunked():
+ *   1. Claims the stripe, so no other writer can touch it until
+ *      every shard has finalized and committed.
+ *   2. Assembles the stripe context and encodes under encode_lock.
+ *   3. Dispatches k+m CHUNK_WRITEs, each pointed at its own shard's
+ *      page array rather than at the user pages.
+ *   4. Completes the header once the whole two-phase chain lands.
  *
- * Serialization: only one chunked stripe assembles per lseg at a
- * time; concurrent writers see fls_stripe_busy set and fall back
- * to MDS-inband writes.  Multi-concurrent chunk-stripe support is
- * a follow-up commit and requires shifting stripe state off the
- * lseg (e.g. onto a per-inode radix tree keyed by stripe offset).
+ * The pageio mirror fanout is deliberately not used for this:
+ * mirrors describe replication, and a k+m stripe is k+m *different*
+ * payloads derived from one encode.  See
+ * ffv2_pg_get_mirror_count_write in flexfilesv2.c.
+ *
+ * Serialization is per stripe, not per lseg: two writers touching
+ * different stripes of the same file proceed in parallel, and only a
+ * writer that wants a stripe another already holds waits for it.
  *
  * Copyright (c) 2026 Thomas Haynes <loghyr@gmail.com>
  */
