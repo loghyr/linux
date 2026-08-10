@@ -1824,22 +1824,6 @@ static void ffv2_chunk_read_dispatch_prepare_v4(struct rpc_task *task,
 }
 
 /*
- * NFS4ERR_DELAY retry parameters.  Linear 100 ms per attempt,
- * capped at 1 s (unreachable at 5 attempts; kept as headroom for a
- * future attempt-count raise).  Total budget: 100+200+300+400+500 =
- * 1.5 s across 5 attempts, comfortably inside the RMW fetch
- * engine's 60 s wait_for_completion_timeout.
- *
- * Uses rpc_restart_call_prepare (NOT rpc_restart_call) so
- * .rpc_call_prepare re-runs on every restart to re-acquire a
- * session slot -- plain rpc_restart_call would re-encode the slot
- * nfs4_sequence_done just freed.
- */
-#define FFV2_CHUNK_READ_DELAY_BASE_MS		100
-#define FFV2_CHUNK_READ_DELAY_CAP_MS		1000
-#define FFV2_CHUNK_READ_MAX_DELAY_ATTEMPTS	5
-
-/*
  * CRC verify + guard capture for one CHUNK_READ reply.  Called
  * only when task->tk_status == 0 AND nchunks == 1 AND
  * effective_len is within bounds.
@@ -2047,6 +2031,12 @@ static void ffv2_chunk_read_dispatch_call_done_v4(struct rpc_task *task,
 	}
 
 	chunk = &f->data.res.chunks[0];
+	if (chunk->status != NFS4_OK && chunk->status != NFS4ERR_NOENT) {
+		task->tk_status =
+			chunk->status == FFV2_NFS4ERR_PAYLOAD_NOT_ATOMIC ?
+			-EBADMSG : -EIO;
+		return;
+	}
 
 	/*
 	 * Shortfall check: DS holds fewer bytes than the authoritative

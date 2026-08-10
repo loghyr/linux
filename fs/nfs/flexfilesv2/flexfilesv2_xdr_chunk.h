@@ -207,6 +207,26 @@ struct ffv2_chunk_read_data {
 extern const struct rpc_procinfo ffv2_chunk_read_procinfo;
 
 /*
+ * NFS4ERR_DELAY retry parameters, shared by every CHUNK_READ caller.
+ * Linear 100 ms per attempt, capped at 1 s (unreachable at 5 attempts;
+ * kept as headroom for a future attempt-count raise).  Total budget:
+ * 100+200+300+400+500 = 1.5 s across 5 attempts, comfortably inside
+ * the RMW fetch engine's 60 s wait_for_completion_timeout.
+ *
+ * Retries MUST go through rpc_restart_call_prepare (NOT
+ * rpc_restart_call): the done callback has already run
+ * nfs4_sequence_done, which freed the slot.  rpc_restart_call
+ * restarts at call_start and skips .rpc_call_prepare, so the retry
+ * would re-encode a freed and possibly re-issued slot --
+ * SEQ_MISORDERED or slot-table corruption on every DELAY.  The
+ * _prepare variant restarts at rpc_prepare_task, which re-invokes
+ * .rpc_call_prepare and re-acquires a slot via nfs4_setup_sequence.
+ */
+#define FFV2_CHUNK_READ_DELAY_BASE_MS		100
+#define FFV2_CHUNK_READ_DELAY_CAP_MS		1000
+#define FFV2_CHUNK_READ_MAX_DELAY_ATTEMPTS	5
+
+/*
  * CHUNK_READ dispatch entry.  Called once per data shard by the
  * contained-partial RMW branch of ffv2_write_pagelist_chunked once
  * that branch is enabled.
