@@ -64,6 +64,13 @@ struct ffv2_chunk_finalize_dispatch {
 	struct ffv2_chunk_finalize_data	wire;
 	struct ffv2_chunk_lifecycle_ctx	ctx;
 	/*
+	 * NFS4ERR_DELAY backoff counter, bumped by
+	 * ffv2_chunk_lifecycle_delay_retry before each rpc_delay +
+	 * rpc_restart_call_prepare; capped at
+	 * FFV2_CHUNK_LIFECYCLE_MAX_DELAY_ATTEMPTS.
+	 */
+	u32				retry_attempts;
+	/*
 	 * Own the rpc_task rather than letting rpc_new_task allocate
 	 * one.  See ffv2_chunk_finalize_dispatch_one_mirror for why
 	 * that allocation cannot be allowed to fail here.
@@ -79,6 +86,42 @@ struct ffv2_chunk_finalize_dispatch {
 	 */
 	int				rpc_status;
 };
+
+/*
+ * NFS4ERR_DELAY on a lifecycle op: back off and resend the same
+ * request.  Unlike CHUNK_WRITE there is no guard to refresh -- neither
+ * FINALIZE nor COMMIT carries one -- so a delay here is the data
+ * server asking us to come back, not a compare-and-swap rejection.
+ *
+ * Returns true when the retry is scheduled and the caller must return
+ * at once, false when the attempt budget is spent and the caller
+ * should record the delay as this shard's outcome.
+ *
+ * MUST use rpc_restart_call_prepare, not rpc_restart_call: the caller
+ * has already run nfs4_sequence_done and freed the session slot, so
+ * only the _prepare variant re-runs .rpc_call_prepare and acquires a
+ * fresh one.  Restarting at call_start would encode a freed slot and
+ * corrupt the slot table.  Same reasoning as
+ * ffv2_chunk_read_delay_retry.
+ *
+ * Because the task restarts rather than completes, its .rpc_release
+ * does not fire, so the writeback chain's accounting is untouched and
+ * the completion callback still runs exactly once.
+ */
+static bool ffv2_chunk_lifecycle_delay_retry(struct rpc_task *task,
+					     u32 *attempts)
+{
+	unsigned long delay_ms;
+
+	if (++*attempts > FFV2_CHUNK_LIFECYCLE_MAX_DELAY_ATTEMPTS)
+		return false;
+	delay_ms = min_t(unsigned long,
+			 *attempts * FFV2_CHUNK_LIFECYCLE_DELAY_BASE_MS,
+			 FFV2_CHUNK_LIFECYCLE_DELAY_CAP_MS);
+	rpc_delay(task, msecs_to_jiffies(delay_ms));
+	rpc_restart_call_prepare(task);
+	return true;
+}
 
 /*
  * .rpc_call_prepare: allocate a session slot on the DS's
@@ -126,6 +169,10 @@ static void ffv2_chunk_finalize_call_done(struct rpc_task *task, void *data)
 	 * outcome.
 	 */
 	if (!nfs4_sequence_done(task, &d->wire.res.seq_res))
+		return;
+
+	if (task->tk_status == -NFS4ERR_DELAY &&
+	    ffv2_chunk_lifecycle_delay_retry(task, &d->retry_attempts))
 		return;
 
 	if (task->tk_status == 0) {
@@ -295,6 +342,7 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 struct ffv2_chunk_commit_dispatch {
 	struct ffv2_chunk_commit_data	wire;
 	struct ffv2_chunk_lifecycle_ctx	ctx;
+	u32				retry_attempts;	/* see FINALIZE wrapper */
 	struct rpc_task			task;		/* see FINALIZE wrapper */
 	int				rpc_status;	/* see FINALIZE wrapper */
 };
@@ -314,6 +362,10 @@ static void ffv2_chunk_commit_call_done(struct rpc_task *task, void *data)
 
 	/* Same restart bail-out as the FINALIZE call_done above. */
 	if (!nfs4_sequence_done(task, &d->wire.res.seq_res))
+		return;
+
+	if (task->tk_status == -NFS4ERR_DELAY &&
+	    ffv2_chunk_lifecycle_delay_retry(task, &d->retry_attempts))
 		return;
 
 	if (task->tk_status == 0) {
@@ -418,6 +470,7 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 struct ffv2_chunk_rollback_dispatch {
 	struct ffv2_chunk_rollback_data	wire;
 	struct ffv2_chunk_lifecycle_ctx	ctx;
+	u32				retry_attempts;
 	struct rpc_task			task;
 	int				rpc_status;
 };
@@ -436,7 +489,11 @@ static void ffv2_chunk_rollback_call_done(struct rpc_task *task, void *data)
 	struct ffv2_chunk_rollback_res *res = &d->wire.res;
 	u32 i;
 
-	nfs4_sequence_done(task, &res->seq_res);
+	if (!nfs4_sequence_done(task, &res->seq_res))
+		return;
+	if (task->tk_status == -NFS4ERR_DELAY &&
+	    ffv2_chunk_lifecycle_delay_retry(task, &d->retry_attempts))
+		return;
 	if (!task->tk_status) {
 		if (res->nstatus != d->wire.args.nowners) {
 			task->tk_status = -EPROTO;

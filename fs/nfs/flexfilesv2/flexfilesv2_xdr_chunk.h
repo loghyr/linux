@@ -238,6 +238,18 @@ extern const struct rpc_procinfo ffv2_chunk_read_procinfo;
 #define FFV2_CHUNK_WRITE_MAX_GUARD_REFRESH	3
 
 /*
+ * NFS4ERR_DELAY backoff for the FINALIZE / COMMIT writeback chain.
+ * Separate from the CHUNK_READ constants above because the two mean
+ * different things: a CHUNK_READ delay is contention on one chunk,
+ * while a lifecycle delay is the data server asking the whole
+ * operation to come back later.  Neither op carries a guard, so there
+ * is nothing to refresh -- the same request is simply resent.
+ */
+#define FFV2_CHUNK_LIFECYCLE_DELAY_BASE_MS	100
+#define FFV2_CHUNK_LIFECYCLE_DELAY_CAP_MS	1000
+#define FFV2_CHUNK_LIFECYCLE_MAX_DELAY_ATTEMPTS	5
+
+/*
  * CHUNK_READ dispatch entry.  Called once per data shard by the
  * contained-partial RMW branch of ffv2_write_pagelist_chunked once
  * that branch is enabled.
