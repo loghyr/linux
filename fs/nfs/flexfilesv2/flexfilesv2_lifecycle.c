@@ -209,8 +209,7 @@ static void ffv2_chunk_finalize_call_done(struct rpc_task *task, void *data)
 
 	if (task->tk_status == 0)
 		task->tk_status = ffv2_chunk_lifecycle_fold_status(
-			res->nstatus, res->status,
-			FFV2_CHUNK_LIFECYCLE_OWNERS_PER_OP);
+			res->nstatus, res->status, d->wire.args.nowners);
 
 	/* Snapshot for the release-cb, which has no rpc_task
 	 * access.  Preserves transport-level errnos
@@ -262,7 +261,7 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 	const struct nfs_fh *fh,
 	const nfs4_stateid *stateid,
 	u64 offset, u32 count,
-	const struct chunk_owner4 *owner)
+	const struct chunk_owner4 *owners, u32 nowners)
 {
 	struct ffv2_chunk_finalize_dispatch *d;
 	struct rpc_message msg = {
@@ -300,6 +299,13 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 	 */
 	if (WARN_ON_ONCE(count == 0))
 		return -EINVAL;
+	/*
+	 * nowners bounds the reply's status array, which IS sized
+	 * FFV2_MAX_CHUNKS_PER_OP -- unlike the range above.
+	 */
+	if (WARN_ON_ONCE(nowners == 0 ||
+			 nowners > FFV2_MAX_CHUNKS_PER_OP))
+		return -EINVAL;
 
 	d = kzalloc(sizeof(*d), GFP_NOFS);
 	if (!d)
@@ -310,7 +316,9 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 	d->wire.args.stateid = *stateid;
 	d->wire.args.offset = offset;
 	d->wire.args.count = count;
-	d->wire.args.owner = *owner;
+	d->wire.args.nowners = nowners;
+	memcpy(d->wire.args.owners, owners,
+	       nowners * sizeof(*owners));
 	/* seq_res.sr_status sentinel: 1 == RPC-level error, matches
 	 * nfs41_sequence_res_init at nfs4proc.c:1019-1024.  Set
 	 * before task submission so a decoder that never runs
@@ -406,8 +414,7 @@ static void ffv2_chunk_commit_call_done(struct rpc_task *task, void *data)
 
 	if (task->tk_status == 0)
 		task->tk_status = ffv2_chunk_lifecycle_fold_status(
-			res->nstatus, res->status,
-			FFV2_CHUNK_LIFECYCLE_OWNERS_PER_OP);
+			res->nstatus, res->status, d->wire.args.nowners);
 	d->rpc_status = task->tk_status;
 }
 
@@ -434,7 +441,7 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 	const struct nfs_fh *fh,
 	const nfs4_stateid *stateid,
 	u64 offset, u32 count,
-	const struct chunk_owner4 *owner)
+	const struct chunk_owner4 *owners, u32 nowners)
 {
 	struct ffv2_chunk_commit_dispatch *d;
 	struct rpc_message msg = {
@@ -472,6 +479,13 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 	 */
 	if (WARN_ON_ONCE(count == 0))
 		return -EINVAL;
+	/*
+	 * nowners bounds the reply's status array, which IS sized
+	 * FFV2_MAX_CHUNKS_PER_OP -- unlike the range above.
+	 */
+	if (WARN_ON_ONCE(nowners == 0 ||
+			 nowners > FFV2_MAX_CHUNKS_PER_OP))
+		return -EINVAL;
 
 	d = kzalloc(sizeof(*d), GFP_NOFS);
 	if (!d)
@@ -482,7 +496,9 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 	d->wire.args.stateid = *stateid;
 	d->wire.args.offset = offset;
 	d->wire.args.count = count;
-	d->wire.args.owner = *owner;
+	d->wire.args.nowners = nowners;
+	memcpy(d->wire.args.owners, owners,
+	       nowners * sizeof(*owners));
 	d->wire.res.seq_res.sr_status = 1;
 	/*
 	 * Initialize sr_slot_ops -- same defect and fix as the
@@ -688,7 +704,7 @@ static void ffv2_chunk_wb_finalize_done(void *arg, int status,
 
 	rc = ffv2_chunk_commit_dispatch_one_mirror(&commit_ctx,
 			wb->cred, &wb->fh, &wb->stateid,
-			wb->offset, wb->count, &wb->owner);
+			wb->offset, wb->count, &wb->owner, 1);
 	if (rc) {
 		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
 		ffv2_chunk_wb_finish(wb, rc);
@@ -825,5 +841,5 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 
 	return ffv2_chunk_finalize_dispatch_one_mirror(&finalize_ctx,
 			wb->cred, &wb->fh, &wb->stateid,
-			wb->offset, wb->count, &wb->owner);
+			wb->offset, wb->count, &wb->owner, 1);
 }

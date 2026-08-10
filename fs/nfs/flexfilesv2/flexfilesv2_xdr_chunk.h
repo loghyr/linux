@@ -249,14 +249,6 @@ extern const struct rpc_procinfo ffv2_chunk_read_procinfo;
 #define FFV2_CHUNK_LIFECYCLE_DELAY_CAP_MS	1000
 #define FFV2_CHUNK_LIFECYCLE_MAX_DELAY_ATTEMPTS	5
 
-/*
- * How many chunk_owner4 entries the FINALIZE / COMMIT encoders put in
- * cfa_chunks<> / cca_chunks<>.  Hard-coded to one: this client is a
- * single owner, and the data server returns one status per entry, so
- * this -- not the chunk range -- is the length the reply must have.
- * Batching the range does not change it.
- */
-#define FFV2_CHUNK_LIFECYCLE_OWNERS_PER_OP	1
 
 /*
  * CHUNK_READ dispatch entry.  Called once per data shard by the
@@ -311,7 +303,14 @@ struct ffv2_chunk_finalize_args {
 	nfs4_stateid		stateid;
 	u64			offset;		/* chunk INDEX, not bytes */
 	u32			count;		/* chunk RANGE count */
-	struct chunk_owner4	owner;
+	/*
+	 * The owners to transition within [offset, offset+count).  The
+	 * data server loops over these, applying the whole range to
+	 * each, and returns ONE STATUS PER OWNER -- so this length, not
+	 * the range, is what the reply array must match.
+	 */
+	u32			nowners;
+	struct chunk_owner4	owners[FFV2_MAX_CHUNKS_PER_OP];
 };
 
 /*
@@ -366,7 +365,14 @@ struct ffv2_chunk_commit_args {
 	nfs4_stateid		stateid;
 	u64			offset;		/* chunk INDEX, not bytes */
 	u32			count;		/* chunk RANGE count */
-	struct chunk_owner4	owner;
+	/*
+	 * The owners to transition within [offset, offset+count).  The
+	 * data server loops over these, applying the whole range to
+	 * each, and returns ONE STATUS PER OWNER -- so this length, not
+	 * the range, is what the reply array must match.
+	 */
+	u32			nowners;
+	struct chunk_owner4	owners[FFV2_MAX_CHUNKS_PER_OP];
 };
 
 /*
@@ -489,7 +495,7 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 	const struct nfs_fh *fh,
 	const nfs4_stateid *stateid,
 	u64 offset, u32 count,
-	const struct chunk_owner4 *owner);
+	const struct chunk_owner4 *owners, u32 nowners);
 
 /*
  * ffv2_chunk_commit_dispatch_one_mirror -- dispatch a
@@ -502,7 +508,7 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 	const struct nfs_fh *fh,
 	const nfs4_stateid *stateid,
 	u64 offset, u32 count,
-	const struct chunk_owner4 *owner);
+	const struct chunk_owner4 *owners, u32 nowners);
 
 int
 ffv2_chunk_rollback_dispatch_one_mirror(struct ffv2_chunk_lifecycle_ctx *ctx,

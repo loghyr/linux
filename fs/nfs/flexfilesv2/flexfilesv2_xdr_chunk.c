@@ -587,8 +587,13 @@ static void ffv2_xdr_enc_chunk_finalize_op(struct xdr_stream *xdr,
 	p = ffv2_reserve_space(xdr, 8 + 4 + 4);
 	p = xdr_encode_hyper(p, a->offset);	/* chunk INDEX, not bytes */
 	*p++ = cpu_to_be32(a->count);
-	*p = cpu_to_be32(1);			/* cfa_chunks<> length == 1 */
-	ffv2_xdr_enc_chunk_owner(xdr, &a->owner);
+	*p = cpu_to_be32(a->nowners);		/* cfa_chunks<> length */
+	{
+		u32 i;
+
+		for (i = 0; i < a->nowners; i++)
+			ffv2_xdr_enc_chunk_owner(xdr, &a->owners[i]);
+	}
 }
 
 /*
@@ -617,7 +622,8 @@ static bool ffv2_xdr_enc_chunk_finalize_check(const struct ffv2_chunk_finalize_a
 	 * variable-length chunks<> array), this guard AND the hard-
 	 * coded 1 in the encoder BOTH must flip together.
 	 */
-	return WARN_ON_ONCE(a->count != 1);
+	return WARN_ON_ONCE(a->count == 0 || a->nowners == 0 ||
+			    a->nowners > FFV2_MAX_CHUNKS_PER_OP);
 }
 
 static void ffv2_xdr_enc_chunk_finalize(struct rpc_rqst *req,
@@ -664,8 +670,13 @@ static void ffv2_xdr_enc_chunk_commit_op(struct xdr_stream *xdr,
 	p = ffv2_reserve_space(xdr, 8 + 4 + 4);
 	p = xdr_encode_hyper(p, a->offset);	/* chunk INDEX, not bytes */
 	*p++ = cpu_to_be32(a->count);
-	*p = cpu_to_be32(1);			/* cca_chunks<> length == 1 */
-	ffv2_xdr_enc_chunk_owner(xdr, &a->owner);
+	*p = cpu_to_be32(a->nowners);		/* cca_chunks<> length */
+	{
+		u32 i;
+
+		for (i = 0; i < a->nowners; i++)
+			ffv2_xdr_enc_chunk_owner(xdr, &a->owners[i]);
+	}
 }
 
 /*
@@ -681,7 +692,8 @@ static bool ffv2_xdr_enc_chunk_commit_check(const struct ffv2_chunk_commit_args 
 	 * see the FINALIZE encoder for the rationale and the
 	 * flip-both-together contract for future batching.
 	 */
-	return WARN_ON_ONCE(a->count != 1);
+	return WARN_ON_ONCE(a->count == 0 || a->nowners == 0 ||
+			    a->nowners > FFV2_MAX_CHUNKS_PER_OP);
 }
 
 static void ffv2_xdr_enc_chunk_commit(struct rpc_rqst *req,
