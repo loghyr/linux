@@ -250,6 +250,15 @@ extern const struct rpc_procinfo ffv2_chunk_read_procinfo;
 #define FFV2_CHUNK_LIFECYCLE_MAX_DELAY_ATTEMPTS	5
 
 /*
+ * How many chunk_owner4 entries the FINALIZE / COMMIT encoders put in
+ * cfa_chunks<> / cca_chunks<>.  Hard-coded to one: this client is a
+ * single owner, and the data server returns one status per entry, so
+ * this -- not the chunk range -- is the length the reply must have.
+ * Batching the range does not change it.
+ */
+#define FFV2_CHUNK_LIFECYCLE_OWNERS_PER_OP	1
+
+/*
  * CHUNK_READ dispatch entry.  Called once per data shard by the
  * contained-partial RMW branch of ffv2_write_pagelist_chunked once
  * that branch is enabled.
@@ -301,7 +310,7 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 struct ffv2_chunk_finalize_args {
 	nfs4_stateid		stateid;
 	u64			offset;		/* chunk INDEX, not bytes */
-	u32			count;		/* chunk COUNT, always 1 */
+	u32			count;		/* chunk RANGE count */
 	struct chunk_owner4	owner;
 };
 
@@ -356,7 +365,7 @@ extern const struct rpc_procinfo ffv2_chunk_finalize_procinfo;
 struct ffv2_chunk_commit_args {
 	nfs4_stateid		stateid;
 	u64			offset;		/* chunk INDEX, not bytes */
-	u32			count;		/* chunk COUNT, always 1 */
+	u32			count;		/* chunk RANGE count */
 	struct chunk_owner4	owner;
 };
 

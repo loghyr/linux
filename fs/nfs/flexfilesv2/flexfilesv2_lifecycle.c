@@ -88,6 +88,38 @@ struct ffv2_chunk_finalize_dispatch {
 };
 
 /*
+ * Fold a reply's status array into one errno.
+ *
+ * The array is ONE STATUS PER OWNER, not per chunk.  cfa_offset +
+ * cfa_count give the chunk RANGE; cfa_chunks<> lists which owners to
+ * transition within it, and the data server returns one status per
+ * entry of that list (it loops over cfa_chunks_len calling
+ * chunk_store_transition with the whole range each time).  So the
+ * expected length is the owner count -- currently 1, hard-coded by
+ * the encoder -- and does NOT grow when the range is batched.
+ *
+ * A length that does not match describes a different operation than
+ * the one we issued; treat it as an op-shape violation rather than
+ * guessing at it.
+ *
+ * First failure wins.  A later one adds nothing the first did not,
+ * and the first is the one with a plausible causal story (the same
+ * rule ffv2_stripe_write_set_status applies across shards).
+ */
+static int ffv2_chunk_lifecycle_fold_status(u32 nstatus, const u32 *status,
+					    u32 expected)
+{
+	u32 i;
+
+	if (nstatus != expected)
+		return -EPROTO;
+	for (i = 0; i < nstatus; i++)
+		if (status[i] != NFS4_OK)
+			return nfs4_stat_to_errno(status[i]);
+	return 0;
+}
+
+/*
  * NFS4ERR_DELAY on a lifecycle op: back off and resend the same
  * request.  Unlike CHUNK_WRITE there is no guard to refresh -- neither
  * FINALIZE nor COMMIT carries one -- so a delay here is the data
@@ -149,11 +181,11 @@ static void ffv2_chunk_finalize_prepare(struct rpc_task *task, void *data)
  *
  *   - task->tk_status != 0: RPC-time failure, transport /
  *     session / etc.  Propagate as-is.
- *   - res->nstatus != 1: op-shape violation (single-owner
- *     dispatch expects a length-1 status<> array); -EPROTO.
- *   - res->status[0] != NFS4_OK: per-chunk failure; propagate
- *     the mapped errno (nfs4_stat_to_errno returns negative
- *     already).
+ *   - the reply's statuses, folded by
+ *     ffv2_chunk_lifecycle_fold_status: one entry per OWNER we
+ *     listed, not per chunk in the range.  A length that does not
+ *     match is an op-shape violation (-EPROTO); otherwise the first
+ *     non-NFS4_OK entry wins as its mapped errno.
  *   - happy path: task->tk_status left at 0, writeverf held
  *     in res->writeverf for the release-cb to forward.
  */
@@ -175,12 +207,10 @@ static void ffv2_chunk_finalize_call_done(struct rpc_task *task, void *data)
 	    ffv2_chunk_lifecycle_delay_retry(task, &d->retry_attempts))
 		return;
 
-	if (task->tk_status == 0) {
-		if (res->nstatus != 1)
-			task->tk_status = -EPROTO;
-		else if (res->status[0] != NFS4_OK)
-			task->tk_status = nfs4_stat_to_errno(res->status[0]);
-	}
+	if (task->tk_status == 0)
+		task->tk_status = ffv2_chunk_lifecycle_fold_status(
+			res->nstatus, res->status,
+			FFV2_CHUNK_LIFECYCLE_OWNERS_PER_OP);
 
 	/* Snapshot for the release-cb, which has no rpc_task
 	 * access.  Preserves transport-level errnos
@@ -262,7 +292,13 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 
 	if (WARN_ON_ONCE(!ctx || !ctx->ds_clp || !ctx->complete))
 		return -EINVAL;
-	if (WARN_ON_ONCE(count != 1))
+	/*
+	 * count is the chunk RANGE, and it is not bounded by the
+	 * reply arrays: those carry one status per OWNER, and the
+	 * encoder sends a single owner.  A zero range is still
+	 * meaningless, so reject only that.
+	 */
+	if (WARN_ON_ONCE(count == 0))
 		return -EINVAL;
 
 	d = kzalloc(sizeof(*d), GFP_NOFS);
@@ -368,12 +404,10 @@ static void ffv2_chunk_commit_call_done(struct rpc_task *task, void *data)
 	    ffv2_chunk_lifecycle_delay_retry(task, &d->retry_attempts))
 		return;
 
-	if (task->tk_status == 0) {
-		if (res->nstatus != 1)
-			task->tk_status = -EPROTO;
-		else if (res->status[0] != NFS4_OK)
-			task->tk_status = nfs4_stat_to_errno(res->status[0]);
-	}
+	if (task->tk_status == 0)
+		task->tk_status = ffv2_chunk_lifecycle_fold_status(
+			res->nstatus, res->status,
+			FFV2_CHUNK_LIFECYCLE_OWNERS_PER_OP);
 	d->rpc_status = task->tk_status;
 }
 
@@ -430,7 +464,13 @@ int ffv2_chunk_commit_dispatch_one_mirror(
 
 	if (WARN_ON_ONCE(!ctx || !ctx->ds_clp || !ctx->complete))
 		return -EINVAL;
-	if (WARN_ON_ONCE(count != 1))
+	/*
+	 * count is the chunk RANGE, and it is not bounded by the
+	 * reply arrays: those carry one status per OWNER, and the
+	 * encoder sends a single owner.  A zero range is still
+	 * meaningless, so reject only that.
+	 */
+	if (WARN_ON_ONCE(count == 0))
 		return -EINVAL;
 
 	d = kzalloc(sizeof(*d), GFP_NOFS);
@@ -742,13 +782,19 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 	if (WARN_ON_ONCE(!wb || !wb->hdr || !wb->ds_clp))
 		return -EINVAL;
 
-	/* Single-owner invariant: matches the encoders'
-	 * WARN_ON_ONCE(count != 1) and the CHUNK_WRITE res.nblocks ==
-	 * 1 check.  Assert here so any future hand-off that thinks it
-	 * can batch trips the warning at the transition site rather
-	 * than at the encoder.
+	/*
+	 * wb->count is the chunk RANGE to transition, bounded only by
+	 * being non-empty: the reply arrays carry one status per owner,
+	 * and this client sends one owner, so a wider range does not
+	 * widen the reply.  Checked here as well as at the dispatch
+	 * entry points so a bad hand-off trips at the transition site
+	 * rather than at the encoder.
+	 *
+	 * Callers still pass 1 today; the chain fires once per chunk.
+	 * Batching the range is the point of this plumbing and lands
+	 * with the commit-phase accumulator.
 	 */
-	if (WARN_ON_ONCE(wb->count != 1))
+	if (WARN_ON_ONCE(wb->count == 0))
 		return -EINVAL;
 
 	/* Layout stateid must be present -- CHUNK_WRITE couldn't
