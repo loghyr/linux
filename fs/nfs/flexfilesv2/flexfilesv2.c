@@ -57,6 +57,9 @@ void ffv2_chunk_guard_init(void)
 	ffv2_cg_client_id_seed = seed;
 }
 
+/* Defined below, next to the commit path it belongs to. */
+static const struct pnfs_commit_ops ffv2_commit_ops;
+
 static struct pnfs_layout_hdr *
 ffv2_alloc_layout_hdr(struct inode *inode, gfp_t gfp_flags)
 {
@@ -65,6 +68,8 @@ ffv2_alloc_layout_hdr(struct inode *inode, gfp_t gfp_flags)
 	ffv2l = kzalloc(sizeof(*ffv2l), gfp_flags);
 	if (!ffv2l)
 		return NULL;
+	pnfs_init_ds_commit_info(&ffv2l->commit_info);
+	ffv2l->commit_info.ops = &ffv2_commit_ops;
 	return &ffv2l->generic_hdr;
 }
 
@@ -153,18 +158,84 @@ ffv2_return_range(struct pnfs_layout_hdr *lo,
 	 */
 }
 
+/*
+ * A single commit bucket, deliberately.
+ *
+ * The generic layer assigns a whole pgio header to one bucket --
+ * nfs_write_completion() passes hdr->ds_commit_idx for every request
+ * it marks (fs/nfs/write.c:938).  Flexfiles v1 can make that a
+ * per-data-server index because it builds one header per (mirror,
+ * data server).  This driver deliberately does the opposite: one
+ * header covers a whole stripe and dispatches all k+m shards from it,
+ * so no single index names the header's data servers and every
+ * request lands in bucket 0 regardless.
+ *
+ * Sizing the array k+m would therefore create k+m-1 buckets that can
+ * never receive a request.  Keep one, and let the commit path resolve
+ * the shard set from the pages it is handed.
+ */
+static void
+ffv2_setup_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
+		   struct pnfs_layout_segment *lseg)
+{
+	struct inode *inode = lseg->pls_layout->plh_inode;
+	struct pnfs_commit_array *array, *new;
+
+	new = pnfs_alloc_commit_array(1, nfs_io_gfp_mask());
+	if (!new)
+		return;
+	spin_lock(&inode->i_lock);
+	array = pnfs_add_commit_array(fl_cinfo, new, lseg);
+	spin_unlock(&inode->i_lock);
+	if (array != new)
+		pnfs_free_commit_array(new);
+}
+
+static void
+ffv2_release_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
+		     struct inode *inode)
+{
+	spin_lock(&inode->i_lock);
+	pnfs_generic_ds_cinfo_destroy(fl_cinfo);
+	spin_unlock(&inode->i_lock);
+}
+
+/*
+ * Commit entry point.  Deliberately declines for now: CHUNK_WRITE
+ * still ships NFS_FILE_SYNC, so nothing is ever marked for commit and
+ * this cannot be reached -- ncommitting stays 0 and pnfs_commit_list()
+ * returns before consulting it.  Returning PNFS_NOT_ATTEMPTED is also
+ * the correct answer if it ever were reached: the caller falls back to
+ * a plain inband COMMIT, which is what happens today.
+ *
+ * The unstable-write conversion that makes this live replaces the body
+ * with a drain of the per-shard pending-finalize state.
+ */
+static int
+ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
+		     int how, struct nfs_commit_info *cinfo)
+{
+	return PNFS_NOT_ATTEMPTED;
+}
+
+static const struct pnfs_commit_ops ffv2_commit_ops = {
+	.setup_ds_info		= ffv2_setup_ds_info,
+	.release_ds_info	= ffv2_release_ds_info,
+	.mark_request_commit	= pnfs_layout_mark_request_commit,
+	.clear_request_commit	= pnfs_generic_clear_request_commit,
+	.scan_commit_lists	= pnfs_generic_scan_commit_lists,
+	.recover_commit_reqs	= pnfs_generic_recover_commit_reqs,
+	.commit_pagelist	= ffv2_commit_pagelist,
+};
+
 static struct pnfs_ds_commit_info *
 ffv2_get_ds_info(struct inode *inode)
 {
-	/*
-	 * The core's ds_commit_info aggregation is FFv1-shaped
-	 * (per-mirror commit lists).  ffv2 will grow its own
-	 * variant when the write path lands; for now returning
-	 * NULL asks the core to skip per-DS commit tracking, which
-	 * is the safe default for read-only mounts and for early
-	 * write experiments that go through the MDS-inband path.
-	 */
-	return NULL;
+	struct pnfs_layout_hdr *layout = NFS_I(inode)->layout;
+
+	if (layout == NULL)
+		return NULL;
+	return &FFV2_LAYOUT_FROM_HDR(layout)->commit_info;
 }
 
 /*

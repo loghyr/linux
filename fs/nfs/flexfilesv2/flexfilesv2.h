@@ -172,6 +172,13 @@ struct ffv2_captured_guard {
  */
 struct nfs4_ffv2_layout {
 	struct pnfs_layout_hdr generic_hdr;
+	/*
+	 * Per-DS commit tracking.  The generic layer reaches a layout
+	 * driver's commit path only through get_ds_info() -> this, so
+	 * without it pnfs_commit_list() short-circuits to
+	 * PNFS_NOT_ATTEMPTED and every write is committed inband.
+	 */
+	struct pnfs_ds_commit_info commit_info;
 };
 
 static inline struct nfs4_ffv2_layout *
