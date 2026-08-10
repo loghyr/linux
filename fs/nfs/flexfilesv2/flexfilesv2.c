@@ -167,18 +167,45 @@ ffv2_get_ds_info(struct inode *inode)
 	return NULL;
 }
 
+/*
+ * ffv2_layoutreturn4 is two variable-length arrays, so the shortest
+ * legal encoding is eight bytes -- a zero count for each -- not an
+ * absent body.  encode_layoutreturn()'s fallback for a layout driver
+ * with no encode op writes a zero-length lrf_body instead, which a
+ * metadata server that validates the body rejects with
+ * NFS4ERR_BADXDR.  Emit the empty arrays explicitly.
+ *
+ * ff_layout_encode_layoutreturn() reaches the same wire shape the
+ * long way round, through encoders that happen to write nothing when
+ * there is nothing to report.  Per-mirror ioerr and iostats reporting
+ * is a later slice for ffv2; until then the shape is the whole job.
+ */
+static void
+ffv2_encode_layoutreturn(struct xdr_stream *xdr, const void *voidargs,
+			 const struct nfs4_xdr_opaque_data *ff_opaque)
+{
+	__be32 *p = xdr_reserve_space(xdr, 12);
+
+	if (WARN_ON_ONCE(!p))
+		return;
+
+	*p++ = cpu_to_be32(8);	/* lrf_body length */
+	*p++ = cpu_to_be32(0);	/* ffv2lr_ioerr_report<>   */
+	*p = cpu_to_be32(0);	/* ffv2lr_iostats_report<> */
+}
+
+/*
+ * No .free: ld_private->data stays NULL, and every caller of .free
+ * tests it first.
+ */
+static const struct nfs4_xdr_opaque_ops ffv2_layoutreturn_ops = {
+	.encode = ffv2_encode_layoutreturn,
+};
+
 static int
 ffv2_prepare_layoutreturn(struct nfs4_layoutreturn_args *args)
 {
-	/*
-	 * ffv2 will eventually send per-mirror ioerr + iostats
-	 * (ffv2_layoutreturn4 in the draft), matching what ffv1
-	 * sends via nfs4_flexfile_layoutreturn_args.  Returning 0
-	 * with no ffv2-specific args keeps LAYOUTRETURN correct
-	 * for the base case; the MDS receives a plain layout
-	 * return with no extended stats.
-	 */
-	args->ld_private->ops = NULL;
+	args->ld_private->ops = &ffv2_layoutreturn_ops;
 	args->ld_private->data = NULL;
 	return 0;
 }
