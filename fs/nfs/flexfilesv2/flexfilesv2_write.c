@@ -738,14 +738,12 @@ static int ffv2_shard_launch(struct ffv2_stripe_write *sw, u32 idx)
 	/*
 	 * Consume the per-shard captured guard populated by the
 	 * CHUNK_READ done-cb after CRC verification.  When a valid
-	 * capture is available (contained-partial RMW path), send
-	 * cwg_check=TRUE with the captured (gen_id, client_id) pair
-	 * so the DS's CAS rejects with NFS4ERR_DELAY if a concurrent
-	 * writer bumped the generation between our fetch and this
-	 * write.  Otherwise (parity mirrors, full-stripe writes, or
-	 * when the guard slot is still uncaptured), fall back to
-	 * cwg_check=FALSE -- currently gated by ONLY_ONE_WRITER
-	 * upstream so that path stays draft-conforming.
+	 * capture is available -- every shard of a contained-partial
+	 * read-modify-write, data and parity alike -- the captured
+	 * (gen_id, client_id) pair travels with this write so the data
+	 * server's compare-and-swap rejects with NFS4ERR_DELAY if a
+	 * concurrent writer bumped the generation in between.  Shards
+	 * with no capture send the sentinel; see the encode note below.
 	 *
 	 * Load-safety.  This helper runs POST-encode_lock-unlock, so
 	 * the read is not under the mutex; the happens-before chain
@@ -774,11 +772,12 @@ static int ffv2_shard_launch(struct ffv2_stripe_write *sw, u32 idx)
 	 * completion would need to revisit this synchronization.
 	 */
 	/*
-	 * Always ship cwg_check=TRUE.  The two shard categories that
-	 * lack a captured guard -- full-stripe / fresh writes to EMPTY
-	 * chunks (data or parity) and parity mirrors before a pre-
-	 * write CHUNK_READ populates their guard slot -- send the
-	 * {0,0} sentinel.
+	 * Always ship cwg_check=TRUE.  Shards that lack a captured
+	 * guard -- full-stripe and safe-append writes, which never
+	 * fetch, plus any shard whose fetch was declined or failed
+	 * verification -- send the {0,0} sentinel.  Contained-partial
+	 * read-modify-write fetches all k+m shards, so both data and
+	 * parity carry a real guard on that path.
 	 *
 	 * The DS's CAS short-circuits on !prev (empty chunk), so a
 	 * first-write with any guard proceeds without version
@@ -1146,10 +1145,10 @@ ffv2_stripe_ctx_alloc(struct nfs4_ffv2_layout_segment *fls,
 	/*
 	 * Per-shard captured guard slots.  kcalloc zeros .valid to
 	 * false for every slot -- correct initial state (no guards
-	 * captured yet; paired writes ship cwg_check=FALSE until a
+	 * captured yet; paired writes ship the {0,0} sentinel until a
 	 * CHUNK_READ succeeds AND CRC-verifies).  Sized [k+m] to
 	 * match ffv2_chunk_write_dispatch_one_mirror's mirror_idx
-	 * range (parity mirrors always stay .valid=false).
+	 * range; every slot in that range is a fetch target.
 	 */
 	ctx->captured_guard = kcalloc(k + m, sizeof(*ctx->captured_guard),
 				      gfp);
@@ -1525,11 +1524,23 @@ static int ffv2_rmw_fetch_initiate(struct ffv2_rmw_fetch *f, u32 version)
 }
 
 /*
+ * ffv2_rmw_fetch_one() returns this in place of 0 when it declines to
+ * issue an RPC for a shard at all.  Distinct from both other returns:
+ * 0 means an RPC is in flight and its release will decrement the
+ * pending counter, a negative errno means dispatch failed and the
+ * fetch as a whole fails, and this means the caller must decrement
+ * the counter itself WITHOUT recording an error.
+ */
+#define FFV2_RMW_FETCH_SKIPPED		1
+
+/*
  * Dispatch one shard's fetch, taking the ctx ref + ds_clp ref that
  * the release will drop.  Returns 0 on successful dispatch (RPC
- * async in flight, release will call fetch_done_one) or negative
- * errno on failure to dispatch (caller must call fetch_done_one
- * itself to keep the pending counter balanced).
+ * async in flight, release will call fetch_done_one),
+ * FFV2_RMW_FETCH_SKIPPED when no RPC was issued by choice, or a
+ * negative errno on failure to dispatch (in the latter two cases the
+ * caller must call fetch_done_one itself to keep the pending counter
+ * balanced).
  */
 static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
 			      struct nfs_pgio_header *tmpl,
@@ -1603,6 +1614,21 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
 		nfs4_put_deviceid_node(devnode);
 		return ffv2_chunk_read_fetch_dispatch(ctx, tmpl, mirror,
 						      shard_idx, 1);
+	}
+
+	/*
+	 * A parity shard reaching here has nothing worth fetching.  The
+	 * only reason to read a parity chunk is to capture its guard,
+	 * and only CHUNK_READ carries one; the plain-NFSv4-READ path
+	 * below would spend a round trip on bytes ffv2_encode_locked
+	 * overwrites, then measure them against an `expected` derived
+	 * from a file offset no parity byte lives at.  Decline instead,
+	 * and let the paired CHUNK_WRITE ship the {0,0} sentinel just as
+	 * it did before parity fetched at all.
+	 */
+	if (shard_idx >= ctx->k) {
+		nfs4_put_deviceid_node(devnode);
+		return FFV2_RMW_FETCH_SKIPPED;
 	}
 
 	f = kzalloc(sizeof(*f), GFP_NOFS);
@@ -1684,9 +1710,10 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
 /*
  * Sync fetch entry point.  Under FETCHING state (transition made
  * by the caller under encode_lock), initialize the fetch counters,
- * dispatch all k shard fetches, and block until the completion
- * fires.  Returns 0 iff every shard completed successfully with
- * res->count >= expected.
+ * dispatch a fetch for each of the k+m shards, and block until the
+ * completion fires.  Returns 0 iff every shard either completed
+ * successfully with res->count >= expected or was deliberately
+ * skipped.
  */
 /*
  * Contained-partial RMW live entry point.  Guard plumbing is in
@@ -1710,39 +1737,68 @@ static int ffv2_rmw_fetch_stripe(struct ffv2_stripe_ctx *ctx,
 		      struct nfs4_ffv2_mirror *mirror)
 {
 	const unsigned long timeout = msecs_to_jiffies(60 * 1000);
-	u32 dispatched = 0, undispatched = 0;
+	u32 dispatched = 0, undispatched = 0, skipped = 0;
+	u32 nshards = ctx->k + ctx->m;
 	u32 i;
 	int rc;
 
-	atomic_set(&ctx->fetch_pending, ctx->k);
+	atomic_set(&ctx->fetch_pending, nshards);
 	ctx->fetch_status = 0;
 	reinit_completion(&ctx->fetch_done);
 	ctx->rmw_isize = i_size_read(tmpl->inode);
 	/*
 	 * Clear captured_guard[i].valid alongside the fetch-counter
 	 * re-arm.  A prior-cycle guard would otherwise sit stale in
-	 * the slot and be read by the paired CHUNK_WRITE.  Clear all
-	 * k+m for uniformity; parity slots stay .valid=false anyway.
+	 * the slot and be read by the paired CHUNK_WRITE.
 	 */
-	for (i = 0; i < ctx->k + ctx->m; i++)
+	for (i = 0; i < nshards; i++)
 		ctx->captured_guard[i].valid = false;
 
-	for (i = 0; i < ctx->k; i++) {
+	/*
+	 * Fetch every shard, parity included.  Parity chunks carry a
+	 * guard exactly as data chunks do, and their paired CHUNK_WRITE
+	 * needs it: shipping the {0,0} sentinel against a non-empty
+	 * parity chunk fails the data server's CAS and comes back
+	 * NFS4ERR_DELAY.  The fetched parity bytes themselves are
+	 * discarded -- ffv2_encode_locked recomputes every parity shard
+	 * from the k data shards after the overlay -- so this reads for
+	 * the guard alone.
+	 *
+	 * A failed parity fetch fails the whole read-modify-write and
+	 * drops the batch to the metadata server, exactly as a data
+	 * shard's failure does.  That is deliberate rather than
+	 * best-effort: until the paired write can retry an
+	 * NFS4ERR_DELAY, carrying on with the sentinel would trade a
+	 * clean fallback for a rejected parity write with nowhere to
+	 * go.  Worth revisiting once that retry exists, since a parity
+	 * guard is only needed for the data server to accept the
+	 * write -- concurrent-writer detection already rests on the
+	 * data shards, which no writer can update without updating
+	 * parity too.
+	 */
+	for (i = 0; i < nshards; i++) {
 		rc = ffv2_rmw_fetch_one(ctx, tmpl, mirror, i);
 		if (!rc) {
 			dispatched++;
+		} else if (rc == FFV2_RMW_FETCH_SKIPPED) {
+			skipped++;
 		} else {
 			cmpxchg(&ctx->fetch_status, 0, rc);
 			undispatched++;
 		}
 	}
 	/*
-	 * Account undispatched slots against pending via the SAME
-	 * single-point helper the RPC release uses.  Every shard
-	 * gets exactly one decrement; the wait always completes.
+	 * Account undispatched and skipped slots against pending via
+	 * the SAME single-point helper the RPC release uses.  Every
+	 * shard gets exactly one decrement; the wait always completes.
+	 * Skipped slots pass status 0: a shard we chose not to fetch is
+	 * not a fetch failure, and recording one would fail the whole
+	 * read-modify-write and drop the batch to the metadata server.
 	 */
 	for (i = 0; i < undispatched; i++)
 		ffv2_rmw_fetch_done_one(ctx, -EIO);
+	for (i = 0; i < skipped; i++)
+		ffv2_rmw_fetch_done_one(ctx, 0);
 
 	if (dispatched > 0 &&
 	    !wait_for_completion_timeout(&ctx->fetch_done, timeout)) {
@@ -1922,11 +1978,11 @@ static int ffv2_chunk_read_verify_and_capture(struct ffv2_chunk_read_fetch *f)
 	 * the paired write comes from the encode_lock release/acquire
 	 * pair.
 	 *
-	 * shard_idx maps 1:1 to mirror_idx for data shards (mirror 0
-	 * with k data + m parity; shard_idx < k ==> mirror_idx ==
-	 * shard_idx).  Parity mirrors are not populated by fetch
-	 * (they have no CHUNK_READ to capture from); their slots stay
-	 * .valid=false.
+	 * shard_idx maps 1:1 to mirror_idx across the whole k+m range
+	 * (a single mirror holding k data shards then m parity shards),
+	 * so this indexes the paired CHUNK_WRITE's slot directly.
+	 * Parity shards reach here too: they are fetched for their
+	 * guard alone, and capture on the same CRC-verified terms.
 	 */
 	f->ctx->captured_guard[f->shard_idx].guard = chunk->owner.co_guard;
 	f->ctx->captured_guard[f->shard_idx].valid = true;
@@ -2258,10 +2314,23 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 	f->ds_clp = ds->ds_clp;
 	f->shard_idx = shard_idx;
 	f->cred = tmpl->cred;
-	f->expected = clamp_t(u64,
-		ctx->rmw_isize > shard_file_off ?
-			ctx->rmw_isize - shard_file_off : 0,
-		0, ctx->shard_len);
+	/*
+	 * How many bytes the data server must hold for this shard.  The
+	 * i_size-derived expectation only means something for a data
+	 * shard, whose bytes occupy [shard_file_off, +shard_len) of the
+	 * file.  A parity shard has no file offset at all -- the
+	 * shard_file_off computed above lands in the NEXT stripe's data
+	 * -- so comparing its length against i_size would gate on an
+	 * unrelated region.  Expect nothing from parity and let the CRC
+	 * check below carry the integrity guarantee on its own.
+	 */
+	if (shard_idx < ctx->k)
+		f->expected = clamp_t(u64,
+			ctx->rmw_isize > shard_file_off ?
+				ctx->rmw_isize - shard_file_off : 0,
+			0, ctx->shard_len);
+	else
+		f->expected = 0;
 
 	/*
 	 * Build rpc_task_setup inline so the ops struct is referenced

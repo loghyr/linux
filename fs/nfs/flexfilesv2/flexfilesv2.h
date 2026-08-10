@@ -101,11 +101,11 @@ struct chunk_owner4 {
  * `valid` is cleared alongside the fetch-counter re-arm in
  * ffv2_rmw_fetch_stripe, so a prior-cycle guard cannot sit stale
  * in the slot and be read by the paired CHUNK_WRITE.  Array sized
- * [k+m] on the ctx; parity mirrors (mirror_idx >= k) never fetch,
- * so their slots stay .valid=false and the paired write ships
- * cwg_check=FALSE.  chunk_guard4 is a plain value type (two u32s),
- * so there is no leak concern for a captured-but-never-consumed
- * guard.
+ * [k+m] on the ctx and every slot is a fetch target: parity chunks
+ * carry a guard just as data chunks do, and their paired write
+ * needs it.  A slot left .valid=false sends the {0,0} sentinel.
+ * chunk_guard4 is a plain value type (two u32s), so there is no
+ * leak concern for a captured-but-never-consumed guard.
  */
 struct ffv2_captured_guard {
 	struct chunk_guard4	guard;
@@ -301,11 +301,13 @@ struct ffv2_stripe_ctx {
 	 * ffv2_chunk_read_dispatch_call_done_v4 ONLY on CRC verify
 	 * SUCCESS; consumed by ffv2_chunk_write_dispatch_one_mirror.
 	 *
-	 * Parity mirrors (mirror_idx >= k) never fetch and stay
-	 * .valid=false; the paired write ships cwg_check=FALSE for
-	 * them.  Multi-writer relaxation of the ONLY_ONE_WRITER gate
-	 * needs a parity-guard strategy first (parity chunks have no
-	 * CHUNK_READ to capture from).
+	 * The contained-partial read-modify-write path fetches all k+m
+	 * shards, parity included -- parity is read for its guard
+	 * alone, since ffv2_encode_locked recomputes the bytes.  Paths
+	 * that never fetch (full-stripe, safe-append) leave every slot
+	 * .valid=false and ship the {0,0} sentinel, which the data
+	 * server accepts because its compare-and-swap short-circuits
+	 * on an empty chunk.
 	 */
 	struct ffv2_captured_guard	*captured_guard;
 	struct nfs4_ffv2_layout_segment *fls;	/* back-pointer for release */
