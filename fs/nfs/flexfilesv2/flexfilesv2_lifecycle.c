@@ -752,44 +752,9 @@ static void ffv2_chunk_wb_commit_done(void *arg, int status,
 }
 
 /*
- * ffv2_chunk_wb_start -- guard/stateid consumer sync between the
- * CHUNK_WRITE hand-off and the FINALIZE / COMMIT dispatch.
- *
- * The wb_ctx passed here must be populated by the phase-one hand-off
- * (ffv2_chunk_write_hand_off_wb in flexfilesv2_write.c) from the
- * CHUNK_WRITE dispatch's wire fields.  The consumer chain is:
- *
- *   CHUNK_WRITE dispatch (flexfilesv2_write.c):
- *     w->wire.args.stateid  = fi->stateid           (layout stateid)
- *     w->wire.args.offset   = chunk_index
- *     w->wire.args.owner    = client-picked chunk_owner4
- *   CHUNK_WRITE completion:
- *     w->wire.res.owners[0] = DS-recorded chunk_owner4 (guard-
- *                             consumer source, same shape as
- *                             w->wire.args.owner on a successful
- *                             write per the single-owner-per-op
- *                             contract)
- *
- *   hand-off wb_ctx:
- *     wb->stateid           = w->wire.args.stateid (layout stateid)
- *     wb->offset            = w->wire.args.offset  (same chunk index)
- *     wb->owner             = w->wire.res.owners[0] (DS-recorded)
- *     wb->count             = 1                   (single-owner invariant)
- *
- *   FINALIZE / COMMIT dispatch (this file):
- *     cfa_stateid / cca_stateid = wb->stateid (same layout stateid
- *                                              the DS's trust table
- *                                              accepted for
- *                                              CHUNK_WRITE)
- *     cfa_chunks[0] / cca_chunks[0] = wb->owner (identifies which
- *                                                PENDING chunk to
- *                                                transition)
- *
- * Every WARN_ON_ONCE here is defence-in-depth against an accidental
- * drift in the hand-off (e.g., a caller populating wb_ctx from a
- * non-CHUNK_WRITE source).  The CHUNK_WRITE call_done already
- * rejects the res.nblocks != 1 shape that would leave res.owners[0]
- * undefined; these asserts catch it if the code shape ever regresses.
+ * Transfer the layout stateid, chunk index, and server-recorded owner
+ * from CHUNK_WRITE to the FINALIZE/COMMIT state machine.  Each write
+ * currently carries one owner, so the lifecycle request has one entry.
  */
 int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 {
