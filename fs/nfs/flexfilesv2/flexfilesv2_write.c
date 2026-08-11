@@ -1698,12 +1698,7 @@ static int ffv2_rmw_fetch_one(struct ffv2_stripe_ctx *ctx,
 		return -ENOMEM;
 	}
 
-	/*
-	 * Per RMW design memo section 3.9: set exactly the fields the
-	 * fetch's own path reads; leave hdr->release, completion_ops,
-	 * mds_ops, io_completion, dreq, lseg untouched -- routing this
-	 * hdr into the generic completion machinery would be wrong.
-	 */
+	/* Initialize only fields consumed by the private fetch completion. */
 	hdr->inode = tmpl->inode;
 	hdr->cred = tmpl->cred;
 	hdr->args.fh = &fi->fh;

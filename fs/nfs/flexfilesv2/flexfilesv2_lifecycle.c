@@ -715,10 +715,9 @@ static void ffv2_chunk_wb_finalize_done(void *arg, int status,
 /*
  * COMMIT completion callback.  Fires from the COMMIT
  * dispatch's release-cb exactly once.  Compares the COMMIT
- * writeverf against the one FINALIZE returned; a mismatch
- * means the DS rebooted between the two ops and FINALIZE's
- * durability guarantee is no longer valid.  Treated as -EPROTO for
- * now; a follow-up commit will map this to a proper retry hook.
+ * writeverf against the one FINALIZE returned.  A mismatch means the
+ * data server rebooted between the two operations, so FINALIZE's
+ * durability guarantee is no longer valid.
  */
 static void ffv2_chunk_wb_commit_done(void *arg, int status,
 				      const nfs4_verifier *wv)
@@ -738,11 +737,7 @@ static void ffv2_chunk_wb_commit_done(void *arg, int status,
 
 	if (memcmp(wv, &wb->finalize_writeverf,
 		   sizeof(wb->finalize_writeverf)) != 0) {
-		/* DS reboot between FINALIZE and COMMIT: mark the
-		 * layout for return so LAYOUTGET-fresh picks up a
-		 * clean state.  A follow-up commit will replace this
-		 * -EPROTO with a proper retry hook.
-		 */
+		/* A reboot invalidates the layout's data-server state. */
 		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
 		ffv2_chunk_wb_finish(wb, -EPROTO);
 		return;

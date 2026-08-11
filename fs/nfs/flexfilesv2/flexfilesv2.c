@@ -213,10 +213,8 @@ ffv2_get_ds_info(struct inode *inode)
  * metadata server that validates the body rejects with
  * NFS4ERR_BADXDR.  Emit the empty arrays explicitly.
  *
- * ff_layout_encode_layoutreturn() reaches the same wire shape the
- * long way round, through encoders that happen to write nothing when
- * there is nothing to report.  Per-mirror ioerr and iostats reporting
- * is a later slice for ffv2; until then the shape is the whole job.
+ * No per-mirror reports are emitted yet; the empty arrays preserve the
+ * required layoutreturn body shape.
  */
 static void
 ffv2_encode_layoutreturn(struct xdr_stream *xdr, const void *voidargs,
