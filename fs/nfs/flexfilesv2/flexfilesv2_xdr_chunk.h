@@ -546,12 +546,9 @@ struct ffv2_stripe_write;
 
 void ffv2_stripe_write_chain_done(struct ffv2_stripe_write *sw, int status);
 
-struct ffv2_chunk_wb_ctx {
-	/* Populated by the caller (the phase-one completion tail).
-	 * Every pointer here is borrowed from sw.
-	 */
-	struct ffv2_stripe_write	*sw;
-	struct nfs_pgio_header		*hdr;
+/* State retained for one chunk between CHUNK_WRITE and its lifecycle ops. */
+struct ffv2_pending_chunk {
+	struct list_head		list;
 	struct nfs_client		*ds_clp;
 	struct pnfs_layout_segment	*lseg;
 	const struct cred		*cred;
@@ -560,6 +557,16 @@ struct ffv2_chunk_wb_ctx {
 	u64				offset;
 	u32				count;
 	struct chunk_owner4		owner;
+	nfs4_verifier			writeverf;
+};
+
+struct ffv2_chunk_wb_ctx {
+	/* Populated by the caller (the phase-one completion tail).
+	 * Every pointer here is borrowed from sw.
+	 */
+	struct ffv2_stripe_write	*sw;
+	struct nfs_pgio_header		*hdr;
+	struct ffv2_pending_chunk	pending;
 	/* Populated by the FINALIZE completion callback:          */
 	nfs4_verifier			finalize_writeverf;
 	bool				have_finalize_writeverf;

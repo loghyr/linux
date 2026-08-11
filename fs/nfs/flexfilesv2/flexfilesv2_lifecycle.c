@@ -681,7 +681,8 @@ static void ffv2_chunk_wb_finalize_done(void *arg, int status,
 	int rc;
 
 	if (status) {
-		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
+		pnfs_error_mark_layout_for_return(wb->hdr->inode,
+					  wb->pending.lseg);
 		ffv2_chunk_wb_finish(wb, status);
 		return;
 	}
@@ -697,16 +698,18 @@ static void ffv2_chunk_wb_finalize_done(void *arg, int status,
 	memcpy(&wb->finalize_writeverf, wv, sizeof(wb->finalize_writeverf));
 	wb->have_finalize_writeverf = true;
 
-	commit_ctx.ds_clp = wb->ds_clp;
-	commit_ctx.lseg = wb->lseg;
+	commit_ctx.ds_clp = wb->pending.ds_clp;
+	commit_ctx.lseg = wb->pending.lseg;
 	commit_ctx.complete_arg = wb;
 	commit_ctx.complete = ffv2_chunk_wb_commit_done;
 
 	rc = ffv2_chunk_commit_dispatch_one_mirror(&commit_ctx,
-			wb->cred, &wb->fh, &wb->stateid,
-			wb->offset, wb->count, &wb->owner, 1);
+			wb->pending.cred, &wb->pending.fh, &wb->pending.stateid,
+			wb->pending.offset, wb->pending.count,
+			&wb->pending.owner, 1);
 	if (rc) {
-		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
+		pnfs_error_mark_layout_for_return(wb->hdr->inode,
+					  wb->pending.lseg);
 		ffv2_chunk_wb_finish(wb, rc);
 	}
 	/* Otherwise commit_done fires eventually; do not touch wb. */
@@ -725,7 +728,8 @@ static void ffv2_chunk_wb_commit_done(void *arg, int status,
 	struct ffv2_chunk_wb_ctx *wb = arg;
 
 	if (status) {
-		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
+		pnfs_error_mark_layout_for_return(wb->hdr->inode,
+					  wb->pending.lseg);
 		ffv2_chunk_wb_finish(wb, status);
 		return;
 	}
@@ -738,7 +742,8 @@ static void ffv2_chunk_wb_commit_done(void *arg, int status,
 	if (memcmp(wv, &wb->finalize_writeverf,
 		   sizeof(wb->finalize_writeverf)) != 0) {
 		/* A reboot invalidates the layout's data-server state. */
-		pnfs_error_mark_layout_for_return(wb->hdr->inode, wb->lseg);
+		pnfs_error_mark_layout_for_return(wb->hdr->inode,
+					  wb->pending.lseg);
 		ffv2_chunk_wb_finish(wb, -EPROTO);
 		return;
 	}
@@ -755,11 +760,11 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 {
 	struct ffv2_chunk_lifecycle_ctx finalize_ctx;
 
-	if (WARN_ON_ONCE(!wb || !wb->hdr || !wb->ds_clp))
+	if (WARN_ON_ONCE(!wb || !wb->hdr || !wb->pending.ds_clp))
 		return -EINVAL;
 
 	/*
-	 * wb->count is the chunk RANGE to transition, bounded only by
+	 * pending.count is the chunk RANGE to transition, bounded only by
 	 * being non-empty: the reply arrays carry one status per owner,
 	 * and this client sends one owner, so a wider range does not
 	 * widen the reply.  Checked here as well as at the dispatch
@@ -770,7 +775,7 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 	 * Batching the range is the point of this plumbing and lands
 	 * with the commit-phase accumulator.
 	 */
-	if (WARN_ON_ONCE(wb->count == 0))
+	if (WARN_ON_ONCE(wb->pending.count == 0))
 		return -EINVAL;
 
 	/* Layout stateid must be present -- CHUNK_WRITE couldn't
@@ -781,7 +786,7 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 	 * before wire time to keep the diagnostic close to the
 	 * source of the drift.
 	 */
-	if (WARN_ON_ONCE(wb->stateid.type == NFS4_SPECIAL_STATEID_TYPE))
+	if (WARN_ON_ONCE(wb->pending.stateid.type == NFS4_SPECIAL_STATEID_TYPE))
 		return -EINVAL;
 
 	/* Cred must be present for the RPC layer (msg.rpc_cred);
@@ -791,15 +796,16 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 	 * lets the DS attribute the FINALIZE / COMMIT to the same
 	 * client.  Fail closed.
 	 */
-	if (WARN_ON_ONCE(!wb->cred))
+	if (WARN_ON_ONCE(!wb->pending.cred))
 		return -EINVAL;
 
-	finalize_ctx.ds_clp = wb->ds_clp;
-	finalize_ctx.lseg = wb->lseg;
+	finalize_ctx.ds_clp = wb->pending.ds_clp;
+	finalize_ctx.lseg = wb->pending.lseg;
 	finalize_ctx.complete_arg = wb;
 	finalize_ctx.complete = ffv2_chunk_wb_finalize_done;
 
 	return ffv2_chunk_finalize_dispatch_one_mirror(&finalize_ctx,
-			wb->cred, &wb->fh, &wb->stateid,
-			wb->offset, wb->count, &wb->owner, 1);
+			wb->pending.cred, &wb->pending.fh,
+			&wb->pending.stateid, wb->pending.offset,
+			wb->pending.count, &wb->pending.owner, 1);
 }

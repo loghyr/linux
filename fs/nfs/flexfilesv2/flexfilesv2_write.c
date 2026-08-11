@@ -444,14 +444,17 @@ static int ffv2_chunk_write_hand_off_wb(struct ffv2_chunk_write_dispatch *w)
 
 	wb->sw = sw;
 	wb->hdr = sw->hdr;
-	wb->ds_clp = w->ds_clp;
-	wb->lseg = sw->lseg;
-	wb->cred = sw->hdr->cred;
-	wb->fh = w->wire.fh;
-	wb->stateid = w->wire.args.stateid;
-	wb->offset = w->wire.args.offset;
-	wb->count = 1;
-	wb->owner = w->wire.res.owners[0];
+	wb->pending.ds_clp = w->ds_clp;
+	INIT_LIST_HEAD(&wb->pending.list);
+	wb->pending.lseg = sw->lseg;
+	wb->pending.cred = sw->hdr->cred;
+	wb->pending.fh = w->wire.fh;
+	wb->pending.stateid = w->wire.args.stateid;
+	wb->pending.offset = w->wire.args.offset;
+	wb->pending.count = 1;
+	wb->pending.owner = w->wire.res.owners[0];
+	memcpy(&wb->pending.writeverf, &w->wire.res.writeverf,
+	       sizeof(wb->pending.writeverf));
 
 	/*
 	 * Taken before the chain can run, dropped by its terminal
