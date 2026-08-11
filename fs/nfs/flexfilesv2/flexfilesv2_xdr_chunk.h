@@ -567,7 +567,7 @@ struct ffv2_chunk_wb_ctx {
 	 */
 	struct ffv2_stripe_write	*sw;
 	struct nfs_pgio_header		*hdr;
-	struct ffv2_pending_chunk	pending;
+	struct ffv2_pending_chunk	*pending;
 	/* Populated by the FINALIZE completion callback:          */
 	nfs4_verifier			finalize_writeverf;
 	bool				have_finalize_writeverf;

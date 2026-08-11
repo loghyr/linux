@@ -655,16 +655,17 @@ ffv2_chunk_rollback_dispatch_one_mirror(struct ffv2_chunk_lifecycle_ctx *ctx,
  */
 static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status)
 {
-	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(wb->pending.lseg);
+	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(wb->pending->lseg);
 
 	spin_lock(&fls->fls_pending_lock);
-	if (wb->pending.queued) {
-		list_del_init(&wb->pending.list);
-		wb->pending.queued = false;
+	if (wb->pending->queued) {
+		list_del_init(&wb->pending->list);
+		wb->pending->queued = false;
 	}
 	spin_unlock(&fls->fls_pending_lock);
 
 	ffv2_stripe_write_chain_done(wb->sw, status);
+	kfree(wb->pending);
 	kfree(wb);
 }
 
@@ -690,7 +691,7 @@ static void ffv2_chunk_wb_finalize_done(void *arg, int status,
 
 	if (status) {
 		pnfs_error_mark_layout_for_return(wb->hdr->inode,
-					  wb->pending.lseg);
+					  wb->pending->lseg);
 		ffv2_chunk_wb_finish(wb, status);
 		return;
 	}
@@ -706,18 +707,18 @@ static void ffv2_chunk_wb_finalize_done(void *arg, int status,
 	memcpy(&wb->finalize_writeverf, wv, sizeof(wb->finalize_writeverf));
 	wb->have_finalize_writeverf = true;
 
-	commit_ctx.ds_clp = wb->pending.ds_clp;
-	commit_ctx.lseg = wb->pending.lseg;
+	commit_ctx.ds_clp = wb->pending->ds_clp;
+	commit_ctx.lseg = wb->pending->lseg;
 	commit_ctx.complete_arg = wb;
 	commit_ctx.complete = ffv2_chunk_wb_commit_done;
 
 	rc = ffv2_chunk_commit_dispatch_one_mirror(&commit_ctx,
-			wb->pending.cred, &wb->pending.fh, &wb->pending.stateid,
-			wb->pending.offset, wb->pending.count,
-			&wb->pending.owner, 1);
+			wb->pending->cred, &wb->pending->fh, &wb->pending->stateid,
+			wb->pending->offset, wb->pending->count,
+			&wb->pending->owner, 1);
 	if (rc) {
 		pnfs_error_mark_layout_for_return(wb->hdr->inode,
-					  wb->pending.lseg);
+					  wb->pending->lseg);
 		ffv2_chunk_wb_finish(wb, rc);
 	}
 	/* Otherwise commit_done fires eventually; do not touch wb. */
@@ -737,7 +738,7 @@ static void ffv2_chunk_wb_commit_done(void *arg, int status,
 
 	if (status) {
 		pnfs_error_mark_layout_for_return(wb->hdr->inode,
-					  wb->pending.lseg);
+					  wb->pending->lseg);
 		ffv2_chunk_wb_finish(wb, status);
 		return;
 	}
@@ -751,7 +752,7 @@ static void ffv2_chunk_wb_commit_done(void *arg, int status,
 		   sizeof(wb->finalize_writeverf)) != 0) {
 		/* A reboot invalidates the layout's data-server state. */
 		pnfs_error_mark_layout_for_return(wb->hdr->inode,
-					  wb->pending.lseg);
+					  wb->pending->lseg);
 		ffv2_chunk_wb_finish(wb, -EPROTO);
 		return;
 	}
@@ -768,7 +769,8 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 {
 	struct ffv2_chunk_lifecycle_ctx finalize_ctx;
 
-	if (WARN_ON_ONCE(!wb || !wb->hdr || !wb->pending.ds_clp))
+	if (WARN_ON_ONCE(!wb || !wb->hdr || !wb->pending ||
+			 !wb->pending->ds_clp))
 		return -EINVAL;
 
 	/*
@@ -783,7 +785,7 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 	 * Batching the range is the point of this plumbing and lands
 	 * with the commit-phase accumulator.
 	 */
-	if (WARN_ON_ONCE(wb->pending.count == 0))
+	if (WARN_ON_ONCE(wb->pending->count == 0))
 		return -EINVAL;
 
 	/* Layout stateid must be present -- CHUNK_WRITE couldn't
@@ -794,7 +796,8 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 	 * before wire time to keep the diagnostic close to the
 	 * source of the drift.
 	 */
-	if (WARN_ON_ONCE(wb->pending.stateid.type == NFS4_SPECIAL_STATEID_TYPE))
+	if (WARN_ON_ONCE(wb->pending->stateid.type ==
+			 NFS4_SPECIAL_STATEID_TYPE))
 		return -EINVAL;
 
 	/* Cred must be present for the RPC layer (msg.rpc_cred);
@@ -804,16 +807,16 @@ int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb)
 	 * lets the DS attribute the FINALIZE / COMMIT to the same
 	 * client.  Fail closed.
 	 */
-	if (WARN_ON_ONCE(!wb->pending.cred))
+	if (WARN_ON_ONCE(!wb->pending->cred))
 		return -EINVAL;
 
-	finalize_ctx.ds_clp = wb->pending.ds_clp;
-	finalize_ctx.lseg = wb->pending.lseg;
+	finalize_ctx.ds_clp = wb->pending->ds_clp;
+	finalize_ctx.lseg = wb->pending->lseg;
 	finalize_ctx.complete_arg = wb;
 	finalize_ctx.complete = ffv2_chunk_wb_finalize_done;
 
 	return ffv2_chunk_finalize_dispatch_one_mirror(&finalize_ctx,
-			wb->pending.cred, &wb->pending.fh,
-			&wb->pending.stateid, wb->pending.offset,
-			wb->pending.count, &wb->pending.owner, 1);
+			wb->pending->cred, &wb->pending->fh,
+			&wb->pending->stateid, wb->pending->offset,
+			wb->pending->count, &wb->pending->owner, 1);
 }
