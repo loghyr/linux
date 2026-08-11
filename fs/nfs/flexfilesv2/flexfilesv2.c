@@ -147,32 +147,10 @@ static void
 ffv2_return_range(struct pnfs_layout_hdr *lo,
 		  struct pnfs_layout_range *range)
 {
-	/*
-	 * Minimal implementation: rely on the pNFS core's default
-	 * behaviour, which invalidates every lseg overlapping the
-	 * range and lets the next I/O trigger a fresh LAYOUTGET.
-	 * A subsequent commit will add ffv2-specific per-mirror
-	 * teardown here once the read/write paths carry per-lseg
-	 * state that needs range-scoped release.
-	 */
+	/* The pNFS core invalidates overlapping lsegs and reacquires them. */
 }
 
-/*
- * A single commit bucket, deliberately.
- *
- * The generic layer assigns a whole pgio header to one bucket --
- * nfs_write_completion() passes hdr->ds_commit_idx for every request
- * it marks (fs/nfs/write.c:938).  Flexfiles v1 can make that a
- * per-data-server index because it builds one header per (mirror,
- * data server).  This driver deliberately does the opposite: one
- * header covers a whole stripe and dispatches all k+m shards from it,
- * so no single index names the header's data servers and every
- * request lands in bucket 0 regardless.
- *
- * Sizing the array k+m would therefore create k+m-1 buckets that can
- * never receive a request.  Keep one, and let the commit path resolve
- * the shard set from the pages it is handed.
- */
+/* A stripe header covers all shards, so commit tracking uses one bucket. */
 static void
 ffv2_setup_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
 		   struct pnfs_layout_segment *lseg)
@@ -199,17 +177,7 @@ ffv2_release_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
 	spin_unlock(&inode->i_lock);
 }
 
-/*
- * Commit entry point.  Deliberately declines for now: CHUNK_WRITE
- * still ships NFS_FILE_SYNC, so nothing is ever marked for commit and
- * this cannot be reached -- ncommitting stays 0 and pnfs_commit_list()
- * returns before consulting it.  Returning PNFS_NOT_ATTEMPTED is also
- * the correct answer if it ever were reached: the caller falls back to
- * a plain inband COMMIT, which is what happens today.
- *
- * The unstable-write conversion that makes this live replaces the body
- * with a drain of the per-shard pending-finalize state.
- */
+/* Commit entry point for FFv2 writes using NFS_UNSTABLE. */
 static int
 ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
 		     int how, struct nfs_commit_info *cinfo)

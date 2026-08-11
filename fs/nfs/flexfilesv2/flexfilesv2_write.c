@@ -588,19 +588,8 @@ static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw)
 			hdr->task.tk_status = sw->status;
 	} else {
 		/*
-		 * Stamping FILE_SYNC is not bookkeeping.  A header left
-		 * at NFS_UNSTABLE takes nfs_write_completion()'s
-		 * need-commit branch, and pnfs_mark_request_commit()
-		 * dereferences cinfo->ds -- which is NULL here, because
-		 * flexfiles v2 registers no pNFS commit operations and
-		 * ffv2_get_ds_info() returns NULL.  The chain has
-		 * already confirmed durability at every data server, so
-		 * FILE_SYNC is also the truth.
-		 *
-		 * res.count is the user bytes this header carried, not
-		 * the wire bytes: a stripe ships k+m shards of padded,
-		 * encoded data, and reporting that as the write length
-		 * would overstate it by the parity and the padding.
+		 * The stripe chain has completed at every data server.  Report
+		 * the logical write length; parity and padding are not user data.
 		 */
 		hdr->res.count = hdr->args.count;
 		hdr->verf.committed = NFS_FILE_SYNC;
@@ -2649,15 +2638,9 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 		return ffv2_write_fallback_to_mds(hdr);
 
 	/*
-	 * Guard validation is performed by the data server.  The
-	 * CHUNK_WRITE encoder ships cwg_check=TRUE uniformly (captured
-	 * guard when valid, {0,0} sentinel otherwise), which is the
-	 * draft-conforming envelope regardless of writer count; the DS
-	 * decides accept vs NFS4ERR_DELAY from its own guard state.
-	 * Empty-chunk first-writes accept immediately (the DS's CAS
-	 * short-circuits on !prev); non-empty mismatches will be
-	 * retried via RMW-refresh once the classify + retry loop is
-	 * in place.
+	 * Always send a checked guard.  A valid captured guard supplies the
+	 * compare value; an uncaptured shard uses the zero sentinel.  The
+	 * data server decides whether the compare succeeds or must be retried.
 	 */
 
 	{
