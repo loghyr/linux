@@ -34,12 +34,11 @@
 #include "flexfilesv2_xdr_chunk.h"
 
 /*
- * See flexfilesv2.h for the semantics of these two.  Definitions
- * live here so both flexfilesv2.o (this module's core) and any future
- * kunit test object can link against them via the extern declaration.
+ * See flexfilesv2.h for the semantics.  The definition lives here so
+ * both flexfilesv2.o (this module's core) and any future kunit test
+ * object can link against it via the extern declaration.
  */
 u32 ffv2_cg_client_id_seed;
-atomic_t ffv2_cg_gen_id_next_val = ATOMIC_INIT(1);
 
 void ffv2_chunk_guard_init(void)
 {

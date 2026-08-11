@@ -2060,7 +2060,7 @@ static int ffv2_chunk_read_verify_and_capture(struct ffv2_chunk_read_fetch *f)
 	 * Parity shards reach here too: they are fetched for their
 	 * guard alone, and capture on the same CRC-verified terms.
 	 */
-	f->ctx->captured_guard[f->shard_idx].guard = chunk->owner.co_guard;
+	f->ctx->captured_guard[f->shard_idx].guard = chunk->guard;
 	f->ctx->captured_guard[f->shard_idx].valid = true;
 	return 0;
 }

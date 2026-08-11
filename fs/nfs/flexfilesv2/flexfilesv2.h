@@ -77,17 +77,34 @@
  * below is only the fallback for a metadata server that supplies a
  * reserved sentinel or no identity at all.
  *
- * cg_gen_id is a client-side monotonic counter (0-skipping on wrap;
- * reserved for a possible future CHUNK_GUARD_GEN_NONE sentinel).
+ * cg_gen_id is assigned by the data server, not the client.  The
+ * server stores old+1 on every accepted CHUNK_WRITE and reports the
+ * current value in read_chunk4.cr_guard; a writer only ever echoes
+ * back the generation it read.  A client that minted its own would
+ * be supplying both sides of the server's compare-and-swap, which is
+ * no check at all.
  */
 struct chunk_guard4 {
 	u32	cg_gen_id;
 	u32	cg_client_id;
 };
 
+/*
+ * chunk_owner4 names a write: co_cohort_id is the transaction,
+ * constant across every chunk of one write; co_id says which chunk
+ * of that transaction this is.  Per
+ * draft-haynes-nfsv4-flexfiles-v2 sec-chunk_owner4, within a single
+ * (co_cohort_id, co_client_id) all co_id values MUST be distinct.
+ *
+ * The guard is NOT nested here.  It is per-chunk compare-and-swap
+ * state the data server owns and reports in its own wire field;
+ * the owner says who wrote the chunk, the guard says what the next
+ * writer must present.
+ */
 struct chunk_owner4 {
-	struct chunk_guard4	co_guard;
-	u32			co_id;
+	u64	co_cohort_id;
+	u32	co_client_id;
+	u32	co_id;
 };
 
 /*
@@ -533,13 +550,8 @@ ffv2_ds_offset(const struct nfs4_ffv2_mirror *mirror, u64 file_off)
  * server registered for the layout stateid, so a locally invented
  * value would be rejected wherever that binding exists.
  *
- * ffv2_cg_gen_id_next_val: monotonic counter incremented per
- * CHUNK_WRITE via ffv2_cg_gen_id_next().  Seeded to 1; skips 0 on
- * wrap to keep room for a possible future CHUNK_GUARD_GEN_NONE
- * sentinel.
  */
 extern u32 ffv2_cg_client_id_seed;
-extern atomic_t ffv2_cg_gen_id_next_val;
 
 void ffv2_chunk_guard_init(void);
 
@@ -568,21 +580,6 @@ static inline u32 ffv2_cg_client_id(const struct nfs4_ffv2_mirror *mirror)
 	return ffv2_cg_client_id_seed;
 }
 
-static inline u32 ffv2_cg_gen_id_next(void)
-{
-	u32 n = (u32)atomic_inc_return(&ffv2_cg_gen_id_next_val);
-
-	/*
-	 * atomic_inc_return returns the new value.  A wrap from 0xFFFFFFFF
-	 * to 0 lands us on the reserved sentinel; skip past it.  Race-safe:
-	 * a second thread that wraps at the same moment gets a distinct
-	 * value from its own inc_return; both threads walk forward.
-	 */
-	if (unlikely(n == 0))
-		n = (u32)atomic_inc_return(&ffv2_cg_gen_id_next_val);
-	return n;
-}
-
 static inline u32
 ffv2_owner_id_next(struct nfs4_ffv2_layout_segment *fls)
 {
@@ -600,16 +597,24 @@ ffv2_owner_id_next(struct nfs4_ffv2_layout_segment *fls)
 
 /*
  * Build a fresh chunk_owner4 for one CHUNK_WRITE on this lseg.
- * All three fields advance monotonically; the returned owner
- * uniquely identifies (this write, this client, this generation).
+ *
+ * No generation is stamped: the data server assigns cg_gen_id and
+ * reports it in cr_guard, so it is not the client's to choose.
+ *
+ * co_cohort_id is left 0 until cohort assignment lands.  The draft
+ * requires co_id to be distinct within one (co_cohort_id,
+ * co_client_id), which ffv2_owner_id_next already gives us per lseg;
+ * a constant cohort collapses every write on the lseg into one
+ * transaction identity, which is wrong but not yet observable -- the
+ * data server matches on co_id alone.
  */
 static inline void
 ffv2_build_chunk_owner(struct nfs4_ffv2_layout_segment *fls,
 		       const struct nfs4_ffv2_mirror *mirror,
 		       struct chunk_owner4 *out)
 {
-	out->co_guard.cg_gen_id = ffv2_cg_gen_id_next();
-	out->co_guard.cg_client_id = ffv2_cg_client_id(mirror);
+	out->co_cohort_id = 0;
+	out->co_client_id = ffv2_cg_client_id(mirror);
 	out->co_id = ffv2_owner_id_next(fls);
 }
 

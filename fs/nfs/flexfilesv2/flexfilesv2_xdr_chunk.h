@@ -26,8 +26,9 @@
  * collapses to a bool-only 4 bytes on the wire.
  *
  * The captured guard on RMW writes comes from the RMW fetch path's
- * retained read_chunk4.cr_owner.co_guard.  A later commit wires the
- * plumbing that populates this on the RMW write path.
+ * retained read_chunk4.cr_guard -- its own wire field, not the
+ * owner.  The owner names the writer; the guard is what the data
+ * server compares against.
  */
 struct ffv2_write_chunk_guard4 {
 	bool			check;
@@ -162,8 +163,9 @@ struct ffv2_checksum4 {
 struct ffv2_read_chunk4 {
 	struct ffv2_checksum4	checksum;
 	u32			effective_len;	/* bytes valid in payload */
-	struct chunk_owner4	owner;		/* guard-capture source */
-	struct chunk_guard4	guard;		/* per-chunk CAS state */
+	struct chunk_owner4	owner;		/* who wrote the chunk */
+	struct chunk_guard4	guard;		/* per-chunk CAS state;
+						 * guard-capture source */
 	u32			payload_id;	/* always 0 for now */
 	u32			locked;		/* chunk_state_flags4 */
 	u32			status;		/* nfsstat4 */

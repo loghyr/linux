@@ -67,7 +67,8 @@
  * CHUNK_WRITE op header + INLINE body (excludes cwa_chunks<>
  * payload which is attached via xdr_write_pages, not inline):
  *   op code (4) + stateid (16) + offset (8) + stable (4)
- *   + owner (12) + payload_id (4) + flags (4)
+ *   + owner (16: cohort 8 + client_id 4 + co_id 4)
+ *   + payload_id (4) + flags (4)
  *   + guard: cwg_check (4) + (worst case) cwg_guard (8)
  *   + chunk_size (4)
  *   + cwa_checksums length (4) + one entry:
@@ -76,7 +77,7 @@
  *   + cwa_chunks length (4) (payload bytes go via xdr_write_pages)
  */
 #define FFV2_CHUNK_WRITE_INLINE_ENC_MAXSZ \
-	(4 + NFS4_STATEID_SIZE + 8 + 4 + 12 + 4 + 4 + (4 + 8) + 4 + \
+	(4 + NFS4_STATEID_SIZE + 8 + 4 + 16 + 4 + 4 + (4 + 8) + 4 + \
 	 (4 + (4 + 4 + FFV2_CHECKSUM_MAX_LEN)) + 4)
 
 /*
@@ -99,7 +100,7 @@
  *     count (4) + committed (4) + writeverf (NFS4_VERIFIER_SIZE = 8)
  *     + block_status<> length (4) + N * 4
  *     + block_activated<> length (4) + N * 4
- *     + owners<> length (4) + N * 12
+ *     + owners<> length (4) + N * 16
  * With N capped at FFV2_MAX_CHUNKS_PER_OP.
  */
 #define FFV2_CHUNK_WRITE_RES_MAXSZ_BYTES \
@@ -109,7 +110,7 @@
 	 (4 + 4 + 4 + 4 + NFS4_VERIFIER_SIZE + \
 	  (4 + FFV2_MAX_CHUNKS_PER_OP * 4) + \
 	  (4 + FFV2_MAX_CHUNKS_PER_OP * 4) + \
-	  (4 + FFV2_MAX_CHUNKS_PER_OP * 12)))
+	  (4 + FFV2_MAX_CHUNKS_PER_OP * 16)))
 
 /*
  * NFS ops track args/replen in u32 units.  Convert byte constants.
@@ -152,9 +153,9 @@
  * Per-chunk worst case in bytes (allows a future non-CRC32
  * algorithm at max cs_value = SHA-512 = 64 bytes):
  *   cs_algorithm (4) + cs_value_len (4) + cs_value (64, pad-free
- *   at 64) + cr_effective_len (4) + cr_owner (12) + cr_guard (8)
+ *   at 64) + cr_effective_len (4) + cr_owner (16) + cr_guard (8)
  *   + cr_payload_id (4) + cr_locked (4)
- *   + cr_status (4) + cr_chunk<> length (4) = 112
+ *   + cr_status (4) + cr_chunk<> length (4) = 116
  * With N capped at FFV2_MAX_CHUNKS_PER_OP.
  *
  * Note: the runtime decoder enforces N in {0, 1} and cs_value_len ==
@@ -167,7 +168,7 @@
 	 (4 + 4) + \
 	 (4 + 4 + 4 + 4 + \
 	  FFV2_MAX_CHUNKS_PER_OP * \
-	  (4 + 4 + FFV2_CHECKSUM_MAX_LEN + 4 + 12 + 8 + 4 + 4 + 4 + 4)))
+	  (4 + 4 + FFV2_CHECKSUM_MAX_LEN + 4 + 16 + 8 + 4 + 4 + 4 + 4)))
 
 #define FFV2_CHUNK_READ_ARGS_MAXSZ	\
 	BYTES_TO_U32(FFV2_CHUNK_READ_ARGS_MAXSZ_BYTES)
@@ -177,13 +178,13 @@
 /*
  * CHUNK_FINALIZE op body (all inline; no page splicing):
  *   op code (4) + stateid (16) + offset (8) + count (4)
- *   + chunks<> length (4) + N * chunk_owner4 (12) = 36 + 12N bytes
+ *   + chunks<> length (4) + N * chunk_owner4 (16) = 36 + 16N bytes
  *
  * N capped at FFV2_MAX_CHUNKS_PER_OP; the current single-owner-
  * per-op shape sends N == 1.
  */
 #define FFV2_CHUNK_FINALIZE_INLINE_ENC_MAXSZ \
-	(4 + NFS4_STATEID_SIZE + 8 + 4 + 4 + FFV2_MAX_CHUNKS_PER_OP * 12)
+	(4 + NFS4_STATEID_SIZE + 8 + 4 + 4 + FFV2_MAX_CHUNKS_PER_OP * 16)
 
 #define FFV2_CHUNK_FINALIZE_ARGS_MAXSZ_BYTES \
 	(FFV2_COMPOUND_HDR_MAXSZ + FFV2_SEQUENCE_ENC_MAXSZ + \
@@ -219,7 +220,7 @@
  * identical today.
  */
 #define FFV2_CHUNK_COMMIT_INLINE_ENC_MAXSZ \
-	(4 + NFS4_STATEID_SIZE + 8 + 4 + 4 + FFV2_MAX_CHUNKS_PER_OP * 12)
+	(4 + NFS4_STATEID_SIZE + 8 + 4 + 4 + FFV2_MAX_CHUNKS_PER_OP * 16)
 
 #define FFV2_CHUNK_COMMIT_ARGS_MAXSZ_BYTES \
 	(FFV2_COMPOUND_HDR_MAXSZ + FFV2_SEQUENCE_ENC_MAXSZ + \
@@ -396,14 +397,18 @@ static void ffv2_xdr_enc_chunk_guard(struct xdr_stream *xdr,
 	*p   = cpu_to_be32(g->cg_client_id);
 }
 
+/*
+ * chunk_owner4 is the {cohort, client, chunk} triple -- 16 bytes, no
+ * nested guard.  The guard rides its own wire field.
+ */
 static void ffv2_xdr_enc_chunk_owner(struct xdr_stream *xdr,
 				     const struct chunk_owner4 *o)
 {
-	__be32 *p;
+	__be32 *p = ffv2_reserve_space(xdr, 16);
 
-	ffv2_xdr_enc_chunk_guard(xdr, &o->co_guard);
-	p = ffv2_reserve_space(xdr, 4);
-	*p = cpu_to_be32(o->co_id);
+	p = xdr_encode_hyper(p, o->co_cohort_id);
+	*p++ = cpu_to_be32(o->co_client_id);
+	*p   = cpu_to_be32(o->co_id);
 }
 
 static void ffv2_xdr_enc_checksum(struct xdr_stream *xdr, u32 algo,
@@ -928,13 +933,13 @@ static int ffv2_xdr_dec_chunk_guard(struct xdr_stream *xdr,
 static int ffv2_xdr_dec_chunk_owner(struct xdr_stream *xdr,
 				    struct chunk_owner4 *out)
 {
-	__be32 *p = xdr_inline_decode(xdr, 12);
+	__be32 *p = xdr_inline_decode(xdr, 16);
 
 	if (!p)
 		return -EIO;
-	out->co_guard.cg_gen_id    = be32_to_cpup(p++);
-	out->co_guard.cg_client_id = be32_to_cpup(p++);
-	out->co_id                 = be32_to_cpup(p);
+	p = xdr_decode_hyper(p, &out->co_cohort_id);
+	out->co_client_id = be32_to_cpup(p++);
+	out->co_id        = be32_to_cpup(p);
 	return 0;
 }
 
@@ -1396,12 +1401,9 @@ static int ffv2_xdr_dec_chunk_rollback(struct rpc_rqst *req,
 /*
  * Decode one read_chunk4 (crr_chunks<> element).
  *
- * cr_guard is the per-chunk CAS state (cg_gen_id, cg_client_id).
- * The server may also expose it inside cr_owner.co_guard on older
- * single-owner shapes; the guard-capture path currently sources
- * from cr_owner.co_guard for interop.  cr_guard becomes
- * authoritative once the owner-triple restructure lands and
- * chunk_owner4 loses its embedded chunk_guard4.
+ * cr_guard is the per-chunk CAS state (cg_gen_id, cg_client_id) and
+ * is the sole carrier: chunk_owner4 is the owner triple and has no
+ * embedded guard, so the guard-capture path sources from cr_guard.
  *
  * cr_chunk<> length is stored on out->chunk_len; the payload bytes
  * themselves are consumed by xdr_read_pages in the enclosing resok
