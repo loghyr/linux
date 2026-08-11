@@ -348,7 +348,9 @@ struct nfs4_ffv2_layout_segment {
 	u32				flags;
 	u32				stats_collect_hint;
 	spinlock_t			fls_ctx_lock;
+	spinlock_t			fls_pending_lock;
 	struct list_head		fls_ctx_list;	/* ffv2_stripe_ctx */
+	struct list_head		fls_pending_list;	/* pending chunks */
 	wait_queue_head_t		fls_ctx_wq;	/* same-stripe gate */
 	/*
 	 * Set when this segment is being recalled or cancelled.  New

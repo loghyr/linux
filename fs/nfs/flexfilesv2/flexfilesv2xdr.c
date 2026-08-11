@@ -317,6 +317,7 @@ void ffv2_free_layout_segment(struct nfs4_ffv2_layout_segment *fls)
 
 	if (!fls)
 		return;
+	WARN_ON_ONCE(!list_empty(&fls->fls_pending_list));
 	/*
 	 * pNFS core guarantees free_lseg fires only after all inflight
 	 * I/O against this lseg drains, so fls_ctx_list must be empty
@@ -367,7 +368,9 @@ ffv2_decode_layout(struct nfs4_layoutget_res *lgr, gfp_t gfp_flags)
 	}
 	fls->mirror_array_cnt = mirror_cnt;
 	spin_lock_init(&fls->fls_ctx_lock);
+	spin_lock_init(&fls->fls_pending_lock);
 	INIT_LIST_HEAD(&fls->fls_ctx_list);
+	INIT_LIST_HEAD(&fls->fls_pending_list);
 	init_waitqueue_head(&fls->fls_ctx_wq);
 	atomic_set(&fls->next_owner_id, 1);
 

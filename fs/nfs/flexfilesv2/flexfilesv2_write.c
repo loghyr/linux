@@ -455,6 +455,11 @@ static int ffv2_chunk_write_hand_off_wb(struct ffv2_chunk_write_dispatch *w)
 	wb->pending.owner = w->wire.res.owners[0];
 	memcpy(&wb->pending.writeverf, &w->wire.res.writeverf,
 	       sizeof(wb->pending.writeverf));
+	spin_lock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
+	list_add_tail(&wb->pending.list,
+		      &FFV2_LSEG(sw->lseg)->fls_pending_list);
+	wb->pending.queued = true;
+	spin_unlock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
 
 	/*
 	 * Taken before the chain can run, dropped by its terminal
@@ -466,6 +471,10 @@ static int ffv2_chunk_write_hand_off_wb(struct ffv2_chunk_write_dispatch *w)
 	rc = ffv2_chunk_wb_start(wb);
 	if (rc) {
 		/* wb_start takes ownership only on success. */
+		spin_lock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
+		list_del_init(&wb->pending.list);
+		wb->pending.queued = false;
+		spin_unlock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
 		refcount_dec(&sw->sw_ref);
 		kfree(wb);
 		return rc;

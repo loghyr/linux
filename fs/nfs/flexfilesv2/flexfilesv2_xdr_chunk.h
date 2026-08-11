@@ -558,6 +558,7 @@ struct ffv2_pending_chunk {
 	u32				count;
 	struct chunk_owner4		owner;
 	nfs4_verifier			writeverf;
+	bool				queued;
 };
 
 struct ffv2_chunk_wb_ctx {

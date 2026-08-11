@@ -650,12 +650,20 @@ ffv2_chunk_rollback_dispatch_one_mirror(struct ffv2_chunk_lifecycle_ctx *ctx,
  * has been finalized, so the header is completed by the stripe's own
  * tail once the last chain has reported in.
  *
- * The wb_ctx borrows hdr / ds_clp / lseg from the stripe write
- * and releases none of them; chain_done drops the reference that
- * kept the stripe write alive for this chain.
+ * The wb_ctx borrows hdr / DS and layout state from the stripe write.
+ * The pending record is removed before the stripe reference is dropped.
  */
 static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status)
 {
+	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(wb->pending.lseg);
+
+	spin_lock(&fls->fls_pending_lock);
+	if (wb->pending.queued) {
+		list_del_init(&wb->pending.list);
+		wb->pending.queued = false;
+	}
+	spin_unlock(&fls->fls_pending_lock);
+
 	ffv2_stripe_write_chain_done(wb->sw, status);
 	kfree(wb);
 }
