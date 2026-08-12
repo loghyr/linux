@@ -759,12 +759,13 @@ static void nfs_inode_remove_request(struct nfs_page *req)
 	}
 }
 
-static void nfs_mark_request_dirty(struct nfs_page *req)
+void nfs_mark_request_dirty(struct nfs_page *req)
 {
 	struct folio *folio = nfs_page_to_folio(req);
 	if (folio)
 		filemap_dirty_folio(folio_mapping(folio), folio);
 }
+EXPORT_SYMBOL_GPL(nfs_mark_request_dirty);
 
 /**
  * nfs_request_add_commit_list_locked - add request to a commit list
