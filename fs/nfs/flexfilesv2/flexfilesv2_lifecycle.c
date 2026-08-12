@@ -714,7 +714,8 @@ struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 	struct ffv2_pending_req *first;
 	struct nfs_commit_data *data;
 
-	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_LIFECYCLE_DONE))
+	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_LIFECYCLE_DONE &&
+			pending->state != FFV2_PENDING_COMMITTING))
 		return NULL;
 	first = list_first_entry_or_null(&pending->requests,
 					struct ffv2_pending_req, list);

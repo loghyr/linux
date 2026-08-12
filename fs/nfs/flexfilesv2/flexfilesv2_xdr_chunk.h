@@ -553,6 +553,7 @@ enum ffv2_pending_state {
 	FFV2_PENDING_IMMEDIATE,
 	FFV2_PENDING_RETAINED,
 	FFV2_PENDING_LIFECYCLE_DONE,
+	FFV2_PENDING_COMMITTING,
 };
 
 enum ffv2_pending_flags {

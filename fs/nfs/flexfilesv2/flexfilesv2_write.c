@@ -217,9 +217,14 @@ struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 	struct ffv2_pending_chunk *pending;
 
 	spin_lock(&sw->pending_lock);
+	if (atomic_read(&sw->chains_pending) != 0 || sw->status) {
+		spin_unlock(&sw->pending_lock);
+		return NULL;
+	}
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
 		if (pending->state == FFV2_PENDING_LIFECYCLE_DONE &&
 		    !list_empty(&pending->requests)) {
+			pending->state = FFV2_PENDING_COMMITTING;
 			spin_unlock(&sw->pending_lock);
 			return ffv2_pending_commitdata_alloc(pending);
 		}
