@@ -729,6 +729,7 @@ struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 	data->lseg = pnfs_get_lseg(pending->lseg);
 	data->ds_clp = pending->ds_clp;
 	refcount_inc(&data->ds_clp->cl_count);
+	data->private = pending;
 	if (ffv2_pending_chunk_move_requests(pending, &data->pages) <= 0) {
 		ffv2_pending_commitdata_free(data);
 		return NULL;

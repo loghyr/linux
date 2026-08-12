@@ -1730,6 +1730,7 @@ struct nfs_commit_data {
 	const struct rpc_call_ops *mds_ops;
 	const struct nfs_commit_completion_ops *completion_ops;
 	int (*commit_done_cb) (struct rpc_task *task, struct nfs_commit_data *data);
+	void *private;
 	unsigned long		flags;
 };
 
