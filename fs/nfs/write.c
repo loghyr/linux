@@ -58,7 +58,6 @@ static const struct rpc_call_ops nfs_commit_ops;
 static const struct nfs_pgio_completion_ops nfs_async_write_completion_ops;
 static const struct nfs_commit_completion_ops nfs_commit_completion_ops;
 static const struct nfs_rw_ops nfs_rw_write_ops;
-static void nfs_inode_remove_request(struct nfs_page *req);
 static void nfs_clear_request_commit(struct nfs_commit_info *cinfo,
 				     struct nfs_page *req);
 static void nfs_init_cinfo_from_inode(struct nfs_commit_info *cinfo,
@@ -732,7 +731,7 @@ static void nfs_inode_add_request(struct nfs_page *req)
 /*
  * Remove a write request from an inode
  */
-static void nfs_inode_remove_request(struct nfs_page *req)
+void nfs_inode_remove_request(struct nfs_page *req)
 {
 	struct nfs_inode *nfsi = NFS_I(nfs_page_to_inode(req));
 
@@ -758,6 +757,7 @@ static void nfs_inode_remove_request(struct nfs_page *req)
 		nfs_release_request(req);
 	}
 }
+EXPORT_SYMBOL_GPL(nfs_inode_remove_request);
 
 void nfs_mark_request_dirty(struct nfs_page *req)
 {
@@ -867,7 +867,7 @@ nfs_mark_request_commit(struct nfs_page *req, struct pnfs_layout_segment *lseg,
 	nfs_request_add_commit_list(req, cinfo);
 }
 
-static void nfs_folio_clear_commit(struct nfs_page *req)
+void nfs_folio_clear_commit(struct nfs_page *req)
 {
 	struct folio *folio = nfs_page_to_folio(req);
 
@@ -878,6 +878,7 @@ static void nfs_folio_clear_commit(struct nfs_page *req)
 		bdi_wb_stat_mod(folio->mapping->host, WB_WRITEBACK, -nr);
 	}
 }
+EXPORT_SYMBOL_GPL(nfs_folio_clear_commit);
 
 /* Called holding the request lock on @req */
 static void nfs_clear_request_commit(struct nfs_commit_info *cinfo,
