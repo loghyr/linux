@@ -726,6 +726,9 @@ struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 	data->cred = get_cred(first->context->cred);
 	data->context = get_nfs_open_context(first->context);
 	data->args.fh = NFS_FH(data->inode);
+	data->lseg = pnfs_get_lseg(pending->lseg);
+	data->ds_clp = pending->ds_clp;
+	refcount_inc(&data->ds_clp->cl_count);
 	if (ffv2_pending_chunk_move_requests(pending, &data->pages) <= 0) {
 		ffv2_pending_commitdata_free(data);
 		return NULL;
@@ -744,6 +747,10 @@ void ffv2_pending_commitdata_free(struct nfs_commit_data *data)
 	}
 	put_nfs_open_context(data->context);
 	put_cred(data->cred);
+	if (data->lseg)
+		pnfs_put_lseg(data->lseg);
+	if (data->ds_clp)
+		nfs_put_client(data->ds_clp);
 	nfs_commitdata_release(data);
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_commitdata_free);
