@@ -639,6 +639,115 @@ ffv2_chunk_rollback_dispatch_one_mirror(struct ffv2_chunk_lifecycle_ctx *ctx,
 /* Writeback chain: FINALIZE -> COMMIT after CHUNK_WRITE              */
 /* ------------------------------------------------------------------ */
 
+void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending)
+{
+	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(pending->lseg);
+	struct ffv2_pending_req *p, *tmp;
+
+	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
+		return;
+	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
+		list_del(&p->list);
+		put_nfs_open_context(p->context);
+		nfs_release_request(p->req);
+		kfree(p);
+	}
+
+	spin_lock(&fls->fls_pending_lock);
+	if (test_and_clear_bit(FFV2_PENDING_QUEUED, &pending->flags)) {
+		list_del_init(&pending->list);
+	}
+	spin_unlock(&fls->fls_pending_lock);
+	spin_lock(pending->stripe_lock);
+	list_del_init(&pending->stripe_list);
+	spin_unlock(pending->stripe_lock);
+	put_cred(pending->cred);
+	nfs_put_client(pending->ds_clp);
+	pnfs_put_lseg(pending->lseg);
+	if (pending->state != FFV2_PENDING_IMMEDIATE)
+		refcount_dec(pending->stripe_ref);
+	kfree(pending);
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_free);
+
+void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending)
+{
+	if (WARN_ON_ONCE(!pending->stripe_ref))
+		return;
+	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_IMMEDIATE))
+		return;
+	refcount_inc(pending->stripe_ref);
+	pending->state = FFV2_PENDING_RETAINED;
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_retain);
+
+void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending)
+{
+	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_RETAINED))
+		return;
+	pending->state = FFV2_PENDING_LIFECYCLE_DONE;
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_lifecycle_done);
+
+int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
+					     struct list_head *dst)
+{
+	struct ffv2_pending_req *p, *tmp;
+	int count = 0;
+
+	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
+		return -EBUSY;
+	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
+		list_del(&p->list);
+		nfs_list_add_request(p->req, dst);
+		kfree(p);
+		count++;
+	}
+	return count;
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_move_requests);
+
+struct nfs_commit_data *ffv2_pending_commitdata_alloc(
+					struct ffv2_pending_chunk *pending)
+{
+	struct ffv2_pending_req *first;
+	struct nfs_commit_data *data;
+
+	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_LIFECYCLE_DONE))
+		return NULL;
+	first = list_first_entry_or_null(&pending->requests,
+					struct ffv2_pending_req, list);
+	if (!first)
+		return NULL;
+	data = nfs_commitdata_alloc();
+	if (!data)
+		return NULL;
+	data->inode = first->inode;
+	data->cred = get_cred(first->context->cred);
+	data->context = get_nfs_open_context(first->context);
+	data->args.fh = NFS_FH(data->inode);
+	if (ffv2_pending_chunk_move_requests(pending, &data->pages) <= 0) {
+		ffv2_pending_commitdata_free(data);
+		return NULL;
+	}
+	return data;
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_commitdata_alloc);
+
+void ffv2_pending_commitdata_free(struct nfs_commit_data *data)
+{
+	struct nfs_page *req, *tmp;
+
+	list_for_each_entry_safe(req, tmp, &data->pages, wb_list) {
+		list_del_init(&req->wb_list);
+		nfs_release_request(req);
+	}
+	put_nfs_open_context(data->context);
+	put_cred(data->cred);
+	nfs_commitdata_release(data);
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_commitdata_free);
+
 /*
  * Terminal callback of one shard's FINALIZE -> COMMIT chain, reached
  * on success and on every failure that aborts the chain.
@@ -655,17 +764,14 @@ ffv2_chunk_rollback_dispatch_one_mirror(struct ffv2_chunk_lifecycle_ctx *ctx,
  */
 static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status)
 {
-	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(wb->pending->lseg);
-
-	spin_lock(&fls->fls_pending_lock);
-	if (wb->pending->queued) {
-		list_del_init(&wb->pending->list);
-		wb->pending->queued = false;
+	if (wb->pending->state == FFV2_PENDING_RETAINED) {
+		ffv2_pending_chunk_lifecycle_done(wb->pending);
+		ffv2_stripe_write_chain_done(wb->sw, status);
+		kfree(wb);
+		return;
 	}
-	spin_unlock(&fls->fls_pending_lock);
-
+	ffv2_pending_chunk_free(wb->pending);
 	ffv2_stripe_write_chain_done(wb->sw, status);
-	kfree(wb->pending);
 	kfree(wb);
 }
 
@@ -704,8 +810,21 @@ static void ffv2_chunk_wb_finalize_done(void *arg, int status,
 		return;
 	}
 
-	memcpy(&wb->finalize_writeverf, wv, sizeof(wb->finalize_writeverf));
+	/* A data-server reboot between CHUNK_WRITE and FINALIZE
+	 * invalidates the write verifier captured with the pending owner. */
+	if (memcmp(wv, &wb->pending->writeverf,
+		   sizeof(wb->pending->writeverf)) != 0) {
+		pnfs_error_mark_layout_for_return(wb->hdr->inode,
+					  wb->pending->lseg);
+		ffv2_chunk_wb_finish(wb, -EPROTO);
+		return;
+	}
+
+	memcpy(&wb->pending->finalize_writeverf, wv,
+	       sizeof(wb->pending->finalize_writeverf));
+	set_bit(FFV2_PENDING_HAVE_FINALIZE_VERF, &wb->pending->flags);
 	wb->have_finalize_writeverf = true;
+	memcpy(&wb->finalize_writeverf, wv, sizeof(wb->finalize_writeverf));
 
 	commit_ctx.ds_clp = wb->pending->ds_clp;
 	commit_ctx.lseg = wb->pending->lseg;
@@ -743,16 +862,29 @@ static void ffv2_chunk_wb_commit_done(void *arg, int status,
 		return;
 	}
 
-	if (WARN_ON_ONCE(!wv) || !wb->have_finalize_writeverf) {
+	if (WARN_ON_ONCE(!wv) || !wb->have_finalize_writeverf ||
+		    !test_bit(FFV2_PENDING_HAVE_FINALIZE_VERF,
+			       &wb->pending->flags)) {
 		ffv2_chunk_wb_finish(wb, -EPROTO);
 		return;
 	}
+	memcpy(&wb->pending->commit_writeverf, wv,
+	       sizeof(wb->pending->commit_writeverf));
+	set_bit(FFV2_PENDING_HAVE_COMMIT_VERF, &wb->pending->flags);
 
 	if (memcmp(wv, &wb->finalize_writeverf,
 		   sizeof(wb->finalize_writeverf)) != 0) {
 		/* A reboot invalidates the layout's data-server state. */
 		pnfs_error_mark_layout_for_return(wb->hdr->inode,
 					  wb->pending->lseg);
+		ffv2_chunk_wb_finish(wb, -EPROTO);
+		return;
+	}
+
+	if (WARN_ON_ONCE(!test_bit(FFV2_PENDING_HAVE_COMMIT_VERF,
+				   &wb->pending->flags)) ||
+		    memcmp(&wb->pending->commit_writeverf, wv,
+			   sizeof(wb->pending->commit_writeverf)) != 0) {
 		ffv2_chunk_wb_finish(wb, -EPROTO);
 		return;
 	}

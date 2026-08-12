@@ -808,7 +808,8 @@ ffv2_pg_test(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
 	struct nfs4_ffv2_layout_segment *fls;
 	struct nfs4_ffv2_mirror *mirror;
 	size_t size;
-	u64 req_shard, prev_shard, in_shard;
+	u64 req_shard, prev_shard;
+	u32 in_shard;
 	u32 shard_len;
 
 	size = pnfs_generic_pg_test(pgio, prev, req);
@@ -830,7 +831,8 @@ ffv2_pg_test(struct nfs_pageio_descriptor *pgio, struct nfs_page *prev,
 		if (prev_shard != req_shard)
 			return 0;	/* force new batch */
 	}
-	in_shard = req_offset(req) % shard_len;
+	req_shard = req_offset(req);
+	in_shard = do_div(req_shard, shard_len);
 	return min_t(size_t, size, shard_len - in_shard);
 }
 

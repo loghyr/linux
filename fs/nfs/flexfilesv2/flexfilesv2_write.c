@@ -104,6 +104,7 @@ struct ffv2_chunk_write_dispatch {
 	 */
 	struct rpc_task			task;
 	struct nfs_client		*ds_clp;
+	struct ffv2_chunk_wb_ctx	*wb;
 	/*
 	 * Index of this shard within the stripe, and the same index
 	 * into ctx->captured_guard[].  Carried explicitly rather than
@@ -201,6 +202,8 @@ struct ffv2_stripe_write {
 	 * another's set and the tail would read whichever raced last.
 	 */
 	atomic_t			resend_mds;
+	struct list_head		pending_chunks;
+	spinlock_t		pending_lock;
 
 	u32				nr_shards;
 	struct ffv2_chunk_write_dispatch disp[];
@@ -225,6 +228,10 @@ static void ffv2_stripe_write_set_status(struct ffv2_stripe_write *sw,
 static void ffv2_stripe_write_free(struct ffv2_stripe_write *sw)
 {
 	u32 i;
+
+	spin_lock(&sw->pending_lock);
+	WARN_ON_ONCE(!list_empty(&sw->pending_chunks));
+	spin_unlock(&sw->pending_lock);
 
 	for (i = 0; i < sw->nr_shards; i++)
 		if (sw->disp[i].ds_clp)
@@ -432,11 +439,11 @@ fail:
  * Returns 0 once the chain is running, or an errno if it never
  * started, in which case the wb_ctx has already been freed.
  */
-static int ffv2_chunk_write_hand_off_wb(struct ffv2_chunk_write_dispatch *w)
+static int ffv2_chunk_write_prepare_wb(struct ffv2_chunk_write_dispatch *w,
+					       struct ffv2_chunk_wb_ctx **out)
 {
 	struct ffv2_stripe_write *sw = w->sw;
 	struct ffv2_chunk_wb_ctx *wb;
-	int rc;
 
 	wb = kzalloc_obj(*wb, GFP_NOFS);
 	if (!wb)
@@ -450,20 +457,51 @@ static int ffv2_chunk_write_hand_off_wb(struct ffv2_chunk_write_dispatch *w)
 	wb->sw = sw;
 	wb->hdr = sw->hdr;
 	wb->pending->ds_clp = w->ds_clp;
+	refcount_inc(&wb->pending->ds_clp->cl_count);
 	INIT_LIST_HEAD(&wb->pending->list);
-	wb->pending->lseg = sw->lseg;
-	wb->pending->cred = sw->hdr->cred;
+	INIT_LIST_HEAD(&wb->pending->stripe_list);
+	INIT_LIST_HEAD(&wb->pending->requests);
+	wb->pending->sw = sw;
+	wb->pending->stripe_ref = &sw->sw_ref;
+	wb->pending->state = FFV2_PENDING_IMMEDIATE;
+	{
+		struct nfs_page *req;
+
+		list_for_each_entry(req, &sw->hdr->pages, wb_list) {
+			struct ffv2_pending_req *p = kzalloc(sizeof(*p), GFP_NOFS);
+
+			if (!p) {
+				ffv2_pending_chunk_free(wb->pending);
+				kfree(wb);
+				return -ENOMEM;
+			}
+			kref_get(&req->wb_kref);
+			p->req = req;
+			p->inode = nfs_page_to_inode(req);
+			p->context = get_nfs_open_context(
+				req->wb_lock_context->open_context);
+			list_add_tail(&p->list, &wb->pending->requests);
+		}
+	}
+	wb->pending->stripe_lock = &sw->pending_lock;
+	wb->pending->hdr = sw->hdr;
+	wb->pending->lseg = pnfs_get_lseg(sw->lseg);
+	wb->pending->cred = get_cred(sw->hdr->cred);
 	wb->pending->fh = w->wire.fh;
 	wb->pending->stateid = w->wire.args.stateid;
 	wb->pending->offset = w->wire.args.offset;
 	wb->pending->count = 1;
+	wb->pending->shard_idx = w->mirror_idx;
 	wb->pending->owner = w->wire.res.owners[0];
 	memcpy(&wb->pending->writeverf, &w->wire.res.writeverf,
 	       sizeof(wb->pending->writeverf));
 	spin_lock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
 	list_add_tail(&wb->pending->list,
 		      &FFV2_LSEG(sw->lseg)->fls_pending_list);
-	wb->pending->queued = true;
+	spin_lock(&sw->pending_lock);
+	list_add_tail(&wb->pending->stripe_list, &sw->pending_chunks);
+	spin_unlock(&sw->pending_lock);
+	set_bit(FFV2_PENDING_QUEUED, &wb->pending->flags);
 	spin_unlock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
 
 	/*
@@ -472,17 +510,31 @@ static int ffv2_chunk_write_hand_off_wb(struct ffv2_chunk_write_dispatch *w)
 	 * the undo below cannot be the last one.
 	 */
 	refcount_inc(&sw->sw_ref);
+	w->wb = wb;
+	*out = wb;
+	return 0;
+}
+
+static void ffv2_chunk_write_discard_wb(struct ffv2_chunk_wb_ctx *wb)
+{
+	struct ffv2_stripe_write *sw = wb->sw;
+	u32 i;
+
+	for (i = 0; i < sw->nr_shards; i++)
+		if (sw->disp[i].wb == wb)
+			sw->disp[i].wb = NULL;
+	ffv2_pending_chunk_free(wb->pending);
+	refcount_dec(&sw->sw_ref);
+	kfree(wb);
+}
+
+static int ffv2_chunk_write_drain_wb(struct ffv2_chunk_wb_ctx *wb)
+{
+	int rc;
 
 	rc = ffv2_chunk_wb_start(wb);
 	if (rc) {
-		/* wb_start takes ownership only on success. */
-		spin_lock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
-		list_del_init(&wb->pending->list);
-		wb->pending->queued = false;
-		spin_unlock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
-		refcount_dec(&sw->sw_ref);
-		kfree(wb->pending);
-		kfree(wb);
+		ffv2_chunk_write_discard_wb(wb);
 		return rc;
 	}
 	return 0;
@@ -553,7 +605,8 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 	}
 
 	for (i = 0; i < sw->nr_shards; i++) {
-		int rc = ffv2_chunk_write_hand_off_wb(&sw->disp[i]);
+		int rc = ffv2_chunk_write_prepare_wb(&sw->disp[i],
+							&sw->disp[i].wb);
 
 		if (rc) {
 			/*
@@ -569,8 +622,26 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 			ffv2_stripe_write_set_status(sw, rc);
 			pnfs_error_mark_layout_for_return(sw->hdr->inode,
 							  sw->lseg);
+			while (i--)
+				ffv2_chunk_write_discard_wb(sw->disp[i].wb);
+			ffv2_stripe_write_chains_retire(sw, sw->nr_shards);
+			return;
+		}
+	}
+
+	for (i = 0; i < sw->nr_shards; i++) {
+		int rc = ffv2_chunk_write_drain_wb(sw->disp[i].wb);
+
+		if (rc) {
+			u32 failed = i;
+			u32 j;
+
+			ffv2_stripe_write_set_status(sw, rc);
+			pnfs_error_mark_layout_for_return(sw->hdr->inode, sw->lseg);
+			for (j = failed + 1; j < sw->nr_shards; j++)
+				ffv2_chunk_write_discard_wb(sw->disp[j].wb);
 			ffv2_stripe_write_chains_retire(sw,
-							sw->nr_shards - i);
+							sw->nr_shards - failed);
 			return;
 		}
 	}
@@ -996,6 +1067,8 @@ ffv2_stripe_write_dispatch(struct nfs_pgio_header *hdr,
 	refcount_set(&sw->sw_ref, 1);	/* this thread's, dropped below */
 	atomic_set(&sw->writes_pending, nr);
 	atomic_set(&sw->chains_pending, nr);
+	INIT_LIST_HEAD(&sw->pending_chunks);
+	spin_lock_init(&sw->pending_lock);
 	pnfs_get_lseg(lseg);
 	for (i = 0; i < nr; i++)
 		sw->disp[i].sw = sw;
@@ -2492,7 +2565,8 @@ int ffv2_chunk_read_fetch_dispatch(struct ffv2_stripe_ctx *ctx,
 			 (u64)shard_idx * mirror->striping_unit_size;
 	chunk_index = ffv2_ds_offset(mirror, ctx->stripe_off);
 	if (mirror->striping_unit_size != 0)
-		chunk_index /= mirror->striping_unit_size;
+		chunk_index = div64_u64(chunk_index,
+					mirror->striping_unit_size);
 	f->data.args.offset = chunk_index;
 	f->data.args.count = count;			/* always 1 */
 	/*
@@ -2663,7 +2737,8 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 		struct ffv2_stripe_ctx *cand, *found;
 		int rc_enc = 0;
 
-		stripe_off = hdr->args.offset - (hdr->args.offset % stripe_bytes);
+		div64_u64_rem(hdr->args.offset, stripe_bytes, &off_in_stripe);
+		stripe_off = hdr->args.offset - off_in_stripe;
 		off_in_stripe = hdr->args.offset - stripe_off;
 		full_stripe = (off_in_stripe == 0 &&
 			       hdr->args.count == stripe_bytes);

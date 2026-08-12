@@ -19,6 +19,8 @@
 
 #include "flexfilesv2.h"
 
+struct ffv2_stripe_write;
+
 /*
  * In-memory form of write_chunk_guard4 (the CAS union on
  * CHUNK_WRITE4args).  When check == true, the encoder emits
@@ -547,8 +549,33 @@ struct ffv2_stripe_write;
 void ffv2_stripe_write_chain_done(struct ffv2_stripe_write *sw, int status);
 
 /* State retained for one chunk between CHUNK_WRITE and its lifecycle ops. */
+enum ffv2_pending_state {
+	FFV2_PENDING_IMMEDIATE,
+	FFV2_PENDING_RETAINED,
+	FFV2_PENDING_LIFECYCLE_DONE,
+};
+
+enum ffv2_pending_flags {
+	FFV2_PENDING_QUEUED,
+	FFV2_PENDING_HAVE_FINALIZE_VERF,
+	FFV2_PENDING_HAVE_COMMIT_VERF,
+};
+
+struct ffv2_pending_req {
+	struct list_head	list;
+	struct nfs_page		*req;
+	struct inode		*inode;
+	struct nfs_open_context	*context;
+};
+
 struct ffv2_pending_chunk {
 	struct list_head		list;
+	struct list_head		stripe_list;
+	struct list_head		requests;
+	struct ffv2_stripe_write	*sw;
+	refcount_t		*stripe_ref;
+	spinlock_t		*stripe_lock;
+	struct nfs_pgio_header		*hdr;
 	struct nfs_client		*ds_clp;
 	struct pnfs_layout_segment	*lseg;
 	const struct cred		*cred;
@@ -556,10 +583,23 @@ struct ffv2_pending_chunk {
 	nfs4_stateid			stateid;
 	u64				offset;
 	u32				count;
+	u32				shard_idx;
 	struct chunk_owner4		owner;
 	nfs4_verifier			writeverf;
-	bool				queued;
+	nfs4_verifier			finalize_writeverf;
+	nfs4_verifier			commit_writeverf;
+	enum ffv2_pending_state	state;
+	unsigned long		flags;
 };
+
+void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending);
+void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending);
+void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending);
+int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
+					     struct list_head *dst);
+struct nfs_commit_data *ffv2_pending_commitdata_alloc(
+					struct ffv2_pending_chunk *pending);
+void ffv2_pending_commitdata_free(struct nfs_commit_data *data);
 
 struct ffv2_chunk_wb_ctx {
 	/* Populated by the caller (the phase-one completion tail).
