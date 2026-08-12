@@ -796,7 +796,7 @@ EXPORT_SYMBOL_GPL(ffv2_commit_release_pages);
  */
 static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status)
 {
-	if (wb->pending->state == FFV2_PENDING_RETAINED) {
+	if (status == 0 && wb->pending->state == FFV2_PENDING_RETAINED) {
 		ffv2_pending_chunk_lifecycle_done(wb->pending);
 		ffv2_stripe_write_chain_done(wb->sw, status);
 		kfree(wb);

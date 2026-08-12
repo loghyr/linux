@@ -599,6 +599,8 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 					     struct list_head *dst);
 struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 					struct ffv2_pending_chunk *pending);
+struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
+					struct ffv2_stripe_write *sw);
 void ffv2_pending_commitdata_free(struct nfs_commit_data *data);
 void ffv2_commit_release_pages(struct nfs_commit_data *data);
 

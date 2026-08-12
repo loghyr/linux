@@ -210,6 +210,24 @@ struct ffv2_stripe_write {
 };
 
 static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw);
+
+struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
+					struct ffv2_stripe_write *sw)
+{
+	struct ffv2_pending_chunk *pending;
+
+	spin_lock(&sw->pending_lock);
+	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
+		if (pending->state == FFV2_PENDING_LIFECYCLE_DONE &&
+		    !list_empty(&pending->requests)) {
+			spin_unlock(&sw->pending_lock);
+			return ffv2_pending_commitdata_alloc(pending);
+		}
+	}
+	spin_unlock(&sw->pending_lock);
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(ffv2_stripe_commitdata_alloc);
 static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
 					   struct ffv2_chunk_write_dispatch *w);
 
