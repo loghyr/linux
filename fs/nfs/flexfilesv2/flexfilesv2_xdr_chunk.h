@@ -596,6 +596,8 @@ struct ffv2_pending_chunk {
 void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending);
+void ffv2_pending_chunk_abort(struct ffv2_pending_chunk *pending);
+bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending);
 int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 					     struct list_head *dst);
 struct nfs_commit_data *ffv2_pending_commitdata_alloc(

@@ -689,6 +689,26 @@ void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending)
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_lifecycle_done);
 
+void ffv2_pending_chunk_abort(struct ffv2_pending_chunk *pending)
+{
+	if (pending->state == FFV2_PENDING_RETAINED ||
+	    pending->state == FFV2_PENDING_COMMITTING) {
+		pending->state = FFV2_PENDING_IMMEDIATE;
+		refcount_dec(pending->stripe_ref);
+	}
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_abort);
+
+bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending)
+{
+	return test_bit(FFV2_PENDING_HAVE_FINALIZE_VERF, &pending->flags) &&
+		test_bit(FFV2_PENDING_HAVE_COMMIT_VERF, &pending->flags) &&
+		!memcmp(&pending->finalize_writeverf,
+			&pending->commit_writeverf,
+			sizeof(pending->finalize_writeverf));
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_verifiers_complete);
+
 int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 					     struct list_head *dst)
 {
@@ -722,8 +742,10 @@ struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 	if (!first)
 		return NULL;
 	data = nfs_commitdata_alloc();
-	if (!data)
+	if (!data) {
+		ffv2_pending_chunk_abort(pending);
 		return NULL;
+	}
 	data->inode = first->inode;
 	data->cred = get_cred(first->context->cred);
 	data->context = get_nfs_open_context(first->context);
@@ -734,6 +756,7 @@ struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 	data->private = pending;
 	if (ffv2_pending_chunk_move_requests(pending, &data->pages) <= 0) {
 		ffv2_pending_commitdata_free(data);
+		ffv2_pending_chunk_abort(pending);
 		return NULL;
 	}
 	return data;
@@ -803,6 +826,8 @@ static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status)
 		kfree(wb);
 		return;
 	}
+	if (status && wb->pending->state == FFV2_PENDING_RETAINED)
+		ffv2_pending_chunk_abort(wb->pending);
 	ffv2_pending_chunk_free(wb->pending);
 	ffv2_stripe_write_chain_done(wb->sw, status);
 	kfree(wb);
