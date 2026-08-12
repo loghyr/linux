@@ -600,6 +600,7 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 					struct ffv2_pending_chunk *pending);
 void ffv2_pending_commitdata_free(struct nfs_commit_data *data);
+void ffv2_commit_release_pages(struct nfs_commit_data *data);
 
 struct ffv2_chunk_wb_ctx {
 	/* Populated by the caller (the phase-one completion tail).

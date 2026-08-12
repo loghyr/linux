@@ -527,6 +527,7 @@ void nfs_unlock_request(struct nfs_page *req)
 		return;
 	wake_up_bit(&req->wb_flags, PG_BUSY);
 }
+EXPORT_SYMBOL_GPL(nfs_unlock_request);
 
 /**
  * nfs_unlock_and_release_request - Unlock request and release the nfs_page
@@ -537,6 +538,7 @@ void nfs_unlock_and_release_request(struct nfs_page *req)
 	nfs_unlock_request(req);
 	nfs_release_request(req);
 }
+EXPORT_SYMBOL_GPL(nfs_unlock_and_release_request);
 
 /*
  * nfs_clear_request - Free up all resources allocated to the request

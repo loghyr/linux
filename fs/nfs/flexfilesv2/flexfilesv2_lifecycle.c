@@ -756,6 +756,29 @@ void ffv2_pending_commitdata_free(struct nfs_commit_data *data)
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_commitdata_free);
 
+void ffv2_commit_release_pages(struct nfs_commit_data *data)
+{
+	struct nfs_page *req;
+	struct nfs_commit_info cinfo;
+	int status = data->task.tk_status;
+
+	while (!list_empty(&data->pages)) {
+		req = nfs_list_entry(data->pages.next);
+		nfs_list_remove_request(req);
+		nfs_folio_clear_commit(req);
+		if (status < 0) {
+			nfs_mapping_set_error(nfs_page_to_folio(req), status);
+			nfs_inode_remove_request(req);
+		} else {
+			nfs_inode_remove_request(req);
+		}
+		nfs_unlock_and_release_request(req);
+	}
+	nfs_init_cinfo(&cinfo, data->inode, data->dreq);
+	nfs_commit_end(cinfo.mds);
+}
+EXPORT_SYMBOL_GPL(ffv2_commit_release_pages);
+
 /*
  * Terminal callback of one shard's FINALIZE -> COMMIT chain, reached
  * on success and on every failure that aborts the chain.

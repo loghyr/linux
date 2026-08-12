@@ -224,7 +224,7 @@ static void nfs_set_pageerror(struct address_space *mapping)
 	spin_unlock(&inode->i_lock);
 }
 
-static void nfs_mapping_set_error(struct folio *folio, int error)
+void nfs_mapping_set_error(struct folio *folio, int error)
 {
 	struct address_space *mapping = folio->mapping;
 
@@ -234,6 +234,7 @@ static void nfs_mapping_set_error(struct folio *folio, int error)
 			   error == -ENOSPC ? -ENOSPC : -EIO);
 	nfs_set_pageerror(mapping);
 }
+EXPORT_SYMBOL_GPL(nfs_mapping_set_error);
 
 /*
  * nfs_page_covers_folio
@@ -1615,6 +1616,7 @@ void nfs_commit_begin(struct nfs_mds_commit_info *cinfo)
 {
 	atomic_inc(&cinfo->rpcs_out);
 }
+EXPORT_SYMBOL_GPL(nfs_commit_begin);
 
 bool nfs_commit_end(struct nfs_mds_commit_info *cinfo)
 {
@@ -1624,6 +1626,7 @@ bool nfs_commit_end(struct nfs_mds_commit_info *cinfo)
 	}
 	return false;
 }
+EXPORT_SYMBOL_GPL(nfs_commit_end);
 
 void nfs_commitdata_release(struct nfs_commit_data *data)
 {

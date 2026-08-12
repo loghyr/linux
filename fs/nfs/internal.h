@@ -617,6 +617,7 @@ void nfs_mark_request_commit(struct nfs_page *req,
 			     struct nfs_commit_info *cinfo,
 				     u32 ds_commit_idx);
 void nfs_mark_request_dirty(struct nfs_page *req);
+void nfs_mapping_set_error(struct folio *folio, int error);
 void nfs_inode_remove_request(struct nfs_page *req);
 void nfs_folio_clear_commit(struct nfs_page *req);
 int nfs_write_need_commit(struct nfs_pgio_header *);
