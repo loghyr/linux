@@ -464,7 +464,19 @@ static int ffv2_chunk_write_prepare_wb(struct ffv2_chunk_write_dispatch *w,
 	wb->pending->sw = sw;
 	wb->pending->stripe_ref = &sw->sw_ref;
 	wb->pending->state = FFV2_PENDING_IMMEDIATE;
-	{
+	wb->pending->stripe_lock = &sw->pending_lock;
+	wb->pending->hdr = sw->hdr;
+	wb->pending->lseg = pnfs_get_lseg(sw->lseg);
+	wb->pending->cred = get_cred(sw->hdr->cred);
+	wb->pending->fh = w->wire.fh;
+	wb->pending->stateid = w->wire.args.stateid;
+	wb->pending->offset = w->wire.args.offset;
+	wb->pending->count = 1;
+	wb->pending->shard_idx = w->mirror_idx;
+	wb->pending->owner = w->wire.res.owners[0];
+	memcpy(&wb->pending->writeverf, &w->wire.res.writeverf,
+	       sizeof(wb->pending->writeverf));
+	if (w->mirror_idx == 0) {
 		struct nfs_page *req;
 
 		list_for_each_entry(req, &sw->hdr->pages, wb_list) {
@@ -483,18 +495,6 @@ static int ffv2_chunk_write_prepare_wb(struct ffv2_chunk_write_dispatch *w,
 			list_add_tail(&p->list, &wb->pending->requests);
 		}
 	}
-	wb->pending->stripe_lock = &sw->pending_lock;
-	wb->pending->hdr = sw->hdr;
-	wb->pending->lseg = pnfs_get_lseg(sw->lseg);
-	wb->pending->cred = get_cred(sw->hdr->cred);
-	wb->pending->fh = w->wire.fh;
-	wb->pending->stateid = w->wire.args.stateid;
-	wb->pending->offset = w->wire.args.offset;
-	wb->pending->count = 1;
-	wb->pending->shard_idx = w->mirror_idx;
-	wb->pending->owner = w->wire.res.owners[0];
-	memcpy(&wb->pending->writeverf, &w->wire.res.writeverf,
-	       sizeof(wb->pending->writeverf));
 	spin_lock(&FFV2_LSEG(sw->lseg)->fls_pending_lock);
 	list_add_tail(&wb->pending->list,
 		      &FFV2_LSEG(sw->lseg)->fls_pending_list);

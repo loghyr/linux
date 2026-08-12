@@ -700,6 +700,7 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
 		list_del(&p->list);
 		nfs_list_add_request(p->req, dst);
+		put_nfs_open_context(p->context);
 		kfree(p);
 		count++;
 	}
