@@ -644,8 +644,10 @@ static int ffv2_chunk_write_drain_wb(struct ffv2_chunk_wb_ctx *wb)
 {
 	int rc;
 
+	ffv2_pending_chunk_retain(wb->pending);
 	rc = ffv2_chunk_wb_start(wb);
 	if (rc) {
+		ffv2_pending_chunk_abort(wb->pending);
 		ffv2_chunk_write_discard_wb(wb);
 		return rc;
 	}
