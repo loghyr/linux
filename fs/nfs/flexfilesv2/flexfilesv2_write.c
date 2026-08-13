@@ -277,6 +277,8 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 			struct ffv2_pending_chunk, stripe_list)->stripe_owner : NULL;
 	if (agg->stripe_ref)
 		refcount_inc(agg->stripe_ref);
+	agg->lseg = pnfs_get_lseg(sw->lseg);
+	agg->inode = sw->hdr->inode;
 	chunk = list_first_entry(&agg->chunks, struct ffv2_commit_chunk, list);
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
 		chunk->pending = pending;
@@ -321,6 +323,7 @@ struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(ffv2_stripe_commitdata_alloc);
+
 static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
 					   struct ffv2_chunk_write_dispatch *w);
 

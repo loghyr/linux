@@ -580,6 +580,8 @@ struct ffv2_commit_aggregate {
 	refcount_t		*stripe_ref;
 	void (*stripe_put)(void *owner);
 	void			*stripe_owner;
+	struct pnfs_layout_segment *lseg;
+	struct inode		*inode;
 	void			*dispatch_batch;
 	void (*dispatch_done)(void *owner, int status);
 	void			*dispatch_done_owner;
