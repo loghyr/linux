@@ -571,6 +571,7 @@ struct ffv2_pending_req {
 };
 
 struct ffv2_commit_aggregate {
+	refcount_t		ref;
 	struct list_head	list;
 	struct list_head	chunks;
 	unsigned int		count;

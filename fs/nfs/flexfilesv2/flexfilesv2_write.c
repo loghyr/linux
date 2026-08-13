@@ -245,6 +245,7 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 	if (!agg)
 		return NULL;
 	INIT_LIST_HEAD(&agg->list);
+	refcount_set(&agg->ref, 1);
 	INIT_LIST_HEAD(&agg->chunks);
 	if (sw->nr_shards == 0)
 		goto fail_alloc;

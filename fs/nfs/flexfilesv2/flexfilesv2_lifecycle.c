@@ -382,6 +382,7 @@ struct ffv2_commit_batch {
 	struct kref ref;
 	struct ffv2_commit_aggregate *agg;
 	atomic_t pending;
+	int status;
 	unsigned int count;
 	struct ffv2_commit_batch_item items[];
 };
@@ -397,15 +398,24 @@ static void ffv2_commit_batch_done(void *arg, int status,
 					const nfs4_verifier *wv)
 {
 	struct ffv2_commit_batch_item *item = arg;
+	bool last;
 
-	if (!status && wv) {
+	if (status)
+		cmpxchg(&item->batch->status, 0, status);
+	else if (!wv || memcmp(wv, &item->pending->finalize_writeverf,
+				       sizeof(*wv)))
+		cmpxchg(&item->batch->status, 0, -EPROTO);
+	else {
 		memcpy(&item->pending->commit_writeverf, wv,
 		       sizeof(item->pending->commit_writeverf));
 		set_bit(FFV2_PENDING_HAVE_COMMIT_VERF,
 			&item->pending->flags);
 	}
-	if (atomic_dec_and_test(&item->batch->pending))
+	last = atomic_dec_and_test(&item->batch->pending);
+	if (last)
 		item->batch->agg->dispatch_batch = NULL;
+	if (last)
+		refcount_dec(&item->batch->agg->ref);
 	kref_put(&item->batch->ref, ffv2_commit_batch_release);
 }
 
@@ -426,6 +436,8 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 	batch->agg = agg;
 	batch->count = count;
 	atomic_set(&batch->pending, count);
+	batch->status = 0;
+	refcount_inc(&agg->ref);
 	agg->dispatch_batch = batch;
 	list_for_each_entry(chunk, &agg->chunks, list) {
 		batch->items[i].batch = batch;
@@ -982,6 +994,9 @@ EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_commitdata_alloc);
 void ffv2_commit_aggregate_free(struct ffv2_commit_aggregate *agg)
 {
 	struct ffv2_commit_chunk *chunk, *tmp;
+
+	if (!refcount_dec_and_test(&agg->ref))
+		return;
 
 	list_for_each_entry_safe(chunk, tmp, &agg->chunks, list) {
 		list_del(&chunk->list);
