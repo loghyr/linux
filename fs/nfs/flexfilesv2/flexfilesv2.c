@@ -182,7 +182,24 @@ static int
 ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
 		     int how, struct nfs_commit_info *cinfo)
 {
-	return PNFS_NOT_ATTEMPTED;
+	struct nfs_commit_data *data;
+	struct ffv2_commit_aggregate *agg;
+	int rc;
+
+	data = ffv2_commit_inode_pending(inode);
+	if (!data)
+		return PNFS_NOT_ATTEMPTED;
+	agg = data->private;
+	agg->dispatch_done = ffv2_commit_aggregate_complete;
+	agg->dispatch_done_owner = data;
+	rc = ffv2_commit_aggregate_dispatch(agg);
+	if (rc) {
+		data->task.tk_status = rc;
+		ffv2_commit_release_pages(data);
+		nfs_commitdata_release(data);
+		return rc;
+	}
+	return PNFS_ATTEMPTED;
 }
 
 static const struct pnfs_commit_ops ffv2_commit_ops = {

@@ -632,6 +632,7 @@ struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
 						struct list_head *dst);
 int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg);
+void ffv2_commit_aggregate_complete(void *owner, int status);
 struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
 					struct ffv2_commit_aggregate *agg);
 struct nfs_commit_data *ffv2_stripe_commitdata_alloc(

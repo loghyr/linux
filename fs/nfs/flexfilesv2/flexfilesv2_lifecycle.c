@@ -474,6 +474,16 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 }
 EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_dispatch);
 
+void ffv2_commit_aggregate_complete(void *owner, int status)
+{
+	struct nfs_commit_data *data = owner;
+
+	data->task.tk_status = status;
+	ffv2_commit_release_pages(data);
+	nfs_commitdata_release(data);
+}
+EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_complete);
+
 
 
 /*
