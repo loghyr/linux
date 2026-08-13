@@ -706,6 +706,8 @@ static void ffv2_stripe_write_rollback(struct ffv2_stripe_write *sw)
  */
 static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 {
+	struct nfs_commit_info cinfo;
+	struct ffv2_pending_req *req;
 	u32 i;
 
 	/*
@@ -717,6 +719,17 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 		ffv2_stripe_write_rollback(sw);
 		return;
 	}
+
+	/* Publish the logical pages to the generic commit machinery once the
+	 * complete stripe has passed CHUNK_WRITE.  Parity has no nfs_page; the
+	 * mirror-zero pending record owns the user request set. */
+	nfs_init_cinfo(&cinfo, sw->hdr->inode, sw->hdr->dreq);
+	list_for_each_entry(req, &list_first_entry(&sw->pending_chunks,
+					struct ffv2_pending_chunk, stripe_list)->requests,
+					list)
+		nfs_mark_request_commit(req->req, sw->lseg, &cinfo, 0);
+	sw->hdr->verf.committed = NFS_UNSTABLE;
+	set_bit(NFS_IOHDR_UNSTABLE_WRITES, &sw->hdr->flags);
 
 	for (i = 0; i < sw->nr_shards; i++) {
 		int rc = ffv2_chunk_write_prepare_wb(&sw->disp[i],
