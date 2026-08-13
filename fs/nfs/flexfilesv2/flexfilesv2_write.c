@@ -361,13 +361,16 @@ EXPORT_SYMBOL_GPL(ffv2_commit_lseg_pending);
 struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode,
 					struct nfs_direct_req *dreq)
 {
-	struct pnfs_layout_hdr *lo = NFS_I(inode)->layout;
+	struct pnfs_layout_hdr *lo;
 	struct pnfs_layout_segment *lseg, *candidate = NULL;
 	struct nfs_commit_data *data;
 
-	if (!lo)
-		return NULL;
 	spin_lock(&inode->i_lock);
+	lo = NFS_I(inode)->layout;
+	if (!lo) {
+		spin_unlock(&inode->i_lock);
+		return NULL;
+	}
 	list_for_each_entry(lseg, &lo->plh_segs, pls_list) {
 		if (!list_empty(&FFV2_LSEG(lseg)->fls_pending_list)) {
 			candidate = pnfs_get_lseg(lseg);
