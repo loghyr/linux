@@ -354,6 +354,30 @@ struct nfs_commit_data *ffv2_commit_lseg_pending(
 }
 EXPORT_SYMBOL_GPL(ffv2_commit_lseg_pending);
 
+struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode)
+{
+	struct pnfs_layout_hdr *lo = NFS_I(inode)->layout;
+	struct pnfs_layout_segment *lseg, *candidate = NULL;
+	struct nfs_commit_data *data;
+
+	if (!lo)
+		return NULL;
+	spin_lock(&inode->i_lock);
+	list_for_each_entry(lseg, &lo->plh_segs, pls_list) {
+		if (!list_empty(&FFV2_LSEG(lseg)->fls_pending_list)) {
+			candidate = pnfs_get_lseg(lseg);
+			break;
+		}
+	}
+	spin_unlock(&inode->i_lock);
+	if (!candidate)
+		return NULL;
+	data = ffv2_commit_lseg_pending(candidate);
+	pnfs_put_lseg(candidate);
+	return data;
+}
+EXPORT_SYMBOL_GPL(ffv2_commit_inode_pending);
+
 static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
 					   struct ffv2_chunk_write_dispatch *w);
 
