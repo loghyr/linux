@@ -713,6 +713,31 @@ bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending)
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_verifiers_complete);
 
+int ffv2_pending_chunk_lock_requests(struct ffv2_pending_chunk *pending)
+{
+	struct ffv2_pending_req *p, *tmp;
+	int count = 0;
+
+	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
+		return -EBUSY;
+	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
+		if (!nfs_lock_request(p->req))
+			goto rollback;
+		p->locked = true;
+		count++;
+	}
+	return count;
+rollback:
+	list_for_each_entry(p, &pending->requests, list) {
+		if (p->locked) {
+			nfs_unlock_request(p->req);
+			p->locked = false;
+		}
+	}
+	return -EBUSY;
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_lock_requests);
+
 int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 					     struct list_head *dst)
 {
@@ -722,8 +747,8 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
 		return -EBUSY;
 	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
-		if (!nfs_lock_request(p->req))
-			return count ? count : -EBUSY;
+		if (WARN_ON_ONCE(!p->locked))
+			return -EBUSY;
 		list_del(&p->list);
 		nfs_list_add_request(p->req, dst);
 		put_nfs_open_context(p->context);
@@ -792,6 +817,21 @@ int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
 	struct ffv2_commit_chunk *chunk;
 	int total = 0, moved;
 
+	list_for_each_entry(chunk, &agg->chunks, list) {
+		moved = ffv2_pending_chunk_lock_requests(chunk->pending);
+		if (moved < 0) {
+			struct ffv2_commit_chunk *rollback;
+			struct ffv2_pending_req *p;
+			list_for_each_entry(rollback, &agg->chunks, list)
+				list_for_each_entry(p, &rollback->pending->requests,
+						    list)
+					if (p->locked) {
+						nfs_unlock_request(p->req);
+						p->locked = false;
+					}
+			return moved;
+		}
+	}
 	list_for_each_entry(chunk, &agg->chunks, list) {
 		moved = ffv2_pending_chunk_move_requests(chunk->pending, dst);
 		if (moved < 0)

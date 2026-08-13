@@ -567,6 +567,7 @@ struct ffv2_pending_req {
 	struct nfs_page		*req;
 	struct inode		*inode;
 	struct nfs_open_context	*context;
+	bool			locked;
 };
 
 struct ffv2_commit_aggregate {
@@ -615,6 +616,7 @@ bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending);
 bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw);
 int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 					     struct list_head *dst);
+int ffv2_pending_chunk_lock_requests(struct ffv2_pending_chunk *pending);
 struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 					struct ffv2_pending_chunk *pending);
 int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
