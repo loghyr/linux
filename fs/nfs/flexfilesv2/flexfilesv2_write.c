@@ -246,6 +246,8 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 		return NULL;
 	INIT_LIST_HEAD(&agg->list);
 	INIT_LIST_HEAD(&agg->chunks);
+	if (sw->nr_shards == 0)
+		goto fail_alloc;
 	for (i = 0; i < sw->nr_shards; i++) {
 		chunk = kzalloc(sizeof(*chunk), GFP_NOFS);
 		if (!chunk)
@@ -263,6 +265,17 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 	}
 	if (count != sw->nr_shards)
 		goto fail_states;
+	agg->stripe_ref = !list_empty(&sw->pending_chunks) ?
+		list_first_entry(&sw->pending_chunks,
+			struct ffv2_pending_chunk, stripe_list)->stripe_ref : NULL;
+	agg->stripe_put = !list_empty(&sw->pending_chunks) ?
+		list_first_entry(&sw->pending_chunks,
+			struct ffv2_pending_chunk, stripe_list)->stripe_put : NULL;
+	agg->stripe_owner = !list_empty(&sw->pending_chunks) ?
+		list_first_entry(&sw->pending_chunks,
+			struct ffv2_pending_chunk, stripe_list)->stripe_owner : NULL;
+	if (agg->stripe_ref)
+		refcount_inc(agg->stripe_ref);
 	chunk = list_first_entry(&agg->chunks, struct ffv2_commit_chunk, list);
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
 		chunk->pending = pending;

@@ -910,6 +910,8 @@ void ffv2_commit_aggregate_free(struct ffv2_commit_aggregate *agg)
 		}
 		kfree(chunk);
 	}
+	if (agg->stripe_put)
+		agg->stripe_put(agg->stripe_owner);
 	kfree(agg);
 }
 EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_free);

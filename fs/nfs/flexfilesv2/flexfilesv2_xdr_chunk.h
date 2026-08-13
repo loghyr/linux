@@ -576,6 +576,9 @@ struct ffv2_commit_aggregate {
 	unsigned int		count;
 	struct nfs_commit_data	*data;
 	struct nfs_mds_commit_info *mds_cinfo;
+	refcount_t		*stripe_ref;
+	void (*stripe_put)(void *owner);
+	void			*stripe_owner;
 };
 
 struct ffv2_commit_chunk {
