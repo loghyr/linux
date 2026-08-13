@@ -187,6 +187,7 @@ void ffv2_guard_refresh_exit(void)
  */
 struct ffv2_stripe_write {
 	struct nfs_pgio_header		*hdr;	/* borrowed */
+	struct inode			*inode;
 	struct pnfs_layout_segment	*lseg;	/* referenced */
 	struct ffv2_stripe_ctx		*ctx;	/* referenced */
 
@@ -278,7 +279,7 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 	if (agg->stripe_ref)
 		refcount_inc(agg->stripe_ref);
 	agg->lseg = pnfs_get_lseg(sw->lseg);
-	agg->inode = sw->hdr->inode;
+	agg->inode = sw->inode;
 	chunk = list_first_entry(&agg->chunks, struct ffv2_commit_chunk, list);
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
 		chunk->pending = pending;
@@ -336,8 +337,7 @@ struct nfs_commit_data *ffv2_commit_lseg_pending(
 		return NULL;
 	spin_lock(&FFV2_LSEG(lseg)->fls_pending_lock);
 	list_for_each_entry(pending, &FFV2_LSEG(lseg)->fls_pending_list, list) {
-		if (pending->hdr && pending->hdr->inode ==
-				lseg->pls_layout->plh_inode &&
+		if (pending->inode == lseg->pls_layout->plh_inode &&
 		    pending->state == FFV2_PENDING_LIFECYCLE_DONE) {
 			candidate = pending;
 			break;
@@ -641,6 +641,7 @@ static int ffv2_chunk_write_prepare_wb(struct ffv2_chunk_write_dispatch *w,
 	wb->pending->state = FFV2_PENDING_IMMEDIATE;
 	wb->pending->stripe_lock = &sw->pending_lock;
 	wb->pending->hdr = sw->hdr;
+	wb->pending->inode = sw->inode;
 	wb->pending->lseg = pnfs_get_lseg(sw->lseg);
 	wb->pending->cred = get_cred(sw->hdr->cred);
 	wb->pending->fh = w->wire.fh;
@@ -1240,6 +1241,7 @@ ffv2_stripe_write_dispatch(struct nfs_pgio_header *hdr,
 
 	sw->nr_shards = nr;
 	sw->hdr = hdr;
+	sw->inode = hdr->inode;
 	sw->lseg = lseg;
 	sw->ctx = ctx;			/* the caller's ref, inherited */
 	refcount_set(&sw->sw_ref, 1);	/* this thread's, dropped below */

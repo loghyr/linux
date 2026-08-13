@@ -598,6 +598,7 @@ struct ffv2_pending_chunk {
 	struct list_head		stripe_list;
 	struct list_head		requests;
 	struct ffv2_stripe_write	*sw;
+	struct inode		*inode;
 	refcount_t		*stripe_ref;
 	void (*stripe_put)(void *owner);
 	void			*stripe_owner;
