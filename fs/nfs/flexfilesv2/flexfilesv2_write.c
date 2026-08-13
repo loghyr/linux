@@ -720,17 +720,6 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 		return;
 	}
 
-	/* Publish the logical pages to the generic commit machinery once the
-	 * complete stripe has passed CHUNK_WRITE.  Parity has no nfs_page; the
-	 * mirror-zero pending record owns the user request set. */
-	nfs_init_cinfo(&cinfo, sw->hdr->inode, sw->hdr->dreq);
-	list_for_each_entry(req, &list_first_entry(&sw->pending_chunks,
-					struct ffv2_pending_chunk, stripe_list)->requests,
-					list)
-		nfs_mark_request_commit(req->req, sw->lseg, &cinfo, 0);
-	sw->hdr->verf.committed = NFS_UNSTABLE;
-	set_bit(NFS_IOHDR_UNSTABLE_WRITES, &sw->hdr->flags);
-
 	for (i = 0; i < sw->nr_shards; i++) {
 		int rc = ffv2_chunk_write_prepare_wb(&sw->disp[i],
 							&sw->disp[i].wb);
@@ -772,6 +761,21 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 			return;
 		}
 	}
+
+	/* Publish only after every lifecycle RPC has been prepared and
+	 * started.  The data-shard record owns the logical request set. */
+	if (list_empty(&sw->pending_chunks)) {
+		ffv2_stripe_write_set_status(sw, -EIO);
+		ffv2_stripe_write_chains_retire(sw, sw->nr_shards);
+		return;
+	}
+	nfs_init_cinfo(&cinfo, sw->hdr->inode, sw->hdr->dreq);
+	list_for_each_entry(req, &list_first_entry(&sw->pending_chunks,
+					struct ffv2_pending_chunk, stripe_list)->requests,
+					list)
+		nfs_mark_request_commit(req->req, sw->lseg, &cinfo, 0);
+	sw->hdr->verf.committed = NFS_UNSTABLE;
+	set_bit(NFS_IOHDR_UNSTABLE_WRITES, &sw->hdr->flags);
 }
 
 /*
