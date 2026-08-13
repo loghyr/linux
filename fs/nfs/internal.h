@@ -1015,3 +1015,4 @@ struct nfs_direct_req {
 #define NFS_ODIRECT_SHOULD_DIRTY	(3)	/* dirty user-space page after read */
 #define NFS_ODIRECT_DONE		INT_MAX	/* write verification failed */
 };
+void nfs_direct_commit_complete(struct nfs_commit_data *data);

@@ -628,7 +628,7 @@ static void nfs_direct_write_reschedule(struct nfs_direct_req *dreq)
 		nfs_direct_write_complete(dreq);
 }
 
-static void nfs_direct_commit_complete(struct nfs_commit_data *data)
+void nfs_direct_commit_complete(struct nfs_commit_data *data)
 {
 	const struct nfs_writeverf *verf = data->res.verf;
 	struct nfs_direct_req *dreq = data->dreq;
@@ -677,6 +677,7 @@ static void nfs_direct_commit_complete(struct nfs_commit_data *data)
 	if (nfs_commit_end(cinfo.mds))
 		nfs_direct_write_complete(dreq);
 }
+EXPORT_SYMBOL_GPL(nfs_direct_commit_complete);
 
 static void nfs_direct_resched_write(struct nfs_commit_info *cinfo,
 		struct nfs_page *req)

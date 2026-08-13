@@ -918,6 +918,15 @@ void ffv2_commit_release_pages(struct nfs_commit_data *data)
 	struct nfs_page *req;
 	int status = data->task.tk_status;
 
+	if (data->dreq) {
+		nfs_direct_commit_complete(data);
+		if (data->private) {
+			ffv2_commit_aggregate_free(data->private);
+			data->private = NULL;
+		}
+		return;
+	}
+
 	while (!list_empty(&data->pages)) {
 		req = nfs_list_entry(data->pages.next);
 		nfs_list_remove_request(req);
