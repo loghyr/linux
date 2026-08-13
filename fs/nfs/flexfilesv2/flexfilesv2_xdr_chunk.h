@@ -582,6 +582,7 @@ struct ffv2_commit_aggregate {
 	void			*stripe_owner;
 	struct pnfs_layout_segment *lseg;
 	struct inode		*inode;
+	struct nfs_direct_req *dreq;
 	void			*dispatch_batch;
 	void (*dispatch_done)(void *owner, int status);
 	void			*dispatch_done_owner;

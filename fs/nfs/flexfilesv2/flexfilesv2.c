@@ -190,6 +190,7 @@ ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
 	if (!data)
 		return PNFS_NOT_ATTEMPTED;
 	agg = data->private;
+	data->dreq = cinfo->dreq;
 	agg->dispatch_done = ffv2_commit_aggregate_complete;
 	agg->dispatch_done_owner = data;
 	rc = ffv2_commit_aggregate_dispatch(agg);
