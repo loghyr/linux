@@ -334,7 +334,9 @@ struct nfs_commit_data *ffv2_commit_lseg_pending(
 		return NULL;
 	spin_lock(&FFV2_LSEG(lseg)->fls_pending_lock);
 	list_for_each_entry(pending, &FFV2_LSEG(lseg)->fls_pending_list, list) {
-		if (pending->state == FFV2_PENDING_LIFECYCLE_DONE) {
+		if (pending->hdr && pending->hdr->inode ==
+				lseg->pls_layout->plh_inode &&
+		    pending->state == FFV2_PENDING_LIFECYCLE_DONE) {
 			candidate = pending;
 			break;
 		}

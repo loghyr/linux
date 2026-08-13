@@ -412,15 +412,14 @@ static void ffv2_commit_batch_done(void *arg, int status,
 			&item->pending->flags);
 	}
 	last = atomic_dec_and_test(&item->batch->pending);
-	if (last) {
+	if (last)
 		item->batch->agg->dispatch_batch = NULL;
-		if (item->batch->agg->dispatch_done)
-			item->batch->agg->dispatch_done(
-				item->batch->agg->dispatch_done_owner,
-				item->batch->status);
-	}
 	if (last)
 		refcount_dec(&item->batch->agg->ref);
+	if (last && item->batch->agg->dispatch_done)
+		item->batch->agg->dispatch_done(
+			item->batch->agg->dispatch_done_owner,
+			item->batch->status);
 	kref_put(&item->batch->ref, ffv2_commit_batch_release);
 }
 
@@ -466,6 +465,12 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 				&item->pending->stateid, item->pending->offset,
 				item->pending->count, &item->pending->owner, 1)) {
 			atomic_dec(&batch->pending);
+			cmpxchg(&batch->status, 0, -EIO);
+			if (atomic_read(&batch->pending) == 0 &&
+			    batch->agg->dispatch_done)
+				batch->agg->dispatch_done(
+					batch->agg->dispatch_done_owner,
+					batch->status);
 			kref_put(&batch->ref, ffv2_commit_batch_release);
 		}
 	}
@@ -477,6 +482,15 @@ EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_dispatch);
 void ffv2_commit_aggregate_complete(void *owner, int status)
 {
 	struct nfs_commit_data *data = owner;
+	struct ffv2_commit_aggregate *agg = data->private;
+	struct ffv2_commit_chunk *chunk;
+
+	if (!status)
+		list_for_each_entry(chunk, &agg->chunks, list)
+			if (!ffv2_pending_chunk_verifiers_complete(chunk->pending)) {
+				status = -EPROTO;
+				break;
+			}
 
 	data->task.tk_status = status;
 	ffv2_commit_release_pages(data);
