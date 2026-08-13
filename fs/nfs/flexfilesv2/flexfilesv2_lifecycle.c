@@ -664,8 +664,10 @@ void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending)
 	put_cred(pending->cred);
 	nfs_put_client(pending->ds_clp);
 	pnfs_put_lseg(pending->lseg);
-	if (pending->state != FFV2_PENDING_IMMEDIATE)
+	if (pending->state != FFV2_PENDING_IMMEDIATE && pending->stripe_put) {
 		refcount_dec(pending->stripe_ref);
+		pending->stripe_put(pending->stripe_owner);
+	}
 	kfree(pending);
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_free);
@@ -695,6 +697,8 @@ void ffv2_pending_chunk_abort(struct ffv2_pending_chunk *pending)
 	    pending->state == FFV2_PENDING_COMMITTING) {
 		pending->state = FFV2_PENDING_IMMEDIATE;
 		refcount_dec(pending->stripe_ref);
+		if (pending->stripe_put)
+			pending->stripe_put(pending->stripe_owner);
 	}
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_abort);

@@ -587,6 +587,8 @@ struct ffv2_pending_chunk {
 	struct list_head		requests;
 	struct ffv2_stripe_write	*sw;
 	refcount_t		*stripe_ref;
+	void (*stripe_put)(void *owner);
+	void			*stripe_owner;
 	spinlock_t		*stripe_lock;
 	struct nfs_pgio_header		*hdr;
 	struct nfs_client		*ds_clp;

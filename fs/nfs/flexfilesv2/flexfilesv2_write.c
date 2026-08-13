@@ -210,6 +210,12 @@ struct ffv2_stripe_write {
 };
 
 static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw);
+static void ffv2_stripe_write_put(struct ffv2_stripe_write *sw);
+
+static void ffv2_pending_stripe_put(void *owner)
+{
+	ffv2_stripe_write_put(owner);
+}
 
 bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw)
 {
@@ -218,7 +224,7 @@ bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw)
 
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
 		if (pending->state != FFV2_PENDING_LIFECYCLE_DONE ||
-		    list_empty(&pending->requests) ||
+		    (pending->shard_idx == 0 && list_empty(&pending->requests)) ||
 		    !ffv2_pending_chunk_verifiers_complete(pending))
 			return false;
 		count++;
@@ -232,13 +238,21 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 {
 	struct ffv2_pending_chunk *pending;
 	struct ffv2_commit_aggregate *agg;
-	unsigned int count = 0;
+	struct ffv2_commit_chunk *chunk;
+	unsigned int count = 0, i;
 
 	agg = kzalloc(sizeof(*agg), GFP_NOFS);
 	if (!agg)
 		return NULL;
 	INIT_LIST_HEAD(&agg->list);
 	INIT_LIST_HEAD(&agg->chunks);
+	for (i = 0; i < sw->nr_shards; i++) {
+		chunk = kzalloc(sizeof(*chunk), GFP_NOFS);
+		if (!chunk)
+			goto fail_alloc;
+		INIT_LIST_HEAD(&chunk->list);
+		list_add_tail(&chunk->list, &agg->chunks);
+	}
 	spin_lock(&sw->pending_lock);
 	if (atomic_read(&sw->chains_pending) != 0 || sw->status ||
 	    !ffv2_stripe_verifiers_complete(sw))
@@ -249,19 +263,23 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 	}
 	if (count != sw->nr_shards)
 		goto fail_states;
+	chunk = list_first_entry(&agg->chunks, struct ffv2_commit_chunk, list);
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
-		struct ffv2_commit_chunk *chunk = kzalloc(sizeof(*chunk), GFP_NOFS);
-
-		if (!chunk)
-			goto fail_states;
 		chunk->pending = pending;
-		list_add_tail(&chunk->list, &agg->chunks);
+		chunk = list_next_entry(chunk, list);
 	}
 	agg->count = count;
 	spin_unlock(&sw->pending_lock);
 	return agg;
 
 fail_states:
+	list_for_each_entry(pending, &sw->pending_chunks, stripe_list)
+		if (pending->state == FFV2_PENDING_COMMITTING)
+			pending->state = FFV2_PENDING_LIFECYCLE_DONE;
+fail_unlock:
+	spin_unlock(&sw->pending_lock);
+	goto fail_alloc;
+fail_alloc:
 	{
 		struct ffv2_commit_chunk *chunk, *tmp;
 		list_for_each_entry_safe(chunk, tmp, &agg->chunks, list) {
@@ -269,11 +287,6 @@ fail_states:
 			kfree(chunk);
 		}
 	}
-	list_for_each_entry(pending, &sw->pending_chunks, stripe_list)
-		if (pending->state == FFV2_PENDING_COMMITTING)
-			pending->state = FFV2_PENDING_LIFECYCLE_DONE;
-fail_unlock:
-	spin_unlock(&sw->pending_lock);
 	kfree(agg);
 	return NULL;
 }
@@ -547,6 +560,8 @@ static int ffv2_chunk_write_prepare_wb(struct ffv2_chunk_write_dispatch *w,
 	INIT_LIST_HEAD(&wb->pending->requests);
 	wb->pending->sw = sw;
 	wb->pending->stripe_ref = &sw->sw_ref;
+	wb->pending->stripe_put = ffv2_pending_stripe_put;
+	wb->pending->stripe_owner = sw;
 	wb->pending->state = FFV2_PENDING_IMMEDIATE;
 	wb->pending->stripe_lock = &sw->pending_lock;
 	wb->pending->hdr = sw->hdr;
