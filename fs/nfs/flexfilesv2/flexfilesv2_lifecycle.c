@@ -815,6 +815,8 @@ int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
 						struct list_head *dst)
 {
 	struct ffv2_commit_chunk *chunk;
+	struct ffv2_pending_req *first, *p;
+	struct nfs_commit_info cinfo;
 	int total = 0, moved;
 
 	list_for_each_entry(chunk, &agg->chunks, list) {
@@ -832,12 +834,23 @@ int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
 			return moved;
 		}
 	}
+	first = list_first_entry(&list_first_entry(&agg->chunks,
+					struct ffv2_commit_chunk, list)->pending->requests,
+					struct ffv2_pending_req, list);
+	nfs_init_cinfo(&cinfo, first->inode, NULL);
+	mutex_lock(&NFS_I(cinfo.inode)->commit_mutex);
+	list_for_each_entry(chunk, &agg->chunks, list)
+		list_for_each_entry(p, &chunk->pending->requests, list)
+			pnfs_generic_clear_request_commit(p->req, &cinfo);
 	list_for_each_entry(chunk, &agg->chunks, list) {
 		moved = ffv2_pending_chunk_move_requests(chunk->pending, dst);
-		if (moved < 0)
+		if (moved < 0) {
+			mutex_unlock(&NFS_I(cinfo.inode)->commit_mutex);
 			return moved;
+		}
 		total += moved;
 	}
+	mutex_unlock(&NFS_I(cinfo.inode)->commit_mutex);
 	return total;
 }
 EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_move_requests);
