@@ -718,6 +718,8 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
 		return -EBUSY;
 	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
+		if (!nfs_lock_request(p->req))
+			return count ? count : -EBUSY;
 		list_del(&p->list);
 		nfs_list_add_request(p->req, dst);
 		put_nfs_open_context(p->context);
@@ -771,7 +773,6 @@ void ffv2_pending_commitdata_free(struct nfs_commit_data *data)
 		list_del_init(&req->wb_list);
 		nfs_release_request(req);
 	}
-	put_nfs_open_context(data->context);
 	put_cred(data->cred);
 	if (data->lseg)
 		pnfs_put_lseg(data->lseg);
