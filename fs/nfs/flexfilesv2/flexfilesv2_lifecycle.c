@@ -887,6 +887,9 @@ struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
 	agg->mds_cinfo = &NFS_I(data->inode)->commit_info;
 	nfs_commit_begin(agg->mds_cinfo);
 	if (ffv2_commit_aggregate_move_requests(agg, &data->pages) <= 0) {
+		nfs_commit_end(agg->mds_cinfo);
+		agg->mds_cinfo = NULL;
+		data->private = NULL;
 		ffv2_pending_commitdata_free(data);
 		return NULL;
 	}
