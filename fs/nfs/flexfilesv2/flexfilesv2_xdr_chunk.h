@@ -579,6 +579,7 @@ struct ffv2_commit_aggregate {
 	refcount_t		*stripe_ref;
 	void (*stripe_put)(void *owner);
 	void			*stripe_owner;
+	void			*dispatch_batch;
 };
 
 struct ffv2_commit_chunk {
@@ -625,6 +626,7 @@ struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 					struct ffv2_pending_chunk *pending);
 int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
 						struct list_head *dst);
+int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg);
 struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
 					struct ffv2_commit_aggregate *agg);
 struct nfs_commit_data *ffv2_stripe_commitdata_alloc(

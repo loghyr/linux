@@ -373,6 +373,90 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 /* CHUNK_COMMIT dispatch                                              */
 /* ------------------------------------------------------------------ */
 
+struct ffv2_commit_batch_item {
+	struct ffv2_commit_batch *batch;
+	struct ffv2_pending_chunk *pending;
+};
+
+struct ffv2_commit_batch {
+	struct kref ref;
+	struct ffv2_commit_aggregate *agg;
+	atomic_t pending;
+	unsigned int count;
+	struct ffv2_commit_batch_item items[];
+};
+
+static void ffv2_commit_batch_release(struct kref *ref)
+{
+	struct ffv2_commit_batch *batch =
+		container_of(ref, struct ffv2_commit_batch, ref);
+	kfree(batch);
+}
+
+static void ffv2_commit_batch_done(void *arg, int status,
+					const nfs4_verifier *wv)
+{
+	struct ffv2_commit_batch_item *item = arg;
+
+	if (!status && wv) {
+		memcpy(&item->pending->commit_writeverf, wv,
+		       sizeof(item->pending->commit_writeverf));
+		set_bit(FFV2_PENDING_HAVE_COMMIT_VERF,
+			&item->pending->flags);
+	}
+	if (atomic_dec_and_test(&item->batch->pending))
+		item->batch->agg->dispatch_batch = NULL;
+	kref_put(&item->batch->ref, ffv2_commit_batch_release);
+}
+
+int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
+{
+	struct ffv2_commit_chunk *chunk;
+	struct ffv2_commit_batch *batch;
+	unsigned int count = 0, i = 0;
+
+	if (!agg || list_empty(&agg->chunks))
+		return -EINVAL;
+	list_for_each_entry(chunk, &agg->chunks, list)
+		count++;
+	batch = kzalloc(struct_size(batch, items, count), GFP_NOFS);
+	if (!batch)
+		return -ENOMEM;
+	kref_init(&batch->ref);
+	batch->agg = agg;
+	batch->count = count;
+	atomic_set(&batch->pending, count);
+	agg->dispatch_batch = batch;
+	list_for_each_entry(chunk, &agg->chunks, list) {
+		batch->items[i].batch = batch;
+		batch->items[i].pending = chunk->pending;
+		i++;
+	}
+	for (i = 0; i < count; i++) {
+		struct ffv2_commit_batch_item *item = &batch->items[i];
+		struct ffv2_chunk_lifecycle_ctx ctx = {
+			.ds_clp = item->pending->ds_clp,
+			.lseg = item->pending->lseg,
+			.complete_arg = item,
+			.complete = ffv2_commit_batch_done,
+		};
+
+		kref_get(&batch->ref);
+		if (ffv2_chunk_commit_dispatch_one_mirror(&ctx,
+				item->pending->cred, &item->pending->fh,
+				&item->pending->stateid, item->pending->offset,
+				item->pending->count, &item->pending->owner, 1)) {
+			atomic_dec(&batch->pending);
+			kref_put(&batch->ref, ffv2_commit_batch_release);
+		}
+	}
+	kref_put(&batch->ref, ffv2_commit_batch_release);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_dispatch);
+
+
+
 /*
  * Wrapper + call-ops for CHUNK_COMMIT.  Structurally identical to
  * the FINALIZE dispatch above (same one-op-per-mirror, same
