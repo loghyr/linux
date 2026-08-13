@@ -432,6 +432,8 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 
 	if (!agg || list_empty(&agg->chunks))
 		return -EINVAL;
+	if (WARN_ON_ONCE(!agg->dispatch_done))
+		return -EINVAL;
 	list_for_each_entry(chunk, &agg->chunks, list)
 		count++;
 	batch = kzalloc(struct_size(batch, items, count), GFP_NOFS);
