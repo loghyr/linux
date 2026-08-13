@@ -706,8 +706,6 @@ static void ffv2_stripe_write_rollback(struct ffv2_stripe_write *sw)
  */
 static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 {
-	struct nfs_commit_info cinfo;
-	struct ffv2_pending_req *req;
 	u32 i;
 
 	/*
@@ -762,45 +760,6 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 		}
 	}
 
-	/* Publish only after every lifecycle RPC has been prepared and
-	 * started.  The data-shard record owns the logical request set. */
-	if (list_empty(&sw->pending_chunks) ||
-	    list_empty(&list_first_entry(&sw->pending_chunks,
-					 struct ffv2_pending_chunk, stripe_list)->requests)) {
-		ffv2_stripe_write_set_status(sw, -EIO);
-		ffv2_stripe_write_chains_retire(sw, sw->nr_shards);
-		return;
-	}
-	nfs_init_cinfo(&cinfo, sw->hdr->inode, sw->hdr->dreq);
-	list_for_each_entry(req, &list_first_entry(&sw->pending_chunks,
-					struct ffv2_pending_chunk, stripe_list)->requests,
-					list) {
-		if (!nfs_lock_request(req->req)) {
-			struct ffv2_pending_req *rollback;
-			list_for_each_entry(rollback, &list_first_entry(
-				&sw->pending_chunks, struct ffv2_pending_chunk,
-				stripe_list)->requests, list)
-				if (rollback->locked) {
-					nfs_unlock_request(rollback->req);
-					rollback->locked = false;
-				}
-			ffv2_stripe_write_set_status(sw, -EBUSY);
-			ffv2_stripe_write_chains_retire(sw, sw->nr_shards);
-			return;
-		}
-		req->locked = true;
-	}
-	list_for_each_entry(req, &list_first_entry(&sw->pending_chunks,
-					struct ffv2_pending_chunk, stripe_list)->requests,
-					list) {
-		if (req->locked) {
-			nfs_mark_request_commit(req->req, sw->lseg, &cinfo, 0);
-			nfs_unlock_request(req->req);
-			req->locked = false;
-		}
-	}
-	sw->hdr->verf.committed = NFS_UNSTABLE;
-	set_bit(NFS_IOHDR_UNSTABLE_WRITES, &sw->hdr->flags);
 }
 
 /*
