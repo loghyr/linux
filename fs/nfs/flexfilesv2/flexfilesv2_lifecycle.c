@@ -423,6 +423,21 @@ static void ffv2_commit_batch_done(void *arg, int status,
 	kref_put(&item->batch->ref, ffv2_commit_batch_release);
 }
 
+static void ffv2_commit_batch_sync_done(struct ffv2_commit_batch_item *item,
+						int status)
+{
+	bool last;
+
+	cmpxchg(&item->batch->status, 0, status);
+	last = atomic_dec_and_test(&item->batch->pending);
+	if (last)
+		refcount_dec(&item->batch->agg->ref);
+	if (last && item->batch->agg->dispatch_done)
+		item->batch->agg->dispatch_done(
+			item->batch->agg->dispatch_done_owner,
+			item->batch->status);
+}
+
 int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 {
 	struct ffv2_commit_chunk *chunk;
@@ -464,13 +479,7 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 				item->pending->cred, &item->pending->fh,
 				&item->pending->stateid, item->pending->offset,
 				item->pending->count, &item->pending->owner, 1)) {
-			atomic_dec(&batch->pending);
-			cmpxchg(&batch->status, 0, -EIO);
-			if (atomic_read(&batch->pending) == 0 &&
-			    batch->agg->dispatch_done)
-				batch->agg->dispatch_done(
-					batch->agg->dispatch_done_owner,
-					batch->status);
+			ffv2_commit_batch_sync_done(item, -EIO);
 			kref_put(&batch->ref, ffv2_commit_batch_release);
 		}
 	}
