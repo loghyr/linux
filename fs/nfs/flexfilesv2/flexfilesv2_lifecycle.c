@@ -992,7 +992,8 @@ int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
 EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_move_requests);
 
 struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
-					struct ffv2_commit_aggregate *agg)
+					struct ffv2_commit_aggregate *agg,
+					struct nfs_direct_req *dreq)
 {
 	struct ffv2_commit_chunk *chunk;
 	struct ffv2_pending_req *first;
@@ -1010,6 +1011,7 @@ struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
 	if (!data)
 		return NULL;
 	data->inode = first->inode;
+	data->dreq = dreq;
 	data->cred = get_cred(first->context->cred);
 	data->context = get_nfs_open_context(first->context);
 	data->args.fh = NFS_FH(data->inode);

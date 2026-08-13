@@ -308,7 +308,8 @@ fail_alloc:
 }
 
 struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
-					struct ffv2_stripe_write *sw)
+					struct ffv2_stripe_write *sw,
+					struct nfs_direct_req *dreq)
 {
 	struct ffv2_commit_aggregate *agg;
 	struct nfs_commit_data *data;
@@ -316,7 +317,7 @@ struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 	agg = ffv2_stripe_claim_pending(sw);
 	if (!agg)
 		return NULL;
-	data = ffv2_commit_aggregate_commitdata_alloc(agg);
+	data = ffv2_commit_aggregate_commitdata_alloc(agg, dreq);
 	if (data)
 		return data;
 	ffv2_commit_aggregate_free(agg);
@@ -325,7 +326,8 @@ struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 EXPORT_SYMBOL_GPL(ffv2_stripe_commitdata_alloc);
 
 struct nfs_commit_data *ffv2_commit_lseg_pending(
-					struct pnfs_layout_segment *lseg)
+					struct pnfs_layout_segment *lseg,
+					struct nfs_direct_req *dreq)
 {
 	struct ffv2_pending_chunk *pending, *candidate = NULL;
 	struct ffv2_stripe_write *sw;
@@ -349,14 +351,15 @@ struct nfs_commit_data *ffv2_commit_lseg_pending(
 	refcount_inc(&sw->sw_ref);
 	spin_unlock(&FFV2_LSEG(lseg)->fls_pending_lock);
 	{
-		struct nfs_commit_data *data = ffv2_stripe_commitdata_alloc(sw);
+		struct nfs_commit_data *data = ffv2_stripe_commitdata_alloc(sw, dreq);
 		ffv2_stripe_write_put(sw);
 		return data;
 	}
 }
 EXPORT_SYMBOL_GPL(ffv2_commit_lseg_pending);
 
-struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode)
+struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode,
+					struct nfs_direct_req *dreq)
 {
 	struct pnfs_layout_hdr *lo = NFS_I(inode)->layout;
 	struct pnfs_layout_segment *lseg, *candidate = NULL;
@@ -374,7 +377,7 @@ struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode)
 	spin_unlock(&inode->i_lock);
 	if (!candidate)
 		return NULL;
-	data = ffv2_commit_lseg_pending(candidate);
+	data = ffv2_commit_lseg_pending(candidate, dreq);
 	pnfs_put_lseg(candidate);
 	return data;
 }
