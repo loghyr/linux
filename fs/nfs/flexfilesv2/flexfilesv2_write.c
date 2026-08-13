@@ -324,6 +324,36 @@ struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 }
 EXPORT_SYMBOL_GPL(ffv2_stripe_commitdata_alloc);
 
+struct nfs_commit_data *ffv2_commit_lseg_pending(
+					struct pnfs_layout_segment *lseg)
+{
+	struct ffv2_pending_chunk *pending, *candidate = NULL;
+	struct ffv2_stripe_write *sw;
+
+	if (!lseg)
+		return NULL;
+	spin_lock(&FFV2_LSEG(lseg)->fls_pending_lock);
+	list_for_each_entry(pending, &FFV2_LSEG(lseg)->fls_pending_list, list) {
+		if (pending->state == FFV2_PENDING_LIFECYCLE_DONE) {
+			candidate = pending;
+			break;
+		}
+	}
+	if (!candidate) {
+		spin_unlock(&FFV2_LSEG(lseg)->fls_pending_lock);
+		return NULL;
+	}
+	sw = candidate->sw;
+	refcount_inc(&sw->sw_ref);
+	spin_unlock(&FFV2_LSEG(lseg)->fls_pending_lock);
+	{
+		struct nfs_commit_data *data = ffv2_stripe_commitdata_alloc(sw);
+		ffv2_stripe_write_put(sw);
+		return data;
+	}
+}
+EXPORT_SYMBOL_GPL(ffv2_commit_lseg_pending);
+
 static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
 					   struct ffv2_chunk_write_dispatch *w);
 
