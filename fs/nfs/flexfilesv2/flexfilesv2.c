@@ -184,11 +184,12 @@ ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
 {
 	struct nfs_commit_data *data;
 	struct ffv2_commit_aggregate *agg;
+	struct pnfs_ds_commit_info *ds = cinfo->ds;
 	int rc;
 
 	data = ffv2_commit_inode_pending(inode, cinfo->dreq);
 	if (!data)
-		return PNFS_NOT_ATTEMPTED;
+		goto mds;
 	agg = data->private;
 	agg->dispatch_done = ffv2_commit_aggregate_complete;
 	agg->dispatch_done_owner = data;
@@ -196,10 +197,18 @@ ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
 	if (rc) {
 		data->task.tk_status = rc;
 		ffv2_commit_release_pages(data);
-		nfs_commitdata_release(data);
-		return rc;
+		if (list_empty(mds_pages))
+			return rc;
 	}
-	return PNFS_ATTEMPTED;
+
+mds:
+	if (list_empty(mds_pages))
+		return data ? PNFS_ATTEMPTED : PNFS_NOT_ATTEMPTED;
+	/* The DS aggregate was handled above; route MDS pages through NFS. */
+	cinfo->ds = NULL;
+	rc = nfs_commit_list(inode, mds_pages, how, cinfo);
+	cinfo->ds = ds;
+	return rc < 0 ? rc : PNFS_ATTEMPTED;
 }
 
 static const struct pnfs_commit_ops ffv2_commit_ops = {

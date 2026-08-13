@@ -632,7 +632,8 @@ int ffv2_pending_chunk_lock_requests(struct ffv2_pending_chunk *pending);
 struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 					struct ffv2_pending_chunk *pending);
 int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
-						struct list_head *dst);
+						struct list_head *dst,
+						struct nfs_direct_req *dreq);
 int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg);
 void ffv2_commit_aggregate_complete(void *owner, int status);
 struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(

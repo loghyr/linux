@@ -503,7 +503,6 @@ void ffv2_commit_aggregate_complete(void *owner, int status)
 
 	data->task.tk_status = status;
 	ffv2_commit_release_pages(data);
-	nfs_commitdata_release(data);
 }
 EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_complete);
 
@@ -892,6 +891,27 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_move_requests);
 
+static int ffv2_pending_chunk_take_scanned(struct ffv2_pending_chunk *pending,
+						 struct pnfs_layout_segment *lseg,
+						 struct list_head *dst,
+						 struct nfs_commit_info *cinfo)
+{
+	struct ffv2_pending_req *p, *tmp;
+	int count = 0;
+
+	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
+		if (!pnfs_generic_take_request_commit(lseg, p->req, dst,
+						      cinfo))
+			continue;
+		list_del(&p->list);
+		put_nfs_open_context(p->context);
+		nfs_release_request(p->req);
+		kfree(p);
+		count++;
+	}
+	return count;
+}
+
 struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 					struct ffv2_pending_chunk *pending)
 {
@@ -944,47 +964,80 @@ void ffv2_pending_commitdata_free(struct nfs_commit_data *data)
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_commitdata_free);
 
-int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
-						struct list_head *dst)
+static void ffv2_commitdata_free(struct nfs_commit_data *data)
+{
+	put_cred(data->cred);
+	if (data->lseg)
+		pnfs_put_lseg(data->lseg);
+	if (data->ds_clp)
+		nfs_put_client(data->ds_clp);
+	nfs_commitdata_release(data);
+}
+
+static void ffv2_commit_aggregate_rollback(struct ffv2_commit_aggregate *agg)
 {
 	struct ffv2_commit_chunk *chunk;
-	struct ffv2_pending_req *first, *p;
-	struct nfs_commit_info cinfo;
-	int total = 0, moved;
 
-	list_for_each_entry(chunk, &agg->chunks, list) {
-		moved = ffv2_pending_chunk_lock_requests(chunk->pending);
-		if (moved < 0) {
-			struct ffv2_commit_chunk *rollback;
-			struct ffv2_pending_req *p;
-			list_for_each_entry(rollback, &agg->chunks, list)
-				list_for_each_entry(p, &rollback->pending->requests,
-						    list)
-					if (p->locked) {
-						nfs_unlock_request(p->req);
-						p->locked = false;
-					}
-			return moved;
-		}
-	}
+	list_for_each_entry(chunk, &agg->chunks, list)
+		if (chunk->pending->state == FFV2_PENDING_COMMITTING)
+			chunk->pending->state = FFV2_PENDING_LIFECYCLE_DONE;
+}
+
+static void ffv2_commit_aggregate_retry(struct ffv2_commit_aggregate *agg,
+					struct nfs_direct_req *dreq)
+{
+	struct ffv2_commit_chunk *chunk;
+	struct ffv2_pending_req *p, *first;
+	struct nfs_commit_info cinfo;
+	LIST_HEAD(retry);
+
 	first = list_first_entry(&list_first_entry(&agg->chunks,
 					struct ffv2_commit_chunk, list)->pending->requests,
 					struct ffv2_pending_req, list);
-	nfs_init_cinfo(&cinfo, first->inode, NULL);
-	cinfo.ds = &FFV2_LAYOUT_FROM_HDR(
-		list_first_entry(&agg->chunks, struct ffv2_commit_chunk,
-					 list)->pending->lseg->pls_layout)->commit_info;
+	nfs_init_cinfo(&cinfo, first->inode, dreq);
 	mutex_lock(&NFS_I(cinfo.inode)->commit_mutex);
 	list_for_each_entry(chunk, &agg->chunks, list)
 		list_for_each_entry(p, &chunk->pending->requests, list)
-			pnfs_generic_clear_request_commit(p->req, &cinfo);
+			pnfs_generic_take_request_commit(chunk->pending->lseg,
+							 p->req, &retry, &cinfo);
+	mutex_unlock(&NFS_I(cinfo.inode)->commit_mutex);
+	if (!list_empty(&retry))
+		nfs_retry_commit(&retry,
+			list_first_entry(&agg->chunks, struct ffv2_commit_chunk,
+					 list)->pending->lseg,
+			&cinfo, 0);
+}
+
+int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
+						struct list_head *dst,
+						struct nfs_direct_req *dreq)
+{
+	struct ffv2_commit_chunk *chunk;
+	struct ffv2_pending_req *first;
+	struct ffv2_pending_req *p;
+	struct nfs_commit_info cinfo;
+	int total = 0;
+
+	first = list_first_entry(&list_first_entry(&agg->chunks,
+					struct ffv2_commit_chunk, list)->pending->requests,
+					struct ffv2_pending_req, list);
+	nfs_init_cinfo(&cinfo, first->inode, dreq);
+	mutex_lock(&NFS_I(cinfo.inode)->commit_mutex);
+	/* Never splice requests still owned by a written bucket. */
 	list_for_each_entry(chunk, &agg->chunks, list) {
-		moved = ffv2_pending_chunk_move_requests(chunk->pending, dst);
-		if (moved < 0) {
-			mutex_unlock(&NFS_I(cinfo.inode)->commit_mutex);
-			return moved;
+		list_for_each_entry(p, &chunk->pending->requests, list) {
+			if (test_bit(PG_COMMIT_TO_DS, &p->req->wb_flags) ||
+			    !pnfs_generic_request_commit_available(
+					chunk->pending->lseg, p->req, &cinfo)) {
+				ffv2_commit_aggregate_rollback(agg);
+				mutex_unlock(&NFS_I(cinfo.inode)->commit_mutex);
+				return -EAGAIN;
+			}
 		}
-		total += moved;
+	}
+	list_for_each_entry(chunk, &agg->chunks, list) {
+		total += ffv2_pending_chunk_take_scanned(chunk->pending,
+						 chunk->pending->lseg, dst, &cinfo);
 	}
 	mutex_unlock(&NFS_I(cinfo.inode)->commit_mutex);
 	return total;
@@ -1008,20 +1061,30 @@ struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
 	if (!first)
 		return NULL;
 	data = nfs_commitdata_alloc();
-	if (!data)
+	if (!data) {
+		ffv2_commit_aggregate_retry(agg, dreq);
+		ffv2_commit_aggregate_rollback(agg);
 		return NULL;
+	}
 	data->inode = first->inode;
 	data->dreq = dreq;
 	data->cred = get_cred(first->context->cred);
 	data->context = get_nfs_open_context(first->context);
 	data->args.fh = NFS_FH(data->inode);
+	data->res.verf = &data->verf;
+	data->verf.committed = NFS_FILE_SYNC;
+	memcpy(&data->verf.verifier,
+	       &chunk->pending->commit_writeverf,
+	       sizeof(data->verf.verifier));
 	data->lseg = pnfs_get_lseg(chunk->pending->lseg);
 	data->ds_clp = chunk->pending->ds_clp;
 	refcount_inc(&data->ds_clp->cl_count);
 	data->private = agg;
-	agg->mds_cinfo = &NFS_I(data->inode)->commit_info;
+	/* Direct I/O completion balances the request-local counter. */
+	agg->mds_cinfo = dreq ? &dreq->mds_cinfo :
+				 &NFS_I(data->inode)->commit_info;
 	nfs_commit_begin(agg->mds_cinfo);
-	if (ffv2_commit_aggregate_move_requests(agg, &data->pages) <= 0) {
+	if (ffv2_commit_aggregate_move_requests(agg, &data->pages, dreq) <= 0) {
 		nfs_commit_end(agg->mds_cinfo);
 		agg->mds_cinfo = NULL;
 		data->private = NULL;
@@ -1067,6 +1130,7 @@ void ffv2_commit_release_pages(struct nfs_commit_data *data)
 			ffv2_commit_aggregate_free(data->private);
 			data->private = NULL;
 		}
+		ffv2_commitdata_free(data);
 		return;
 	}
 
@@ -1088,6 +1152,7 @@ void ffv2_commit_release_pages(struct nfs_commit_data *data)
 		ffv2_commit_aggregate_free(data->private);
 		data->private = NULL;
 	}
+	ffv2_commitdata_free(data);
 }
 EXPORT_SYMBOL_GPL(ffv2_commit_release_pages);
 

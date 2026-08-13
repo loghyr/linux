@@ -863,7 +863,8 @@ static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw)
 		 * the logical write length; parity and padding are not user data.
 		 */
 		hdr->res.count = hdr->args.count;
-		hdr->verf.committed = NFS_FILE_SYNC;
+		/* Publish the write as unstable so pNFS schedules FFv2 COMMIT. */
+		hdr->verf.committed = NFS_UNSTABLE;
 		memcpy(&hdr->verf.verifier, &sw->disp[0].wire.res.writeverf,
 		       sizeof(hdr->verf.verifier));
 
