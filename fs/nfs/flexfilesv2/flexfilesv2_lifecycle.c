@@ -838,6 +838,9 @@ int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
 					struct ffv2_commit_chunk, list)->pending->requests,
 					struct ffv2_pending_req, list);
 	nfs_init_cinfo(&cinfo, first->inode, NULL);
+	cinfo.ds = &FFV2_LAYOUT_FROM_HDR(
+		list_first_entry(&agg->chunks, struct ffv2_commit_chunk,
+					 list)->pending->lseg->pls_layout)->commit_info;
 	mutex_lock(&NFS_I(cinfo.inode)->commit_mutex);
 	list_for_each_entry(chunk, &agg->chunks, list)
 		list_for_each_entry(p, &chunk->pending->requests, list)
@@ -881,6 +884,8 @@ struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
 	data->ds_clp = chunk->pending->ds_clp;
 	refcount_inc(&data->ds_clp->cl_count);
 	data->private = agg;
+	agg->mds_cinfo = &NFS_I(data->inode)->commit_info;
+	nfs_commit_begin(agg->mds_cinfo);
 	if (ffv2_commit_aggregate_move_requests(agg, &data->pages) <= 0) {
 		ffv2_pending_commitdata_free(data);
 		return NULL;
@@ -909,7 +914,6 @@ EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_free);
 void ffv2_commit_release_pages(struct nfs_commit_data *data)
 {
 	struct nfs_page *req;
-	struct nfs_commit_info cinfo;
 	int status = data->task.tk_status;
 
 	while (!list_empty(&data->pages)) {
@@ -924,8 +928,8 @@ void ffv2_commit_release_pages(struct nfs_commit_data *data)
 		}
 		nfs_unlock_and_release_request(req);
 	}
-	nfs_init_cinfo(&cinfo, data->inode, data->dreq);
-	nfs_commit_end(cinfo.mds);
+	if (data->private)
+		nfs_commit_end(((struct ffv2_commit_aggregate *)data->private)->mds_cinfo);
 	if (data->private) {
 		ffv2_commit_aggregate_free(data->private);
 		data->private = NULL;

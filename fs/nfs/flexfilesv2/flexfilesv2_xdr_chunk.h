@@ -575,6 +575,7 @@ struct ffv2_commit_aggregate {
 	struct list_head	chunks;
 	unsigned int		count;
 	struct nfs_commit_data	*data;
+	struct nfs_mds_commit_info *mds_cinfo;
 };
 
 struct ffv2_commit_chunk {
