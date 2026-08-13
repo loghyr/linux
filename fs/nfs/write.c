@@ -1765,7 +1765,7 @@ static void nfs_commit_resched_write(struct nfs_commit_info *cinfo,
 /*
  * Commit dirty pages
  */
-static int
+int
 nfs_commit_list(struct inode *inode, struct list_head *head, int how,
 		struct nfs_commit_info *cinfo)
 {
@@ -1795,6 +1795,7 @@ nfs_commit_list(struct inode *inode, struct list_head *head, int how,
 				   data->mds_ops, how,
 				   RPC_TASK_CRED_NOREF | task_flags, localio);
 }
+EXPORT_SYMBOL_GPL(nfs_commit_list);
 
 /*
  * COMMIT call returned

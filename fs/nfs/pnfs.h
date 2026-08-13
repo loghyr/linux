@@ -401,6 +401,18 @@ void pnfs_generic_ds_cinfo_destroy(struct pnfs_ds_commit_info *fl_cinfo);
 
 void pnfs_generic_clear_request_commit(struct nfs_page *req,
 				       struct nfs_commit_info *cinfo);
+/*
+ * Transfer one scanner-owned request to @head.  The caller must hold the
+ * inode commit_mutex; the helper balances ncommitting and bucket lseg refs.
+ */
+bool pnfs_generic_take_request_commit(struct pnfs_layout_segment *lseg,
+					struct nfs_page *req,
+					struct list_head *head,
+					struct nfs_commit_info *cinfo);
+/* Test whether @req is still owned by a committing pNFS bucket. */
+bool pnfs_generic_request_commit_available(struct pnfs_layout_segment *lseg,
+						   struct nfs_page *req,
+						   struct nfs_commit_info *cinfo);
 void pnfs_generic_commit_release(void *calldata);
 void pnfs_generic_prepare_to_resend_writes(struct nfs_commit_data *data);
 void pnfs_generic_rw_release(void *data);

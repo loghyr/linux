@@ -95,6 +95,92 @@ out:
 }
 EXPORT_SYMBOL_GPL(pnfs_generic_clear_request_commit);
 
+static struct pnfs_layout_segment *
+pnfs_bucket_get_committing(struct list_head *head,
+				   struct pnfs_commit_bucket *bucket,
+				   struct nfs_commit_info *cinfo);
+static struct pnfs_commit_array *
+pnfs_find_commit_array_by_lseg(struct pnfs_ds_commit_info *fl_cinfo,
+				       struct pnfs_layout_segment *lseg);
+static struct pnfs_commit_array *
+pnfs_lookup_commit_array(struct pnfs_ds_commit_info *fl_cinfo,
+				 struct pnfs_layout_segment *lseg);
+static struct pnfs_commit_array *
+pnfs_get_commit_array(struct pnfs_commit_array *array);
+static void pnfs_put_commit_array(struct pnfs_commit_array *array,
+				  struct inode *inode);
+
+bool pnfs_generic_take_request_commit(struct pnfs_layout_segment *lseg,
+				      struct nfs_page *req,
+				      struct list_head *head,
+				      struct nfs_commit_info *cinfo)
+{
+	struct pnfs_commit_array *array;
+	struct pnfs_commit_bucket *bucket;
+	struct pnfs_layout_segment *free_lseg = NULL;
+	struct nfs_page *pos;
+	bool found = false;
+
+	lockdep_assert_held(&NFS_I(cinfo->inode)->commit_mutex);
+	rcu_read_lock();
+	array = pnfs_find_commit_array_by_lseg(cinfo->ds, lseg);
+	if (!array) {
+		rcu_read_unlock();
+		return false;
+	}
+	if (!pnfs_get_commit_array(array)) {
+		rcu_read_unlock();
+		return false;
+	}
+	for (bucket = array->buckets;
+	     bucket < array->buckets + array->nbuckets; bucket++) {
+		list_for_each_entry(pos, &bucket->committing, wb_list) {
+			if (pos != req)
+				continue;
+			list_move_tail(&pos->wb_list, head);
+			cinfo->ds->ncommitting--;
+			free_lseg = pnfs_free_bucket_lseg(bucket);
+			found = true;
+			break;
+		}
+		if (found)
+			break;
+	}
+	rcu_read_unlock();
+	pnfs_put_lseg(free_lseg);
+	pnfs_put_commit_array(array, cinfo->inode);
+	return found;
+}
+EXPORT_SYMBOL_GPL(pnfs_generic_take_request_commit);
+
+bool pnfs_generic_request_commit_available(struct pnfs_layout_segment *lseg,
+						   struct nfs_page *req,
+						   struct nfs_commit_info *cinfo)
+{
+	struct pnfs_commit_array *array;
+	struct pnfs_commit_bucket *bucket;
+	struct nfs_page *pos;
+	bool found = false;
+
+	lockdep_assert_held(&NFS_I(cinfo->inode)->commit_mutex);
+	rcu_read_lock();
+	array = pnfs_find_commit_array_by_lseg(cinfo->ds, lseg);
+	if (array && pnfs_get_commit_array(array)) {
+		for (bucket = array->buckets;
+		     bucket < array->buckets + array->nbuckets && !found;
+		     bucket++)
+			list_for_each_entry(pos, &bucket->committing, wb_list)
+				if (pos == req) {
+					found = true;
+					break;
+				}
+		pnfs_put_commit_array(array, cinfo->inode);
+	}
+	rcu_read_unlock();
+	return found;
+}
+EXPORT_SYMBOL_GPL(pnfs_generic_request_commit_available);
+
 struct pnfs_commit_array *
 pnfs_alloc_commit_array(size_t n, gfp_t gfp_flags)
 {
@@ -1222,4 +1308,3 @@ pnfs_nfs_generic_sync(struct inode *inode, bool datasync)
 	return pnfs_layoutcommit_inode(inode, true);
 }
 EXPORT_SYMBOL_GPL(pnfs_nfs_generic_sync);
-
