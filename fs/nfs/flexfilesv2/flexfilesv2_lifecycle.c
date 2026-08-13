@@ -782,6 +782,73 @@ void ffv2_pending_commitdata_free(struct nfs_commit_data *data)
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_commitdata_free);
 
+int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
+						struct list_head *dst)
+{
+	struct ffv2_commit_chunk *chunk;
+	int total = 0, moved;
+
+	list_for_each_entry(chunk, &agg->chunks, list) {
+		moved = ffv2_pending_chunk_move_requests(chunk->pending, dst);
+		if (moved < 0)
+			return moved;
+		total += moved;
+	}
+	return total;
+}
+EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_move_requests);
+
+struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
+					struct ffv2_commit_aggregate *agg)
+{
+	struct ffv2_commit_chunk *chunk;
+	struct ffv2_pending_req *first;
+	struct nfs_commit_data *data;
+
+	chunk = list_first_entry_or_null(&agg->chunks,
+					struct ffv2_commit_chunk, list);
+	if (!chunk)
+		return NULL;
+	first = list_first_entry_or_null(&chunk->pending->requests,
+					struct ffv2_pending_req, list);
+	if (!first)
+		return NULL;
+	data = nfs_commitdata_alloc();
+	if (!data)
+		return NULL;
+	data->inode = first->inode;
+	data->cred = get_cred(first->context->cred);
+	data->context = get_nfs_open_context(first->context);
+	data->args.fh = NFS_FH(data->inode);
+	data->lseg = pnfs_get_lseg(chunk->pending->lseg);
+	data->ds_clp = chunk->pending->ds_clp;
+	refcount_inc(&data->ds_clp->cl_count);
+	data->private = agg;
+	if (ffv2_commit_aggregate_move_requests(agg, &data->pages) <= 0) {
+		ffv2_pending_commitdata_free(data);
+		return NULL;
+	}
+	agg->data = data;
+	return data;
+}
+EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_commitdata_alloc);
+
+void ffv2_commit_aggregate_free(struct ffv2_commit_aggregate *agg)
+{
+	struct ffv2_commit_chunk *chunk, *tmp;
+
+	list_for_each_entry_safe(chunk, tmp, &agg->chunks, list) {
+		list_del(&chunk->list);
+		if (chunk->pending->state == FFV2_PENDING_COMMITTING) {
+			ffv2_pending_chunk_abort(chunk->pending);
+			ffv2_pending_chunk_free(chunk->pending);
+		}
+		kfree(chunk);
+	}
+	kfree(agg);
+}
+EXPORT_SYMBOL_GPL(ffv2_commit_aggregate_free);
+
 void ffv2_commit_release_pages(struct nfs_commit_data *data)
 {
 	struct nfs_page *req;
@@ -802,6 +869,10 @@ void ffv2_commit_release_pages(struct nfs_commit_data *data)
 	}
 	nfs_init_cinfo(&cinfo, data->inode, data->dreq);
 	nfs_commit_end(cinfo.mds);
+	if (data->private) {
+		ffv2_commit_aggregate_free(data->private);
+		data->private = NULL;
+	}
 }
 EXPORT_SYMBOL_GPL(ffv2_commit_release_pages);
 

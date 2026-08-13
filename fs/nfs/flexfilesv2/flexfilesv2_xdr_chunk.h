@@ -569,6 +569,18 @@ struct ffv2_pending_req {
 	struct nfs_open_context	*context;
 };
 
+struct ffv2_commit_aggregate {
+	struct list_head	list;
+	struct list_head	chunks;
+	unsigned int		count;
+	struct nfs_commit_data	*data;
+};
+
+struct ffv2_commit_chunk {
+	struct list_head	list;
+	struct ffv2_pending_chunk *pending;
+};
+
 struct ffv2_pending_chunk {
 	struct list_head		list;
 	struct list_head		stripe_list;
@@ -603,9 +615,14 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 					     struct list_head *dst);
 struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 					struct ffv2_pending_chunk *pending);
+int ffv2_commit_aggregate_move_requests(struct ffv2_commit_aggregate *agg,
+						struct list_head *dst);
+struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
+					struct ffv2_commit_aggregate *agg);
 struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 					struct ffv2_stripe_write *sw);
 void ffv2_pending_commitdata_free(struct nfs_commit_data *data);
+void ffv2_commit_aggregate_free(struct ffv2_commit_aggregate *agg);
 void ffv2_commit_release_pages(struct nfs_commit_data *data);
 
 struct ffv2_chunk_wb_ctx {

@@ -227,31 +227,70 @@ bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw)
 }
 EXPORT_SYMBOL_GPL(ffv2_stripe_verifiers_complete);
 
+static struct ffv2_commit_aggregate *
+ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
+{
+	struct ffv2_pending_chunk *pending;
+	struct ffv2_commit_aggregate *agg;
+	unsigned int count = 0;
+
+	agg = kzalloc(sizeof(*agg), GFP_NOFS);
+	if (!agg)
+		return NULL;
+	INIT_LIST_HEAD(&agg->list);
+	INIT_LIST_HEAD(&agg->chunks);
+	spin_lock(&sw->pending_lock);
+	if (atomic_read(&sw->chains_pending) != 0 || sw->status ||
+	    !ffv2_stripe_verifiers_complete(sw))
+		goto fail_unlock;
+	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
+		pending->state = FFV2_PENDING_COMMITTING;
+		count++;
+	}
+	if (count != sw->nr_shards)
+		goto fail_states;
+	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
+		struct ffv2_commit_chunk *chunk = kzalloc(sizeof(*chunk), GFP_NOFS);
+
+		if (!chunk)
+			goto fail_states;
+		chunk->pending = pending;
+		list_add_tail(&chunk->list, &agg->chunks);
+	}
+	agg->count = count;
+	spin_unlock(&sw->pending_lock);
+	return agg;
+
+fail_states:
+	{
+		struct ffv2_commit_chunk *chunk, *tmp;
+		list_for_each_entry_safe(chunk, tmp, &agg->chunks, list) {
+			list_del(&chunk->list);
+			kfree(chunk);
+		}
+	}
+	list_for_each_entry(pending, &sw->pending_chunks, stripe_list)
+		if (pending->state == FFV2_PENDING_COMMITTING)
+			pending->state = FFV2_PENDING_LIFECYCLE_DONE;
+fail_unlock:
+	spin_unlock(&sw->pending_lock);
+	kfree(agg);
+	return NULL;
+}
+
 struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 					struct ffv2_stripe_write *sw)
 {
-	struct ffv2_pending_chunk *pending;
+	struct ffv2_commit_aggregate *agg;
+	struct nfs_commit_data *data;
 
-	spin_lock(&sw->pending_lock);
-	if (atomic_read(&sw->chains_pending) != 0 || sw->status) {
-		spin_unlock(&sw->pending_lock);
+	agg = ffv2_stripe_claim_pending(sw);
+	if (!agg)
 		return NULL;
-	}
-	if (!ffv2_stripe_verifiers_complete(sw)) {
-		spin_unlock(&sw->pending_lock);
-		return NULL;
-	}
-	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
-		if (pending->state == FFV2_PENDING_LIFECYCLE_DONE &&
-		    !list_empty(&pending->requests)) {
-			if (!ffv2_pending_chunk_verifiers_complete(pending))
-				continue;
-			pending->state = FFV2_PENDING_COMMITTING;
-			spin_unlock(&sw->pending_lock);
-			return ffv2_pending_commitdata_alloc(pending);
-		}
-	}
-	spin_unlock(&sw->pending_lock);
+	data = ffv2_commit_aggregate_commitdata_alloc(agg);
+	if (data)
+		return data;
+	ffv2_commit_aggregate_free(agg);
 	return NULL;
 }
 EXPORT_SYMBOL_GPL(ffv2_stripe_commitdata_alloc);
