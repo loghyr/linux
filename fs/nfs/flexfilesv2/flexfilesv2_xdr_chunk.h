@@ -581,6 +581,8 @@ struct ffv2_commit_aggregate {
 	void (*stripe_put)(void *owner);
 	void			*stripe_owner;
 	void			*dispatch_batch;
+	void (*dispatch_done)(void *owner, int status);
+	void			*dispatch_done_owner;
 };
 
 struct ffv2_commit_chunk {

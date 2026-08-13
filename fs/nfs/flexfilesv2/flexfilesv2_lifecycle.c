@@ -412,8 +412,13 @@ static void ffv2_commit_batch_done(void *arg, int status,
 			&item->pending->flags);
 	}
 	last = atomic_dec_and_test(&item->batch->pending);
-	if (last)
+	if (last) {
 		item->batch->agg->dispatch_batch = NULL;
+		if (item->batch->agg->dispatch_done)
+			item->batch->agg->dispatch_done(
+				item->batch->agg->dispatch_done_owner,
+				item->batch->status);
+	}
 	if (last)
 		refcount_dec(&item->batch->agg->ref);
 	kref_put(&item->batch->ref, ffv2_commit_batch_release);
