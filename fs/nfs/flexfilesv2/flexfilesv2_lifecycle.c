@@ -744,8 +744,8 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
 		return -EBUSY;
 	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
-		if (WARN_ON_ONCE(!p->locked))
-			return -EBUSY;
+		/* The aggregate preflight locks every request before this pass. */
+		WARN_ON_ONCE(!p->locked);
 		list_del(&p->list);
 		nfs_list_add_request(p->req, dst);
 		put_nfs_open_context(p->context);
