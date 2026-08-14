@@ -148,12 +148,14 @@ void ffv2_guard_refresh_exit(void)
  * always reach the parent, and the parent cannot be freed while any
  * callback can still name it.
  *
- * Completion runs in two phases, because a CHUNK_FINALIZE and a
- * CHUNK_COMMIT each address exactly one chunk on one data server:
+ * Completion runs in two phases.  Compatible shard lifecycle records use
+ * bounded multi-owner FINALIZE cohorts; COMMIT remains per member.  Shards
+ * with different RPC identities retain the per-shard fallback:
  *
  *      k+m CHUNK_WRITEs
  *        -> writes_pending reaches 0
- *        -> on success, fan out k+m FINALIZE -> COMMIT chains
+ *        -> on success, dispatch FINALIZE cohorts (or per-shard fallback)
+ *        -> fan out per-member COMMIT chains
  *        -> chains_pending reaches 0
  *        -> stamp the header and complete it
  *
