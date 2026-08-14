@@ -826,6 +826,8 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 			}
 		}
 	}
+	if (!cohort)
+		pr_debug("flexfilesv2: using per-shard lifecycle dispatch\n");
 	if (cohort) {
 		struct ffv2_chunk_wb_ctx *wbs[FFV2_MAX_CHUNKS_PER_OP];
 		int rc;
