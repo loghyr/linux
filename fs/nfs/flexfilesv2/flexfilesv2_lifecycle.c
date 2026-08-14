@@ -457,7 +457,7 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 	struct ffv2_commit_chunk *chunk;
 	struct ffv2_commit_batch *batch;
 	unsigned int count = 0, i = 0, j;
-	u64 min_offset = U64_MAX, max_end = 0, end;
+	u64 end;
 
 	if (!agg || list_empty(&agg->chunks))
 		return -EINVAL;
@@ -472,13 +472,7 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 		    check_add_overflow(pending->offset,
 				       (u64)pending->count, &end))
 			return -EOVERFLOW;
-		if (pending->offset < min_offset)
-			min_offset = pending->offset;
-		if (end > max_end)
-			max_end = end;
 	}
-	if (max_end <= min_offset || max_end - min_offset > U32_MAX)
-		return -EOVERFLOW;
 	batch = kzalloc(struct_size(batch, items, count), GFP_NOFS);
 	if (!batch)
 		return -ENOMEM;
@@ -493,15 +487,23 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 		struct ffv2_pending_chunk *pending = chunk->pending;
 		struct ffv2_commit_batch_item *item = NULL;
 
+		end = pending->offset + pending->count;
+
 		for (j = 0; j < i; j++) {
 			struct ffv2_pending_chunk *first = batch->items[j].pending[0];
+			u64 item_end = batch->items[j].offset +
+				batch->items[j].count;
+			u64 new_start = min(batch->items[j].offset,
+					    pending->offset);
+			u64 new_end = max(item_end, end);
 
 			if (batch->items[j].nowners == FFV2_MAX_CHUNKS_PER_OP ||
 			    first->shard_idx != pending->shard_idx ||
 			    first->ds_clp != pending->ds_clp ||
 			    memcmp(&first->fh, &pending->fh, sizeof(first->fh)) ||
 			    memcmp(&first->stateid, &pending->stateid,
-				   sizeof(first->stateid)))
+				   sizeof(first->stateid)) ||
+			    new_end - new_start > U32_MAX)
 				continue;
 			item = &batch->items[j];
 			break;
@@ -514,13 +516,11 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 			item->count = pending->count;
 		} else {
 			u64 item_end = item->offset + item->count;
+			u64 new_start = min(item->offset, pending->offset);
+			u64 new_end = max(item_end, end);
 
-			end = pending->offset + pending->count;
-
-			if (pending->offset < item->offset)
-				item->offset = pending->offset;
-			if (end > item_end)
-				item->count = end - item->offset;
+			item->offset = new_start;
+			item->count = new_end - new_start;
 		}
 		item->pending[item->nowners] = pending;
 		item->owners[item->nowners] = pending->owner;
