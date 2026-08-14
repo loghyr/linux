@@ -498,7 +498,6 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 			u64 new_end = max(item_end, end);
 
 			if (batch->items[j].nowners == FFV2_MAX_CHUNKS_PER_OP ||
-			    first->shard_idx != pending->shard_idx ||
 			    first->ds_clp != pending->ds_clp ||
 			    memcmp(&first->fh, &pending->fh, sizeof(first->fh)) ||
 			    memcmp(&first->stateid, &pending->stateid,
