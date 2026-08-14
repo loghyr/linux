@@ -457,6 +457,7 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 	struct ffv2_commit_chunk *chunk;
 	struct ffv2_commit_batch *batch;
 	unsigned int count = 0, i = 0, j;
+	u64 min_offset = U64_MAX, max_end = 0, end;
 
 	if (!agg || list_empty(&agg->chunks))
 		return -EINVAL;
@@ -464,6 +465,20 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 		return -EINVAL;
 	list_for_each_entry(chunk, &agg->chunks, list)
 		count++;
+	list_for_each_entry(chunk, &agg->chunks, list) {
+		struct ffv2_pending_chunk *pending = chunk->pending;
+
+		if (!pending->count ||
+		    check_add_overflow(pending->offset,
+				       (u64)pending->count, &end))
+			return -EOVERFLOW;
+		if (pending->offset < min_offset)
+			min_offset = pending->offset;
+		if (end > max_end)
+			max_end = end;
+	}
+	if (max_end <= min_offset || max_end - min_offset > U32_MAX)
+		return -EOVERFLOW;
 	batch = kzalloc(struct_size(batch, items, count), GFP_NOFS);
 	if (!batch)
 		return -ENOMEM;
@@ -498,8 +513,9 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 			item->offset = pending->offset;
 			item->count = pending->count;
 		} else {
-			u64 end = pending->offset + pending->count;
 			u64 item_end = item->offset + item->count;
+
+			end = pending->offset + pending->count;
 
 			if (pending->offset < item->offset)
 				item->offset = pending->offset;
