@@ -375,7 +375,11 @@ int ffv2_chunk_finalize_dispatch_one_mirror(
 
 struct ffv2_commit_batch_item {
 	struct ffv2_commit_batch *batch;
-	struct ffv2_pending_chunk *pending;
+	struct ffv2_pending_chunk *pending[FFV2_MAX_CHUNKS_PER_OP];
+	struct chunk_owner4 owners[FFV2_MAX_CHUNKS_PER_OP];
+	u64 offset;
+	u32 count;
+	u32 nowners;
 };
 
 struct ffv2_commit_batch {
@@ -398,18 +402,27 @@ static void ffv2_commit_batch_done(void *arg, int status,
 					const nfs4_verifier *wv)
 {
 	struct ffv2_commit_batch_item *item = arg;
+	unsigned int i;
 	bool last;
 
 	if (status)
 		cmpxchg(&item->batch->status, 0, status);
-	else if (!wv || memcmp(wv, &item->pending->finalize_writeverf,
-				       sizeof(*wv)))
+	else if (!wv)
 		cmpxchg(&item->batch->status, 0, -EPROTO);
 	else {
-		memcpy(&item->pending->commit_writeverf, wv,
-		       sizeof(item->pending->commit_writeverf));
-		set_bit(FFV2_PENDING_HAVE_COMMIT_VERF,
-			&item->pending->flags);
+		for (i = 0; i < item->nowners; i++) {
+			struct ffv2_pending_chunk *pending = item->pending[i];
+
+			if (memcmp(wv, &pending->finalize_writeverf,
+				   sizeof(*wv))) {
+				cmpxchg(&item->batch->status, 0, -EPROTO);
+				continue;
+			}
+			memcpy(&pending->commit_writeverf, wv,
+			       sizeof(pending->commit_writeverf));
+			set_bit(FFV2_PENDING_HAVE_COMMIT_VERF,
+				&pending->flags);
+		}
 	}
 	last = atomic_dec_and_test(&item->batch->pending);
 	if (last)
@@ -442,7 +455,7 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 {
 	struct ffv2_commit_chunk *chunk;
 	struct ffv2_commit_batch *batch;
-	unsigned int count = 0, i = 0;
+	unsigned int count = 0, i = 0, j;
 
 	if (!agg || list_empty(&agg->chunks))
 		return -EINVAL;
@@ -461,24 +474,57 @@ int ffv2_commit_aggregate_dispatch(struct ffv2_commit_aggregate *agg)
 	refcount_inc(&agg->ref);
 	agg->dispatch_batch = batch;
 	list_for_each_entry(chunk, &agg->chunks, list) {
-		batch->items[i].batch = batch;
-		batch->items[i].pending = chunk->pending;
-		i++;
+		struct ffv2_pending_chunk *pending = chunk->pending;
+		struct ffv2_commit_batch_item *item = NULL;
+
+		for (j = 0; j < i; j++) {
+			struct ffv2_pending_chunk *first = batch->items[j].pending[0];
+
+			if (batch->items[j].nowners == FFV2_MAX_CHUNKS_PER_OP ||
+			    first->shard_idx != pending->shard_idx ||
+			    first->ds_clp != pending->ds_clp ||
+			    memcmp(&first->fh, &pending->fh, sizeof(first->fh)) ||
+			    memcmp(&first->stateid, &pending->stateid,
+				   sizeof(first->stateid)))
+				continue;
+			item = &batch->items[j];
+			break;
+		}
+		if (!item)
+			item = &batch->items[i++];
+		if (!item->nowners) {
+			item->batch = batch;
+			item->offset = pending->offset;
+			item->count = pending->count;
+		} else {
+			u64 end = pending->offset + pending->count;
+			u64 item_end = item->offset + item->count;
+
+			if (pending->offset < item->offset)
+				item->offset = pending->offset;
+			if (end > item_end)
+				item->count = end - item->offset;
+		}
+		item->pending[item->nowners] = pending;
+		item->owners[item->nowners] = pending->owner;
+		item->nowners++;
 	}
-	for (i = 0; i < count; i++) {
+	batch->count = i;
+	atomic_set(&batch->pending, i);
+	for (i = 0; i < batch->count; i++) {
 		struct ffv2_commit_batch_item *item = &batch->items[i];
 		struct ffv2_chunk_lifecycle_ctx ctx = {
-			.ds_clp = item->pending->ds_clp,
-			.lseg = item->pending->lseg,
+			.ds_clp = item->pending[0]->ds_clp,
+			.lseg = item->pending[0]->lseg,
 			.complete_arg = item,
 			.complete = ffv2_commit_batch_done,
 		};
 
 		kref_get(&batch->ref);
 		if (ffv2_chunk_commit_dispatch_one_mirror(&ctx,
-				item->pending->cred, &item->pending->fh,
-				&item->pending->stateid, item->pending->offset,
-				item->pending->count, &item->pending->owner, 1)) {
+				item->pending[0]->cred, &item->pending[0]->fh,
+				&item->pending[0]->stateid, item->offset,
+				item->count, item->owners, item->nowners)) {
 			ffv2_commit_batch_sync_done(item, -EIO);
 			kref_put(&batch->ref, ffv2_commit_batch_release);
 		}
