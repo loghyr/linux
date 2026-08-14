@@ -29,6 +29,7 @@
 #include <linux/nfs4.h>
 #include <linux/nfs_common.h>
 #include <linux/nfs_fs.h>
+#include <linux/overflow.h>
 #include <linux/slab.h>
 #include <linux/sunrpc/sched.h>
 
@@ -1229,6 +1230,143 @@ static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status)
 	ffv2_pending_chunk_free(wb->pending);
 	ffv2_stripe_write_chain_done(wb->sw, status);
 	kfree(wb);
+}
+
+struct ffv2_finalize_batch {
+	struct ffv2_chunk_wb_ctx *wb[FFV2_MAX_CHUNKS_PER_OP];
+	u32 count;
+};
+
+static void ffv2_finalize_batch_done(void *arg, int status,
+					 const nfs4_verifier *wv)
+{
+	struct ffv2_finalize_batch *batch = arg;
+	u32 i;
+
+	if (status || !wv) {
+		if (!status)
+			status = -EPROTO;
+		for (i = 0; i < batch->count; i++) {
+			struct ffv2_chunk_wb_ctx *wb = batch->wb[i];
+
+			pnfs_error_mark_layout_for_return(wb->hdr->inode,
+						  wb->pending->lseg);
+			ffv2_chunk_wb_finish(wb, status);
+		}
+		kfree(batch);
+		return;
+	}
+	for (i = 0; i < batch->count; i++)
+		if (memcmp(wv, &batch->wb[i]->pending->writeverf,
+			   sizeof(*wv))) {
+			for (i = 0; i < batch->count; i++) {
+				struct ffv2_chunk_wb_ctx *wb = batch->wb[i];
+
+				pnfs_error_mark_layout_for_return(wb->hdr->inode,
+							  wb->pending->lseg);
+				ffv2_chunk_wb_finish(wb, -EPROTO);
+			}
+			kfree(batch);
+			return;
+		}
+
+	for (i = 0; i < batch->count; i++) {
+		struct ffv2_chunk_wb_ctx *wb = batch->wb[i];
+		struct ffv2_chunk_lifecycle_ctx commit_ctx = {
+			.ds_clp = wb->pending->ds_clp,
+			.lseg = wb->pending->lseg,
+			.complete_arg = wb,
+			.complete = ffv2_chunk_wb_commit_done,
+		};
+		int rc;
+
+		memcpy(&wb->pending->finalize_writeverf, wv,
+		       sizeof(wb->pending->finalize_writeverf));
+		set_bit(FFV2_PENDING_HAVE_FINALIZE_VERF,
+			&wb->pending->flags);
+		memcpy(&wb->finalize_writeverf, wv,
+		       sizeof(wb->finalize_writeverf));
+		wb->have_finalize_writeverf = true;
+		rc = ffv2_chunk_commit_dispatch_one_mirror(&commit_ctx,
+				wb->pending->cred, &wb->pending->fh,
+				&wb->pending->stateid, wb->pending->offset,
+				wb->pending->count, &wb->pending->owner, 1);
+		if (rc) {
+			pnfs_error_mark_layout_for_return(wb->hdr->inode,
+						  wb->pending->lseg);
+			ffv2_chunk_wb_finish(wb, rc);
+		}
+	}
+	kfree(batch);
+}
+
+int ffv2_chunk_wb_start_batch(struct ffv2_chunk_wb_ctx **wbs, u32 count)
+{
+	struct ffv2_chunk_wb_ctx *first;
+	struct ffv2_finalize_batch *batch;
+	struct ffv2_chunk_lifecycle_ctx ctx;
+	struct chunk_owner4 owners[FFV2_MAX_CHUNKS_PER_OP];
+	u64 offset, end;
+	u32 i;
+
+	if (!count || count > FFV2_MAX_CHUNKS_PER_OP)
+		return -EINVAL;
+	first = wbs[0];
+	batch = kzalloc(sizeof(*batch), GFP_NOFS);
+	if (!batch)
+		return -ENOMEM;
+	batch->count = count;
+	for (i = 0; i < count; i++) {
+		struct ffv2_pending_chunk *pending = wbs[i]->pending;
+
+		if (pending->ds_clp != first->pending->ds_clp ||
+		    memcmp(&pending->fh, &first->pending->fh,
+			   sizeof(pending->fh)) ||
+		    memcmp(&pending->stateid, &first->pending->stateid,
+			   sizeof(pending->stateid))) {
+			kfree(batch);
+			return -EXDEV;
+		}
+		batch->wb[i] = wbs[i];
+		owners[i] = pending->owner;
+	}
+	if (check_add_overflow(first->pending->offset,
+			       (u64)first->pending->count, &end)) {
+		kfree(batch);
+		return -EOVERFLOW;
+	}
+	offset = first->pending->offset;
+	for (i = 1; i < count; i++) {
+		struct ffv2_pending_chunk *pending = wbs[i]->pending;
+		u64 pending_end;
+
+		if (check_add_overflow(pending->offset,
+				       (u64)pending->count, &pending_end)) {
+			kfree(batch);
+			return -EOVERFLOW;
+		}
+
+		if (pending->offset < offset)
+			offset = pending->offset;
+		if (pending_end > end)
+			end = pending_end;
+	}
+	if (end <= offset || end - offset > U32_MAX) {
+		kfree(batch);
+		return -E2BIG;
+	}
+	ctx.ds_clp = first->pending->ds_clp;
+	ctx.lseg = first->pending->lseg;
+	ctx.complete_arg = batch;
+	ctx.complete = ffv2_finalize_batch_done;
+	if (ffv2_chunk_finalize_dispatch_one_mirror(&ctx,
+			first->pending->cred, &first->pending->fh,
+			&first->pending->stateid, offset, end - offset,
+			owners, count)) {
+		kfree(batch);
+		return -EIO;
+	}
+	return 0;
 }
 
 /*

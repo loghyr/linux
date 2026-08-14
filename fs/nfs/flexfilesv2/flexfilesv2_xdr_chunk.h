@@ -675,5 +675,6 @@ struct ffv2_chunk_wb_ctx {
  * reaches the stripe write via ffv2_stripe_write_chain_done().
  */
 int ffv2_chunk_wb_start(struct ffv2_chunk_wb_ctx *wb);
+int ffv2_chunk_wb_start_batch(struct ffv2_chunk_wb_ctx **wbs, u32 count);
 
 #endif /* FS_NFS_NFS4FLEXFILES_V2_XDR_CHUNK_H */

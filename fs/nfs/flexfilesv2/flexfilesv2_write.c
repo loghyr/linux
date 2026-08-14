@@ -774,6 +774,7 @@ static void ffv2_stripe_write_rollback(struct ffv2_stripe_write *sw)
 static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 {
 	u32 i;
+	bool cohort = sw->nr_shards <= FFV2_MAX_CHUNKS_PER_OP;
 
 	/*
 	 * A failed stripe is not durable, so finalizing any shard of it
@@ -805,6 +806,49 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 							  sw->lseg);
 			while (i--)
 				ffv2_chunk_write_discard_wb(sw->disp[i].wb);
+			ffv2_stripe_write_chains_retire(sw, sw->nr_shards);
+			return;
+		}
+	}
+	if (cohort) {
+		struct ffv2_chunk_wb_ctx *first = sw->disp[0].wb;
+
+		for (i = 1; i < sw->nr_shards; i++) {
+			struct ffv2_chunk_wb_ctx *wb = sw->disp[i].wb;
+
+			if (wb->pending->ds_clp != first->pending->ds_clp ||
+			    memcmp(&wb->pending->fh, &first->pending->fh,
+				   sizeof(wb->pending->fh)) ||
+			    memcmp(&wb->pending->stateid, &first->pending->stateid,
+				   sizeof(wb->pending->stateid))) {
+				cohort = false;
+				break;
+			}
+		}
+	}
+	if (cohort) {
+		struct ffv2_chunk_wb_ctx *wbs[FFV2_MAX_CHUNKS_PER_OP];
+		int rc;
+
+		for (i = 0; i < sw->nr_shards; i++) {
+			wbs[i] = sw->disp[i].wb;
+			ffv2_pending_chunk_retain(wbs[i]->pending);
+		}
+		rc = ffv2_chunk_wb_start_batch(wbs, sw->nr_shards);
+		if (!rc)
+			return;
+		if (rc == -E2BIG) {
+			for (i = 0; i < sw->nr_shards; i++)
+				ffv2_pending_chunk_abort(wbs[i]->pending);
+			cohort = false;
+		} else {
+			ffv2_stripe_write_set_status(sw, rc);
+			pnfs_error_mark_layout_for_return(sw->hdr->inode,
+							  sw->lseg);
+			for (i = 0; i < sw->nr_shards; i++) {
+				ffv2_pending_chunk_abort(wbs[i]->pending);
+				ffv2_chunk_write_discard_wb(wbs[i]);
+			}
 			ffv2_stripe_write_chains_retire(sw, sw->nr_shards);
 			return;
 		}
