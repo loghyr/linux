@@ -626,6 +626,7 @@ void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_defer(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_abort(struct ffv2_pending_chunk *pending);
+void ffv2_pending_lseg_reclaim(struct nfs4_ffv2_layout_segment *fls);
 bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending);
 bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw);
 int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,

@@ -55,6 +55,7 @@
 
 #include "../pnfs.h"
 #include "flexfilesv2.h"
+#include "flexfilesv2_xdr_chunk.h"
 
 static int ffv2_decode_deviceid(struct xdr_stream *xdr,
 				struct nfs4_deviceid *devid)
@@ -317,7 +318,7 @@ void ffv2_free_layout_segment(struct nfs4_ffv2_layout_segment *fls)
 
 	if (!fls)
 		return;
-	WARN_ON_ONCE(!list_empty(&fls->fls_pending_list));
+	ffv2_pending_lseg_reclaim(fls);
 	/*
 	 * pNFS core guarantees free_lseg fires only after all inflight
 	 * I/O against this lseg drains, so fls_ctx_list must be empty

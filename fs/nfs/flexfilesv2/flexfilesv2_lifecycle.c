@@ -855,6 +855,7 @@ void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending)
 		list_del_init(&pending->list);
 	}
 	spin_unlock(&fls->fls_pending_lock);
+	wake_up_all(&fls->fls_ctx_wq);
 	spin_lock(pending->stripe_lock);
 	list_del_init(&pending->stripe_list);
 	spin_unlock(pending->stripe_lock);
@@ -866,6 +867,32 @@ void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending)
 	kfree(pending);
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_free);
+
+void ffv2_pending_lseg_reclaim(struct nfs4_ffv2_layout_segment *fls)
+{
+	struct ffv2_pending_chunk *pending, *tmp;
+	LIST_HEAD(reclaim);
+
+	spin_lock(&fls->fls_pending_lock);
+	list_for_each_entry_safe(pending, tmp, &fls->fls_pending_list, list) {
+		if (pending->state == FFV2_PENDING_COMMITTING)
+			continue;
+		list_del_init(&pending->list);
+		clear_bit(FFV2_PENDING_QUEUED, &pending->flags);
+		list_add_tail(&pending->list, &reclaim);
+	}
+	spin_unlock(&fls->fls_pending_lock);
+
+	list_for_each_entry_safe(pending, tmp, &reclaim, list) {
+		list_del_init(&pending->list);
+		ffv2_pending_chunk_abort(pending);
+		ffv2_pending_chunk_free(pending);
+	}
+
+	wait_event(fls->fls_ctx_wq,
+		   list_empty_careful(&fls->fls_pending_list));
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_lseg_reclaim);
 
 void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending)
 {
