@@ -878,6 +878,14 @@ void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending)
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_retain);
 
+void ffv2_pending_chunk_defer(struct ffv2_pending_chunk *pending)
+{
+	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_RETAINED))
+		return;
+	pending->state = FFV2_PENDING_DEFERRED;
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_defer);
+
 void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending)
 {
 	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_RETAINED))
@@ -889,6 +897,7 @@ EXPORT_SYMBOL_GPL(ffv2_pending_chunk_lifecycle_done);
 void ffv2_pending_chunk_abort(struct ffv2_pending_chunk *pending)
 {
 	if (pending->state == FFV2_PENDING_RETAINED ||
+	    pending->state == FFV2_PENDING_DEFERRED ||
 	    pending->state == FFV2_PENDING_COMMITTING) {
 		pending->state = FFV2_PENDING_IMMEDIATE;
 		if (pending->stripe_put)

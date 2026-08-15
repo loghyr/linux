@@ -552,6 +552,7 @@ void ffv2_stripe_write_chain_done(struct ffv2_stripe_write *sw, int status);
 enum ffv2_pending_state {
 	FFV2_PENDING_IMMEDIATE,
 	FFV2_PENDING_RETAINED,
+	FFV2_PENDING_DEFERRED,
 	FFV2_PENDING_LIFECYCLE_DONE,
 	FFV2_PENDING_COMMITTING,
 };
@@ -622,6 +623,7 @@ struct ffv2_pending_chunk {
 
 void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending);
+void ffv2_pending_chunk_defer(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_abort(struct ffv2_pending_chunk *pending);
 bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending);
