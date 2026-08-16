@@ -150,15 +150,25 @@ ffv2_return_range(struct pnfs_layout_hdr *lo,
 	/* The pNFS core invalidates overlapping lsegs and reacquires them. */
 }
 
-/* A stripe header covers all shards, so commit tracking uses one bucket. */
+/* Size commit tracking for the largest shard set in this layout. */
 static void
 ffv2_setup_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
 		   struct pnfs_layout_segment *lseg)
 {
+	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(lseg);
 	struct inode *inode = lseg->pls_layout->plh_inode;
 	struct pnfs_commit_array *array, *new;
+	u32 nbuckets = 1, i;
 
-	new = pnfs_alloc_commit_array(1, nfs_io_gfp_mask());
+	for (i = 0; i < fls->mirror_array_cnt; i++) {
+		struct nfs4_ffv2_mirror *mirror = fls->mirror_array[i];
+		u32 shards = mirror->protection_data +
+				mirror->protection_parity;
+
+		if (shards > nbuckets)
+			nbuckets = shards;
+	}
+	new = pnfs_alloc_commit_array(nbuckets, nfs_io_gfp_mask());
 	if (!new)
 		return;
 	spin_lock(&inode->i_lock);
