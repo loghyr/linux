@@ -22,6 +22,7 @@
 #include <linux/nfs4.h>
 #include <linux/nfs_fs.h>
 #include <linux/nfs_page.h>
+#include <linux/overflow.h>
 #include <linux/random.h>
 #include <linux/sched/mm.h>
 #include <linux/sunrpc/metrics.h>
@@ -162,8 +163,11 @@ ffv2_setup_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
 
 	for (i = 0; i < fls->mirror_array_cnt; i++) {
 		struct nfs4_ffv2_mirror *mirror = fls->mirror_array[i];
-		u32 shards = mirror->protection_data +
-				mirror->protection_parity;
+		u32 shards;
+
+		if (check_add_overflow(mirror->protection_data,
+				       mirror->protection_parity, &shards))
+			return;
 
 		if (shards > nbuckets)
 			nbuckets = shards;
