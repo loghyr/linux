@@ -151,7 +151,37 @@ ffv2_return_range(struct pnfs_layout_hdr *lo,
 	/* The pNFS core invalidates overlapping lsegs and reacquires them. */
 }
 
-/* Size commit tracking for the largest shard set in this layout. */
+/* Size commit tracking for the distinct data servers in this layout. */
+static bool
+ffv2_find_ds_bucket(struct nfs4_ffv2_layout_segment *fls,
+			    u32 mirror_idx, u32 stripe_idx,
+			    const struct nfs4_deviceid *devid, u32 *bucket)
+{
+	u32 m, n, p;
+
+	for (m = 0; m <= mirror_idx; m++) {
+		u32 nstripes = m == mirror_idx ? stripe_idx :
+			fls->mirror_array[m]->stripes_cnt;
+
+		for (n = 0; n < nstripes; n++) {
+			struct nfs4_ffv2_stripe *stripe =
+				&fls->mirror_array[m]->stripes[n];
+
+			for (p = 0; p < stripe->data_servers_cnt; p++) {
+				struct nfs4_ffv2_data_server *candidate =
+					&stripe->data_servers[p];
+
+				if (!memcmp(devid, &candidate->devid,
+					    sizeof(*devid))) {
+					*bucket = candidate->commit_bucket;
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
 static void
 ffv2_setup_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
 		   struct pnfs_layout_segment *lseg)
@@ -159,19 +189,28 @@ ffv2_setup_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
 	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(lseg);
 	struct inode *inode = lseg->pls_layout->plh_inode;
 	struct pnfs_commit_array *array, *new;
-	u32 nbuckets = 1, i;
+	u32 nbuckets = 0, i, j, k;
 
 	for (i = 0; i < fls->mirror_array_cnt; i++) {
 		struct nfs4_ffv2_mirror *mirror = fls->mirror_array[i];
-		u32 shards;
 
-		if (check_add_overflow(mirror->protection_data,
-				       mirror->protection_parity, &shards))
-			return;
+		for (j = 0; j < mirror->stripes_cnt; j++) {
+			struct nfs4_ffv2_stripe *stripe = &mirror->stripes[j];
 
-		if (shards > nbuckets)
-			nbuckets = shards;
+			for (k = 0; k < stripe->data_servers_cnt; k++) {
+				struct nfs4_ffv2_data_server *ds =
+					&stripe->data_servers[k];
+				u32 bucket;
+
+				if (!ffv2_find_ds_bucket(fls, i, j, &ds->devid,
+							 &bucket))
+					bucket = nbuckets++;
+				ds->commit_bucket = bucket;
+			}
+		}
 	}
+	if (!nbuckets)
+		return;
 	new = pnfs_alloc_commit_array(nbuckets, nfs_io_gfp_mask());
 	if (!new)
 		return;

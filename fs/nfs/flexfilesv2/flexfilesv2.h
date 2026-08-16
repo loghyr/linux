@@ -220,6 +220,7 @@ struct nfs4_ffv2_file_info {
  */
 struct nfs4_ffv2_data_server {
 	struct nfs4_deviceid	devid;
+	u32			commit_bucket;
 	u32			efficiency;
 	u32			versions_cnt;
 	struct nfs4_ffv2_file_info *versions;
