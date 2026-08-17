@@ -137,6 +137,18 @@ config PNFS_FLEXFILE_V2_LAYOUT
 	select RAID6_PQ
 	default NFS_V4
 
+config PNFS_FLEXFILE_V2_KUNIT_TEST
+	tristate "KUnit tests for the pNFS FlexFiles v2 layout driver"
+	depends on KUNIT && PNFS_FLEXFILE_V2_LAYOUT
+	default KUNIT_ALL_TESTS
+	help
+	  Enable KUnit coverage for the pNFS FlexFiles v2 lifecycle helpers,
+	  including verifier matching across deferred commit cohorts.  The
+	  tests are linked into the layout-driver module and register when
+	  that module is loaded.
+
+	  If unsure, say N.
+
 config NFS_V4_1_IMPLEMENTATION_ID_DOMAIN
 	string "NFSv4.1 Implementation ID Domain"
 	depends on NFS_V4

@@ -60,6 +60,39 @@ ffv2_pending_drain_identity(const struct ffv2_deferred_drain *drain,
 	return pending->lseg == drain->lseg &&
 		pending->commit_bucket == drain->data->ds_commit_index;
 }
+
+bool ffv2_deferred_finalize_verifier_matches(
+		struct ffv2_pending_chunk * const *pending, unsigned int count,
+		const nfs4_verifier *writeverf)
+{
+	unsigned int i;
+
+	if (!count || !writeverf)
+		return false;
+	for (i = 0; i < count; i++)
+		if (memcmp(writeverf, &pending[i]->writeverf,
+			   sizeof(*writeverf)))
+			return false;
+	return true;
+}
+EXPORT_SYMBOL_GPL(ffv2_deferred_finalize_verifier_matches);
+
+bool ffv2_deferred_commit_verifier_matches(
+		struct ffv2_pending_chunk * const *pending, unsigned int count,
+		const nfs4_verifier *writeverf)
+{
+	unsigned int i;
+
+	if (!count || !writeverf)
+		return false;
+	for (i = 0; i < count; i++)
+		if (memcmp(writeverf, &pending[i]->finalize_writeverf,
+			   sizeof(*writeverf)))
+			return false;
+	return true;
+}
+EXPORT_SYMBOL_GPL(ffv2_deferred_commit_verifier_matches);
+
 /* ------------------------------------------------------------------ */
 /* CHUNK_FINALIZE dispatch                                            */
 /* ------------------------------------------------------------------ */
@@ -1005,17 +1038,20 @@ static void ffv2_deferred_group_commit_done(void *arg, int status,
 	if (!status && !writeverf)
 		status = -EPROTO;
 	if (!status) {
-		for (i = 0; i < group->nowners; i++) {
-			struct ffv2_pending_chunk *pending = group->pending[i];
+		if (!ffv2_deferred_commit_verifier_matches(group->pending,
+							    group->nowners,
+							    writeverf))
+			status = -EPROTO;
+		if (!status) {
+			for (i = 0; i < group->nowners; i++) {
+				struct ffv2_pending_chunk *pending =
+					group->pending[i];
 
-			if (memcmp(writeverf, &pending->finalize_writeverf,
-				   sizeof(*writeverf))) {
-				status = -EPROTO;
-				break;
+				memcpy(&pending->commit_writeverf, writeverf,
+				       sizeof(pending->commit_writeverf));
+				set_bit(FFV2_PENDING_HAVE_COMMIT_VERF,
+					&pending->flags);
 			}
-			memcpy(&pending->commit_writeverf, writeverf,
-			       sizeof(pending->commit_writeverf));
-			set_bit(FFV2_PENDING_HAVE_COMMIT_VERF, &pending->flags);
 		}
 	}
 	ffv2_deferred_group_finish(group, status);
@@ -1035,13 +1071,13 @@ static void ffv2_deferred_group_finalize_done(void *arg, int status,
 		kref_put(&drain->ref, ffv2_deferred_drain_release);
 		return;
 	}
+	if (!ffv2_deferred_finalize_verifier_matches(group->pending,
+							 group->nowners, writeverf)) {
+		ffv2_deferred_group_finish(group, -EPROTO);
+		kref_put(&drain->ref, ffv2_deferred_drain_release);
+		return;
+	}
 	for (i = 0; i < group->nowners; i++) {
-		if (memcmp(writeverf, &group->pending[i]->writeverf,
-			   sizeof(*writeverf))) {
-			ffv2_deferred_group_finish(group, -EPROTO);
-			kref_put(&drain->ref, ffv2_deferred_drain_release);
-			return;
-		}
 		memcpy(&group->pending[i]->finalize_writeverf, writeverf,
 		       sizeof(group->pending[i]->finalize_writeverf));
 		set_bit(FFV2_PENDING_HAVE_FINALIZE_VERF,

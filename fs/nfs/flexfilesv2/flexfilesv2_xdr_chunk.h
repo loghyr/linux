@@ -689,6 +689,12 @@ void ffv2_deferred_drain_put(struct ffv2_deferred_drain *drain);
 void ffv2_deferred_drain_abort(struct ffv2_deferred_drain *drain);
 void ffv2_pending_lseg_reclaim(struct nfs4_ffv2_layout_segment *fls);
 bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending);
+bool ffv2_deferred_finalize_verifier_matches(
+		struct ffv2_pending_chunk * const *pending, unsigned int count,
+		const nfs4_verifier *writeverf);
+bool ffv2_deferred_commit_verifier_matches(
+		struct ffv2_pending_chunk * const *pending, unsigned int count,
+		const nfs4_verifier *writeverf);
 bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw);
 int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 					     struct list_head *dst);
