@@ -21,6 +21,16 @@
 
 struct ffv2_stripe_write;
 
+/* Private stripe state exposed to lifecycle code through a narrow view. */
+struct ffv2_stripe_pending_view {
+	u32			nr_shards;
+	struct list_head	*pending_chunks;
+	spinlock_t		*pending_lock;
+};
+
+void ffv2_stripe_pending_view(struct ffv2_stripe_write *sw,
+				      struct ffv2_stripe_pending_view *view);
+
 /*
  * In-memory form of write_chunk_guard4 (the CAS union on
  * CHUNK_WRITE4args).  When check == true, the encoder emits
@@ -595,16 +605,29 @@ struct ffv2_commit_chunk {
 };
 
 struct ffv2_deferred_drain;
+struct ffv2_deferred_cohort;
 
 struct ffv2_deferred_group {
 	struct list_head		list;
 	struct ffv2_deferred_drain	*drain;
+	struct ffv2_deferred_cohort	*cohort;
 	struct ffv2_pending_chunk	*pending[FFV2_MAX_CHUNKS_PER_OP];
 	struct chunk_owner4		owners[FFV2_MAX_CHUNKS_PER_OP];
 	u64				offset;
 	u32				count;
 	u32				nowners;
 	bool				finished;
+};
+
+struct ffv2_deferred_cohort {
+	struct list_head		list;
+	struct ffv2_stripe_write	*sw;
+	/* Keeps the stripe list alive while terminal drain frees its entries. */
+	refcount_t		*stripe_ref;
+	void			(*stripe_put)(void *owner);
+	void			*stripe_owner;
+	bool				complete;
+	bool				claimed;
 };
 
 /*
@@ -617,10 +640,13 @@ struct ffv2_deferred_drain {
 	struct nfs_commit_data		*data;
 	struct nfs_mds_commit_info	*mds_cinfo;
 	struct pnfs_layout_segment	*lseg;
+	struct list_head		cohorts;
 	struct list_head		groups;
 	struct list_head		retry_pages;
 	atomic_t			pending_ops;
+	atomic_t			finished;
 	int				status;
+	bool				launch_done;
 };
 
 struct ffv2_pending_chunk {
@@ -656,6 +682,11 @@ void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_defer(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending);
 void ffv2_pending_chunk_abort(struct ffv2_pending_chunk *pending);
+int ffv2_deferred_drain_claim(struct ffv2_deferred_drain *drain,
+				       struct nfs_commit_info *cinfo);
+int ffv2_deferred_drain_start(struct ffv2_deferred_drain *drain, int how);
+void ffv2_deferred_drain_put(struct ffv2_deferred_drain *drain);
+void ffv2_deferred_drain_abort(struct ffv2_deferred_drain *drain);
 void ffv2_pending_lseg_reclaim(struct nfs4_ffv2_layout_segment *fls);
 bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending);
 bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw);

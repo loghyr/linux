@@ -48,7 +48,18 @@ static void
 ffv2_chunk_wb_commit_done(void *arg, int status,
 			  const nfs4_verifier *wv);
 static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status);
+static void ffv2_deferred_drain_clear_groups(
+		struct ffv2_deferred_drain *drain);
 
+static bool
+ffv2_pending_drain_identity(const struct ffv2_deferred_drain *drain,
+			    const struct ffv2_pending_chunk *pending)
+{
+	if (!drain || !drain->data || !pending)
+		return false;
+	return pending->lseg == drain->lseg &&
+		pending->commit_bucket == drain->data->ds_commit_index;
+}
 /* ------------------------------------------------------------------ */
 /* CHUNK_FINALIZE dispatch                                            */
 /* ------------------------------------------------------------------ */
@@ -832,6 +843,261 @@ ffv2_chunk_rollback_dispatch_one_mirror(struct ffv2_chunk_lifecycle_ctx *ctx,
 	return 0;
 }
 
+static void ffv2_deferred_drain_release(struct kref *ref)
+{
+	struct ffv2_deferred_drain *drain =
+		container_of(ref, struct ffv2_deferred_drain, ref);
+
+	kfree(drain);
+}
+
+void ffv2_deferred_drain_put(struct ffv2_deferred_drain *drain)
+{
+	kref_put(&drain->ref, ffv2_deferred_drain_release);
+}
+
+static void ffv2_deferred_pending_drop_requests(
+		struct ffv2_pending_chunk *pending)
+{
+	struct ffv2_pending_req *request, *tmp;
+
+	list_for_each_entry_safe(request, tmp, &pending->requests, list) {
+		list_del(&request->list);
+		put_nfs_open_context(request->context);
+		kfree(request);
+	}
+}
+
+static void
+ffv2_deferred_cohort_release(struct ffv2_deferred_cohort *cohort)
+{
+	if (!cohort->stripe_ref || !cohort->stripe_put)
+		return;
+	cohort->stripe_put(cohort->stripe_owner);
+	cohort->stripe_ref = NULL;
+	cohort->stripe_put = NULL;
+	cohort->stripe_owner = NULL;
+}
+
+static void ffv2_deferred_pending_finish(struct ffv2_pending_chunk *pending,
+					 int status)
+{
+	struct ffv2_stripe_pending_view view;
+
+	ffv2_stripe_pending_view(pending->sw, &view);
+	spin_lock(view.pending_lock);
+	ffv2_deferred_pending_drop_requests(pending);
+	if (!status)
+		pending->state = FFV2_PENDING_LIFECYCLE_DONE;
+	spin_unlock(view.pending_lock);
+	if (status)
+		ffv2_pending_chunk_abort(pending);
+	ffv2_pending_chunk_free(pending);
+}
+
+static void ffv2_deferred_drain_release_pages(
+		struct ffv2_deferred_drain *drain)
+{
+	struct ffv2_deferred_cohort *cohort;
+	struct nfs_page *req;
+	struct nfs_direct_req *dreq = drain->data->dreq;
+	int status = drain->status;
+
+	list_for_each_entry(cohort, &drain->cohorts, list) {
+		struct ffv2_stripe_pending_view view;
+		struct ffv2_pending_chunk *pending;
+
+		ffv2_stripe_pending_view(cohort->sw, &view);
+		spin_lock(view.pending_lock);
+		list_for_each_entry(pending, view.pending_chunks, stripe_list)
+			ffv2_deferred_pending_drop_requests(pending);
+		spin_unlock(view.pending_lock);
+	}
+
+	list_for_each_entry(cohort, &drain->cohorts, list) {
+		struct ffv2_stripe_pending_view view;
+		struct ffv2_pending_chunk *pending, *tmp;
+
+		ffv2_stripe_pending_view(cohort->sw, &view);
+		list_for_each_entry_safe(pending, tmp, view.pending_chunks,
+					 stripe_list)
+			ffv2_deferred_pending_finish(pending, status);
+		ffv2_deferred_cohort_release(cohort);
+	}
+
+	if (dreq) {
+		if (!status) {
+			while (!list_empty(&drain->data->pages)) {
+				req = nfs_list_entry(drain->data->pages.next);
+				nfs_list_remove_request(req);
+				nfs_release_request(req);
+				nfs_unlock_and_release_request(req);
+			}
+		}
+		drain->data->task.tk_status = status;
+		nfs_direct_commit_complete(drain->data);
+		return;
+	}
+
+	while (!list_empty(&drain->data->pages)) {
+		req = nfs_list_entry(drain->data->pages.next);
+		nfs_list_remove_request(req);
+		nfs_folio_clear_commit(req);
+		if (status) {
+			nfs_mark_request_dirty(req);
+			set_bit(NFS_CONTEXT_WRITE_SYNC,
+				&req->wb_lock_context->open_context->flags);
+			atomic_long_inc(&NFS_I(drain->data->inode)->redirtied_pages);
+		}
+		nfs_inode_remove_request(req);
+		nfs_unlock_and_release_request(req);
+	}
+}
+
+static void ffv2_deferred_drain_finish(struct ffv2_deferred_drain *drain)
+{
+	if (atomic_cmpxchg(&drain->finished, 0, 1))
+		return;
+	if (drain->status)
+		pnfs_error_mark_layout_for_return(drain->data->inode,
+						  drain->data->lseg);
+	ffv2_deferred_drain_release_pages(drain);
+	if (!drain->data->dreq)
+		nfs_commit_end(drain->mds_cinfo);
+	if (drain->data->lseg) {
+		pnfs_put_lseg(drain->data->lseg);
+		drain->data->lseg = NULL;
+	}
+	nfs_commitdata_release(drain->data);
+	drain->data = NULL;
+	ffv2_deferred_drain_clear_groups(drain);
+}
+
+static void ffv2_deferred_group_finish(struct ffv2_deferred_group *group,
+					       int status)
+{
+	struct ffv2_deferred_drain *drain = group->drain;
+
+	if (group->finished)
+		return;
+	group->finished = true;
+	if (status)
+		cmpxchg(&drain->status, 0, status);
+	if (atomic_dec_and_test(&drain->pending_ops) && drain->launch_done)
+		ffv2_deferred_drain_finish(drain);
+}
+
+static void ffv2_deferred_group_commit_done(void *arg, int status,
+					     const nfs4_verifier *writeverf)
+{
+	struct ffv2_deferred_group *group = arg;
+	struct ffv2_deferred_drain *drain = group->drain;
+	unsigned int i;
+
+	if (!status && !writeverf)
+		status = -EPROTO;
+	if (!status) {
+		for (i = 0; i < group->nowners; i++) {
+			struct ffv2_pending_chunk *pending = group->pending[i];
+
+			if (memcmp(writeverf, &pending->finalize_writeverf,
+				   sizeof(*writeverf))) {
+				status = -EPROTO;
+				break;
+			}
+			memcpy(&pending->commit_writeverf, writeverf,
+			       sizeof(pending->commit_writeverf));
+			set_bit(FFV2_PENDING_HAVE_COMMIT_VERF, &pending->flags);
+		}
+	}
+	ffv2_deferred_group_finish(group, status);
+	kref_put(&drain->ref, ffv2_deferred_drain_release);
+}
+
+static void ffv2_deferred_group_finalize_done(void *arg, int status,
+						const nfs4_verifier *writeverf)
+{
+	struct ffv2_deferred_group *group = arg;
+	struct ffv2_deferred_drain *drain = group->drain;
+	struct ffv2_chunk_lifecycle_ctx ctx;
+	unsigned int i;
+
+	if (status || !writeverf) {
+		ffv2_deferred_group_finish(group, status ?: -EPROTO);
+		kref_put(&drain->ref, ffv2_deferred_drain_release);
+		return;
+	}
+	for (i = 0; i < group->nowners; i++) {
+		if (memcmp(writeverf, &group->pending[i]->writeverf,
+			   sizeof(*writeverf))) {
+			ffv2_deferred_group_finish(group, -EPROTO);
+			kref_put(&drain->ref, ffv2_deferred_drain_release);
+			return;
+		}
+		memcpy(&group->pending[i]->finalize_writeverf, writeverf,
+		       sizeof(group->pending[i]->finalize_writeverf));
+		set_bit(FFV2_PENDING_HAVE_FINALIZE_VERF,
+			&group->pending[i]->flags);
+	}
+	ctx.ds_clp = group->pending[0]->ds_clp;
+	ctx.lseg = group->pending[0]->lseg;
+	ctx.complete_arg = group;
+	ctx.complete = ffv2_deferred_group_commit_done;
+	status = ffv2_chunk_commit_dispatch_one_mirror(&ctx,
+			group->pending[0]->cred, &group->pending[0]->fh,
+			&group->pending[0]->stateid, group->offset, group->count,
+			group->owners, group->nowners);
+	if (status)
+		ffv2_deferred_group_commit_done(group, status, NULL);
+}
+
+/*
+ * Launch the deferred drain.  A successful call consumes the caller's
+ * drain reference; synchronous dispatch failures are folded into group
+ * completion.  A nonzero return is pre-launch: the caller still owns
+ * drain->data and the drain reference and must release both.
+ */
+int ffv2_deferred_drain_start(struct ffv2_deferred_drain *drain, int how)
+{
+	struct ffv2_deferred_group *group;
+	unsigned int count = 0;
+
+	(void)how;
+
+	list_for_each_entry(group, &drain->groups, list)
+		count++;
+	if (WARN_ON_ONCE(!count)) {
+		ffv2_deferred_drain_abort(drain);
+		return -EAGAIN;
+	}
+	atomic_set(&drain->pending_ops, count);
+	list_for_each_entry(group, &drain->groups, list) {
+		struct ffv2_chunk_lifecycle_ctx ctx = {
+			.ds_clp = group->pending[0]->ds_clp,
+			.lseg = group->pending[0]->lseg,
+			.complete_arg = group,
+			.complete = ffv2_deferred_group_finalize_done,
+		};
+		int ret;
+
+		kref_get(&drain->ref);
+		ret = ffv2_chunk_finalize_dispatch_one_mirror(&ctx,
+				group->pending[0]->cred, &group->pending[0]->fh,
+				&group->pending[0]->stateid, group->offset,
+				group->count, group->owners, group->nowners);
+		if (ret) {
+			ffv2_deferred_group_finish(group, ret);
+			kref_put(&drain->ref, ffv2_deferred_drain_release);
+		}
+	}
+	WRITE_ONCE(drain->launch_done, true);
+	if (!atomic_read(&drain->pending_ops))
+		ffv2_deferred_drain_finish(drain);
+	kref_put(&drain->ref, ffv2_deferred_drain_release);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ffv2_deferred_drain_start);
+
 /* ------------------------------------------------------------------ */
 /* Writeback chain: FINALIZE -> COMMIT after CHUNK_WRITE              */
 /* ------------------------------------------------------------------ */
@@ -840,9 +1106,15 @@ void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending)
 {
 	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(pending->lseg);
 	struct ffv2_pending_req *p, *tmp;
+	bool release_stripe;
 
-	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
-		return;
+	spin_lock(pending->stripe_lock);
+	if (WARN_ON_ONCE(READ_ONCE(pending->state) == FFV2_PENDING_RETAINED))
+		goto out_unlock;
+	release_stripe = pending->state != FFV2_PENDING_IMMEDIATE &&
+		pending->stripe_put;
+	spin_unlock(pending->stripe_lock);
+
 	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
 		list_del(&p->list);
 		put_nfs_open_context(p->context);
@@ -862,9 +1134,13 @@ void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending)
 	put_cred(pending->cred);
 	nfs_put_client(pending->ds_clp);
 	pnfs_put_lseg(pending->lseg);
-	if (pending->state != FFV2_PENDING_IMMEDIATE && pending->stripe_put)
+	if (release_stripe)
 		pending->stripe_put(pending->stripe_owner);
 	kfree(pending);
+	return;
+
+out_unlock:
+	spin_unlock(pending->stripe_lock);
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_free);
 
@@ -875,7 +1151,12 @@ void ffv2_pending_lseg_reclaim(struct nfs4_ffv2_layout_segment *fls)
 
 	spin_lock(&fls->fls_pending_lock);
 	list_for_each_entry_safe(pending, tmp, &fls->fls_pending_list, list) {
-		if (pending->state == FFV2_PENDING_COMMITTING)
+		bool committing;
+
+		spin_lock(pending->stripe_lock);
+		committing = pending->state == FFV2_PENDING_COMMITTING;
+		spin_unlock(pending->stripe_lock);
+		if (committing)
 			continue;
 		list_del_init(&pending->list);
 		clear_bit(FFV2_PENDING_QUEUED, &pending->flags);
@@ -896,40 +1177,62 @@ EXPORT_SYMBOL_GPL(ffv2_pending_lseg_reclaim);
 
 void ffv2_pending_chunk_retain(struct ffv2_pending_chunk *pending)
 {
+	if (WARN_ON_ONCE(!pending->stripe_lock))
+		return;
+	spin_lock(pending->stripe_lock);
 	if (WARN_ON_ONCE(!pending->stripe_ref))
-		return;
+		goto out_unlock;
 	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_IMMEDIATE))
-		return;
+		goto out_unlock;
 	refcount_inc(pending->stripe_ref);
 	pending->state = FFV2_PENDING_RETAINED;
+out_unlock:
+	spin_unlock(pending->stripe_lock);
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_retain);
 
 void ffv2_pending_chunk_defer(struct ffv2_pending_chunk *pending)
 {
-	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_RETAINED))
+	if (WARN_ON_ONCE(!pending->stripe_lock))
 		return;
+	spin_lock(pending->stripe_lock);
+	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_RETAINED))
+		goto out_unlock;
 	pending->state = FFV2_PENDING_DEFERRED;
+out_unlock:
+	spin_unlock(pending->stripe_lock);
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_defer);
 
 void ffv2_pending_chunk_lifecycle_done(struct ffv2_pending_chunk *pending)
 {
-	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_RETAINED))
+	if (WARN_ON_ONCE(!pending->stripe_lock))
 		return;
+	spin_lock(pending->stripe_lock);
+	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_RETAINED))
+		goto out_unlock;
 	pending->state = FFV2_PENDING_LIFECYCLE_DONE;
+out_unlock:
+	spin_unlock(pending->stripe_lock);
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_lifecycle_done);
 
 void ffv2_pending_chunk_abort(struct ffv2_pending_chunk *pending)
 {
+	bool release_stripe = false;
+
+	if (WARN_ON_ONCE(!pending->stripe_lock))
+		return;
+	spin_lock(pending->stripe_lock);
 	if (pending->state == FFV2_PENDING_RETAINED ||
 	    pending->state == FFV2_PENDING_DEFERRED ||
 	    pending->state == FFV2_PENDING_COMMITTING) {
 		pending->state = FFV2_PENDING_IMMEDIATE;
-		if (pending->stripe_put)
-			pending->stripe_put(pending->stripe_owner);
+		release_stripe = true;
 	}
+	spin_unlock(pending->stripe_lock);
+	if (release_stripe && pending->stripe_put)
+		pending->stripe_put(pending->stripe_owner);
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_abort);
 
@@ -943,12 +1246,376 @@ bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending)
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_verifiers_complete);
 
+/* Caller holds fls_pending_lock.  A request must have one owner. */
+static unsigned int
+ffv2_pending_request_lookup_locked(struct nfs4_ffv2_layout_segment *fls,
+					   struct nfs_page *req,
+					   struct ffv2_pending_chunk **found)
+{
+	struct ffv2_pending_chunk *pending;
+	struct ffv2_pending_req *p;
+	unsigned int count = 0;
+
+	list_for_each_entry(pending, &fls->fls_pending_list, list) {
+		if (pending->shard_idx != 0)
+			continue;
+		list_for_each_entry(p, &pending->requests, list) {
+			if (p->req != req)
+				continue;
+			if (!count)
+				*found = pending;
+			count++;
+		}
+	}
+	return count;
+}
+
+static struct ffv2_deferred_cohort *
+ffv2_deferred_cohort_find(struct ffv2_deferred_drain *drain,
+				   struct ffv2_stripe_write *sw)
+{
+	struct ffv2_deferred_cohort *cohort;
+
+	list_for_each_entry(cohort, &drain->cohorts, list)
+		if (cohort->sw == sw)
+			return cohort;
+	return NULL;
+}
+
+static bool
+ffv2_deferred_group_matches(const struct ffv2_deferred_group *group,
+				    const struct ffv2_pending_chunk *pending)
+{
+	const struct ffv2_pending_chunk *first;
+
+	if (!group->nowners)
+		return false;
+	first = group->pending[0];
+	return first->ds_clp == pending->ds_clp &&
+		!memcmp(&first->fh, &pending->fh, sizeof(first->fh)) &&
+		!memcmp(&first->stateid, &pending->stateid,
+			 sizeof(first->stateid));
+}
+
+static int
+ffv2_deferred_group_add(struct ffv2_deferred_drain *drain,
+				struct ffv2_deferred_cohort *cohort,
+				struct ffv2_pending_chunk *pending)
+{
+	struct ffv2_deferred_group *group;
+	u64 end, old_end, new_start, new_end;
+
+	list_for_each_entry(group, &drain->groups, list) {
+		if (group->cohort != cohort ||
+		    !ffv2_deferred_group_matches(group, pending))
+			continue;
+		if (group->nowners == FFV2_MAX_CHUNKS_PER_OP)
+			return -E2BIG;
+		if (check_add_overflow(pending->offset,
+				       (u64)pending->count, &end))
+			return -EOVERFLOW;
+		if (check_add_overflow(group->offset,
+				       (u64)group->count, &old_end))
+			return -EOVERFLOW;
+		new_start = min(group->offset, pending->offset);
+		new_end = max(old_end, end);
+		if (new_end <= new_start || new_end - new_start > U32_MAX)
+			return -E2BIG;
+		group->offset = new_start;
+		group->count = new_end - new_start;
+		group->pending[group->nowners] = pending;
+		group->owners[group->nowners] = pending->owner;
+		group->nowners++;
+		return 0;
+	}
+
+	group = kzalloc_obj(*group, GFP_ATOMIC);
+	if (!group)
+		return -ENOMEM;
+	group->drain = drain;
+	group->cohort = cohort;
+	if (check_add_overflow(pending->offset, (u64)pending->count, &end) ||
+	    !pending->count || end - pending->offset > U32_MAX) {
+		kfree(group);
+		return -EOVERFLOW;
+	}
+	group->offset = pending->offset;
+	group->count = pending->count;
+	group->pending[0] = pending;
+	group->owners[0] = pending->owner;
+	group->nowners = 1;
+	list_add_tail(&group->list, &drain->groups);
+	return 0;
+}
+
+static void
+ffv2_deferred_drain_clear_groups(struct ffv2_deferred_drain *drain)
+{
+	struct ffv2_deferred_group *group, *group_tmp;
+	struct ffv2_deferred_cohort *cohort, *cohort_tmp;
+
+	list_for_each_entry_safe(group, group_tmp, &drain->groups, list) {
+		list_del(&group->list);
+		kfree(group);
+	}
+	list_for_each_entry_safe(cohort, cohort_tmp, &drain->cohorts, list) {
+		list_del(&cohort->list);
+		ffv2_deferred_cohort_release(cohort);
+		kfree(cohort);
+	}
+}
+
+static void
+ffv2_deferred_drain_remove_cohort(struct ffv2_deferred_drain *drain,
+					struct ffv2_deferred_cohort *cohort)
+{
+	struct ffv2_deferred_group *group, *group_tmp;
+
+	list_for_each_entry_safe(group, group_tmp, &drain->groups, list) {
+		if (group->cohort != cohort)
+			continue;
+		list_del(&group->list);
+		kfree(group);
+	}
+	list_del(&cohort->list);
+	ffv2_deferred_cohort_release(cohort);
+	kfree(cohort);
+}
+
+static void
+ffv2_deferred_drain_restore_pages(struct ffv2_deferred_drain *drain)
+{
+	list_splice_tail_init(&drain->retry_pages, &drain->data->pages);
+}
+
+static void
+ffv2_deferred_drain_unclaim_locked(struct ffv2_deferred_drain *drain,
+				   struct nfs4_ffv2_layout_segment *fls)
+{
+	struct ffv2_deferred_cohort *cohort;
+
+	lockdep_assert_held(&fls->fls_pending_lock);
+	list_for_each_entry(cohort, &drain->cohorts, list) {
+		struct ffv2_stripe_pending_view view;
+		struct ffv2_pending_chunk *pending;
+
+		if (!cohort->claimed)
+			continue;
+		ffv2_stripe_pending_view(cohort->sw, &view);
+		spin_lock(view.pending_lock);
+		list_for_each_entry(pending, view.pending_chunks, stripe_list)
+			if (pending->state == FFV2_PENDING_COMMITTING &&
+			    ffv2_pending_drain_identity(drain, pending))
+				pending->state = FFV2_PENDING_DEFERRED;
+		spin_unlock(view.pending_lock);
+	}
+}
+
+static void ffv2_deferred_drain_unclaim(struct ffv2_deferred_drain *drain)
+{
+	struct nfs4_ffv2_layout_segment *fls;
+
+	if (list_empty(&drain->cohorts))
+		return;
+	if (WARN_ON_ONCE(!drain->lseg))
+		return;
+	fls = FFV2_LSEG(drain->lseg);
+	lockdep_assert_not_held(&fls->fls_pending_lock);
+	spin_lock(&fls->fls_pending_lock);
+	ffv2_deferred_drain_unclaim_locked(drain, fls);
+	spin_unlock(&fls->fls_pending_lock);
+}
+
+void ffv2_deferred_drain_abort(struct ffv2_deferred_drain *drain)
+{
+	if (!drain || !drain->data)
+		return;
+	if (WARN_ON_ONCE(drain->launch_done))
+		return;
+	ffv2_deferred_drain_unclaim(drain);
+	ffv2_deferred_drain_restore_pages(drain);
+	ffv2_deferred_drain_clear_groups(drain);
+}
+EXPORT_SYMBOL_GPL(ffv2_deferred_drain_abort);
+
+static int
+ffv2_deferred_cohort_validate(struct ffv2_deferred_drain *drain,
+				       struct ffv2_deferred_cohort *cohort,
+				       struct nfs4_ffv2_layout_segment *fls)
+{
+	struct ffv2_pending_chunk *pending, *shard_zero = NULL;
+	struct ffv2_stripe_pending_view view;
+	unsigned int shards = 0, expected = 0, actual = 0;
+	struct ffv2_pending_req *request;
+	struct nfs_page *req;
+	u32 seen = 0;
+
+	ffv2_stripe_pending_view(cohort->sw, &view);
+	spin_lock(view.pending_lock);
+	if (view.nr_shards > FFV2_MAX_CHUNKS_PER_OP) {
+		spin_unlock(view.pending_lock);
+		return -E2BIG;
+	}
+	list_for_each_entry(pending, view.pending_chunks, stripe_list) {
+		if (pending->lseg != drain->lseg ||
+		    pending->state != FFV2_PENDING_DEFERRED) {
+			spin_unlock(view.pending_lock);
+			return -EAGAIN;
+		}
+		if (pending->shard_idx >= view.nr_shards ||
+		    seen & BIT(pending->shard_idx)) {
+			spin_unlock(view.pending_lock);
+			return -EPROTO;
+		}
+		seen |= BIT(pending->shard_idx);
+		if (pending->shard_idx == 0)
+			shard_zero = pending;
+		shards++;
+	}
+	if (!shard_zero || shards != view.nr_shards) {
+		spin_unlock(view.pending_lock);
+		return -EAGAIN;
+	}
+
+	list_for_each_entry(request, &shard_zero->requests, list)
+		expected++;
+	spin_unlock(view.pending_lock);
+	list_for_each_entry(req, &drain->data->pages, wb_list) {
+		struct ffv2_pending_chunk *owner = NULL;
+
+		if (ffv2_pending_request_lookup_locked(fls, req, &owner) != 1)
+			return -EPROTO;
+		if (owner->sw == cohort->sw)
+			actual++;
+	}
+	if (expected != actual)
+		return -EAGAIN;
+	return 0;
+}
+
+/*
+ * Claim complete deferred cohorts from the list already detached by the
+ * generic pNFS commit code.  The caller holds commit_mutex; this helper takes
+ * the lseg and stripe locks only while matching and changing pending state.
+ * Retry pages remain detached so the caller can drop commit_mutex before
+ * nfs_retry_commit() re-enters the mark hook.
+ */
+int ffv2_deferred_drain_claim(struct ffv2_deferred_drain *drain,
+				       struct nfs_commit_info *cinfo)
+{
+	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(drain->lseg);
+	struct ffv2_deferred_cohort *cohort, *cohort_tmp;
+	struct nfs_page *req, *req_tmp;
+	int ret = 0;
+
+	lockdep_assert_held(&NFS_I(cinfo->inode)->commit_mutex);
+	INIT_LIST_HEAD(&drain->cohorts);
+	INIT_LIST_HEAD(&drain->groups);
+	INIT_LIST_HEAD(&drain->retry_pages);
+	spin_lock(&fls->fls_pending_lock);
+	list_for_each_entry(req, &drain->data->pages, wb_list) {
+		struct ffv2_pending_chunk *pending = NULL;
+		struct ffv2_deferred_cohort *new_cohort;
+
+		if (ffv2_pending_request_lookup_locked(fls, req, &pending) != 1 ||
+		    pending->lseg != drain->lseg ||
+		    pending->commit_bucket != drain->data->ds_commit_index ||
+		    pending->state != FFV2_PENDING_DEFERRED) {
+			ret = -EPROTO;
+			goto out_unlock;
+		}
+		new_cohort = ffv2_deferred_cohort_find(drain, pending->sw);
+		if (new_cohort)
+			continue;
+		new_cohort = kzalloc_obj(*new_cohort, GFP_ATOMIC);
+		if (!new_cohort) {
+			ret = -ENOMEM;
+			goto out_unlock;
+		}
+		new_cohort->sw = pending->sw;
+		if (WARN_ON_ONCE(!pending->stripe_ref || !pending->stripe_put)) {
+			kfree(new_cohort);
+			ret = -EPROTO;
+			goto out_unlock;
+		}
+		refcount_inc(pending->stripe_ref);
+		new_cohort->stripe_ref = pending->stripe_ref;
+		new_cohort->stripe_put = pending->stripe_put;
+		new_cohort->stripe_owner = pending->stripe_owner;
+		list_add_tail(&new_cohort->list, &drain->cohorts);
+		{
+			struct ffv2_stripe_pending_view view;
+
+			ffv2_stripe_pending_view(pending->sw, &view);
+			spin_lock(view.pending_lock);
+			list_for_each_entry(pending, view.pending_chunks,
+					stripe_list) {
+				ret = ffv2_deferred_group_add(drain, new_cohort,
+							      pending);
+				if (ret)
+					break;
+			}
+			spin_unlock(view.pending_lock);
+		}
+		if (ret)
+			goto out_unlock;
+	}
+
+	list_for_each_entry_safe(cohort, cohort_tmp, &drain->cohorts, list) {
+		ret = ffv2_deferred_cohort_validate(drain, cohort, fls);
+		if (!ret) {
+			cohort->complete = true;
+			continue;
+		}
+		if (ret != -EAGAIN)
+			goto out_unlock;
+		list_for_each_entry_safe(req, req_tmp, &drain->data->pages,
+					 wb_list) {
+			struct ffv2_pending_chunk *pending = NULL;
+
+			if (ffv2_pending_request_lookup_locked(fls, req,
+							&pending) == 1 &&
+				pending->sw == cohort->sw)
+				list_move_tail(&req->wb_list, &drain->retry_pages);
+		}
+		ffv2_deferred_drain_remove_cohort(drain, cohort);
+		ret = 0;
+	}
+
+	list_for_each_entry(cohort, &drain->cohorts, list) {
+		struct ffv2_pending_chunk *pending;
+		struct ffv2_stripe_pending_view view;
+
+		if (!cohort->complete)
+			continue;
+		ffv2_stripe_pending_view(cohort->sw, &view);
+		spin_lock(view.pending_lock);
+		list_for_each_entry(pending, view.pending_chunks,
+					stripe_list)
+			pending->state = FFV2_PENDING_COMMITTING;
+		spin_unlock(view.pending_lock);
+		cohort->claimed = true;
+	}
+	if (list_empty(&drain->groups))
+		ret = -EAGAIN;
+out_unlock:
+	if (ret)
+		ffv2_deferred_drain_unclaim_locked(drain, fls);
+	spin_unlock(&fls->fls_pending_lock);
+	if (ret) {
+		ffv2_deferred_drain_restore_pages(drain);
+		ffv2_deferred_drain_clear_groups(drain);
+	}
+	return ret;
+}
+EXPORT_SYMBOL_GPL(ffv2_deferred_drain_claim);
+
 int ffv2_pending_chunk_lock_requests(struct ffv2_pending_chunk *pending)
 {
 	struct ffv2_pending_req *p, *tmp;
 	int count = 0;
 
-	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
+	if (WARN_ON_ONCE(READ_ONCE(pending->state) == FFV2_PENDING_RETAINED))
 		return -EBUSY;
 	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
 		if (!nfs_lock_request(p->req))
@@ -974,7 +1641,7 @@ int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 	struct ffv2_pending_req *p, *tmp;
 	int count = 0;
 
-	if (WARN_ON_ONCE(pending->state == FFV2_PENDING_RETAINED))
+	if (WARN_ON_ONCE(READ_ONCE(pending->state) == FFV2_PENDING_RETAINED))
 		return -EBUSY;
 	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
 		/* The aggregate preflight locks every request before this pass. */
@@ -1016,8 +1683,9 @@ struct nfs_commit_data *ffv2_pending_commitdata_alloc(
 	struct ffv2_pending_req *first;
 	struct nfs_commit_data *data;
 
-	if (WARN_ON_ONCE(pending->state != FFV2_PENDING_LIFECYCLE_DONE &&
-			pending->state != FFV2_PENDING_COMMITTING))
+	if (WARN_ON_ONCE(READ_ONCE(pending->state) !=
+			 FFV2_PENDING_LIFECYCLE_DONE &&
+			 READ_ONCE(pending->state) != FFV2_PENDING_COMMITTING))
 		return NULL;
 	first = list_first_entry_or_null(&pending->requests,
 					struct ffv2_pending_req, list);
@@ -1076,9 +1744,12 @@ static void ffv2_commit_aggregate_rollback(struct ffv2_commit_aggregate *agg)
 {
 	struct ffv2_commit_chunk *chunk;
 
-	list_for_each_entry(chunk, &agg->chunks, list)
+	list_for_each_entry(chunk, &agg->chunks, list) {
+		spin_lock(chunk->pending->stripe_lock);
 		if (chunk->pending->state == FFV2_PENDING_COMMITTING)
 			chunk->pending->state = FFV2_PENDING_LIFECYCLE_DONE;
+		spin_unlock(chunk->pending->stripe_lock);
+	}
 }
 
 static void ffv2_commit_aggregate_retry(struct ffv2_commit_aggregate *agg,
@@ -1202,8 +1873,13 @@ void ffv2_commit_aggregate_free(struct ffv2_commit_aggregate *agg)
 		return;
 
 	list_for_each_entry_safe(chunk, tmp, &agg->chunks, list) {
+		bool committing;
+
 		list_del(&chunk->list);
-		if (chunk->pending->state == FFV2_PENDING_COMMITTING) {
+		spin_lock(chunk->pending->stripe_lock);
+		committing = chunk->pending->state == FFV2_PENDING_COMMITTING;
+		spin_unlock(chunk->pending->stripe_lock);
+		if (committing) {
 			ffv2_pending_chunk_abort(chunk->pending);
 			ffv2_pending_chunk_free(chunk->pending);
 		}
@@ -1270,13 +1946,18 @@ EXPORT_SYMBOL_GPL(ffv2_commit_release_pages);
  */
 static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status)
 {
-	if (status == 0 && wb->pending->state == FFV2_PENDING_RETAINED) {
+	bool retained;
+
+	spin_lock(wb->pending->stripe_lock);
+	retained = wb->pending->state == FFV2_PENDING_RETAINED;
+	spin_unlock(wb->pending->stripe_lock);
+	if (status == 0 && retained) {
 		ffv2_pending_chunk_lifecycle_done(wb->pending);
 		ffv2_stripe_write_chain_done(wb->sw, status);
 		kfree(wb);
 		return;
 	}
-	if (status && wb->pending->state == FFV2_PENDING_RETAINED)
+	if (status && retained)
 		ffv2_pending_chunk_abort(wb->pending);
 	ffv2_pending_chunk_free(wb->pending);
 	ffv2_stripe_write_chain_done(wb->sw, status);

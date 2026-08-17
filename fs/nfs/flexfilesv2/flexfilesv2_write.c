@@ -212,6 +212,15 @@ struct ffv2_stripe_write {
 	struct ffv2_chunk_write_dispatch disp[];
 };
 
+void ffv2_stripe_pending_view(struct ffv2_stripe_write *sw,
+				      struct ffv2_stripe_pending_view *view)
+{
+	view->nr_shards = sw->nr_shards;
+	view->pending_chunks = &sw->pending_chunks;
+	view->pending_lock = &sw->pending_lock;
+}
+EXPORT_SYMBOL_GPL(ffv2_stripe_pending_view);
+
 static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw);
 static void ffv2_stripe_write_put(struct ffv2_stripe_write *sw);
 
@@ -220,11 +229,12 @@ static void ffv2_pending_stripe_put(void *owner)
 	ffv2_stripe_write_put(owner);
 }
 
-bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw)
+static bool ffv2_stripe_verifiers_complete_locked(struct ffv2_stripe_write *sw)
 {
 	struct ffv2_pending_chunk *pending;
 	u32 count = 0;
 
+	lockdep_assert_held(&sw->pending_lock);
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
 		if (pending->state != FFV2_PENDING_LIFECYCLE_DONE ||
 		    (pending->shard_idx == 0 && list_empty(&pending->requests)) ||
@@ -233,6 +243,16 @@ bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw)
 		count++;
 	}
 	return count == sw->nr_shards;
+}
+
+bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw)
+{
+	bool complete;
+
+	spin_lock(&sw->pending_lock);
+	complete = ffv2_stripe_verifiers_complete_locked(sw);
+	spin_unlock(&sw->pending_lock);
+	return complete;
 }
 EXPORT_SYMBOL_GPL(ffv2_stripe_verifiers_complete);
 
@@ -261,7 +281,7 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 	}
 	spin_lock(&sw->pending_lock);
 	if (atomic_read(&sw->chains_pending) != 0 || sw->status ||
-	    !ffv2_stripe_verifiers_complete(sw))
+	    !ffv2_stripe_verifiers_complete_locked(sw))
 		goto fail_unlock;
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
 		pending->state = FFV2_PENDING_COMMITTING;
@@ -339,8 +359,14 @@ struct nfs_commit_data *ffv2_commit_lseg_pending(
 		return NULL;
 	spin_lock(&FFV2_LSEG(lseg)->fls_pending_lock);
 	list_for_each_entry(pending, &FFV2_LSEG(lseg)->fls_pending_list, list) {
-		if (pending->inode == lseg->pls_layout->plh_inode &&
-		    pending->state == FFV2_PENDING_LIFECYCLE_DONE) {
+		bool lifecycle_done;
+
+		if (pending->inode != lseg->pls_layout->plh_inode)
+			continue;
+		spin_lock(pending->stripe_lock);
+		lifecycle_done = pending->state == FFV2_PENDING_LIFECYCLE_DONE;
+		spin_unlock(pending->stripe_lock);
+		if (lifecycle_done) {
 			candidate = pending;
 			break;
 		}
@@ -374,7 +400,26 @@ struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode,
 		return NULL;
 	}
 	list_for_each_entry(lseg, &lo->plh_segs, pls_list) {
-		if (!list_empty(&FFV2_LSEG(lseg)->fls_pending_list)) {
+		struct ffv2_pending_chunk *pending;
+		bool found = false;
+
+		spin_lock(&FFV2_LSEG(lseg)->fls_pending_lock);
+		list_for_each_entry(pending, &FFV2_LSEG(lseg)->fls_pending_list,
+					list) {
+			bool lifecycle_done;
+
+			if (pending->inode != inode)
+				continue;
+			spin_lock(pending->stripe_lock);
+			lifecycle_done = pending->state == FFV2_PENDING_LIFECYCLE_DONE;
+			spin_unlock(pending->stripe_lock);
+			if (lifecycle_done) {
+				found = true;
+				break;
+			}
+		}
+		spin_unlock(&FFV2_LSEG(lseg)->fls_pending_lock);
+		if (found) {
 			candidate = pnfs_get_lseg(lseg);
 			break;
 		}

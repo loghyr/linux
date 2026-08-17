@@ -230,6 +230,100 @@ ffv2_release_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
 	spin_unlock(&inode->i_lock);
 }
 
+static bool ffv2_deferred_pending_ready(struct inode *inode)
+{
+	struct pnfs_layout_hdr *lo;
+	struct pnfs_layout_segment *lseg;
+	bool deferred = false, ready = true;
+
+	spin_lock(&inode->i_lock);
+	lo = NFS_I(inode)->layout;
+	if (!lo)
+		goto out;
+	list_for_each_entry(lseg, &lo->plh_segs, pls_list) {
+		struct ffv2_pending_chunk *pending;
+
+		spin_lock(&FFV2_LSEG(lseg)->fls_pending_lock);
+		list_for_each_entry(pending,
+				    &FFV2_LSEG(lseg)->fls_pending_list, list) {
+			bool is_deferred;
+
+			spin_lock(pending->stripe_lock);
+			is_deferred = pending->state == FFV2_PENDING_DEFERRED;
+			if (is_deferred) {
+				deferred = true;
+				spin_unlock(pending->stripe_lock);
+				continue;
+			}
+			if (pending->state != FFV2_PENDING_IMMEDIATE)
+				ready = false;
+			spin_unlock(pending->stripe_lock);
+		}
+		spin_unlock(&FFV2_LSEG(lseg)->fls_pending_lock);
+	}
+out:
+	spin_unlock(&inode->i_lock);
+	return deferred && ready;
+}
+
+static void ffv2_deferred_reject(struct nfs_commit_data *data,
+					 struct nfs_commit_info *cinfo)
+{
+	nfs_retry_commit(&data->pages, data->lseg, cinfo,
+				data->ds_commit_index);
+	if (data->dreq) {
+		data->task.tk_status = -EIO;
+		nfs_direct_commit_complete(data);
+	} else {
+		nfs_commit_end(cinfo->mds);
+	}
+	pnfs_put_lseg(data->lseg);
+	data->lseg = NULL;
+	nfs_commitdata_release(data);
+}
+
+static int ffv2_initiate_deferred_commit(struct nfs_commit_data *data,
+						int how)
+{
+	struct ffv2_deferred_drain *drain;
+	struct nfs_commit_info cinfo;
+	LIST_HEAD(retry_pages);
+	int ret;
+
+	nfs_init_cinfo(&cinfo, data->inode, data->dreq);
+	drain = kzalloc_obj(*drain, GFP_NOFS);
+	if (!drain) {
+		ffv2_deferred_reject(data, &cinfo);
+		return -ENOMEM;
+	}
+	kref_init(&drain->ref);
+	atomic_set(&drain->finished, 0);
+	drain->data = data;
+	drain->mds_cinfo = cinfo.mds;
+	drain->lseg = data->lseg;
+
+	mutex_lock(&NFS_I(data->inode)->commit_mutex);
+	ret = ffv2_deferred_drain_claim(drain, &cinfo);
+	mutex_unlock(&NFS_I(data->inode)->commit_mutex);
+	if (ret) {
+		ffv2_deferred_reject(data, &cinfo);
+		ffv2_deferred_drain_put(drain);
+		return ret;
+	}
+	list_splice_init(&drain->retry_pages, &retry_pages);
+	if (!list_empty(&retry_pages))
+		nfs_retry_commit(&retry_pages, data->lseg, &cinfo,
+				data->ds_commit_index);
+	ret = ffv2_deferred_drain_start(drain, how);
+	if (ret) {
+		ffv2_deferred_drain_abort(drain);
+		ffv2_deferred_reject(data, &cinfo);
+		ffv2_deferred_drain_put(drain);
+		return ret;
+	}
+	return 0;
+}
+
 /* Commit entry point for FFv2 writes using NFS_UNSTABLE. */
 static int
 ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
@@ -239,6 +333,11 @@ ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
 	struct ffv2_commit_aggregate *agg;
 	struct pnfs_ds_commit_info *ds = cinfo->ds;
 	int rc;
+
+	if (ffv2_deferred_pending_ready(inode))
+		return pnfs_generic_commit_pagelist(inode, mds_pages, how,
+						    cinfo,
+						    ffv2_initiate_deferred_commit);
 
 	data = ffv2_commit_inode_pending(inode, cinfo->dreq);
 	if (!data)
