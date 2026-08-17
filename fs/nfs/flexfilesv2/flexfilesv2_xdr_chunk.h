@@ -695,7 +695,12 @@ bool ffv2_deferred_finalize_verifier_matches(
 bool ffv2_deferred_commit_verifier_matches(
 		struct ffv2_pending_chunk * const *pending, unsigned int count,
 		const nfs4_verifier *writeverf);
+bool ffv2_deferred_group_complete(struct ffv2_deferred_drain *drain,
+				  struct ffv2_deferred_group *group, int status);
 bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw);
+#if IS_ENABLED(CONFIG_PNFS_FLEXFILE_V2_KUNIT_TEST)
+int ffv2_kunit_deferred_rollback_state_test(void);
+#endif
 int ffv2_pending_chunk_move_requests(struct ffv2_pending_chunk *pending,
 					     struct list_head *dst);
 int ffv2_pending_chunk_lock_requests(struct ffv2_pending_chunk *pending);

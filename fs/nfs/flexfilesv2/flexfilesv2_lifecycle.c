@@ -1014,17 +1014,26 @@ static void ffv2_deferred_drain_finish(struct ffv2_deferred_drain *drain)
 	ffv2_deferred_drain_clear_groups(drain);
 }
 
+bool ffv2_deferred_group_complete(struct ffv2_deferred_drain *drain,
+					  struct ffv2_deferred_group *group,
+					  int status)
+{
+	if (group->finished)
+		return false;
+	group->finished = true;
+	if (status)
+		cmpxchg(&drain->status, 0, status);
+	return atomic_dec_and_test(&drain->pending_ops) &&
+		READ_ONCE(drain->launch_done);
+}
+EXPORT_SYMBOL_GPL(ffv2_deferred_group_complete);
+
 static void ffv2_deferred_group_finish(struct ffv2_deferred_group *group,
 					       int status)
 {
 	struct ffv2_deferred_drain *drain = group->drain;
 
-	if (group->finished)
-		return;
-	group->finished = true;
-	if (status)
-		cmpxchg(&drain->status, 0, status);
-	if (atomic_dec_and_test(&drain->pending_ops) && drain->launch_done)
+	if (ffv2_deferred_group_complete(drain, group, status))
 		ffv2_deferred_drain_finish(drain);
 }
 

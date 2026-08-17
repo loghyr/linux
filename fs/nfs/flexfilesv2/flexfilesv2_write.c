@@ -256,6 +256,116 @@ bool ffv2_stripe_verifiers_complete(struct ffv2_stripe_write *sw)
 }
 EXPORT_SYMBOL_GPL(ffv2_stripe_verifiers_complete);
 
+#if IS_ENABLED(CONFIG_PNFS_FLEXFILE_V2_KUNIT_TEST)
+struct ffv2_kunit_ref {
+	refcount_t ref;
+	unsigned int puts;
+};
+
+static void ffv2_kunit_ref_put(void *owner)
+{
+	struct ffv2_kunit_ref *held = owner;
+
+	refcount_dec(&held->ref);
+	held->puts++;
+}
+
+int ffv2_kunit_deferred_rollback_state_test(void)
+{
+	struct ffv2_stripe_write *first_sw;
+	struct ffv2_stripe_write *second_sw;
+	struct nfs4_ffv2_layout_segment fls = { };
+	struct nfs_commit_data data = { };
+	struct nfs_direct_req dreq = { };
+	struct ffv2_pending_chunk first = { };
+	struct ffv2_pending_chunk second = { };
+	struct ffv2_deferred_drain drain = { };
+	struct ffv2_deferred_cohort *first_cohort;
+	struct ffv2_deferred_cohort *second_cohort;
+	struct ffv2_kunit_ref held;
+	int ret;
+
+	first_sw = kzalloc_obj(*first_sw, GFP_KERNEL);
+	second_sw = kzalloc_obj(*second_sw, GFP_KERNEL);
+	if (!first_sw || !second_sw) {
+		kfree(first_sw);
+		kfree(second_sw);
+		return -ENOMEM;
+	}
+	INIT_LIST_HEAD(&first_sw->pending_chunks);
+	INIT_LIST_HEAD(&second_sw->pending_chunks);
+	spin_lock_init(&first_sw->pending_lock);
+	spin_lock_init(&second_sw->pending_lock);
+	INIT_LIST_HEAD(&fls.fls_pending_list);
+	spin_lock_init(&fls.fls_pending_lock);
+	INIT_LIST_HEAD(&drain.cohorts);
+	INIT_LIST_HEAD(&drain.groups);
+	INIT_LIST_HEAD(&drain.retry_pages);
+	INIT_LIST_HEAD(&data.pages);
+	refcount_set(&held.ref, 3);
+	held.puts = 0;
+
+	data.dreq = &dreq;
+	data.ds_commit_index = 1;
+	drain.data = &data;
+	drain.lseg = &fls.generic_hdr;
+	first_cohort = kzalloc_obj(*first_cohort, GFP_KERNEL);
+	second_cohort = kzalloc_obj(*second_cohort, GFP_KERNEL);
+	if (!first_cohort || !second_cohort) {
+		kfree(first_cohort);
+		kfree(second_cohort);
+		kfree(first_sw);
+		kfree(second_sw);
+		return -ENOMEM;
+	}
+
+	first.sw = first_sw;
+	first.stripe_lock = &first_sw->pending_lock;
+	INIT_LIST_HEAD(&first.requests);
+	first.lseg = &fls.generic_hdr;
+	first.commit_bucket = 1;
+	first.state = FFV2_PENDING_COMMITTING;
+	list_add(&first.stripe_list, &first_sw->pending_chunks);
+	list_add(&first.list, &fls.fls_pending_list);
+
+	second.sw = second_sw;
+	second.stripe_lock = &second_sw->pending_lock;
+	INIT_LIST_HEAD(&second.requests);
+	second.lseg = &fls.generic_hdr;
+	second.commit_bucket = 1;
+	second.state = FFV2_PENDING_COMMITTING;
+	list_add(&second.stripe_list, &second_sw->pending_chunks);
+	list_add(&second.list, &fls.fls_pending_list);
+
+	first_cohort->sw = first_sw;
+	first_cohort->stripe_ref = &held.ref;
+	first_cohort->stripe_put = ffv2_kunit_ref_put;
+	first_cohort->stripe_owner = &held;
+	first_cohort->claimed = true;
+	list_add(&first_cohort->list, &drain.cohorts);
+	second_cohort->sw = second_sw;
+	second_cohort->stripe_ref = &held.ref;
+	second_cohort->stripe_put = ffv2_kunit_ref_put;
+	second_cohort->stripe_owner = &held;
+	list_add(&second_cohort->list, &drain.cohorts);
+
+	ffv2_deferred_drain_abort(&drain);
+
+	ret = first.state == FFV2_PENDING_DEFERRED &&
+		second.state == FFV2_PENDING_COMMITTING &&
+		held.puts == 2 && refcount_read(&held.ref) == 1 &&
+		list_empty(&drain.cohorts);
+	list_del_init(&first.stripe_list);
+	list_del_init(&first.list);
+	list_del_init(&second.stripe_list);
+	list_del_init(&second.list);
+	kfree(first_sw);
+	kfree(second_sw);
+	return ret ? 0 : -EINVAL;
+}
+EXPORT_SYMBOL_GPL(ffv2_kunit_deferred_rollback_state_test);
+#endif
+
 static struct ffv2_commit_aggregate *
 ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 {

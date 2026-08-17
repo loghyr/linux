@@ -54,16 +54,94 @@ static void ffv2_mixed_cohort_verifier_test(struct kunit *test)
 							&verifier_b));
 }
 
-static struct kunit_case ffv2_verifier_test_cases[] = {
+static void ffv2_deferred_group_wait_test(struct kunit *test)
+{
+	struct ffv2_deferred_drain drain = { };
+	struct ffv2_deferred_group first = { };
+	struct ffv2_deferred_group second = { };
+
+	atomic_set(&drain.pending_ops, 2);
+	drain.launch_done = true;
+
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_group_complete(&drain, &first, -EIO));
+	KUNIT_EXPECT_EQ(test, 1, atomic_read(&drain.pending_ops));
+	KUNIT_EXPECT_EQ(test, -EIO, drain.status);
+	KUNIT_EXPECT_TRUE(test,
+		ffv2_deferred_group_complete(&drain, &second, 0));
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&drain.pending_ops));
+	KUNIT_EXPECT_EQ(test, -EIO, drain.status);
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_group_complete(&drain, &second, 0));
+}
+
+static void ffv2_pending_state_transition_test(struct kunit *test)
+{
+	struct ffv2_pending_chunk pending = { };
+	spinlock_t stripe_lock; /* protects pending state in this fixture */
+	refcount_t stripe_ref;
+
+	spin_lock_init(&stripe_lock);
+	refcount_set(&stripe_ref, 1);
+	pending.stripe_lock = &stripe_lock;
+	pending.stripe_ref = &stripe_ref;
+	pending.state = FFV2_PENDING_IMMEDIATE;
+
+	ffv2_pending_chunk_retain(&pending);
+	KUNIT_EXPECT_EQ(test, FFV2_PENDING_RETAINED, pending.state);
+	KUNIT_EXPECT_EQ(test, 2, refcount_read(&stripe_ref));
+	ffv2_pending_chunk_defer(&pending);
+	KUNIT_EXPECT_EQ(test, FFV2_PENDING_DEFERRED, pending.state);
+	ffv2_pending_chunk_abort(&pending);
+	KUNIT_EXPECT_EQ(test, FFV2_PENDING_IMMEDIATE, pending.state);
+
+	pending.state = FFV2_PENDING_RETAINED;
+	ffv2_pending_chunk_lifecycle_done(&pending);
+	KUNIT_EXPECT_EQ(test, FFV2_PENDING_LIFECYCLE_DONE, pending.state);
+}
+
+static void ffv2_deferred_drain_abort_test(struct kunit *test)
+{
+	struct ffv2_deferred_drain drain = { };
+	struct nfs_commit_data data = { };
+	struct nfs_page page = { };
+	struct nfs_page *actual;
+
+	INIT_LIST_HEAD(&drain.cohorts);
+	INIT_LIST_HEAD(&drain.groups);
+	INIT_LIST_HEAD(&drain.retry_pages);
+	INIT_LIST_HEAD(&data.pages);
+	drain.data = &data;
+	list_add(&page.wb_list, &drain.retry_pages);
+
+	ffv2_deferred_drain_abort(&drain);
+
+	KUNIT_EXPECT_TRUE(test, list_empty(&drain.retry_pages));
+	KUNIT_ASSERT_FALSE(test, list_empty(&data.pages));
+	KUNIT_EXPECT_TRUE(test, list_is_singular(&data.pages));
+	actual = list_first_entry(&data.pages, struct nfs_page, wb_list);
+	KUNIT_EXPECT_PTR_EQ(test, &page, actual);
+}
+
+static void ffv2_deferred_rollback_ownership_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, 0, ffv2_kunit_deferred_rollback_state_test());
+}
+
+static struct kunit_case ffv2_deferred_test_cases[] = {
 	KUNIT_CASE(ffv2_mixed_cohort_verifier_test),
+	KUNIT_CASE(ffv2_deferred_group_wait_test),
+	KUNIT_CASE(ffv2_pending_state_transition_test),
+	KUNIT_CASE(ffv2_deferred_drain_abort_test),
+	KUNIT_CASE(ffv2_deferred_rollback_ownership_test),
 	{}
 };
 
-static struct kunit_suite ffv2_verifier_test_suite = {
-	.name = "ffv2-verifier",
-	.test_cases = ffv2_verifier_test_cases,
+static struct kunit_suite ffv2_deferred_test_suite = {
+	.name = "ffv2-deferred",
+	.test_cases = ffv2_deferred_test_cases,
 };
 
-kunit_test_suite(ffv2_verifier_test_suite);
+kunit_test_suite(ffv2_deferred_test_suite);
 
 MODULE_LICENSE("GPL");
