@@ -51,6 +51,19 @@ static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status);
 static void ffv2_deferred_drain_clear_groups(
 		struct ffv2_deferred_drain *drain);
 
+bool ffv2_deferred_pending_matches_drain(
+		const struct ffv2_deferred_drain *drain,
+		const struct ffv2_pending_chunk *pending)
+{
+	if (!drain || !drain->data || !pending)
+		return false;
+	return pending->lseg == drain->lseg &&
+		pending->dreq == drain->data->dreq &&
+		pending->commit_bucket == drain->data->ds_commit_index &&
+		READ_ONCE(pending->state) == FFV2_PENDING_DEFERRED;
+}
+EXPORT_SYMBOL_GPL(ffv2_deferred_pending_matches_drain);
+
 static bool
 ffv2_pending_drain_identity(const struct ffv2_deferred_drain *drain,
 			    const struct ffv2_pending_chunk *pending)
@@ -58,8 +71,21 @@ ffv2_pending_drain_identity(const struct ffv2_deferred_drain *drain,
 	if (!drain || !drain->data || !pending)
 		return false;
 	return pending->lseg == drain->lseg &&
-		pending->dreq == drain->data->dreq &&
-		pending->commit_bucket == drain->data->ds_commit_index;
+		pending->dreq == drain->data->dreq;
+}
+
+/*
+ * The generic commit list selects pages by the data-shard bucket.  A
+ * deferred stripe's sibling shards belong to other DS buckets, but remain
+ * part of the same cohort and must be claimed with the selected data pages.
+ */
+static bool
+ffv2_deferred_cohort_pending_matches_drain(
+		const struct ffv2_deferred_drain *drain,
+		const struct ffv2_pending_chunk *pending)
+{
+	return ffv2_pending_drain_identity(drain, pending) &&
+		READ_ONCE(pending->state) == FFV2_PENDING_DEFERRED;
 }
 
 bool ffv2_deferred_finalize_verifier_matches(
@@ -1514,9 +1540,7 @@ ffv2_deferred_cohort_validate(struct ffv2_deferred_drain *drain,
 		return -E2BIG;
 	}
 	list_for_each_entry(pending, view.pending_chunks, stripe_list) {
-		if (pending->lseg != drain->lseg ||
-		    pending->dreq != drain->data->dreq ||
-		    pending->state != FFV2_PENDING_DEFERRED) {
+		if (!ffv2_deferred_cohort_pending_matches_drain(drain, pending)) {
 			spin_unlock(view.pending_lock);
 			return -EAGAIN;
 		}
@@ -1576,10 +1600,7 @@ int ffv2_deferred_drain_claim(struct ffv2_deferred_drain *drain,
 		struct ffv2_deferred_cohort *new_cohort;
 
 		if (ffv2_pending_request_lookup_locked(fls, req, &pending) != 1 ||
-		    pending->lseg != drain->lseg ||
-		    pending->dreq != drain->data->dreq ||
-		    pending->commit_bucket != drain->data->ds_commit_index ||
-		    pending->state != FFV2_PENDING_DEFERRED) {
+		    !ffv2_deferred_pending_matches_drain(drain, pending)) {
 			ret = -EPROTO;
 			goto out_unlock;
 		}
