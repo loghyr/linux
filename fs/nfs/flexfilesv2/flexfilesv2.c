@@ -249,9 +249,10 @@ static bool ffv2_deferred_pending_ready(struct inode *inode,
 				    &FFV2_LSEG(lseg)->fls_pending_list, list) {
 			bool is_deferred;
 
+			if (pending->dreq != dreq)
+				continue;
 			spin_lock(pending->stripe_lock);
-			is_deferred = pending->state == FFV2_PENDING_DEFERRED &&
-				pending->dreq == dreq;
+			is_deferred = pending->state == FFV2_PENDING_DEFERRED;
 			if (is_deferred) {
 				deferred = true;
 				spin_unlock(pending->stripe_lock);
