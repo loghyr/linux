@@ -206,6 +206,46 @@ static void ffv2_deferred_group_identity_test(struct kunit *test)
 		ffv2_deferred_group_matches_pending(&group, &pending));
 }
 
+static void ffv2_pending_identity_test(struct kunit *test)
+{
+	struct ffv2_pending_chunk first = { };
+	struct ffv2_pending_chunk pending = { };
+	struct pnfs_layout_segment lseg;
+	struct nfs_direct_req dreq;
+	struct nfs_client *clp = (void *)&first;
+
+	first.lseg = pending.lseg = &lseg;
+	first.dreq = pending.dreq = &dreq;
+	first.ds_clp = pending.ds_clp = clp;
+	first.commit_bucket = pending.commit_bucket = 5;
+	KUNIT_EXPECT_TRUE(test,
+		ffv2_pending_chunk_identity_matches(&first, &pending));
+
+	pending.lseg = NULL;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_pending_chunk_identity_matches(&first, &pending));
+	pending.lseg = first.lseg;
+	pending.dreq = NULL;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_pending_chunk_identity_matches(&first, &pending));
+	pending.dreq = first.dreq;
+	pending.ds_clp = (void *)&pending;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_pending_chunk_identity_matches(&first, &pending));
+	pending.ds_clp = first.ds_clp;
+	pending.commit_bucket++;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_pending_chunk_identity_matches(&first, &pending));
+	pending.commit_bucket--;
+	pending.fh.size = 1;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_pending_chunk_identity_matches(&first, &pending));
+	pending.fh = first.fh;
+	pending.stateid.seqid++;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_pending_chunk_identity_matches(&first, &pending));
+}
+
 static void ffv2_deferred_group_range_test(struct kunit *test)
 {
 	struct ffv2_deferred_group group = {
@@ -250,6 +290,7 @@ static struct kunit_case ffv2_deferred_test_cases[] = {
 	KUNIT_CASE(ffv2_deferred_drain_abort_test),
 	KUNIT_CASE(ffv2_deferred_rollback_ownership_test),
 	KUNIT_CASE(ffv2_deferred_group_identity_test),
+	KUNIT_CASE(ffv2_pending_identity_test),
 	KUNIT_CASE(ffv2_deferred_group_range_test),
 	{}
 };

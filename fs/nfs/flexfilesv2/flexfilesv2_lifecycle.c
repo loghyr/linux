@@ -126,6 +126,22 @@ bool ffv2_deferred_commit_verifier_matches(
 }
 EXPORT_SYMBOL_GPL(ffv2_deferred_commit_verifier_matches);
 
+bool ffv2_pending_chunk_identity_matches(
+		const struct ffv2_pending_chunk *first,
+		const struct ffv2_pending_chunk *pending)
+{
+	if (!first || !pending)
+		return false;
+	return first->lseg == pending->lseg &&
+		first->dreq == pending->dreq &&
+		first->ds_clp == pending->ds_clp &&
+		first->commit_bucket == pending->commit_bucket &&
+		!memcmp(&first->fh, &pending->fh, sizeof(first->fh)) &&
+		!memcmp(&first->stateid, &pending->stateid,
+			 sizeof(first->stateid));
+}
+EXPORT_SYMBOL_GPL(ffv2_pending_chunk_identity_matches);
+
 /* ------------------------------------------------------------------ */
 /* CHUNK_FINALIZE dispatch                                            */
 /* ------------------------------------------------------------------ */
@@ -1375,16 +1391,9 @@ bool ffv2_deferred_group_matches_pending(
 		const struct ffv2_deferred_group *group,
 		const struct ffv2_pending_chunk *pending)
 {
-	const struct ffv2_pending_chunk *first;
-
 	if (!group || !pending || !group->nowners || !group->pending[0])
 		return false;
-	first = group->pending[0];
-	return first->ds_clp == pending->ds_clp &&
-		first->commit_bucket == pending->commit_bucket &&
-		!memcmp(&first->fh, &pending->fh, sizeof(first->fh)) &&
-		!memcmp(&first->stateid, &pending->stateid,
-			 sizeof(first->stateid));
+	return ffv2_pending_chunk_identity_matches(group->pending[0], pending);
 }
 EXPORT_SYMBOL_GPL(ffv2_deferred_group_matches_pending);
 
@@ -2163,11 +2172,7 @@ int ffv2_chunk_wb_start_batch(struct ffv2_chunk_wb_ctx **wbs, u32 count)
 	for (i = 0; i < count; i++) {
 		struct ffv2_pending_chunk *pending = wbs[i]->pending;
 
-		if (pending->ds_clp != first->pending->ds_clp ||
-		    memcmp(&pending->fh, &first->pending->fh,
-			   sizeof(pending->fh)) ||
-		    memcmp(&pending->stateid, &first->pending->stateid,
-			   sizeof(pending->stateid))) {
+		if (!ffv2_pending_chunk_identity_matches(first->pending, pending)) {
 			kfree(batch);
 			return -EXDEV;
 		}

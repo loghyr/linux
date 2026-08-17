@@ -692,6 +692,9 @@ void ffv2_deferred_drain_abort(struct ffv2_deferred_drain *drain);
 bool ffv2_deferred_pending_matches_drain(
 		const struct ffv2_deferred_drain *drain,
 		const struct ffv2_pending_chunk *pending);
+bool ffv2_pending_chunk_identity_matches(
+		const struct ffv2_pending_chunk *first,
+		const struct ffv2_pending_chunk *pending);
 bool ffv2_deferred_group_matches_pending(
 		const struct ffv2_deferred_group *group,
 		const struct ffv2_pending_chunk *pending);
