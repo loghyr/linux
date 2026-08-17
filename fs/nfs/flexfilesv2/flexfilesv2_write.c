@@ -369,7 +369,8 @@ EXPORT_SYMBOL_GPL(ffv2_kunit_deferred_rollback_state_test);
 #endif
 
 static struct ffv2_commit_aggregate *
-ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
+ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw,
+				  struct nfs_direct_req *dreq)
 {
 	struct ffv2_pending_chunk *pending;
 	struct ffv2_commit_aggregate *agg;
@@ -396,6 +397,8 @@ ffv2_stripe_claim_pending(struct ffv2_stripe_write *sw)
 	    !ffv2_stripe_verifiers_complete_locked(sw))
 		goto fail_unlock;
 	list_for_each_entry(pending, &sw->pending_chunks, stripe_list) {
+		if (pending->dreq != dreq)
+			goto fail_unlock;
 		pending->state = FFV2_PENDING_COMMITTING;
 		count++;
 	}
@@ -449,7 +452,7 @@ struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 	struct ffv2_commit_aggregate *agg;
 	struct nfs_commit_data *data;
 
-	agg = ffv2_stripe_claim_pending(sw);
+	agg = ffv2_stripe_claim_pending(sw, dreq);
 	if (!agg)
 		return NULL;
 	data = ffv2_commit_aggregate_commitdata_alloc(agg, dreq);
@@ -473,7 +476,8 @@ ffv2_legacy_commit_lseg_pending(struct pnfs_layout_segment *lseg,
 	list_for_each_entry(pending, &FFV2_LSEG(lseg)->fls_pending_list, list) {
 		bool lifecycle_done;
 
-		if (pending->inode != lseg->pls_layout->plh_inode)
+		if (pending->inode != lseg->pls_layout->plh_inode ||
+		    pending->dreq != dreq)
 			continue;
 		spin_lock(pending->stripe_lock);
 		lifecycle_done = pending->state == FFV2_PENDING_LIFECYCLE_DONE;
@@ -522,7 +526,7 @@ ffv2_legacy_commit_inode_pending(struct inode *inode,
 					list) {
 			bool lifecycle_done;
 
-			if (pending->inode != inode)
+			if (pending->inode != inode || pending->dreq != dreq)
 				continue;
 			spin_lock(pending->stripe_lock);
 			lifecycle_done = pending->state == FFV2_PENDING_LIFECYCLE_DONE;
