@@ -75,6 +75,39 @@ static void ffv2_deferred_group_wait_test(struct kunit *test)
 		ffv2_deferred_group_complete(&drain, &second, 0));
 }
 
+static void ffv2_deferred_owner_identity_test(struct kunit *test)
+{
+	struct ffv2_deferred_drain drain = { };
+	struct ffv2_pending_chunk pending = { };
+	struct nfs_commit_data data = { };
+	struct pnfs_layout_segment lseg = { };
+	struct nfs_direct_req dreq = { };
+
+	drain.data = &data;
+	drain.lseg = &lseg;
+	data.dreq = &dreq;
+	data.ds_commit_index = 3;
+	pending.lseg = &lseg;
+	pending.dreq = &dreq;
+	pending.commit_bucket = 3;
+	pending.state = FFV2_PENDING_DEFERRED;
+
+	KUNIT_EXPECT_TRUE(test,
+		ffv2_deferred_pending_matches_drain(&drain, &pending));
+
+	pending.commit_bucket++;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_pending_matches_drain(&drain, &pending));
+	pending.commit_bucket--;
+	pending.state = FFV2_PENDING_LIFECYCLE_DONE;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_pending_matches_drain(&drain, &pending));
+	pending.state = FFV2_PENDING_DEFERRED;
+	pending.dreq = NULL;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_pending_matches_drain(&drain, &pending));
+}
+
 static void ffv2_pending_state_transition_test(struct kunit *test)
 {
 	struct ffv2_pending_chunk pending = { };
@@ -131,6 +164,7 @@ static void ffv2_deferred_rollback_ownership_test(struct kunit *test)
 static struct kunit_case ffv2_deferred_test_cases[] = {
 	KUNIT_CASE(ffv2_mixed_cohort_verifier_test),
 	KUNIT_CASE(ffv2_deferred_group_wait_test),
+	KUNIT_CASE(ffv2_deferred_owner_identity_test),
 	KUNIT_CASE(ffv2_pending_state_transition_test),
 	KUNIT_CASE(ffv2_deferred_drain_abort_test),
 	KUNIT_CASE(ffv2_deferred_rollback_ownership_test),
