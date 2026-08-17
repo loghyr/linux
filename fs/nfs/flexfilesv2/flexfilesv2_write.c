@@ -1282,10 +1282,16 @@ ffv2_stripe_write_dispatch(struct nfs_pgio_header *hdr,
 {
 	struct pnfs_layout_segment *lseg = hdr->lseg;
 	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(lseg);
-	struct nfs4_ffv2_mirror *mirror = fls->mirror_array[0];
+	struct nfs4_ffv2_mirror *mirror;
 	struct ffv2_stripe_write *sw;
 	u32 nr = ctx->k + ctx->m;
 	u32 i;
+
+	if (fls->mirror_array_cnt != 1 ||
+	    !fls->mirror_array[0] ||
+	    fls->mirror_array[0]->stripes_cnt != 1)
+		return PNFS_NOT_ATTEMPTED;
+	mirror = fls->mirror_array[0];
 
 	(void)sync;	/* CHUNK_WRITE is always FILE_SYNC4. */
 
