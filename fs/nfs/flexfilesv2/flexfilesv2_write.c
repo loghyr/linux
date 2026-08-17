@@ -1281,6 +1281,8 @@ ffv2_stripe_write_dispatch(struct nfs_pgio_header *hdr,
 			   struct ffv2_stripe_ctx *ctx, int sync)
 {
 	struct pnfs_layout_segment *lseg = hdr->lseg;
+	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(lseg);
+	struct nfs4_ffv2_mirror *mirror = fls->mirror_array[0];
 	struct ffv2_stripe_write *sw;
 	u32 nr = ctx->k + ctx->m;
 	u32 i;
@@ -1306,11 +1308,14 @@ ffv2_stripe_write_dispatch(struct nfs_pgio_header *hdr,
 		sw->disp[i].sw = sw;
 
 	/*
-	 * Commit-bucket hint.  Flexfiles v2 registers no pNFS commit
-	 * operations, so nothing consumes it; a stripe has no single
-	 * bucket to name in any case.
+	 * User pages are carried by data shard zero; route their commit
+	 * requests to that shard's data-server bucket.
 	 */
-	hdr->ds_commit_idx = 0;
+	if (mirror->stripes_cnt && mirror->stripes[0].data_servers_cnt)
+		hdr->ds_commit_idx =
+			mirror->stripes[0].data_servers[0].commit_bucket;
+	else
+		hdr->ds_commit_idx = 0;
 
 	for (i = 0; i < nr; i++) {
 		int rc = ffv2_shard_launch(sw, i);
