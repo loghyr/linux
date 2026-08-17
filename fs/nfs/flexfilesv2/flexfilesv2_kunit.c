@@ -199,6 +199,42 @@ static void ffv2_deferred_group_identity_test(struct kunit *test)
 		ffv2_deferred_group_matches_pending(&group, &pending));
 }
 
+static void ffv2_deferred_group_range_test(struct kunit *test)
+{
+	struct ffv2_deferred_group group = {
+		.offset = 100,
+		.count = 10,
+	};
+	struct ffv2_pending_chunk pending = {
+		.offset = 105,
+		.count = 20,
+	};
+
+	KUNIT_EXPECT_EQ(test, 0,
+		ffv2_deferred_group_extend_range(&group, &pending));
+	KUNIT_EXPECT_EQ(test, (u64)100, group.offset);
+	KUNIT_EXPECT_EQ(test, (u32)25, group.count);
+
+	pending.offset = 90;
+	pending.count = 5;
+	KUNIT_EXPECT_EQ(test, 0,
+		ffv2_deferred_group_extend_range(&group, &pending));
+	KUNIT_EXPECT_EQ(test, (u64)90, group.offset);
+	KUNIT_EXPECT_EQ(test, (u32)35, group.count);
+
+	group.offset = U64_MAX - 1;
+	group.count = 4;
+	KUNIT_EXPECT_EQ(test, -EOVERFLOW,
+		ffv2_deferred_group_extend_range(&group, &pending));
+
+	group.offset = 0;
+	group.count = U32_MAX;
+	pending.offset = U32_MAX;
+	pending.count = 1;
+	KUNIT_EXPECT_EQ(test, -E2BIG,
+		ffv2_deferred_group_extend_range(&group, &pending));
+}
+
 static struct kunit_case ffv2_deferred_test_cases[] = {
 	KUNIT_CASE(ffv2_mixed_cohort_verifier_test),
 	KUNIT_CASE(ffv2_deferred_group_wait_test),
@@ -207,6 +243,7 @@ static struct kunit_case ffv2_deferred_test_cases[] = {
 	KUNIT_CASE(ffv2_deferred_drain_abort_test),
 	KUNIT_CASE(ffv2_deferred_rollback_ownership_test),
 	KUNIT_CASE(ffv2_deferred_group_identity_test),
+	KUNIT_CASE(ffv2_deferred_group_range_test),
 	{}
 };
 

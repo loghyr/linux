@@ -1381,32 +1381,49 @@ bool ffv2_deferred_group_matches_pending(
 }
 EXPORT_SYMBOL_GPL(ffv2_deferred_group_matches_pending);
 
+int ffv2_deferred_group_extend_range(
+		struct ffv2_deferred_group *group,
+		const struct ffv2_pending_chunk *pending)
+{
+	u64 pending_end, group_end, start, end;
+
+	if (!group || !pending)
+		return -EINVAL;
+	if (check_add_overflow(pending->offset, (u64)pending->count,
+				       &pending_end) ||
+	    check_add_overflow(group->offset, (u64)group->count,
+			       &group_end))
+		return -EOVERFLOW;
+	start = min(group->offset, pending->offset);
+	end = max(group_end, pending_end);
+	if (end <= start || end - start > U32_MAX)
+		return -E2BIG;
+	group->offset = start;
+	group->count = end - start;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(ffv2_deferred_group_extend_range);
+
 static int
 ffv2_deferred_group_add(struct ffv2_deferred_drain *drain,
 				struct ffv2_deferred_cohort *cohort,
 				struct ffv2_pending_chunk *pending)
 {
 	struct ffv2_deferred_group *group;
-	u64 end, old_end, new_start, new_end;
+	u64 end;
+	int ret;
 
 	list_for_each_entry(group, &drain->groups, list) {
 		if (group->cohort != cohort ||
 		    !ffv2_deferred_group_matches_pending(group, pending))
 			continue;
 		if (group->nowners == FFV2_MAX_CHUNKS_PER_OP)
-			return -E2BIG;
-		if (check_add_overflow(pending->offset,
-				       (u64)pending->count, &end))
-			return -EOVERFLOW;
-		if (check_add_overflow(group->offset,
-				       (u64)group->count, &old_end))
-			return -EOVERFLOW;
-		new_start = min(group->offset, pending->offset);
-		new_end = max(old_end, end);
-		if (new_end <= new_start || new_end - new_start > U32_MAX)
-			return -E2BIG;
-		group->offset = new_start;
-		group->count = new_end - new_start;
+			continue;
+		ret = ffv2_deferred_group_extend_range(group, pending);
+		if (ret == -E2BIG)
+			continue;
+		if (ret)
+			return ret;
 		group->pending[group->nowners] = pending;
 		group->owners[group->nowners] = pending->owner;
 		group->nowners++;
