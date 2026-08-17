@@ -94,12 +94,15 @@ bool ffv2_deferred_finalize_verifier_matches(
 {
 	unsigned int i;
 
-	if (!count || !writeverf)
+	if (!count || !writeverf || !pending)
 		return false;
-	for (i = 0; i < count; i++)
+	for (i = 0; i < count; i++) {
+		if (!pending[i])
+			return false;
 		if (memcmp(writeverf, &pending[i]->writeverf,
 			   sizeof(*writeverf)))
 			return false;
+	}
 	return true;
 }
 EXPORT_SYMBOL_GPL(ffv2_deferred_finalize_verifier_matches);
@@ -110,12 +113,15 @@ bool ffv2_deferred_commit_verifier_matches(
 {
 	unsigned int i;
 
-	if (!count || !writeverf)
+	if (!count || !writeverf || !pending)
 		return false;
-	for (i = 0; i < count; i++)
+	for (i = 0; i < count; i++) {
+		if (!pending[i])
+			return false;
 		if (memcmp(writeverf, &pending[i]->finalize_writeverf,
 			   sizeof(*writeverf)))
 			return false;
+	}
 	return true;
 }
 EXPORT_SYMBOL_GPL(ffv2_deferred_commit_verifier_matches);
@@ -1375,6 +1381,7 @@ bool ffv2_deferred_group_matches_pending(
 		return false;
 	first = group->pending[0];
 	return first->ds_clp == pending->ds_clp &&
+		first->commit_bucket == pending->commit_bucket &&
 		!memcmp(&first->fh, &pending->fh, sizeof(first->fh)) &&
 		!memcmp(&first->stateid, &pending->stateid,
 			 sizeof(first->stateid));

@@ -52,6 +52,13 @@ static void ffv2_mixed_cohort_verifier_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test,
 		ffv2_deferred_commit_verifier_matches(mixed, 2,
 							&verifier_b));
+	mixed[1] = NULL;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_finalize_verifier_matches(mixed, 2,
+							&verifier_a));
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_commit_verifier_matches(mixed, 2,
+							&verifier_a));
 }
 
 static void ffv2_deferred_group_wait_test(struct kunit *test)
