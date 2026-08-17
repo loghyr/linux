@@ -897,6 +897,7 @@ static void ffv2_deferred_pending_drop_requests(
 	list_for_each_entry_safe(request, tmp, &pending->requests, list) {
 		list_del(&request->list);
 		put_nfs_open_context(request->context);
+		nfs_release_request(request->req);
 		kfree(request);
 	}
 }
