@@ -547,8 +547,8 @@ static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
  *   - block_status[0] != NFS4_OK: per-chunk failure; propagate the
  *     mapped errno (nfs4_stat_to_errno returns negative -- no
  *     leading '-').
- *   - committed < FILE_SYNC4: DS wrote weaker durability than
- *     requested; -EPROTO + failure.
+ *   - committed below the requested stable level: DS wrote weaker
+ *     durability than requested; -EPROTO + failure.
  *   - count == 0 with block_status[0] == NFS4_OK: draft-legal short
  *     write; -EAGAIN so ffv2 re-encodes and reissues via the MDS
  *     fallback.  Under NO_IO_THRU_MDS there is no resend: the
@@ -604,7 +604,7 @@ static void ffv2_chunk_write_call_done(struct rpc_task *task, void *data)
 				nfs4_stat_to_errno(res->block_status[0]);
 			goto fail;
 		}
-		if (res->committed < NFS_FILE_SYNC) {
+		if (res->committed < w->wire.args.stable) {
 			task->tk_status = -EPROTO;
 			goto fail;
 		}
@@ -822,9 +822,11 @@ static void ffv2_stripe_write_rollback(struct ffv2_stripe_write *sw)
 }
 
 /*
- * Phase-one barrier tail: every CHUNK_WRITE has completed.  On
- * success, fan out one FINALIZE -> COMMIT chain per shard; the
- * phase-two tail runs when the last of them completes.
+ * Phase-one barrier tail: every CHUNK_WRITE has completed.  Stable
+ * requests fan out one FINALIZE -> COMMIT chain per shard; unstable
+ * requests retain their owners for the later commit-bucket drain.
+ * The phase-two tail runs when the handoff or the lifecycle chains
+ * complete.
  *
  * Runs from the last shard's rpc_release, which still holds that
  * shard's reference for the duration.  A dispatch that launches no
@@ -870,6 +872,20 @@ static void ffv2_stripe_write_phase1(struct ffv2_stripe_write *sw)
 			ffv2_stripe_write_chains_retire(sw, sw->nr_shards);
 			return;
 		}
+	}
+	if (sw->hdr->args.stable == NFS_UNSTABLE) {
+		/* Leave FINALIZE/COMMIT to the generic commit buckets. */
+		for (i = 0; i < sw->nr_shards; i++) {
+			struct ffv2_chunk_wb_ctx *wb = sw->disp[i].wb;
+
+			ffv2_pending_chunk_retain(wb->pending);
+			ffv2_pending_chunk_defer(wb->pending);
+			sw->disp[i].wb = NULL;
+			ffv2_stripe_write_put(sw);
+			kfree(wb);
+		}
+		ffv2_stripe_write_chains_retire(sw, sw->nr_shards);
+		return;
 	}
 	if (cohort) {
 		struct ffv2_chunk_wb_ctx *first = sw->disp[0].wb;
@@ -970,8 +986,8 @@ static void ffv2_stripe_write_complete(struct ffv2_stripe_write *sw)
 		 * the logical write length; parity and padding are not user data.
 		 */
 		hdr->res.count = hdr->args.count;
-		/* Publish the write as unstable so pNFS schedules FFv2 COMMIT. */
-		hdr->verf.committed = NFS_UNSTABLE;
+		/* Direct lifecycle writes report their requested stable level. */
+		hdr->verf.committed = hdr->args.stable;
 		memcpy(&hdr->verf.verifier, &sw->disp[0].wire.res.writeverf,
 		       sizeof(hdr->verf.verifier));
 
@@ -1154,8 +1170,8 @@ static int ffv2_shard_launch(struct ffv2_stripe_write *sw, u32 idx)
 	/* Step 12: DS-side stateid from the layout's per-mirror slot. */
 	w->wire.args.stateid = fi->stateid;
 
-	/* Step 13-16: fixed postures + offset conversion. */
-	w->wire.args.stable       = NFS_FILE_SYNC;
+	/* Step 13-16: durability request and offset conversion. */
+	w->wire.args.stable       = hdr->args.stable;
 	w->wire.args.offset       = div64_u64(
 		ffv2_ds_offset(mirror, ctx->stripe_off),
 		mirror->striping_unit_size);

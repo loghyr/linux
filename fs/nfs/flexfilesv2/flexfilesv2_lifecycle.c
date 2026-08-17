@@ -926,6 +926,14 @@ static void ffv2_deferred_drain_release_pages(
 	}
 
 	if (dreq) {
+		/*
+		 * FFv2 validates each cohort's FINALIZE and COMMIT
+		 * verifiers before reaching this point.  The generic direct
+		 * completion takes one verifier for all pages, while a bucket
+		 * drain may contain several cohorts, so do not hand a mixed
+		 * list to that single-verifier check after a successful drain.
+		 * On failure, leave the pages for its normal truncation path.
+		 */
 		if (!status) {
 			while (!list_empty(&drain->data->pages)) {
 				req = nfs_list_entry(drain->data->pages.next);
@@ -1952,7 +1960,14 @@ static void ffv2_chunk_wb_finish(struct ffv2_chunk_wb_ctx *wb, int status)
 	retained = wb->pending->state == FFV2_PENDING_RETAINED;
 	spin_unlock(wb->pending->stripe_lock);
 	if (status == 0 && retained) {
-		ffv2_pending_chunk_lifecycle_done(wb->pending);
+		/* Stable writes already completed their DS lifecycle. */
+		if (wb->hdr->args.stable == NFS_UNSTABLE)
+			ffv2_pending_chunk_lifecycle_done(wb->pending);
+		else {
+			/* Drop the retained stripe reference before freeing it. */
+			ffv2_pending_chunk_abort(wb->pending);
+			ffv2_pending_chunk_free(wb->pending);
+		}
 		ffv2_stripe_write_chain_done(wb->sw, status);
 		kfree(wb);
 		return;
