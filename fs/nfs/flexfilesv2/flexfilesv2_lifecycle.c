@@ -58,6 +58,7 @@ ffv2_pending_drain_identity(const struct ffv2_deferred_drain *drain,
 	if (!drain || !drain->data || !pending)
 		return false;
 	return pending->lseg == drain->lseg &&
+		pending->dreq == drain->data->dreq &&
 		pending->commit_bucket == drain->data->ds_commit_index;
 }
 
@@ -1512,6 +1513,7 @@ ffv2_deferred_cohort_validate(struct ffv2_deferred_drain *drain,
 	}
 	list_for_each_entry(pending, view.pending_chunks, stripe_list) {
 		if (pending->lseg != drain->lseg ||
+		    pending->dreq != drain->data->dreq ||
 		    pending->state != FFV2_PENDING_DEFERRED) {
 			spin_unlock(view.pending_lock);
 			return -EAGAIN;
@@ -1573,6 +1575,7 @@ int ffv2_deferred_drain_claim(struct ffv2_deferred_drain *drain,
 
 		if (ffv2_pending_request_lookup_locked(fls, req, &pending) != 1 ||
 		    pending->lseg != drain->lseg ||
+		    pending->dreq != drain->data->dreq ||
 		    pending->commit_bucket != drain->data->ds_commit_index ||
 		    pending->state != FFV2_PENDING_DEFERRED) {
 			ret = -EPROTO;

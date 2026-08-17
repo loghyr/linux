@@ -230,7 +230,8 @@ ffv2_release_ds_info(struct pnfs_ds_commit_info *fl_cinfo,
 	spin_unlock(&inode->i_lock);
 }
 
-static bool ffv2_deferred_pending_ready(struct inode *inode)
+static bool ffv2_deferred_pending_ready(struct inode *inode,
+					struct nfs_direct_req *dreq)
 {
 	struct pnfs_layout_hdr *lo;
 	struct pnfs_layout_segment *lseg;
@@ -249,7 +250,8 @@ static bool ffv2_deferred_pending_ready(struct inode *inode)
 			bool is_deferred;
 
 			spin_lock(pending->stripe_lock);
-			is_deferred = pending->state == FFV2_PENDING_DEFERRED;
+			is_deferred = pending->state == FFV2_PENDING_DEFERRED &&
+				pending->dreq == dreq;
 			if (is_deferred) {
 				deferred = true;
 				spin_unlock(pending->stripe_lock);
@@ -334,7 +336,7 @@ ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
 	struct pnfs_ds_commit_info *ds = cinfo->ds;
 	int rc;
 
-	if (ffv2_deferred_pending_ready(inode))
+	if (ffv2_deferred_pending_ready(inode, cinfo->dreq))
 		return pnfs_generic_commit_pagelist(inode, mds_pages, how,
 						    cinfo,
 						    ffv2_initiate_deferred_commit);

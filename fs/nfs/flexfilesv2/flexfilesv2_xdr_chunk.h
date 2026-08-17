@@ -660,6 +660,8 @@ struct ffv2_pending_chunk {
 	void			*stripe_owner;
 	spinlock_t		*stripe_lock;
 	struct nfs_pgio_header		*hdr;
+	/* Identity only; never dereferenced. NULL denotes buffered I/O. */
+	struct nfs_direct_req		*dreq;
 	struct nfs_client		*ds_clp;
 	struct pnfs_layout_segment	*lseg;
 	const struct cred		*cred;

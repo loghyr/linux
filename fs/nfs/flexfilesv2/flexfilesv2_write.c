@@ -323,6 +323,7 @@ int ffv2_kunit_deferred_rollback_state_test(void)
 	first.stripe_lock = &first_sw->pending_lock;
 	INIT_LIST_HEAD(&first.requests);
 	first.lseg = &fls.generic_hdr;
+	first.dreq = &dreq;
 	first.commit_bucket = 1;
 	first.state = FFV2_PENDING_COMMITTING;
 	list_add(&first.stripe_list, &first_sw->pending_chunks);
@@ -332,6 +333,7 @@ int ffv2_kunit_deferred_rollback_state_test(void)
 	second.stripe_lock = &second_sw->pending_lock;
 	INIT_LIST_HEAD(&second.requests);
 	second.lseg = &fls.generic_hdr;
+	second.dreq = &dreq;
 	second.commit_bucket = 1;
 	second.state = FFV2_PENDING_COMMITTING;
 	list_add(&second.stripe_list, &second_sw->pending_chunks);
@@ -803,6 +805,7 @@ static int ffv2_chunk_write_prepare_wb(struct ffv2_chunk_write_dispatch *w,
 	wb->pending->state = FFV2_PENDING_IMMEDIATE;
 	wb->pending->stripe_lock = &sw->pending_lock;
 	wb->pending->hdr = sw->hdr;
+	wb->pending->dreq = sw->hdr->dreq;
 	wb->pending->inode = sw->inode;
 	wb->pending->lseg = pnfs_get_lseg(sw->lseg);
 	wb->pending->cred = get_cred(sw->hdr->cred);
