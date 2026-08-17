@@ -806,6 +806,8 @@ static int ffv2_chunk_write_prepare_wb(struct ffv2_chunk_write_dispatch *w,
 	wb->pending->stripe_lock = &sw->pending_lock;
 	wb->pending->hdr = sw->hdr;
 	wb->pending->dreq = sw->hdr->dreq;
+	if (wb->pending->dreq)
+		nfs_direct_req_get(wb->pending->dreq);
 	wb->pending->inode = sw->inode;
 	wb->pending->lseg = pnfs_get_lseg(sw->lseg);
 	wb->pending->cred = get_cred(sw->hdr->cred);

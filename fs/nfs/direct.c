@@ -215,8 +215,20 @@ static void nfs_direct_req_free(struct kref *kref)
 
 static void nfs_direct_req_release(struct nfs_direct_req *dreq)
 {
+	nfs_direct_req_put(dreq);
+}
+
+void nfs_direct_req_get(struct nfs_direct_req *dreq)
+{
+	kref_get(&dreq->kref);
+}
+EXPORT_SYMBOL_GPL(nfs_direct_req_get);
+
+void nfs_direct_req_put(struct nfs_direct_req *dreq)
+{
 	kref_put(&dreq->kref, nfs_direct_req_free);
 }
+EXPORT_SYMBOL_GPL(nfs_direct_req_put);
 
 ssize_t nfs_dreq_bytes_left(struct nfs_direct_req *dreq, loff_t offset)
 {

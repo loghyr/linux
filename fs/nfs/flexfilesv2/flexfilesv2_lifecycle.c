@@ -1188,6 +1188,8 @@ void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending)
 	spin_unlock(pending->stripe_lock);
 	put_cred(pending->cred);
 	nfs_put_client(pending->ds_clp);
+	if (pending->dreq)
+		nfs_direct_req_put(pending->dreq);
 	pnfs_put_lseg(pending->lseg);
 	if (release_stripe)
 		pending->stripe_put(pending->stripe_owner);
