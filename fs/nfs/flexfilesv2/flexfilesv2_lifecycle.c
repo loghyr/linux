@@ -1209,31 +1209,32 @@ void ffv2_pending_chunk_free(struct ffv2_pending_chunk *pending)
 {
 	struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(pending->lseg);
 	struct ffv2_pending_req *p, *tmp;
+	LIST_HEAD(requests);
 	bool release_stripe;
 
 	spin_lock(pending->stripe_lock);
 	if (WARN_ON_ONCE(READ_ONCE(pending->state) == FFV2_PENDING_RETAINED))
 		goto out_unlock;
-	release_stripe = pending->state != FFV2_PENDING_IMMEDIATE &&
-		pending->stripe_put;
 	spin_unlock(pending->stripe_lock);
-
-	list_for_each_entry_safe(p, tmp, &pending->requests, list) {
-		list_del(&p->list);
-		put_nfs_open_context(p->context);
-		nfs_release_request(p->req);
-		kfree(p);
-	}
 
 	spin_lock(&fls->fls_pending_lock);
 	if (test_and_clear_bit(FFV2_PENDING_QUEUED, &pending->flags)) {
 		list_del_init(&pending->list);
 	}
+	spin_lock(pending->stripe_lock);
+	list_splice_init(&pending->requests, &requests);
+	list_del_init(&pending->stripe_list);
+	release_stripe = pending->state != FFV2_PENDING_IMMEDIATE &&
+		pending->stripe_put;
+	spin_unlock(pending->stripe_lock);
 	spin_unlock(&fls->fls_pending_lock);
 	wake_up_all(&fls->fls_ctx_wq);
-	spin_lock(pending->stripe_lock);
-	list_del_init(&pending->stripe_list);
-	spin_unlock(pending->stripe_lock);
+	list_for_each_entry_safe(p, tmp, &requests, list) {
+		list_del(&p->list);
+		put_nfs_open_context(p->context);
+		nfs_release_request(p->req);
+		kfree(p);
+	}
 	put_cred(pending->cred);
 	nfs_put_client(pending->ds_clp);
 	if (pending->dreq)
@@ -1351,7 +1352,10 @@ bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending)
 }
 EXPORT_SYMBOL_GPL(ffv2_pending_chunk_verifiers_complete);
 
-/* Caller holds fls_pending_lock.  A request must have one owner. */
+/*
+ * Caller holds fls_pending_lock.  Take each stripe lock before walking its
+ * request list; a request must have one owner.
+ */
 static unsigned int
 ffv2_pending_request_lookup_locked(struct nfs4_ffv2_layout_segment *fls,
 					   struct nfs_page *req,
@@ -1364,6 +1368,9 @@ ffv2_pending_request_lookup_locked(struct nfs4_ffv2_layout_segment *fls,
 	list_for_each_entry(pending, &fls->fls_pending_list, list) {
 		if (pending->shard_idx != 0)
 			continue;
+		if (WARN_ON_ONCE(!pending->stripe_lock))
+			continue;
+		spin_lock(pending->stripe_lock);
 		list_for_each_entry(p, &pending->requests, list) {
 			if (p->req != req)
 				continue;
@@ -1371,6 +1378,7 @@ ffv2_pending_request_lookup_locked(struct nfs4_ffv2_layout_segment *fls,
 				*found = pending;
 			count++;
 		}
+		spin_unlock(pending->stripe_lock);
 	}
 	return count;
 }
