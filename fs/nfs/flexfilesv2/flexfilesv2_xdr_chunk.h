@@ -594,6 +594,35 @@ struct ffv2_commit_chunk {
 	struct ffv2_pending_chunk *pending;
 };
 
+struct ffv2_deferred_drain;
+
+struct ffv2_deferred_group {
+	struct list_head		list;
+	struct ffv2_deferred_drain	*drain;
+	struct ffv2_pending_chunk	*pending[FFV2_MAX_CHUNKS_PER_OP];
+	struct chunk_owner4		owners[FFV2_MAX_CHUNKS_PER_OP];
+	u64				offset;
+	u32				count;
+	u32				nowners;
+	bool				finished;
+};
+
+/*
+ * State retained by the deferred FINALIZE -> COMMIT drain.  The generic
+ * pNFS commit helper has already moved the selected requests to data->pages
+ * and incremented mds_cinfo->rpcs_out before the driver callback runs.
+ */
+struct ffv2_deferred_drain {
+	struct kref			ref;
+	struct nfs_commit_data		*data;
+	struct nfs_mds_commit_info	*mds_cinfo;
+	struct pnfs_layout_segment	*lseg;
+	struct list_head		groups;
+	struct list_head		retry_pages;
+	atomic_t			pending_ops;
+	int				status;
+};
+
 struct ffv2_pending_chunk {
 	struct list_head		list;
 	struct list_head		stripe_list;
