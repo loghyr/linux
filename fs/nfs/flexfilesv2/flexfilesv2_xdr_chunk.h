@@ -692,6 +692,9 @@ void ffv2_deferred_drain_abort(struct ffv2_deferred_drain *drain);
 bool ffv2_deferred_pending_matches_drain(
 		const struct ffv2_deferred_drain *drain,
 		const struct ffv2_pending_chunk *pending);
+bool ffv2_deferred_group_matches_pending(
+		const struct ffv2_deferred_group *group,
+		const struct ffv2_pending_chunk *pending);
 void ffv2_pending_lseg_reclaim(struct nfs4_ffv2_layout_segment *fls);
 bool ffv2_pending_chunk_verifiers_complete(struct ffv2_pending_chunk *pending);
 bool ffv2_deferred_finalize_verifier_matches(

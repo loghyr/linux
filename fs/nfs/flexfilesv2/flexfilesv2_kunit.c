@@ -161,6 +161,44 @@ static void ffv2_deferred_rollback_ownership_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0, ffv2_kunit_deferred_rollback_state_test());
 }
 
+static void ffv2_deferred_group_identity_test(struct kunit *test)
+{
+	struct ffv2_deferred_group group = { };
+	struct ffv2_pending_chunk first = { };
+	struct ffv2_pending_chunk pending = { };
+	struct nfs_client *first_clp = (void *)&group;
+	struct nfs_client *other_clp = (void *)&pending;
+
+	group.pending[0] = &first;
+	group.nowners = 1;
+	first.ds_clp = first_clp;
+	pending.ds_clp = first.ds_clp;
+	first.fh.size = pending.fh.size = 1;
+	first.fh.data[0] = pending.fh.data[0] = 0x11;
+	first.stateid.seqid = pending.stateid.seqid = 7;
+	first.stateid.other[0] = pending.stateid.other[0] = 0x22;
+	first.commit_bucket = pending.commit_bucket = 4;
+
+	KUNIT_EXPECT_TRUE(test,
+		ffv2_deferred_group_matches_pending(&group, &pending));
+
+	pending.ds_clp = other_clp;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_group_matches_pending(&group, &pending));
+	pending.ds_clp = first.ds_clp;
+	pending.fh.data[0]++;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_group_matches_pending(&group, &pending));
+	pending.fh.data[0]--;
+	pending.stateid.seqid++;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_group_matches_pending(&group, &pending));
+	pending.stateid.seqid--;
+	pending.commit_bucket++;
+	KUNIT_EXPECT_FALSE(test,
+		ffv2_deferred_group_matches_pending(&group, &pending));
+}
+
 static struct kunit_case ffv2_deferred_test_cases[] = {
 	KUNIT_CASE(ffv2_mixed_cohort_verifier_test),
 	KUNIT_CASE(ffv2_deferred_group_wait_test),
@@ -168,6 +206,7 @@ static struct kunit_case ffv2_deferred_test_cases[] = {
 	KUNIT_CASE(ffv2_pending_state_transition_test),
 	KUNIT_CASE(ffv2_deferred_drain_abort_test),
 	KUNIT_CASE(ffv2_deferred_rollback_ownership_test),
+	KUNIT_CASE(ffv2_deferred_group_identity_test),
 	{}
 };
 

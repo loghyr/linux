@@ -1365,13 +1365,13 @@ ffv2_deferred_cohort_find(struct ffv2_deferred_drain *drain,
 	return NULL;
 }
 
-static bool
-ffv2_deferred_group_matches(const struct ffv2_deferred_group *group,
-				    const struct ffv2_pending_chunk *pending)
+bool ffv2_deferred_group_matches_pending(
+		const struct ffv2_deferred_group *group,
+		const struct ffv2_pending_chunk *pending)
 {
 	const struct ffv2_pending_chunk *first;
 
-	if (!group->nowners)
+	if (!group || !pending || !group->nowners || !group->pending[0])
 		return false;
 	first = group->pending[0];
 	return first->ds_clp == pending->ds_clp &&
@@ -1379,6 +1379,7 @@ ffv2_deferred_group_matches(const struct ffv2_deferred_group *group,
 		!memcmp(&first->stateid, &pending->stateid,
 			 sizeof(first->stateid));
 }
+EXPORT_SYMBOL_GPL(ffv2_deferred_group_matches_pending);
 
 static int
 ffv2_deferred_group_add(struct ffv2_deferred_drain *drain,
@@ -1390,7 +1391,7 @@ ffv2_deferred_group_add(struct ffv2_deferred_drain *drain,
 
 	list_for_each_entry(group, &drain->groups, list) {
 		if (group->cohort != cohort ||
-		    !ffv2_deferred_group_matches(group, pending))
+		    !ffv2_deferred_group_matches_pending(group, pending))
 			continue;
 		if (group->nowners == FFV2_MAX_CHUNKS_PER_OP)
 			return -E2BIG;
