@@ -3203,9 +3203,14 @@ ffv2_write_pagelist_chunked(struct nfs_pgio_header *hdr, int sync)
 	 * PNFS_ATTEMPTED the header belongs to the completion tails and
 	 * must not be touched again.
 	 */
-	if (ffv2_stripe_write_dispatch(hdr, ctx, sync) == PNFS_ATTEMPTED)
+	rc_fail = ffv2_stripe_write_dispatch(hdr, ctx, sync);
+	if (rc_fail == PNFS_ATTEMPTED)
 		return PNFS_ATTEMPTED;
-	rc_fail = -ENOMEM;	/* the only non-ATTEMPTED return it has */
+	if (rc_fail == PNFS_NOT_ATTEMPTED) {
+		ffv2_stripe_ctx_put(ctx);
+		return ffv2_write_fallback_to_mds(hdr);
+	}
+	rc_fail = -ENOMEM;
 
 out_fail_claimed:
 	/*
