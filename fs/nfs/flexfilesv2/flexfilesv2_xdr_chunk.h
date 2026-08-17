@@ -613,6 +613,7 @@ struct ffv2_pending_chunk {
 	u64				offset;
 	u32				count;
 	u32				shard_idx;
+	u32				commit_bucket;
 	struct chunk_owner4		owner;
 	nfs4_verifier			writeverf;
 	nfs4_verifier			finalize_writeverf;

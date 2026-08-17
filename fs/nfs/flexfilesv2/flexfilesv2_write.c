@@ -654,6 +654,18 @@ static int ffv2_chunk_write_prepare_wb(struct ffv2_chunk_write_dispatch *w,
 	wb->pending->offset = w->wire.args.offset;
 	wb->pending->count = 1;
 	wb->pending->shard_idx = w->mirror_idx;
+	{
+		struct nfs4_ffv2_layout_segment *fls = FFV2_LSEG(sw->lseg);
+		struct nfs4_ffv2_mirror *mirror = NULL;
+
+		if (fls->mirror_array_cnt == 1)
+			mirror = fls->mirror_array[0];
+
+		if (mirror && mirror->stripes_cnt &&
+		    w->mirror_idx < mirror->stripes[0].data_servers_cnt)
+			wb->pending->commit_bucket =
+				mirror->stripes[0].data_servers[w->mirror_idx].commit_bucket;
+	}
 	wb->pending->owner = w->wire.res.owners[0];
 	memcpy(&wb->pending->writeverf, &w->wire.res.writeverf,
 	       sizeof(wb->pending->writeverf));
