@@ -706,11 +706,13 @@ struct nfs_commit_data *ffv2_commit_aggregate_commitdata_alloc(
 struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 					struct ffv2_stripe_write *sw,
 					struct nfs_direct_req *dreq);
-struct nfs_commit_data *ffv2_commit_lseg_pending(
-					struct pnfs_layout_segment *lseg,
-					struct nfs_direct_req *dreq);
-struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode,
-					struct nfs_direct_req *dreq);
+/* Legacy COMMIT-only aggregate path; deferred records use the bucket drain. */
+struct nfs_commit_data *
+ffv2_legacy_commit_lseg_pending(struct pnfs_layout_segment *lseg,
+				struct nfs_direct_req *dreq);
+struct nfs_commit_data *
+ffv2_legacy_commit_inode_pending(struct inode *inode,
+					 struct nfs_direct_req *dreq);
 void ffv2_pending_commitdata_free(struct nfs_commit_data *data);
 void ffv2_commit_aggregate_free(struct ffv2_commit_aggregate *agg);
 void ffv2_commit_release_pages(struct nfs_commit_data *data);

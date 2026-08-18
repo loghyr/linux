@@ -348,9 +348,9 @@ struct nfs_commit_data *ffv2_stripe_commitdata_alloc(
 }
 EXPORT_SYMBOL_GPL(ffv2_stripe_commitdata_alloc);
 
-struct nfs_commit_data *ffv2_commit_lseg_pending(
-					struct pnfs_layout_segment *lseg,
-					struct nfs_direct_req *dreq)
+struct nfs_commit_data *
+ffv2_legacy_commit_lseg_pending(struct pnfs_layout_segment *lseg,
+				struct nfs_direct_req *dreq)
 {
 	struct ffv2_pending_chunk *pending, *candidate = NULL;
 	struct ffv2_stripe_write *sw;
@@ -380,14 +380,16 @@ struct nfs_commit_data *ffv2_commit_lseg_pending(
 	spin_unlock(&FFV2_LSEG(lseg)->fls_pending_lock);
 	{
 		struct nfs_commit_data *data = ffv2_stripe_commitdata_alloc(sw, dreq);
+
 		ffv2_stripe_write_put(sw);
 		return data;
 	}
 }
-EXPORT_SYMBOL_GPL(ffv2_commit_lseg_pending);
+EXPORT_SYMBOL_GPL(ffv2_legacy_commit_lseg_pending);
 
-struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode,
-					struct nfs_direct_req *dreq)
+struct nfs_commit_data *
+ffv2_legacy_commit_inode_pending(struct inode *inode,
+					 struct nfs_direct_req *dreq)
 {
 	struct pnfs_layout_hdr *lo;
 	struct pnfs_layout_segment *lseg, *candidate = NULL;
@@ -427,11 +429,11 @@ struct nfs_commit_data *ffv2_commit_inode_pending(struct inode *inode,
 	spin_unlock(&inode->i_lock);
 	if (!candidate)
 		return NULL;
-	data = ffv2_commit_lseg_pending(candidate, dreq);
+	data = ffv2_legacy_commit_lseg_pending(candidate, dreq);
 	pnfs_put_lseg(candidate);
 	return data;
 }
-EXPORT_SYMBOL_GPL(ffv2_commit_inode_pending);
+EXPORT_SYMBOL_GPL(ffv2_legacy_commit_inode_pending);
 
 static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
 					   struct ffv2_chunk_write_dispatch *w);

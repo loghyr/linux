@@ -339,7 +339,8 @@ ffv2_commit_pagelist(struct inode *inode, struct list_head *mds_pages,
 						    cinfo,
 						    ffv2_initiate_deferred_commit);
 
-	data = ffv2_commit_inode_pending(inode, cinfo->dreq);
+	/* Deferred records must use the page-authoritative bucket drain above. */
+	data = ffv2_legacy_commit_inode_pending(inode, cinfo->dreq);
 	if (!data)
 		goto mds;
 	agg = data->private;
