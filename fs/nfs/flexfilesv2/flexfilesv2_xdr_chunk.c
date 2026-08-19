@@ -264,10 +264,10 @@
  *   + 1 * (cs_algorithm (1q) + cs_value_len (1q)
  *          + cs_value bytes (1q; CRC32 = 4 bytes quad-aligned,
  *            no pad)
- *          + cr_effective_len (1q) + cr_owner (3q) + cr_guard (2q)
+ *          + cr_effective_len (1q) + cr_owner (4q) + cr_guard (2q)
  *          + cr_payload_id (1q) + cr_locked (1q)
  *          + cr_status (1q) + cr_chunk_len (1q))
- *   = 33 quads.
+ *   = 34 quads.
  *
  * The corresponding N=0 short-reply (transient-OOM truncation on
  * the DS side) yields a shorter wire; the xprt fills only what the
@@ -275,7 +275,7 @@
  * the trailing quads.  A future batching (N > 1) or non-CRC32
  * checksum extension MUST rework this constant as a coordinated change.
  */
-#define FFV2_CHUNK_READ_REPLY_HDR_QUADS		33
+#define FFV2_CHUNK_READ_REPLY_HDR_QUADS		34
 
 /*
  * Reserve space in the XDR stream.  A NULL return from
