@@ -2747,7 +2747,8 @@ static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
 		return false;
 	w->guard_refreshes++;
 
-	if (WARN_ON_ONCE(!ctx->fls || !ctx->fls->mirror_array))
+	if (WARN_ON_ONCE(!ctx->fls || !ctx->fls->mirror_array_cnt ||
+			 !ctx->fls->mirror_array[0]))
 		return false;
 	mirror = ctx->fls->mirror_array[0];
 
