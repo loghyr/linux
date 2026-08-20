@@ -261,6 +261,7 @@ static void ffv2_chunk_finalize_prepare(struct rpc_task *task, void *data)
 {
 	struct ffv2_chunk_finalize_dispatch *d = data;
 
+	ffv2_rpc_bound_timeout(task);
 	nfs4_setup_sequence(d->ctx.ds_clp, &d->wire.seq_args,
 			    &d->wire.res.seq_res, task);
 }
@@ -685,6 +686,7 @@ static void ffv2_chunk_commit_prepare(struct rpc_task *task, void *data)
 {
 	struct ffv2_chunk_commit_dispatch *d = data;
 
+	ffv2_rpc_bound_timeout(task);
 	nfs4_setup_sequence(d->ctx.ds_clp, &d->wire.seq_args,
 			    &d->wire.res.seq_res, task);
 }
@@ -825,6 +827,7 @@ static void ffv2_chunk_rollback_prepare(struct rpc_task *task, void *data)
 {
 	struct ffv2_chunk_rollback_dispatch *d = data;
 
+	ffv2_rpc_bound_timeout(task);
 	nfs4_setup_sequence(d->ctx.ds_clp, &d->wire.seq_args,
 			    &d->wire.res.seq_res, task);
 }

@@ -624,6 +624,8 @@ static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
 	struct ffv2_captured_guard *slot =
 		&w->sw->ctx->captured_guard[w->mirror_idx];
 
+	ffv2_rpc_bound_timeout(task);
+
 	/*
 	 * Take the guard from its slot on every pass, not just the
 	 * first.  On the initial dispatch this reproduces what the
@@ -1958,6 +1960,8 @@ static void ffv2_rmw_fetch_prepare_v4(struct rpc_task *task, void *data)
 	struct ffv2_rmw_fetch *f = data;
 	struct nfs_pgio_header *hdr = f->hdr;
 
+	ffv2_rpc_bound_timeout(task);
+
 	if (nfs4_setup_sequence(hdr->ds_clp,
 				&hdr->args.seq_args,
 				&hdr->res.seq_res,
@@ -2465,6 +2469,8 @@ static void ffv2_chunk_read_dispatch_prepare_v4(struct rpc_task *task,
 						void *data)
 {
 	struct ffv2_chunk_read_fetch *f = data;
+
+	ffv2_rpc_bound_timeout(task);
 
 	if (nfs4_setup_sequence(f->ds_clp, &f->data.seq_args,
 				&f->data.res.seq_res, task))

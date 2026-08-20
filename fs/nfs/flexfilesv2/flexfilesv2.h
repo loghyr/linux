@@ -15,6 +15,7 @@
 #include <linux/math64.h>
 #include <linux/refcount.h>
 #include <linux/nfs4.h>
+#include <linux/sunrpc/sched.h>
 #include "../pnfs.h"
 
 /* NFSv4 status extensions assigned by the Flex Files v2 draft. */
@@ -61,6 +62,13 @@
  * batched-N follow-up without protocol churn.
  */
 #define FFV2_MAX_CHUNKS_PER_OP		32
+
+/* FFv2 barriers must complete when a connected DS stops replying. */
+static inline void ffv2_rpc_bound_timeout(struct rpc_task *task)
+{
+	task->tk_flags &= ~RPC_TASK_NO_RETRANS_TIMEOUT;
+	task->tk_flags |= RPC_TASK_TIMEOUT;
+}
 
 /*
  * chunk_guard4 / chunk_owner4 -- wire types shared by every non-

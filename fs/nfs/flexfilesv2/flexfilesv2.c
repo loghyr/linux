@@ -572,6 +572,8 @@ static void ffv2_shard_read_prepare(struct rpc_task *task, void *data)
 {
 	struct ffv2_shard_read *r = data;
 
+	ffv2_rpc_bound_timeout(task);
+
 	if (nfs4_setup_sequence(r->ds_clp, &r->data.seq_args,
 				&r->data.res.seq_res, task))
 		return;
