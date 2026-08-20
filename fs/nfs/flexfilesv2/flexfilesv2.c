@@ -527,6 +527,26 @@ static void ffv2_reset_read_to_mds(struct nfs_pgio_header *hdr)
 		hdr->task.tk_status = pnfs_read_done_resend_to_mds(hdr);
 }
 
+static void ffv2_reset_read_to_pnfs(struct nfs_pgio_header *hdr)
+{
+	/* Reacquire layout state so the MDS can refresh DS trust state. */
+	pnfs_error_mark_layout_for_return(hdr->inode, hdr->lseg);
+	/* pnfs_read_resend_pnfs() owns the one-shot REDO gate. */
+	pnfs_read_resend_pnfs(hdr, 0);
+}
+
+static void ffv2_read_set_resend(struct nfs_pgio_header *hdr, int status)
+{
+	nfs_set_pgio_error(hdr, status, hdr->args.offset);
+	if (ffv2_no_fallback_to_mds(hdr->lseg) ||
+	    status == -NFS4ERR_BAD_STATEID ||
+	    status == -NFS4ERR_BADSESSION ||
+	    status == -NFS4ERR_STALE_CLIENTID)
+		set_bit(NFS_IOHDR_RESEND_PNFS, &hdr->flags);
+	else
+		set_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags);
+}
+
 /* ---------- chunk-encoded shard read ---------------------------- */
 
 /*
@@ -724,8 +744,7 @@ static void ffv2_shard_read_call_done(struct rpc_task *task, void *data)
 	return;
 
 out_err:
-	nfs_set_pgio_error(hdr, task->tk_status, hdr->args.offset);
-	set_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags);
+	ffv2_read_set_resend(hdr, task->tk_status);
 }
 
 static void ffv2_shard_read_release(void *data)
@@ -741,7 +760,9 @@ static void ffv2_shard_read_release(void *data)
 	 * it -- and only then drop the lseg ref, which the header's own
 	 * ref no longer covers once it is gone.
 	 */
-	if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags))
+	if (test_bit(NFS_IOHDR_RESEND_PNFS, &hdr->flags))
+		ffv2_reset_read_to_pnfs(hdr);
+	else if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags))
 		ffv2_reset_read_to_mds(hdr);
 	kfree(r);
 	nfs_put_client(ds_clp);
