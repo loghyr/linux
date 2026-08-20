@@ -554,6 +554,12 @@ EXPORT_SYMBOL_GPL(ffv2_legacy_commit_inode_pending);
 static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
 					   struct ffv2_chunk_write_dispatch *w);
 
+/* Generic writeback error accounting accepts errno values, not NFS status. */
+static int ffv2_status_to_errno(int status)
+{
+	return status <= -10000 ? -EIO : status;
+}
+
 /*
  * Record a shard's or a chain's failure.  First error wins: a later
  * failure tells us nothing the first one did not, and the first is
@@ -562,6 +568,7 @@ static bool ffv2_chunk_write_guard_refresh(struct rpc_task *task,
 static void ffv2_stripe_write_set_status(struct ffv2_stripe_write *sw,
 					 int status)
 {
+	status = ffv2_status_to_errno(status);
 	if (status)
 		cmpxchg(&sw->status, 0, status);
 }
@@ -1949,6 +1956,7 @@ struct ffv2_rmw_fetch {
 static void ffv2_rmw_fetch_done_one(struct ffv2_stripe_ctx *ctx,
 				    int status)
 {
+	status = ffv2_status_to_errno(status);
 	if (status < 0)
 		cmpxchg(&ctx->fetch_status, 0, status);
 	if (atomic_dec_and_test(&ctx->fetch_pending))

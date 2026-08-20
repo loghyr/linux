@@ -836,26 +836,15 @@ static void ffv2_chunk_rollback_call_done(struct rpc_task *task, void *data)
 {
 	struct ffv2_chunk_rollback_dispatch *d = data;
 	struct ffv2_chunk_rollback_res *res = &d->wire.res;
-	u32 i;
 
 	if (!nfs4_sequence_done(task, &res->seq_res))
 		return;
 	if (task->tk_status == -NFS4ERR_DELAY &&
 	    ffv2_chunk_lifecycle_delay_retry(task, &d->retry_attempts))
 		return;
-	if (!task->tk_status) {
-		if (res->nstatus != d->wire.args.nowners) {
-			task->tk_status = -EPROTO;
-		} else {
-			for (i = 0; i < res->nstatus; i++) {
-				if (res->status[i] == NFS4_OK)
-					continue;
-				task->tk_status =
-					nfs4_stat_to_errno(res->status[i]);
-				break;
-			}
-		}
-	}
+	if (!task->tk_status)
+		task->tk_status = ffv2_chunk_lifecycle_fold_status(
+			res->nstatus, res->status, d->wire.args.nowners);
 	d->rpc_status = task->tk_status;
 }
 
