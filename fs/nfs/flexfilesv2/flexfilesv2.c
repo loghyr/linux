@@ -28,6 +28,7 @@
 #include <linux/sunrpc/metrics.h>
 
 #include "../internal.h"
+#include "../nfs42.h"
 #include "../nfs4_fs.h"
 #include "../nfs4trace.h"
 #include "../pnfs.h"
@@ -568,7 +569,12 @@ struct ffv2_shard_read {
 	struct nfs_pgio_header	*hdr;		/* owned; we complete it */
 	struct pnfs_layout_segment *lseg;	/* holds one lseg ref */
 	struct nfs_client	*ds_clp;	/* holds one cl_count ref */
+	struct nfs4_deviceid	devid;
 	int			retry_attempts;
+	int			layouterror_status;
+	bool			layouterror_pending;
+	refcount_t		refs;
+	struct work_struct	retry_work;
 	struct ffv2_chunk_read_data data;
 	/*
 	 * Embedded rpc_task: a caller-supplied task never carries
@@ -578,6 +584,17 @@ struct ffv2_shard_read {
 	 */
 	struct rpc_task		task;
 };
+
+static void ffv2_shard_read_retry_work(struct work_struct *work);
+
+static void ffv2_shard_read_put(struct ffv2_shard_read *r)
+{
+	if (!refcount_dec_and_test(&r->refs))
+		return;
+	nfs_put_client(r->ds_clp);
+	pnfs_put_lseg(r->lseg);
+	kfree(r);
+}
 
 /* Account the RPC through the wrapper's pgio header. */
 static void ffv2_shard_read_count_stats(struct rpc_task *task, void *data)
@@ -641,6 +658,62 @@ static int ffv2_shard_read_verify(struct ffv2_shard_read *r,
 	return 0;
 }
 
+#ifdef CONFIG_NFS_V4_2
+static void ffv2_shard_read_layouterror_done(void *data, int status)
+{
+	struct ffv2_shard_read *r = data;
+
+	r->layouterror_status = status;
+	if (!schedule_work(&r->retry_work))
+		ffv2_shard_read_put(r);
+}
+#endif
+
+static int ffv2_shard_read_start_layouterror(struct ffv2_shard_read *r)
+{
+#ifdef CONFIG_NFS_V4_2
+	struct nfs42_layout_error error = {
+		.offset = r->hdr->args.offset,
+		.length = r->hdr->args.count,
+		.errors[0] = {
+			.dev_id = r->devid,
+			.status = NFS4ERR_BAD_STATEID,
+			.opnum = OP_CHUNK_READ,
+		},
+	};
+	int ret;
+
+	if (!nfs_server_capable(r->hdr->inode, NFS_CAP_LAYOUTERROR))
+		return -EOPNOTSUPP;
+
+	r->layouterror_pending = true;
+	refcount_inc(&r->refs);
+	ret = nfs42_proc_layouterror_async(r->lseg, &error, 1,
+					   ffv2_shard_read_layouterror_done, r);
+	if (ret) {
+		r->layouterror_pending = false;
+		ffv2_shard_read_put(r);
+	}
+	return ret;
+#else
+	return -EOPNOTSUPP;
+#endif
+}
+
+static void ffv2_shard_read_retry_work(struct work_struct *work)
+{
+	struct ffv2_shard_read *r =
+		container_of(work, struct ffv2_shard_read, retry_work);
+	struct nfs_pgio_header *hdr = r->hdr;
+
+	if (!r->layouterror_status)
+		pnfs_read_resend_pnfs(hdr, 0);
+	else
+		ffv2_reset_read_to_pnfs(hdr);
+	hdr->completion_ops->completion(hdr);
+	ffv2_shard_read_put(r);
+}
+
 static void ffv2_shard_read_call_done(struct rpc_task *task, void *data)
 {
 	struct ffv2_shard_read *r = data;
@@ -666,6 +739,11 @@ static void ffv2_shard_read_call_done(struct rpc_task *task, void *data)
 	if (task->tk_status < 0) {
 		unsigned long delay_ms;
 
+		if (task->tk_status == -NFS4ERR_BAD_STATEID) {
+			if (!ffv2_shard_read_start_layouterror(r))
+				return;
+			goto out_err;
+		}
 		if (task->tk_status != -NFS4ERR_DELAY)
 			goto out_err;
 		if (++r->retry_attempts > FFV2_CHUNK_READ_MAX_DELAY_ATTEMPTS) {
@@ -760,6 +838,10 @@ static void ffv2_shard_read_release(void *data)
 	 * it -- and only then drop the lseg ref, which the header's own
 	 * ref no longer covers once it is gone.
 	 */
+	if (r->layouterror_pending) {
+		ffv2_shard_read_put(r);
+		return;
+	}
 	if (test_bit(NFS_IOHDR_RESEND_PNFS, &hdr->flags))
 		ffv2_reset_read_to_pnfs(hdr);
 	else if (test_bit(NFS_IOHDR_RESEND_MDS, &hdr->flags))
@@ -859,6 +941,9 @@ ffv2_read_dispatch_chunk(struct nfs_pgio_header *hdr,
 	}
 	if (!r)
 		goto out_put_devnode;
+	refcount_set(&r->refs, 1);
+	INIT_WORK(&r->retry_work, ffv2_shard_read_retry_work);
+	r->devid = ds_slot->devid;
 
 	/*
 	 * cra_offset is a chunk index, not a byte offset.  ffv2_ds_offset
