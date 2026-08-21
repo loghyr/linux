@@ -429,6 +429,8 @@ struct nfs42_layouterror_data {
 	struct nfs42_layouterror_res res;
 	struct inode *inode;
 	struct pnfs_layout_segment *lseg;
+	void (*done)(void *data, int status);
+	void *done_data;
 };
 
 struct nfs42_clone_args {

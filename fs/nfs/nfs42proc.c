@@ -1150,7 +1150,7 @@ nfs42_layouterror_done(struct rpc_task *task, void *calldata)
 
 	switch (task->tk_status) {
 	case 0:
-		return;
+		break;
 	case -NFS4ERR_BADHANDLE:
 	case -ESTALE:
 		pnfs_destroy_layout(NFS_I(inode));
@@ -1187,6 +1187,8 @@ nfs42_layouterror_done(struct rpc_task *task, void *calldata)
 						&data->args.errors[0].stateid))
 				rpc_delay(task, HZ);
 			rpc_restart_call_prepare(task);
+			spin_unlock(&inode->i_lock);
+			return;
 		}
 		spin_unlock(&inode->i_lock);
 		break;
@@ -1197,6 +1199,8 @@ nfs42_layouterror_done(struct rpc_task *task, void *calldata)
 
 	trace_nfs4_layouterror(inode, &data->args.errors[0].stateid,
 			       task->tk_status);
+	if (data->done)
+		data->done(data->done_data, task->tk_status);
 }
 
 static void
@@ -1213,8 +1217,11 @@ static const struct rpc_call_ops nfs42_layouterror_ops = {
 	.rpc_release = nfs42_layouterror_release,
 };
 
-int nfs42_proc_layouterror(struct pnfs_layout_segment *lseg,
-		const struct nfs42_layout_error *errors, size_t n)
+int nfs42_proc_layouterror_async(struct pnfs_layout_segment *lseg,
+				 const struct nfs42_layout_error *errors,
+				 size_t n,
+				 void (*done)(void *data, int status),
+				 void *done_data)
 {
 	struct inode *inode = lseg->pls_layout->plh_inode;
 	struct nfs_server *server = NFS_SERVER(inode);
@@ -1237,6 +1244,8 @@ int nfs42_proc_layouterror(struct pnfs_layout_segment *lseg,
 	data = nfs42_alloc_layouterror_data(lseg, nfs_io_gfp_mask());
 	if (!data)
 		return -ENOMEM;
+	data->done = done;
+	data->done_data = done_data;
 	for (i = 0; i < n; i++) {
 		data->args.errors[i] = errors[i];
 		data->args.num_errors++;
@@ -1249,10 +1258,20 @@ int nfs42_proc_layouterror(struct pnfs_layout_segment *lseg,
 	nfs4_init_sequence(server->nfs_client, &data->args.seq_args,
 			   &data->res.seq_res, 0, 0);
 	task = rpc_run_task(&task_setup);
-	if (IS_ERR(task))
-		return PTR_ERR(task);
+	if (IS_ERR(task)) {
+		int status = PTR_ERR(task);
+
+		return status;
+	}
 	rpc_put_task(task);
 	return 0;
+}
+EXPORT_SYMBOL_GPL(nfs42_proc_layouterror_async);
+
+int nfs42_proc_layouterror(struct pnfs_layout_segment *lseg,
+			   const struct nfs42_layout_error *errors, size_t n)
+{
+	return nfs42_proc_layouterror_async(lseg, errors, n, NULL, NULL);
 }
 EXPORT_SYMBOL_GPL(nfs42_proc_layouterror);
 

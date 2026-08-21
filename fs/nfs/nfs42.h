@@ -29,6 +29,11 @@ int nfs42_proc_clone(struct file *, struct file *, loff_t, loff_t, loff_t);
 int nfs42_proc_layouterror(struct pnfs_layout_segment *lseg,
 			   const struct nfs42_layout_error *errors,
 			   size_t n);
+int nfs42_proc_layouterror_async(struct pnfs_layout_segment *lseg,
+				 const struct nfs42_layout_error *errors,
+				 size_t n,
+				 void (*done)(void *data, int status),
+				 void *done_data);
 int nfs42_proc_copy_notify(struct file *, struct file *,
 			   struct nfs42_copy_notify_res *);
 static inline bool nfs42_files_from_same_server(struct file *in,
