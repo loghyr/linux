@@ -18,6 +18,20 @@
 #include "flexfilesv2.h"
 #include "flexfilesv2_xdr_chunk.h"
 
+static void ffv2_rpc_timeout_policy_test(struct kunit *test)
+{
+	struct rpc_task task = {
+		.tk_flags = RPC_TASK_NO_RETRANS_TIMEOUT | RPC_TASK_SOFTCONN,
+	};
+
+	ffv2_rpc_bound_timeout(&task);
+
+	KUNIT_EXPECT_FALSE(test,
+			   task.tk_flags & RPC_TASK_NO_RETRANS_TIMEOUT);
+	KUNIT_EXPECT_TRUE(test, task.tk_flags & RPC_TASK_TIMEOUT);
+	KUNIT_EXPECT_TRUE(test, task.tk_flags & RPC_TASK_SOFTCONN);
+}
+
 static void ffv2_mixed_cohort_verifier_test(struct kunit *test)
 {
 	struct ffv2_pending_chunk first = { };
@@ -283,6 +297,7 @@ static void ffv2_deferred_group_range_test(struct kunit *test)
 }
 
 static struct kunit_case ffv2_deferred_test_cases[] = {
+	KUNIT_CASE(ffv2_rpc_timeout_policy_test),
 	KUNIT_CASE(ffv2_mixed_cohort_verifier_test),
 	KUNIT_CASE(ffv2_deferred_group_wait_test),
 	KUNIT_CASE(ffv2_deferred_owner_identity_test),
