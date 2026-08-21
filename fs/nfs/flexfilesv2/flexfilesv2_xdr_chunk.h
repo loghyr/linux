@@ -39,8 +39,8 @@ void ffv2_stripe_pending_view(struct ffv2_stripe_write *sw,
  *
  * The captured guard on RMW writes comes from the RMW fetch path's
  * retained read_chunk4.cr_guard -- its own wire field, not the
- * owner.  The owner names the writer; the guard is what the data
- * server compares against.
+ * owner.  The compact carrier names the writer; the guard is what the
+ * data server compares against.
  */
 struct ffv2_write_chunk_guard4 {
 	bool			check;
@@ -63,7 +63,10 @@ struct ffv2_chunk_write_args {
 	nfs4_stateid			stateid;
 	u64				offset;		/* chunk index */
 	u32				stable;		/* stable_how4 */
-	struct chunk_owner4		owner;
+	u64				cohort_id;
+	u32				client_id;
+	u32				nco_ids;
+	u32				co_ids[FFV2_MAX_CHUNKS_PER_OP];
 	u32				payload_id;	/* always 0 for now */
 	u32				flags;		/* always 0 for now */
 	struct ffv2_write_chunk_guard4	guard;

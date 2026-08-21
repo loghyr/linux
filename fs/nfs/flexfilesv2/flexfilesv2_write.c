@@ -205,6 +205,7 @@ struct ffv2_stripe_write {
 	 * another's set and the tail would read whichever raced last.
 	 */
 	atomic_t			resend_mds;
+	u64				cohort_id;
 	struct list_head		pending_chunks;
 	spinlock_t		pending_lock;
 
@@ -1292,13 +1293,10 @@ static int ffv2_shard_launch(struct ffv2_stripe_write *sw, u32 idx)
 	w->wire.args.checksum_algo = mirror->checksum_algorithm;
 	w->wire.args.checksum_len  = csum_len;
 
-	/* Step 11: build the chunk owner identifying this write. */
-	ffv2_build_chunk_owner(fls, mirror, &w->wire.args.owner);
-
-	/* Step 12: DS-side stateid from the layout's per-mirror slot. */
+	/* Step 11: DS-side stateid from the layout's per-mirror slot. */
 	w->wire.args.stateid = fi->stateid;
 
-	/* Step 13-16: durability request and offset conversion. */
+	/* Step 12-15: durability request and offset conversion. */
 	w->wire.args.stable       = hdr->args.stable;
 	w->wire.args.offset       = div64_u64(
 		ffv2_ds_offset(mirror, ctx->stripe_off),
@@ -1306,6 +1304,22 @@ static int ffv2_shard_launch(struct ffv2_stripe_write *sw, u32 idx)
 	w->wire.args.chunk_size   = mirror->striping_unit_size;
 	w->wire.args.payload_id   = 0;
 	w->wire.args.flags        = 0;
+
+	/* Step 16: build the compact per-payload owner carrier. */
+	{
+		u32 owner_id;
+
+		ffv2_build_chunk_carrier(fls, mirror, sw->cohort_id,
+					 &w->wire.args.cohort_id,
+					 &w->wire.args.client_id, &owner_id);
+		w->wire.args.nco_ids = DIV_ROUND_UP(w->wire.args.payload_len,
+							w->wire.args.chunk_size);
+		if (!w->wire.args.nco_ids ||
+		    w->wire.args.nco_ids > FFV2_MAX_CHUNKS_PER_OP)
+			goto out_undo_refs;
+		for (u32 i = 0; i < w->wire.args.nco_ids; i++)
+			w->wire.args.co_ids[i] = owner_id + i;
+	}
 
 	/*
 	 * Consume the per-shard captured guard populated by the
@@ -1507,6 +1521,7 @@ ffv2_stripe_write_dispatch(struct nfs_pgio_header *hdr,
 	sw->inode = hdr->inode;
 	sw->lseg = lseg;
 	sw->ctx = ctx;			/* the caller's ref, inherited */
+	sw->cohort_id = ffv2_owner_id_next(FFV2_LSEG(lseg));
 	refcount_set(&sw->sw_ref, 1);	/* this thread's, dropped below */
 	atomic_set(&sw->writes_pending, nr);
 	atomic_set(&sw->chains_pending, nr);

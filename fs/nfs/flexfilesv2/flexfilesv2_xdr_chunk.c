@@ -67,7 +67,8 @@
  * CHUNK_WRITE op header + INLINE body (excludes cwa_chunks<>
  * payload which is attached via xdr_write_pages, not inline):
  *   op code (4) + stateid (16) + offset (8) + stable (4)
- *   + owner (16: cohort 8 + client_id 4 + co_id 4)
+ *   + cohort_id (8) + client_id (4) + co_ids<> length (4) and
+ *       FFV2_MAX_CHUNKS_PER_OP co_ids (4 each)
  *   + payload_id (4) + flags (4)
  *   + guard: cwg_check (4) + (worst case) cwg_guard (8)
  *   + chunk_size (4)
@@ -77,7 +78,8 @@
  *   + cwa_chunks length (4) (payload bytes go via xdr_write_pages)
  */
 #define FFV2_CHUNK_WRITE_INLINE_ENC_MAXSZ \
-	(4 + NFS4_STATEID_SIZE + 8 + 4 + 16 + 4 + 4 + (4 + 8) + 4 + \
+	(4 + NFS4_STATEID_SIZE + 8 + 4 + 8 + 4 + 4 + \
+	 FFV2_MAX_CHUNKS_PER_OP * 4 + 4 + (4 + 8) + 4 + \
 	 (4 + (4 + 4 + FFV2_CHECKSUM_MAX_LEN)) + 4)
 
 /*
@@ -440,7 +442,12 @@ static void ffv2_xdr_enc_chunk_write_op(struct xdr_stream *xdr,
 	p = ffv2_reserve_space(xdr, 8 + 4);
 	p = xdr_encode_hyper(p, a->offset);	/* chunk INDEX, not bytes */
 	*p = cpu_to_be32(a->stable);
-	ffv2_xdr_enc_chunk_owner(xdr, &a->owner);
+	p = ffv2_reserve_space(xdr, 8 + 4 + 4 + a->nco_ids * 4);
+	p = xdr_encode_hyper(p, a->cohort_id);
+	*p++ = cpu_to_be32(a->client_id);
+	*p++ = cpu_to_be32(a->nco_ids);
+	for (u32 i = 0; i < a->nco_ids; i++)
+		*p++ = cpu_to_be32(a->co_ids[i]);
 	p = ffv2_reserve_space(xdr, 4 + 4);
 	*p++ = cpu_to_be32(a->payload_id);	/* always 0 for now */
 	*p   = cpu_to_be32(a->flags);		/* always 0 for now */

@@ -607,26 +607,24 @@ ffv2_owner_id_next(struct nfs4_ffv2_layout_segment *fls)
 }
 
 /*
- * Build a fresh chunk_owner4 for one CHUNK_WRITE on this lseg.
+ * Allocate the compact identity carrier for one CHUNK_WRITE on this lseg.
  *
  * No generation is stamped: the data server assigns cg_gen_id and
  * reports it in cr_guard, so it is not the client's to choose.
  *
- * co_cohort_id is left 0 until cohort assignment lands.  The draft
- * requires co_id to be distinct within one (co_cohort_id,
- * co_client_id), which ffv2_owner_id_next already gives us per lseg;
- * a constant cohort collapses every write on the lseg into one
- * transaction identity, which is wrong but not yet observable -- the
- * data server matches on co_id alone.
+ * The caller supplies one cohort for the stripe.  The payload carries
+ * that cohort followed by one co_id per chunk; co_id allocation remains
+ * per-layout so the full owner triples stay distinct.
  */
 static inline void
-ffv2_build_chunk_owner(struct nfs4_ffv2_layout_segment *fls,
-		       const struct nfs4_ffv2_mirror *mirror,
-		       struct chunk_owner4 *out)
+ffv2_build_chunk_carrier(struct nfs4_ffv2_layout_segment *fls,
+			 const struct nfs4_ffv2_mirror *mirror, u64 cohort_id,
+			 u64 *out_cohort_id,
+			 u32 *client_id, u32 *owner_id)
 {
-	out->co_cohort_id = 0;
-	out->co_client_id = ffv2_cg_client_id(mirror);
-	out->co_id = ffv2_owner_id_next(fls);
+	*owner_id = ffv2_owner_id_next(fls);
+	*out_cohort_id = cohort_id;
+	*client_id = ffv2_cg_client_id(mirror);
 }
 
 /* flexfilesv2_checksum.c */
