@@ -46,15 +46,6 @@
 #define FFV2_CHECKSUM_MAX_LEN		64
 
 /*
- * CHUNK op codes per draft-haynes-nfsv4-flexfiles-v2.
- */
-#define OP_CHUNK_COMMIT			78
-#define OP_CHUNK_FINALIZE		80
-#define OP_CHUNK_READ			83
-#define OP_CHUNK_ROLLBACK		85
-#define OP_CHUNK_WRITE			87
-
-/*
  * Reply-side cap on batched chunks per CHUNK op.  Initial posture is
  * N=1 chunk per op (both CHUNK_WRITE and CHUNK_READ); the cap sizes
  * the reply arrays defensively so a malformed or malicious DS reply

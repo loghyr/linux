@@ -836,6 +836,16 @@ struct nfsd4_copy_notify {
 	struct nl4_server	*cpn_src;
 };
 
+/*
+ * The provider dispatch seam needs the common file, range, and stateid
+ * fields. Operation-specific decoders consume the remaining wire fields.
+ */
+struct nfsd4_ffv2 {
+	stateid_t	stateid;
+	u64		offset;
+	u64		count;
+};
+
 struct nfsd4_op {
 	u32					opnum;
 	__be32					status;
@@ -904,6 +914,9 @@ struct nfsd4_op {
 		struct nfsd4_setxattr		setxattr;
 		struct nfsd4_listxattrs		listxattrs;
 		struct nfsd4_removexattr	removexattr;
+
+		/* Flex Files v2 data-server operations */
+		struct nfsd4_ffv2		ffv2;
 	} u;
 };
 
