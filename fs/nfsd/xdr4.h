@@ -846,6 +846,18 @@ struct nfsd4_ffv2 {
 	u64		count;
 };
 
+struct nfsd4_chunk_read {
+	stateid_t	cra_stateid;
+	u64		cra_offset;
+	u32		cra_count;
+};
+
+struct nfsd4_chunk_header_read {
+	stateid_t	chra_stateid;
+	u64		chra_offset;
+	u32		chra_count;
+};
+
 struct nfsd4_op {
 	u32					opnum;
 	__be32					status;
@@ -917,6 +929,8 @@ struct nfsd4_op {
 
 		/* Flex Files v2 data-server operations */
 		struct nfsd4_ffv2		ffv2;
+		struct nfsd4_chunk_read		chunk_read;
+		struct nfsd4_chunk_header_read	chunk_header_read;
 	} u;
 };
 

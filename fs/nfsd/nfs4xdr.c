@@ -2595,19 +2595,38 @@ static __be32
 nfsd4_decode_chunk_read(struct nfsd4_compoundargs *argp,
 			union nfsd4_op_u *u)
 {
-	return nfsd4_decode_ffv2_range(argp, &u->ffv2);
+	struct nfsd4_chunk_read *read = &u->chunk_read;
+	__be32 status;
+
+	memset(read, 0, sizeof(*read));
+	status = nfsd4_decode_stateid4(argp, &read->cra_stateid);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u64(argp->xdr, &read->cra_offset) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &read->cra_count) < 0)
+		return nfserr_bad_xdr;
+	if (read->cra_count > NFSD4_FFV2_MAX_ITEMS)
+		return nfserr_inval;
+	return nfs_ok;
 }
 
 static __be32
 nfsd4_decode_chunk_header_read(struct nfsd4_compoundargs *argp,
 			       union nfsd4_op_u *u)
 {
+	struct nfsd4_chunk_header_read *read = &u->chunk_header_read;
 	__be32 status;
 
-	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
+	memset(read, 0, sizeof(*read));
+	status = nfsd4_decode_stateid4(argp, &read->chra_stateid);
 	if (status)
 		return status;
-	if (u->ffv2.count > NFSD4_FFV2_MAX_HEADER_READ)
+	if (xdr_stream_decode_u64(argp->xdr, &read->chra_offset) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &read->chra_count) < 0)
+		return nfserr_bad_xdr;
+	if (read->chra_count > NFSD4_FFV2_MAX_HEADER_READ)
 		return nfserr_inval;
 	return nfs_ok;
 }
