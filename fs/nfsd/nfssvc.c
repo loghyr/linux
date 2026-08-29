@@ -526,6 +526,7 @@ void nfsd_destroy_serv(struct net *net)
 	 */
 	svc_xprt_destroy_all(serv, net, true);
 	nfsd_shutdown_net(net);
+	nfsd_ffv2_service_down(nn);
 	svc_destroy(&serv);
 }
 
@@ -571,6 +572,7 @@ static int nfsd_get_default_max_blksize(void)
 void nfsd_shutdown_threads(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	struct nfsd_ffv2_generation *generation;
 	struct svc_serv *serv;
 
 	mutex_lock(&nfsd_mutex);
@@ -581,7 +583,9 @@ void nfsd_shutdown_threads(struct net *net)
 	}
 
 	/* Kill outstanding nfsd threads */
+	generation = nfsd_ffv2_service_stop_begin(nn);
 	svc_set_num_threads(serv, 0, 0);
+	nfsd_ffv2_service_stop_finish(nn, generation);
 	nfsd_destroy_serv(net);
 	mutex_unlock(&nfsd_mutex);
 }
@@ -751,7 +755,9 @@ int
 nfsd_svc(int n, int *nthreads, struct net *net, const struct cred *cred, const char *scope)
 {
 	int	error;
+	bool	stop;
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	struct nfsd_ffv2_generation *generation = NULL;
 	struct svc_serv *serv;
 
 	lockdep_assert_held(&nfsd_mutex);
@@ -769,11 +775,19 @@ nfsd_svc(int n, int *nthreads, struct net *net, const struct cred *cred, const c
 	error = nfsd_startup_net(net, cred);
 	if (error)
 		goto out_put;
+	nfsd_ffv2_service_up(nn);
+	stop = nfsd_ffv2_requested_zero_threads(n, nthreads, serv->sv_nrpools);
+	if (stop)
+		generation = nfsd_ffv2_service_stop_begin(nn);
 	error = nfsd_set_nrthreads(n, nthreads, net);
+	if (error && serv->sv_nrthreads == 0 && !generation)
+		generation = nfsd_ffv2_service_stop_begin(nn);
 	if (error)
 		goto out_put;
 	error = serv->sv_nrthreads;
 out_put:
+	if (generation)
+		nfsd_ffv2_service_stop_finish(nn, generation);
 	if (serv->sv_nrthreads == 0)
 		nfsd_destroy_serv(net);
 out:

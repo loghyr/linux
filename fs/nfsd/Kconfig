@@ -91,6 +91,18 @@ config NFSD_V4
 
 	  If unsure, say N.
 
+config NFSD_FFV2_KUNIT_TEST
+	bool "KUnit tests for the nfsd Flex Files v2 lifecycle" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && NFSD=y && NFSD_V4
+	default KUNIT_ALL_TESTS
+	help
+	  Run tests for the fail-closed nfsd Flex Files v2 service lifecycle.
+	  The tests cover per-network-namespace initialization, service start,
+	  idempotent stop, restart, terminal namespace exit, and the private
+	  registration stub. No provider callback is enabled by these tests.
+
+	  If unsure, say N.
+
 config NFSD_PNFS
 	bool
 

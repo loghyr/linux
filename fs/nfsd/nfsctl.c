@@ -2417,9 +2417,10 @@ static __net_init int nfsd_net_init(struct net *net)
 	int retval;
 	int i;
 
+	nfsd_ffv2_net_init(nn);
 	retval = nfsd_net_cb_init(nn);
 	if (retval)
-		return retval;
+		goto out_ffv2_error;
 	retval = nfsd_export_init(net);
 	if (retval)
 		goto out_export_error;
@@ -2461,25 +2462,29 @@ out_idmap_error:
 	nfsd_export_shutdown(net);
 out_export_error:
 	nfsd_net_cb_shutdown(nn);
+out_ffv2_error:
+	nfsd_ffv2_net_pre_exit(nn);
+	nfsd_ffv2_net_destroy(nn);
 	return retval;
 }
 
-#if IS_ENABLED(CONFIG_NFS_LOCALIO)
 /**
- * nfsd_net_pre_exit - Disconnect localio clients from net namespace
+ * nfsd_net_pre_exit - Fence nfsd users from a departing net namespace
  * @net: a network namespace that is about to be destroyed
  *
- * This invalidates ->net pointers held by localio clients
- * while they can still safely access nn->counter.
+ * This closes FFv2 service admission. With LOCALIO enabled, it also
+ * invalidates ->net pointers while clients can still access nn->counter.
  */
 static __net_exit void nfsd_net_pre_exit(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
+	nfsd_ffv2_net_pre_exit(nn);
+#if IS_ENABLED(CONFIG_NFS_LOCALIO)
 	nfs_localio_invalidate_clients(&nn->local_clients,
 				       &nn->local_clients_lock);
-}
 #endif
+}
 
 /**
  * nfsd_net_exit - Release the nfsd_net portion of a net namespace
@@ -2490,6 +2495,7 @@ static __net_exit void nfsd_net_exit(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
+	nfsd_ffv2_net_destroy(nn);
 	kfree_sensitive(nn->fh_key);
 	nfsd_net_cb_shutdown(nn);
 	nfsd_proc_stat_shutdown(net);
@@ -2500,9 +2506,7 @@ static __net_exit void nfsd_net_exit(struct net *net)
 
 static struct pernet_operations nfsd_net_ops = {
 	.init = nfsd_net_init,
-#if IS_ENABLED(CONFIG_NFS_LOCALIO)
 	.pre_exit = nfsd_net_pre_exit,
-#endif
 	.exit = nfsd_net_exit,
 	.id   = &nfsd_net_id,
 	.size = sizeof(struct nfsd_net),
