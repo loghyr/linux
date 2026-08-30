@@ -185,6 +185,30 @@ static int nfsd_ffv2_shutdown_thread(void *data)
 	return 0;
 }
 
+static void
+nfsd_ffv2_shutdown_ctx_init(struct nfsd_ffv2_shutdown_ctx *ctx,
+			    struct net *net)
+{
+	ctx->net = get_net(net);
+	init_completion(&ctx->done);
+}
+
+static void nfsd_ffv2_shutdown_ctx_put(struct nfsd_ffv2_shutdown_ctx *ctx)
+{
+	put_net(ctx->net);
+	ctx->net = NULL;
+}
+
+static struct task_struct *
+nfsd_ffv2_shutdown_thread_start(struct nfsd_ffv2_shutdown_ctx *ctx,
+				bool fail)
+{
+	if (fail)
+		return ERR_PTR(-ENOMEM);
+	return kthread_run(nfsd_ffv2_shutdown_thread, ctx,
+			   "nfsd-ffv2-netns-shutdown-test");
+}
+
 static void nfsd_ffv2_count_release(void *payload)
 {
 	atomic_inc(payload);
@@ -606,6 +630,7 @@ static void nfsd_ffv2_service_integration_test(struct kunit *test)
 	unsigned long timeout;
 	bool service_up = false;
 	bool worker_installed = false;
+	bool shutdown_initialized = false;
 	bool shutdown_started = false;
 	bool retired;
 	int threads = 1;
@@ -643,10 +668,9 @@ static void nfsd_ffv2_service_integration_test(struct kunit *test)
 		goto out_cleanup;
 	}
 
-	shutdown.net = net;
-	init_completion(&shutdown.done);
-	shutdown_task = kthread_run(nfsd_ffv2_shutdown_thread, &shutdown,
-				    "nfsd-ffv2-shutdown-test");
+	nfsd_ffv2_shutdown_ctx_init(&shutdown, net);
+	shutdown_initialized = true;
+	shutdown_task = nfsd_ffv2_shutdown_thread_start(&shutdown, false);
 	if (IS_ERR(shutdown_task)) {
 		error = PTR_ERR(shutdown_task);
 		shutdown_task = NULL;
@@ -726,6 +750,8 @@ out_cleanup:
 		nfsd_shutdown_threads(net);
 	if (worker_installed)
 		nfsd_ffv2_worker_ctx_remove(&worker);
+	if (shutdown_initialized)
+		nfsd_ffv2_shutdown_ctx_put(&shutdown);
 out_put_net:
 	put_net(net);
 	net_ns_barrier();
@@ -792,6 +818,7 @@ static void nfsd_ffv2_production_netns_integration_test(struct kunit *test)
 	atomic_t releases;
 	unsigned long timeout;
 	bool worker_installed = false;
+	bool shutdown_initialized = false;
 	bool shutdown_started = false;
 	bool service_up = false;
 	bool retired;
@@ -826,12 +853,11 @@ static void nfsd_ffv2_production_netns_integration_test(struct kunit *test)
 		goto out_cleanup;
 	}
 
-	shutdown.net = net;
-	init_completion(&shutdown.done);
+	nfsd_ffv2_shutdown_ctx_init(&shutdown, net);
+	shutdown_initialized = true;
 	put_net(net);
 	net = NULL;
-	shutdown_task = kthread_run(nfsd_ffv2_shutdown_thread, &shutdown,
-				    "nfsd-ffv2-netns-shutdown-test");
+	shutdown_task = nfsd_ffv2_shutdown_thread_start(&shutdown, false);
 	if (IS_ERR(shutdown_task)) {
 		error = PTR_ERR(shutdown_task);
 		shutdown_task = NULL;
@@ -863,6 +889,10 @@ static void nfsd_ffv2_production_netns_integration_test(struct kunit *test)
 	shutdown_started = false;
 	service_up = false;
 	KUNIT_EXPECT_EQ(test, atomic_read(&releases), 1);
+	KUNIT_EXPECT_PTR_NE(test, shutdown.net, NULL);
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_PTR_EQ(test, nn->nfsd_serv, NULL);
+	mutex_unlock(&nfsd_mutex);
 	error = 0;
 
 out_cleanup:
@@ -880,9 +910,50 @@ out_cleanup:
 		nfsd_ffv2_worker_ctx_remove(&worker);
 	if (net)
 		put_net(net);
+	if (shutdown_initialized)
+		nfsd_ffv2_shutdown_ctx_put(&shutdown);
 	net_ns_barrier();
 	if (error)
 		KUNIT_FAIL(test, "production netns lifecycle failed: %d", error);
+}
+
+static void nfsd_ffv2_shutdown_start_failure_test(struct kunit *test)
+{
+	struct nfsd_ffv2_shutdown_ctx shutdown;
+	struct task_struct *shutdown_task;
+	struct nfsd_net *nn;
+	struct net *net;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create test netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	error = nfsd_ffv2_start_test_service(net, NULL);
+	if (error)
+		goto out_put_net;
+
+	nfsd_ffv2_shutdown_ctx_init(&shutdown, net);
+	put_net(net);
+	net = NULL;
+	shutdown_task = nfsd_ffv2_shutdown_thread_start(&shutdown, true);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(shutdown_task));
+	KUNIT_EXPECT_EQ(test, PTR_ERR(shutdown_task), -ENOMEM);
+	KUNIT_EXPECT_PTR_NE(test, shutdown.net, NULL);
+	nfsd_shutdown_threads(shutdown.net);
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_PTR_EQ(test, nn->nfsd_serv, NULL);
+	mutex_unlock(&nfsd_mutex);
+	nfsd_ffv2_shutdown_ctx_put(&shutdown);
+	net_ns_barrier();
+	return;
+
+out_put_net:
+	put_net(net);
+	net_ns_barrier();
+	KUNIT_FAIL(test, "failed to start test service: %d", error);
 }
 
 static void nfsd_ffv2_listener_only_integration_test(struct kunit *test)
@@ -945,6 +1016,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_service_integration_test),
 	KUNIT_CASE(nfsd_ffv2_netns_integration_test),
 	KUNIT_CASE(nfsd_ffv2_production_netns_integration_test),
+	KUNIT_CASE(nfsd_ffv2_shutdown_start_failure_test),
 	KUNIT_CASE(nfsd_ffv2_listener_only_integration_test),
 	KUNIT_CASE(nfsd_ffv2_partial_start_cleanup_test),
 	{}
