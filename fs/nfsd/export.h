@@ -78,6 +78,10 @@ struct svc_export {
 	struct rcu_head		ex_rcu;
 	unsigned long		ex_xprtsec_modes;
 	struct export_stats	*ex_stats;
+	struct list_head	ex_ffv2_inventory;
+	struct path		ex_ffv2_path;
+	struct nfsd_ffv2_participant *ex_ffv2_participant;
+	bool			ex_ffv2_listed;
 };
 
 /* an "export key" (expkey) maps a filehandlefragement to an

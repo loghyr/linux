@@ -60,6 +60,7 @@ enum {
  */
 struct nfsd_net {
 	struct nfsd_ffv2_anchor ffv2;
+	struct nfsd_ffv2_participant ffv2_participant;
 	struct cld_net *cld_net;
 
 	struct cache_detail *svc_expkey_cache;

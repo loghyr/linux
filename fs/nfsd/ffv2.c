@@ -3,9 +3,14 @@
 #include <linux/lockdep.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
+#include <linux/fs.h>
+#include <linux/fs_context.h>
+#include <linux/mount.h>
 #include <linux/sunrpc/svc_xprt.h>
 #include <linux/wait.h>
+#include <net/net_namespace.h>
 
+#include "export.h"
 #include "ffv2.h"
 #include "nfsd.h"
 #include "netns.h"
@@ -41,6 +46,412 @@ struct nfsd_ffv2_generation {
 	void				*payload;
 	void				(*release)(void *payload);
 };
+
+static DEFINE_MUTEX(nfsd_ffv2_registry_lock);
+static DEFINE_MUTEX(nfsd_ffv2_export_policy_lock);
+static LIST_HEAD(nfsd_ffv2_participants);
+static LIST_HEAD(nfsd_ffv2_reservations);
+
+enum nfsd_ffv2_reservation_state {
+	NFSD_FFV2_RESERVING,
+	NFSD_FFV2_RESERVATION_ACTIVE,
+	NFSD_FFV2_RESERVATION_FENCING,
+	NFSD_FFV2_RESERVATION_QUIESCING,
+};
+
+struct nfsd_ffv2_reservation {
+	struct list_head		node;
+	refcount_t		ref;
+	/* Serializes publication and rollback for this reservation. */
+	struct mutex		entry_lock;
+	struct path		root;
+	struct inode		*inode;
+	struct super_block	*sb;
+	enum nfsd_ffv2_reservation_state state;
+	u8			store_uuid[16];
+	u8			binding_token[32];
+};
+
+struct nfsd_ffv2_participant_snapshot {
+	struct nfsd_ffv2_participant *participant;
+	struct net		*net;
+};
+
+static void
+nfsd_ffv2_participant_put(struct nfsd_ffv2_participant *participant);
+
+static void
+nfsd_ffv2_reservation_put(struct nfsd_ffv2_reservation *reservation)
+{
+	if (!refcount_dec_and_test(&reservation->ref))
+		return;
+	iput(reservation->inode);
+	path_put(&reservation->root);
+	mutex_destroy(&reservation->entry_lock);
+	kfree(reservation);
+}
+
+static bool nfsd_ffv2_superblock_reserved(struct super_block *sb)
+{
+	struct nfsd_ffv2_reservation *reservation;
+	bool reserved = false;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(reservation, &nfsd_ffv2_reservations, node) {
+		if (READ_ONCE(reservation->sb) == sb) {
+			reserved = true;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return reserved;
+}
+
+static void
+nfsd_ffv2_snapshot_put(struct nfsd_ffv2_participant_snapshot *snapshot)
+{
+	put_net(snapshot->net);
+	nfsd_ffv2_participant_put(snapshot->participant);
+}
+
+static int
+nfsd_ffv2_snapshot_participants(struct nfsd_ffv2_participant_snapshot **result,
+				unsigned int *count)
+{
+	struct nfsd_ffv2_participant_snapshot *snapshots;
+	struct nfsd_ffv2_participant *participant;
+	unsigned int allocated = 0;
+	unsigned int nr = 0;
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	list_for_each_entry(participant, &nfsd_ffv2_participants, node)
+		allocated++;
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+
+	snapshots = kcalloc(allocated, sizeof(*snapshots), GFP_KERNEL);
+	if (!snapshots && allocated)
+		return -ENOMEM;
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	list_for_each_entry(participant, &nfsd_ffv2_participants, node) {
+		struct net *net;
+
+		if (nr == allocated || !READ_ONCE(participant->attached))
+			continue;
+		net = maybe_get_net(participant->net);
+		if (!net)
+			continue;
+		refcount_inc(&participant->ref);
+		snapshots[nr].participant = participant;
+		snapshots[nr].net = net;
+		nr++;
+	}
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+
+	*result = snapshots;
+	*count = nr;
+	return 0;
+}
+
+static bool
+nfsd_ffv2_snapshot_conflicts(struct nfsd_ffv2_participant_snapshot *snapshots,
+			     unsigned int count, struct super_block *sb)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++) {
+		struct nfsd_ffv2_participant *participant =
+			snapshots[i].participant;
+		struct svc_export *exp;
+
+		mutex_lock(&participant->inventory_lock);
+		list_for_each_entry(exp, &participant->inventory,
+				    ex_ffv2_inventory) {
+			if (exp->ex_ffv2_path.mnt->mnt_sb == sb) {
+				mutex_unlock(&participant->inventory_lock);
+				return true;
+			}
+		}
+		mutex_unlock(&participant->inventory_lock);
+	}
+	return false;
+}
+
+static void
+nfsd_ffv2_release_snapshots(struct nfsd_ffv2_participant_snapshot *snapshots,
+			    unsigned int count)
+{
+	while (count)
+		nfsd_ffv2_snapshot_put(&snapshots[--count]);
+	kfree(snapshots);
+}
+
+static void
+nfsd_ffv2_reservation_unlink(struct nfsd_ffv2_reservation *reservation)
+{
+	bool linked = false;
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (!list_empty(&reservation->node)) {
+		list_del_rcu(&reservation->node);
+		INIT_LIST_HEAD(&reservation->node);
+		linked = true;
+	}
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	if (linked) {
+		synchronize_rcu();
+		nfsd_ffv2_reservation_put(reservation);
+	}
+}
+
+int nfsd_ffv2_reservation_claim(const struct path *root,
+				const u8 store_uuid[16],
+				const u8 binding_token[32],
+				struct nfsd_ffv2_reservation **result)
+{
+	struct nfsd_ffv2_participant_snapshot *snapshots = NULL;
+	struct nfsd_ffv2_reservation *reservation, *cursor;
+	unsigned int count = 0;
+	unsigned int i;
+	int error;
+
+	if (!root || !root->dentry || !root->mnt || !store_uuid ||
+	    !binding_token || !result ||
+	    !d_is_dir(root->dentry) || !IS_ROOT(root->dentry) ||
+	    root->mnt->mnt_sb->s_stack_depth || !root->mnt->mnt_sb->s_export_op)
+		return -EOPNOTSUPP;
+
+	reservation = kzalloc_obj(*reservation, GFP_KERNEL);
+	if (!reservation)
+		return -ENOMEM;
+	reservation->inode = igrab(d_inode(root->dentry));
+	if (!reservation->inode) {
+		kfree(reservation);
+		return -ESTALE;
+	}
+	refcount_set(&reservation->ref, 1);
+	mutex_init(&reservation->entry_lock);
+	INIT_LIST_HEAD(&reservation->node);
+	reservation->root = *root;
+	path_get(&reservation->root);
+	reservation->sb = root->mnt->mnt_sb;
+	reservation->state = NFSD_FFV2_RESERVING;
+	memcpy(reservation->store_uuid, store_uuid,
+	       sizeof(reservation->store_uuid));
+	memcpy(reservation->binding_token, binding_token,
+	       sizeof(reservation->binding_token));
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	list_for_each_entry(cursor, &nfsd_ffv2_reservations, node) {
+		if (cursor->sb == reservation->sb) {
+			error = -EBUSY;
+			goto out_unlock_registry;
+		}
+	}
+	refcount_inc(&reservation->ref);
+	list_add_tail_rcu(&reservation->node, &nfsd_ffv2_reservations);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+
+	error = nfsd_ffv2_snapshot_participants(&snapshots, &count);
+	if (error)
+		goto out_unlink;
+
+	mutex_lock(&reservation->entry_lock);
+	mutex_lock(&nfsd_ffv2_export_policy_lock);
+	if (nfsd_ffv2_snapshot_conflicts(snapshots, count, reservation->sb))
+		error = -EBUSY;
+	else
+		error = 0;
+	mutex_unlock(&nfsd_ffv2_export_policy_lock);
+	mutex_unlock(&reservation->entry_lock);
+	for (i = 0; i < count; i++)
+		WARN_ON_ONCE(snapshots[i].net !=
+			     snapshots[i].participant->net);
+	nfsd_ffv2_release_snapshots(snapshots, count);
+	if (error)
+		goto out_unlink;
+
+	*result = reservation;
+	return 0;
+
+out_unlock_registry:
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	nfsd_ffv2_reservation_put(reservation);
+	return error;
+out_unlink:
+	nfsd_ffv2_reservation_unlink(reservation);
+	nfsd_ffv2_reservation_put(reservation);
+	return error;
+}
+
+int nfsd_ffv2_reservation_activate(struct nfsd_ffv2_reservation *reservation)
+{
+	int error = 0;
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (list_empty(&reservation->node) ||
+	    reservation->state != NFSD_FFV2_RESERVING) {
+		error = -ESHUTDOWN;
+	} else {
+		/* Replace the transaction reference with the context owner. */
+		refcount_inc(&reservation->ref);
+		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_ACTIVE);
+	}
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	if (!error)
+		nfsd_ffv2_reservation_put(reservation);
+	return error;
+}
+
+void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation)
+{
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (!list_empty(&reservation->node))
+		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_QUIESCING);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	nfsd_ffv2_reservation_unlink(reservation);
+	nfsd_ffv2_reservation_put(reservation);
+}
+
+void nfsd_ffv2_reservation_fence(struct nfsd_ffv2_reservation *reservation)
+{
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (!list_empty(&reservation->node))
+		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_FENCING);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	nfsd_ffv2_reservation_unlink(reservation);
+	nfsd_ffv2_reservation_put(reservation);
+}
+
+bool nfsd4_ffv2_mount_crossing_allowed(const struct path *path)
+{
+	return !nfsd_ffv2_superblock_reserved(path->mnt->mnt_sb);
+}
+
+static void
+nfsd_ffv2_participant_put(struct nfsd_ffv2_participant *participant)
+{
+	if (refcount_dec_and_test(&participant->ref))
+		complete(&participant->released);
+}
+
+int nfsd_ffv2_participant_register(struct nfsd_net *nn, struct net *net)
+{
+	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
+
+	INIT_LIST_HEAD(&participant->node);
+	refcount_set(&participant->ref, 1);
+	init_completion(&participant->released);
+	mutex_init(&participant->inventory_lock);
+	INIT_LIST_HEAD(&participant->inventory);
+	init_waitqueue_head(&participant->inventory_wait);
+	participant->inventory_count = 0;
+	participant->net = net;
+	WRITE_ONCE(participant->attached, true);
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	list_add_tail(&participant->node, &nfsd_ffv2_participants);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	return 0;
+}
+
+void nfsd_ffv2_participant_detach_begin(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
+
+	/* Serialize the last export update before removing snapshot visibility. */
+	mutex_lock(&nfsd_ffv2_export_policy_lock);
+	WRITE_ONCE(participant->attached, false);
+	mutex_unlock(&nfsd_ffv2_export_policy_lock);
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (!list_empty(&participant->node))
+		list_del_init(&participant->node);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+
+	nfsd_ffv2_participant_put(participant);
+	wait_for_completion(&participant->released);
+}
+
+void nfsd_ffv2_participant_detach_finish(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
+
+	wait_event(participant->inventory_wait,
+		   !READ_ONCE(participant->inventory_count));
+	participant->net = NULL;
+	mutex_destroy(&participant->inventory_lock);
+}
+
+int nfsd_ffv2_export_update_begin(struct svc_export *exp)
+{
+	struct nfsd_net *nn = net_generic(exp->cd->net, nfsd_net_id);
+	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
+
+	lockdep_assert_not_held(&nfsd_mutex);
+	mutex_lock(&nfsd_ffv2_export_policy_lock);
+	if (!READ_ONCE(participant->attached)) {
+		mutex_unlock(&nfsd_ffv2_export_policy_lock);
+		return -ESHUTDOWN;
+	}
+	if (!test_bit(CACHE_NEGATIVE, &exp->h.flags) &&
+	    nfsd_ffv2_superblock_reserved(exp->ex_path.mnt->mnt_sb)) {
+		mutex_unlock(&nfsd_ffv2_export_policy_lock);
+		return -EBUSY;
+	}
+	return 0;
+}
+
+void nfsd_ffv2_export_update_end(struct svc_export *exp)
+{
+	struct nfsd_net *nn = net_generic(exp->cd->net, nfsd_net_id);
+	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
+
+	mutex_lock(&participant->inventory_lock);
+	if (test_bit(CACHE_NEGATIVE, &exp->h.flags)) {
+		if (exp->ex_ffv2_listed) {
+			list_del_init(&exp->ex_ffv2_inventory);
+			exp->ex_ffv2_listed = false;
+			exp->ex_ffv2_participant = NULL;
+			participant->inventory_count--;
+			path_put(&exp->ex_ffv2_path);
+		}
+	} else if (!exp->ex_ffv2_listed) {
+		exp->ex_ffv2_path = exp->ex_path;
+		path_get(&exp->ex_ffv2_path);
+		exp->ex_ffv2_participant = participant;
+		exp->ex_ffv2_listed = true;
+		list_add_tail(&exp->ex_ffv2_inventory,
+			      &participant->inventory);
+		participant->inventory_count++;
+	}
+	mutex_unlock(&participant->inventory_lock);
+	mutex_unlock(&nfsd_ffv2_export_policy_lock);
+}
+
+void nfsd_ffv2_export_update_abort(void)
+{
+	mutex_unlock(&nfsd_ffv2_export_policy_lock);
+}
+
+void nfsd_ffv2_export_release(struct svc_export *exp)
+{
+	struct nfsd_ffv2_participant *participant = exp->ex_ffv2_participant;
+
+	if (!participant)
+		return;
+	mutex_lock(&participant->inventory_lock);
+	if (exp->ex_ffv2_listed) {
+		list_del_init(&exp->ex_ffv2_inventory);
+		exp->ex_ffv2_listed = false;
+		exp->ex_ffv2_participant = NULL;
+		participant->inventory_count--;
+		path_put(&exp->ex_ffv2_path);
+		if (!participant->inventory_count)
+			wake_up_all(&participant->inventory_wait);
+	}
+	mutex_unlock(&participant->inventory_lock);
+}
 
 static bool nfsd_ffv2_anchor_get(struct nfsd_ffv2_anchor *anchor)
 {

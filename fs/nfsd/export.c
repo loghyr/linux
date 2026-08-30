@@ -25,6 +25,7 @@
 #include "netns.h"
 #include "pnfs.h"
 #include "filecache.h"
+#include "ffv2.h"
 #include "trace.h"
 #include "netlink.h"
 
@@ -638,6 +639,7 @@ static void svc_export_put(struct kref *ref)
 {
 	struct svc_export *exp = container_of(ref, struct svc_export, h.ref);
 
+	nfsd_ffv2_export_release(exp);
 	path_put(&exp->ex_path);
 	auth_domain_put(exp->ex_client);
 	call_rcu(&exp->ex_rcu, svc_export_release);
@@ -1014,7 +1016,16 @@ static int nfsd_nl_parse_one_export(struct cache_detail *cd,
 		err = -ENOMEM;
 		goto out_uuid;
 	}
+	err = nfsd_ffv2_export_update_begin(&exp);
+	if (err) {
+		exp_put(expp);
+		goto out_uuid;
+	}
 	expp = svc_export_update(&exp, expp);
+	if (expp)
+		nfsd_ffv2_export_update_end(expp);
+	else
+		nfsd_ffv2_export_update_abort();
 	if (expp) {
 		trace_nfsd_export_update(expp);
 		cache_flush();
@@ -1054,12 +1065,10 @@ int nfsd_nl_svc_export_set_reqs_doit(struct sk_buff *skb,
 
 	nn = net_generic(genl_info_net(info), nfsd_net_id);
 
-	mutex_lock(&nfsd_mutex);
-
 	cd = nn->svc_export_cache;
 	if (!cd) {
 		ret = -ENODEV;
-		goto out_unlock;
+		goto out;
 	}
 
 	nlmsg_for_each_attr_type(attr, NFSD_A_SVC_EXPORT_REQS_REQUESTS,
@@ -1069,8 +1078,7 @@ int nfsd_nl_svc_export_set_reqs_doit(struct sk_buff *skb,
 			break;
 	}
 
-out_unlock:
-	mutex_unlock(&nfsd_mutex);
+out:
 	return ret;
 }
 
@@ -1433,7 +1441,16 @@ static int svc_export_parse(struct cache_detail *cd, char *mesg, int mlen)
 		err = -ENOMEM;
 		goto out4;
 	}
+	err = nfsd_ffv2_export_update_begin(&exp);
+	if (err) {
+		exp_put(expp);
+		goto out4;
+	}
 	expp = svc_export_update(&exp, expp);
+	if (expp)
+		nfsd_ffv2_export_update_end(expp);
+	else
+		nfsd_ffv2_export_update_abort();
 	if (expp) {
 		trace_nfsd_export_update(expp);
 		cache_flush();
@@ -1539,6 +1556,9 @@ static void svc_export_init(struct cache_head *cnew, struct cache_head *citem)
 	new->ex_layout_types = 0;
 	new->ex_uuid = NULL;
 	new->cd = item->cd;
+	INIT_LIST_HEAD(&new->ex_ffv2_inventory);
+	new->ex_ffv2_participant = NULL;
+	new->ex_ffv2_listed = false;
 	export_stats_reset(new->ex_stats);
 }
 
@@ -1587,6 +1607,9 @@ static struct cache_head *svc_export_alloc(void)
 		kfree(i);
 		return NULL;
 	}
+	INIT_LIST_HEAD(&i->ex_ffv2_inventory);
+	i->ex_ffv2_participant = NULL;
+	i->ex_ffv2_listed = false;
 
 	return &i->h;
 }
@@ -2209,8 +2232,13 @@ nfsd_export_init(struct net *net)
 	rv = cache_register_net(nn->svc_expkey_cache, net);
 	if (rv)
 		goto destroy_expkey_cache;
+	rv = nfsd_ffv2_participant_register(nn, net);
+	if (rv)
+		goto unregister_expkey_cache;
 	return 0;
 
+unregister_expkey_cache:
+	cache_unregister_net(nn->svc_expkey_cache, net);
 destroy_expkey_cache:
 	cache_destroy_net(nn->svc_expkey_cache, net);
 unregister_export_cache:
@@ -2242,8 +2270,10 @@ nfsd_export_shutdown(struct net *net)
 
 	dprintk("nfsd: shutting down export module (net: %x).\n", net->ns.inum);
 
+	nfsd_ffv2_participant_detach_begin(nn);
 	cache_unregister_net(nn->svc_expkey_cache, net);
 	cache_unregister_net(nn->svc_export_cache, net);
+	nfsd_ffv2_participant_detach_finish(nn);
 	cache_destroy_net(nn->svc_expkey_cache, net);
 	cache_destroy_net(nn->svc_export_cache, net);
 	svcauth_unix_purge(net);
