@@ -645,6 +645,21 @@ static void svc_export_put(struct kref *ref)
 	call_rcu(&exp->ex_rcu, svc_export_release);
 }
 
+struct svc_export *nfsd_export_get(struct svc_export *exp)
+{
+	return exp_get(exp);
+}
+
+void nfsd_export_put(struct svc_export *exp)
+{
+	exp_put(exp);
+}
+
+void nfsd_export_unhash(struct svc_export *exp)
+{
+	sunrpc_cache_unhash(exp->cd, &exp->h);
+}
+
 /**
  * nfsd_nl_svc_export_get_reqs_dumpit - dump pending svc_export requests
  * @skb: reply buffer
@@ -1016,7 +1031,7 @@ static int nfsd_nl_parse_one_export(struct cache_detail *cd,
 		err = -ENOMEM;
 		goto out_uuid;
 	}
-	err = nfsd_ffv2_export_update_begin(&exp);
+	err = nfsd_ffv2_export_update_begin(&exp, expp);
 	if (err) {
 		exp_put(expp);
 		goto out_uuid;
@@ -1441,7 +1456,7 @@ static int svc_export_parse(struct cache_detail *cd, char *mesg, int mlen)
 		err = -ENOMEM;
 		goto out4;
 	}
-	err = nfsd_ffv2_export_update_begin(&exp);
+	err = nfsd_ffv2_export_update_begin(&exp, expp);
 	if (err) {
 		exp_put(expp);
 		goto out4;
@@ -1559,6 +1574,8 @@ static void svc_export_init(struct cache_head *cnew, struct cache_head *citem)
 	INIT_LIST_HEAD(&new->ex_ffv2_inventory);
 	new->ex_ffv2_participant = NULL;
 	new->ex_ffv2_listed = false;
+	RCU_INIT_POINTER(new->ex_ffv2_context, NULL);
+	new->ex_ffv2_context_released = NULL;
 	export_stats_reset(new->ex_stats);
 }
 
@@ -1588,6 +1605,9 @@ static void export_update(struct cache_head *cnew, struct cache_head *citem)
 		new->ex_flavors[i] = item->ex_flavors[i];
 	}
 	new->ex_xprtsec_modes = item->ex_xprtsec_modes;
+	RCU_INIT_POINTER(new->ex_ffv2_context,
+			 rcu_access_pointer(item->ex_ffv2_context));
+	RCU_INIT_POINTER(item->ex_ffv2_context, NULL);
 }
 
 static struct cache_head *svc_export_alloc(void)
@@ -1610,6 +1630,8 @@ static struct cache_head *svc_export_alloc(void)
 	INIT_LIST_HEAD(&i->ex_ffv2_inventory);
 	i->ex_ffv2_participant = NULL;
 	i->ex_ffv2_listed = false;
+	RCU_INIT_POINTER(i->ex_ffv2_context, NULL);
+	i->ex_ffv2_context_released = NULL;
 
 	return &i->h;
 }

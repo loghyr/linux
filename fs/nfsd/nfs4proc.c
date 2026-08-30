@@ -50,6 +50,7 @@
 #include "netns.h"
 #include "acl.h"
 #include "pnfs.h"
+#include "ffv2.h"
 #include "trace.h"
 
 static bool inter_copy_offload_enable;
@@ -3152,6 +3153,12 @@ nfsd4_proc_compound(struct svc_rqst *rqstp)
 
 		if (op->status)
 			goto encode_op;
+		if (current_fh->fh_export) {
+			op->status = nfsd4_ffv2_export_policy_check(current_fh->fh_export,
+								    op->opnum);
+			if (op->status)
+				goto encode_op;
+		}
 
 		if (op->opdesc->op_get_currentstateid)
 			op->opdesc->op_get_currentstateid(cstate, &op->u);

@@ -13,6 +13,7 @@
 struct knfsd_fh;
 struct svc_fh;
 struct svc_rqst;
+struct nfsd_ffv2_service_context;
 
 /*
  * FS Locations
@@ -82,6 +83,8 @@ struct svc_export {
 	struct path		ex_ffv2_path;
 	struct nfsd_ffv2_participant *ex_ffv2_participant;
 	bool			ex_ffv2_listed;
+	struct nfsd_ffv2_service_context __rcu *ex_ffv2_context;
+	struct completion	*ex_ffv2_context_released;
 };
 
 /* an "export key" (expkey) maps a filehandlefragement to an
@@ -136,6 +139,10 @@ static inline struct svc_export *exp_get(struct svc_export *exp)
 	cache_get(&exp->h);
 	return exp;
 }
+
+struct svc_export *nfsd_export_get(struct svc_export *exp);
+void nfsd_export_put(struct svc_export *exp);
+void nfsd_export_unhash(struct svc_export *exp);
 struct svc_export *rqst_exp_find(struct cache_req *reqp, struct net *net,
 				 struct auth_domain *cl, struct auth_domain *gsscl,
 				 int fsid_type, u32 *fsidv);

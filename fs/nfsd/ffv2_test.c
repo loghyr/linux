@@ -2,9 +2,11 @@
 #include <kunit/test.h>
 #include <linux/completion.h>
 #include <linux/cred.h>
+#include <linux/fs_struct.h>
 #include <linux/iopoll.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
+#include <linux/namei.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
 #include <linux/sunrpc/svcsock.h>
@@ -12,6 +14,7 @@
 #include <net/net_namespace.h>
 
 #include "ffv2.h"
+#include "export.h"
 #include "nfsd.h"
 #include "netns.h"
 
@@ -1158,6 +1161,194 @@ static void nfsd_ffv2_partial_start_cleanup_test(struct kunit *test)
 	net_ns_barrier();
 }
 
+static void nfsd_ffv2_reservation_context_test(struct kunit *test)
+{
+	struct nfsd_ffv2_service_context *context = NULL;
+	struct nfsd_ffv2_reservation *duplicate;
+	struct nfsd_ffv2_reservation *reservation;
+	struct nfsd_ffv2_generation *generation;
+	struct svc_export exp = {};
+	struct svc_export exp2 = {};
+	struct nfsd_net *nn;
+	struct nfsd_net *nn2;
+	struct path nonroot;
+	struct path root;
+	struct net *net;
+	struct net *net2;
+	bool inventory_live = false;
+	bool inventory2_live = false;
+	bool reservation_live = false;
+	bool service_up = false;
+	u8 token[32] = { 1 };
+	u8 uuid[16] = { 2 };
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create reservation test netns: %ld",
+			   PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	net2 = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net2)) {
+		KUNIT_FAIL(test, "failed to create second test netns: %ld",
+			   PTR_ERR(net2));
+		put_net(net);
+		net_ns_barrier();
+		return;
+	}
+	nn2 = net_generic(net2, nfsd_net_id);
+	get_fs_root(current->fs, &root);
+
+	error = nfsd_ffv2_reservation_claim(&root, uuid, token, &reservation);
+	if (!error)
+		nfsd_ffv2_reservation_abort(reservation);
+	else
+		KUNIT_EXPECT_EQ(test, error, -EOPNOTSUPP);
+	error = nfsd_ffv2_test_reservation_claim(&root, uuid, token, &reservation);
+	if (error) {
+		KUNIT_FAIL(test, "initial reservation failed: %d", error);
+		goto out_root;
+	}
+	nfsd_ffv2_reservation_abort(reservation);
+
+	exp.cd = nn->svc_export_cache;
+	exp.ex_path = root;
+	INIT_LIST_HEAD(&exp.ex_ffv2_inventory);
+	error = nfsd_ffv2_export_update_begin(&exp, &exp);
+	if (error) {
+		KUNIT_FAIL(test, "inventory publication failed: %d", error);
+		goto out_root;
+	}
+	nfsd_ffv2_export_update_end(&exp);
+	inventory_live = true;
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 1U);
+	set_bit(CACHE_NEGATIVE, &exp.h.flags);
+	error = nfsd_ffv2_export_update_begin(&exp, &exp);
+	if (!error) {
+		nfsd_ffv2_export_update_end(&exp);
+		inventory_live = false;
+	}
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 0U);
+	clear_bit(CACHE_NEGATIVE, &exp.h.flags);
+	error = nfsd_ffv2_export_update_begin(&exp, &exp);
+	if (!error) {
+		nfsd_ffv2_export_update_end(&exp);
+		inventory_live = true;
+	}
+	KUNIT_EXPECT_EQ(test, error, 0);
+
+	exp2.cd = nn2->svc_export_cache;
+	exp2.ex_path = root;
+	INIT_LIST_HEAD(&exp2.ex_ffv2_inventory);
+	error = nfsd_ffv2_export_update_begin(&exp2, &exp2);
+	if (!error) {
+		nfsd_ffv2_export_update_end(&exp2);
+		inventory2_live = true;
+	}
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_EQ(test, nn2->ffv2_participant.inventory_count, 1U);
+	error = nfsd_ffv2_test_reservation_claim(&root, uuid, token, &reservation);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	nfsd_ffv2_export_release(&exp);
+	inventory_live = false;
+	nfsd_ffv2_export_release(&exp2);
+	inventory2_live = false;
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 0U);
+
+	error = nfsd_ffv2_test_reservation_claim(&root, uuid, token, &reservation);
+	if (error) {
+		KUNIT_FAIL(test, "DS-first reservation failed: %d", error);
+		goto out_root;
+	}
+	reservation_live = true;
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	error = nfsd_ffv2_test_reservation_claim(&root, uuid, token, &duplicate);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	error = nfsd_ffv2_export_update_begin(&exp, &exp);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	error = nfsd_ffv2_export_update_begin(&exp2, &exp2);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+
+	context = nfsd_ffv2_service_context_alloc(reservation, current_cred(),
+						  1);
+	if (!context) {
+		KUNIT_FAIL(test, "service-context allocation failed");
+		goto out_reservation;
+	}
+	nfsd_ffv2_service_context_prepare_export(context, &exp);
+	KUNIT_EXPECT_EQ(test, nfsd4_ffv2_export_policy_check(&exp, OP_GETATTR),
+			nfserr_notsupp);
+	RCU_INIT_POINTER(exp.ex_ffv2_context, NULL);
+	error = nfsd_ffv2_reservation_activate(reservation);
+	if (error) {
+		KUNIT_FAIL(test, "reservation activation failed: %d", error);
+		nfsd_ffv2_service_context_abort(context);
+		context = NULL;
+		goto out_reservation;
+	}
+	reservation_live = false;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_up(nn);
+	if (!error) {
+		service_up = true;
+		error = nfsd_ffv2_test_publish(nn, context,
+					       nfsd_ffv2_service_context_release,
+					       NULL);
+	}
+	generation = error ? NULL : nfsd_ffv2_service_stop_begin(nn);
+	mutex_unlock(&nfsd_mutex);
+	if (error) {
+		KUNIT_FAIL(test, "context generation publication failed: %d",
+			   error);
+		nfsd_ffv2_service_context_release(context);
+		context = NULL;
+		goto out_service;
+	}
+	context = NULL;
+	nfsd_ffv2_service_stop_finish(nn, generation);
+	service_up = false;
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_service_down(nn);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+
+	error = kern_path("/proc/self", LOOKUP_FOLLOW, &nonroot);
+	if (!error) {
+		error = nfsd_ffv2_reservation_claim(&nonroot, uuid, token, &reservation);
+		KUNIT_EXPECT_EQ(test, error, -EOPNOTSUPP);
+		path_put(&nonroot);
+	}
+	goto out_root;
+
+out_service:
+	if (service_up) {
+		mutex_lock(&nfsd_mutex);
+		generation = nfsd_ffv2_service_stop_begin(nn);
+		mutex_unlock(&nfsd_mutex);
+		nfsd_ffv2_service_stop_finish(nn, generation);
+		mutex_lock(&nfsd_mutex);
+		nfsd_ffv2_service_down(nn);
+		mutex_unlock(&nfsd_mutex);
+	}
+out_reservation:
+	if (reservation_live)
+		nfsd_ffv2_reservation_abort(reservation);
+
+out_root:
+	if (inventory_live)
+		nfsd_ffv2_export_release(&exp);
+	if (inventory2_live)
+		nfsd_ffv2_export_release(&exp2);
+	path_put(&root);
+	put_net(net2);
+	put_net(net);
+	net_ns_barrier();
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -1171,6 +1362,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_shutdown_start_failure_test),
 	KUNIT_CASE(nfsd_ffv2_listener_only_integration_test),
 	KUNIT_CASE(nfsd_ffv2_partial_start_cleanup_test),
+	KUNIT_CASE(nfsd_ffv2_reservation_context_test),
 	{}
 };
 
