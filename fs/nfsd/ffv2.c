@@ -72,6 +72,8 @@ static void nfsd_ffv2_generation_put(struct nfsd_ffv2_generation *generation)
 }
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static atomic_t nfsd_ffv2_start_failure;
+
 static struct nfsd_ffv2_generation *
 nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *))
 {
@@ -586,5 +588,24 @@ unsigned int nfsd_ffv2_test_refcount(struct nfsd_ffv2_admission *admission)
 unsigned int nfsd_ffv2_test_anchor_refcount(struct nfsd_net *nn)
 {
 	return refcount_read(&nn->ffv2.ref);
+}
+
+/**
+ * nfsd_ffv2_test_set_start_failure - arm a test-only service-start failure
+ * @fail: whether the next successful worker adjustment should fail
+ */
+void nfsd_ffv2_test_set_start_failure(bool fail)
+{
+	atomic_set(&nfsd_ffv2_start_failure, fail);
+}
+
+/**
+ * nfsd_ffv2_test_start_failure - consume a test-only service-start failure
+ *
+ * Return: true when the current worker adjustment should report failure.
+ */
+bool nfsd_ffv2_test_start_failure(void)
+{
+	return atomic_xchg(&nfsd_ffv2_start_failure, 0);
 }
 #endif

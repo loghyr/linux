@@ -730,8 +730,15 @@ int nfsd_set_nrthreads(int n, int *nthreads, struct net *net)
 		return 0;
 
 	/* Special case: When n == 1, distribute threads equally among pools. */
-	if (n == 1)
-		return svc_set_num_threads(nn->nfsd_serv, nn->min_threads, nthreads[0]);
+	if (n == 1) {
+		err = svc_set_num_threads(nn->nfsd_serv, nn->min_threads,
+					  nthreads[0]);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		if (!err && nfsd_ffv2_test_start_failure())
+			err = -EIO;
+#endif
+		return err;
+	}
 
 	if (n > nn->nfsd_serv->sv_nrpools)
 		n = nn->nfsd_serv->sv_nrpools;
@@ -762,6 +769,12 @@ int nfsd_set_nrthreads(int n, int *nthreads, struct net *net)
 					   nn->min_threads, nthreads[i]);
 		if (err)
 			goto out;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		if (nfsd_ffv2_test_start_failure()) {
+			err = -EIO;
+			goto out;
+		}
+#endif
 	}
 
 	/* Anything undefined in array is considered to be 0 */

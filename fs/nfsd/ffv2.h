@@ -78,5 +78,7 @@ bool nfsd_ffv2_test_admission_retired(struct nfsd_ffv2_admission *admission);
 unsigned int nfsd_ffv2_test_refcount(struct nfsd_ffv2_admission *admission);
 unsigned int nfsd_ffv2_test_anchor_refcount(struct nfsd_net *nn);
 void nfsd_ffv2_test_worker(struct svc_rqst *rqstp, struct svc_xprt *xprt);
+void nfsd_ffv2_test_set_start_failure(bool fail);
+bool nfsd_ffv2_test_start_failure(void);
 
 #endif /* _NFSD_FFV2_H */
