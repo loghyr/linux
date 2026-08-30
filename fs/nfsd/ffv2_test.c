@@ -484,6 +484,52 @@ static void nfsd_ffv2_zero_threads_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_requested_zero_threads(0, overlong, 1));
 }
 
+static void nfsd_ffv2_generation_boundary_test(struct kunit *test)
+{
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_net *nn;
+	atomic_t *releases;
+	u64 generation_id = 0;
+	int error;
+
+	releases = kunit_kzalloc(test, sizeof(*releases), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, releases);
+	atomic_set(releases, 0);
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	mutex_lock(&nfsd_mutex);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_service_up(nn), 0);
+	mutex_lock(&nn->ffv2.lock);
+	nn->ffv2.next_generation = U64_MAX - 1;
+	mutex_unlock(&nn->ffv2.lock);
+	error = nfsd_ffv2_test_publish(nn, releases,
+				       nfsd_ffv2_count_release,
+				       &generation_id);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_EQ(test, generation_id, U64_MAX - 1);
+	KUNIT_EXPECT_EQ(test, nn->ffv2.next_generation, U64_MAX);
+	generation = nfsd_ffv2_service_stop_begin(nn);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_ASSERT_NOT_NULL(test, generation);
+	nfsd_ffv2_service_stop_finish(nn, generation);
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_service_down(nn);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), 0);
+	generation_id = 0;
+	error = nfsd_ffv2_test_publish(nn, releases,
+				       nfsd_ffv2_count_release,
+				       &generation_id);
+	KUNIT_EXPECT_EQ(test, error, -EOVERFLOW);
+	KUNIT_EXPECT_EQ(test, generation_id, 0ULL);
+	KUNIT_EXPECT_EQ(test, nn->ffv2.next_generation, U64_MAX);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, atomic_read(releases), 1);
+	nfsd_ffv2_test_net_destroy(test, nn);
+}
+
 static void nfsd_ffv2_multi_retirement_test(struct kunit *test)
 {
 	struct nfsd_ffv2_unregister_ctx unregister[2];
@@ -667,6 +713,7 @@ static void nfsd_ffv2_service_integration_test(struct kunit *test)
 		error = timeout ? worker.admit_result : -ETIMEDOUT;
 		goto out_cleanup;
 	}
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(nn), 2U);
 
 	nfsd_ffv2_shutdown_ctx_init(&shutdown, net);
 	shutdown_initialized = true;
@@ -852,6 +899,7 @@ static void nfsd_ffv2_production_netns_integration_test(struct kunit *test)
 		error = timeout ? worker.admit_result : -ETIMEDOUT;
 		goto out_cleanup;
 	}
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(nn), 2U);
 
 	nfsd_ffv2_shutdown_ctx_init(&shutdown, net);
 	shutdown_initialized = true;
@@ -893,6 +941,7 @@ static void nfsd_ffv2_production_netns_integration_test(struct kunit *test)
 	mutex_lock(&nfsd_mutex);
 	KUNIT_EXPECT_PTR_EQ(test, nn->nfsd_serv, NULL);
 	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(nn), 1U);
 	error = 0;
 
 out_cleanup:
@@ -959,6 +1008,7 @@ static void nfsd_ffv2_production_pre_exit_overlap_test(struct kunit *test)
 		error = timeout ? worker.admit_result : -ETIMEDOUT;
 		goto out_cleanup;
 	}
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(nn), 2U);
 
 	exit_ctx.nn = nn;
 	init_completion(&exit_ctx.done);
@@ -978,6 +1028,7 @@ static void nfsd_ffv2_production_pre_exit_overlap_test(struct kunit *test)
 	}
 	KUNIT_EXPECT_FALSE(test, completion_done(&exit_ctx.done));
 	KUNIT_EXPECT_EQ(test, atomic_read(&releases), 0);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(nn), 3U);
 	complete(&worker.allow_complete);
 	timeout = wait_for_completion_timeout(&worker.returned, HZ);
 	if (!timeout) {
@@ -993,6 +1044,7 @@ static void nfsd_ffv2_production_pre_exit_overlap_test(struct kunit *test)
 	exit_task = NULL;
 	KUNIT_EXPECT_EQ(test, atomic_read(&releases), 1);
 	KUNIT_EXPECT_EQ(test, nn->ffv2.net_state, NFSD_FFV2_NET_EXITING);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(nn), 1U);
 
 	nfsd_shutdown_threads(net);
 	service_up = false;
@@ -1110,6 +1162,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
 	KUNIT_CASE(nfsd_ffv2_zero_threads_test),
+	KUNIT_CASE(nfsd_ffv2_generation_boundary_test),
 	KUNIT_CASE(nfsd_ffv2_multi_retirement_test),
 	KUNIT_CASE(nfsd_ffv2_service_integration_test),
 	KUNIT_CASE(nfsd_ffv2_netns_integration_test),

@@ -198,7 +198,8 @@ static int nfsd_ffv2_publish(struct nfsd_ffv2_anchor *anchor,
 		error = -ENXIO;
 	} else if (anchor->active || anchor->retiring) {
 		error = -EBUSY;
-	} else if (!anchor->next_generation) {
+	} else if (!anchor->next_generation ||
+		   anchor->next_generation == U64_MAX) {
 		error = -EOVERFLOW;
 	} else {
 		generation->identity->generation = anchor->next_generation++;
@@ -385,7 +386,6 @@ nfsd_ffv2_admit_generation(struct nfsd_net *nn,
 	INIT_LIST_HEAD(&admission->node);
 	admission->anchor = NULL;
 	admission->generation = NULL;
-	admission->net = NULL;
 	admission->task = NULL;
 	if (!nfsd_ffv2_anchor_get(anchor))
 		return -ESHUTDOWN;
@@ -419,59 +419,34 @@ nfsd_ffv2_admit_generation(struct nfsd_net *nn,
 int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 		    struct nfsd_ffv2_admission *admission)
 {
-	struct net *net;
 	struct nfsd_net *nn;
-	int error;
 
 	if (nfsd_current_rqst() != rqstp || !rqstp->rq_xprt)
 		return -EOPNOTSUPP;
-	net = rqstp->rq_xprt->xpt_net;
-	rcu_read_lock();
-	if (!nfsd_net_try_get(net)) {
-		rcu_read_unlock();
-		return -ESHUTDOWN;
-	}
-	rcu_read_unlock();
-	nn = net_generic(net, nfsd_net_id);
-	error = nfsd_ffv2_admit_generation(nn, admission);
-	if (!error) {
-		admission->net = net;
-	} else {
-		rcu_read_lock();
-		nfsd_net_put(net);
-		rcu_read_unlock();
-	}
-	return error;
+	nn = net_generic(rqstp->rq_xprt->xpt_net, nfsd_net_id);
+	return nfsd_ffv2_admit_generation(nn, admission);
 }
 
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 {
 	struct nfsd_ffv2_generation *generation;
 	struct nfsd_ffv2_anchor *anchor;
-	struct net *net;
 
 	/* Completion owns and consumes the admission exactly once. */
 	generation = xchg(&admission->generation, NULL);
 	if (!generation)
 		return;
 	anchor = admission->anchor;
-	net = admission->net;
 
 	spin_lock(&generation->admissions_lock);
 	list_del_init(&admission->node);
 	spin_unlock(&generation->admissions_lock);
 	admission->anchor = NULL;
-	admission->net = NULL;
 	admission->task = NULL;
 	if (atomic_dec_and_test(&generation->admitted))
 		wake_up_all(&generation->admitted_wait);
 	nfsd_ffv2_generation_put(generation);
 	nfsd_ffv2_anchor_put(anchor);
-	if (net) {
-		rcu_read_lock();
-		nfsd_net_put(net);
-		rcu_read_unlock();
-	}
 }
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
@@ -501,7 +476,6 @@ int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
 int nfsd_ffv2_test_admit(struct nfsd_net *nn,
 			 struct nfsd_ffv2_admission *admission)
 {
-	admission->net = NULL;
 	return nfsd_ffv2_admit_generation(nn, admission);
 }
 

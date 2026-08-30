@@ -59,7 +59,6 @@ struct nfsd_ffv2_admission {
 	struct list_head			node;
 	struct nfsd_ffv2_anchor		*anchor;
 	struct nfsd_ffv2_generation	*generation;
-	struct net			*net;
 	struct task_struct		*task;
 };
 
