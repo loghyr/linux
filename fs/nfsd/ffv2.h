@@ -11,6 +11,7 @@ struct net;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
 struct svc_rqst;
+struct svc_xprt;
 struct task_struct;
 
 enum nfsd_ffv2_net_state {
@@ -76,5 +77,6 @@ bool nfsd_ffv2_test_generation_retired(struct nfsd_ffv2_generation *generation);
 bool nfsd_ffv2_test_admission_retired(struct nfsd_ffv2_admission *admission);
 unsigned int nfsd_ffv2_test_refcount(struct nfsd_ffv2_admission *admission);
 unsigned int nfsd_ffv2_test_anchor_refcount(struct nfsd_net *nn);
+void nfsd_ffv2_test_worker(struct svc_rqst *rqstp, struct svc_xprt *xprt);
 
 #endif /* _NFSD_FFV2_H */

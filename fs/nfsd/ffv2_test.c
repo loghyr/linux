@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
 #include <linux/completion.h>
+#include <linux/cred.h>
 #include <linux/iopoll.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
+#include <linux/refcount.h>
+#include <linux/sched.h>
+#include <linux/sunrpc/svcsock.h>
+#include <linux/sunrpc/svc_xprt.h>
+#include <net/net_namespace.h>
 
 #include "ffv2.h"
 #include "nfsd.h"
@@ -21,9 +27,198 @@ struct nfsd_ffv2_exit_ctx {
 	struct completion done;
 };
 
+struct nfsd_ffv2_worker_ctx {
+	struct net		*net;
+	refcount_t		ref;
+	struct completion	released;
+	atomic_t		claimed;
+	struct completion	run;
+	struct completion	admitted;
+	struct completion	allow_complete;
+	struct completion	returned;
+	struct nfsd_ffv2_admission	*admission;
+	int			admit_result;
+};
+
+struct nfsd_ffv2_release_ctx {
+	atomic_t		releases;
+	struct completion	started;
+	struct completion	proceed;
+};
+
+struct nfsd_ffv2_shutdown_ctx {
+	struct net		*net;
+	struct completion	done;
+};
+
+static DEFINE_SPINLOCK(nfsd_ffv2_worker_lock);
+static struct nfsd_ffv2_worker_ctx *nfsd_ffv2_worker_ctx;
+
+static void nfsd_ffv2_test_thread_park(void);
+
+static void nfsd_ffv2_worker_ctx_put(struct nfsd_ffv2_worker_ctx *ctx)
+{
+	if (refcount_dec_and_test(&ctx->ref))
+		complete(&ctx->released);
+}
+
+static struct nfsd_ffv2_worker_ctx *
+nfsd_ffv2_worker_ctx_get(struct net *net)
+{
+	struct nfsd_ffv2_worker_ctx *ctx;
+
+	spin_lock(&nfsd_ffv2_worker_lock);
+	ctx = nfsd_ffv2_worker_ctx;
+	if (!ctx || ctx->net != net ||
+	    !refcount_inc_not_zero(&ctx->ref))
+		ctx = NULL;
+	spin_unlock(&nfsd_ffv2_worker_lock);
+	return ctx;
+}
+
+static int
+nfsd_ffv2_worker_ctx_install(struct nfsd_ffv2_worker_ctx *ctx,
+			     struct net *net)
+{
+	int error = 0;
+
+	ctx->net = net;
+	refcount_set(&ctx->ref, 1);
+	init_completion(&ctx->released);
+	atomic_set(&ctx->claimed, 0);
+	init_completion(&ctx->run);
+	init_completion(&ctx->admitted);
+	init_completion(&ctx->allow_complete);
+	init_completion(&ctx->returned);
+	ctx->admit_result = -EINPROGRESS;
+	ctx->admission = NULL;
+
+	spin_lock(&nfsd_ffv2_worker_lock);
+	if (nfsd_ffv2_worker_ctx)
+		error = -EBUSY;
+	else
+		nfsd_ffv2_worker_ctx = ctx;
+	spin_unlock(&nfsd_ffv2_worker_lock);
+	return error;
+}
+
+static void
+nfsd_ffv2_worker_ctx_remove(struct nfsd_ffv2_worker_ctx *ctx)
+{
+	spin_lock(&nfsd_ffv2_worker_lock);
+	if (WARN_ON_ONCE(nfsd_ffv2_worker_ctx != ctx)) {
+		spin_unlock(&nfsd_ffv2_worker_lock);
+		return;
+	}
+	nfsd_ffv2_worker_ctx = NULL;
+	spin_unlock(&nfsd_ffv2_worker_lock);
+
+	nfsd_ffv2_worker_ctx_put(ctx);
+	wait_for_completion(&ctx->released);
+}
+
+/**
+ * nfsd_ffv2_test_worker - run one admission on a real nfsd worker
+ * @rqstp: request context owned by the current nfsd worker
+ * @xprt: permanent transport that identifies the worker's network namespace
+ *
+ * This hook exists only in the private KUnit configuration.  It does not
+ * register a provider or make an NFS operation dispatchable.
+ */
+void nfsd_ffv2_test_worker(struct svc_rqst *rqstp, struct svc_xprt *xprt)
+{
+	struct nfsd_ffv2_worker_ctx *ctx;
+	struct nfsd_ffv2_admission admission = {};
+
+	ctx = nfsd_ffv2_worker_ctx_get(xprt->xpt_net);
+	if (!ctx)
+		return;
+	if (atomic_cmpxchg(&ctx->claimed, 0, 1))
+		goto out_put;
+
+	wait_for_completion(&ctx->run);
+	if (WARN_ON_ONCE(rqstp->rq_xprt)) {
+		ctx->admit_result = -EBUSY;
+		goto out_admitted;
+	}
+	rqstp->rq_xprt = xprt;
+	ctx->admit_result = nfsd_ffv2_admit(rqstp, &admission);
+	rqstp->rq_xprt = NULL;
+	if (!ctx->admit_result)
+		WRITE_ONCE(ctx->admission, &admission);
+out_admitted:
+	complete(&ctx->admitted);
+	if (!ctx->admit_result) {
+		wait_for_completion(&ctx->allow_complete);
+		nfsd_ffv2_complete(&admission);
+		WRITE_ONCE(ctx->admission, NULL);
+	}
+	complete(&ctx->returned);
+out_put:
+	nfsd_ffv2_worker_ctx_put(ctx);
+}
+
+static void nfsd_ffv2_blocking_release(void *payload)
+{
+	struct nfsd_ffv2_release_ctx *ctx = payload;
+
+	atomic_inc(&ctx->releases);
+	complete(&ctx->started);
+	wait_for_completion(&ctx->proceed);
+}
+
+static bool
+nfsd_ffv2_worker_admission_retired(struct nfsd_ffv2_worker_ctx *ctx)
+{
+	struct nfsd_ffv2_admission *admission = READ_ONCE(ctx->admission);
+
+	return admission && nfsd_ffv2_test_admission_retired(admission);
+}
+
+static int nfsd_ffv2_shutdown_thread(void *data)
+{
+	struct nfsd_ffv2_shutdown_ctx *ctx = data;
+
+	nfsd_shutdown_threads(ctx->net);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
 static void nfsd_ffv2_count_release(void *payload)
 {
 	atomic_inc(payload);
+}
+
+static int nfsd_ffv2_start_test_service(struct net *net)
+{
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	int threads = 1;
+	int error;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_create_serv(net);
+	if (error)
+		goto out_unlock;
+	error = svc_xprt_create(nn->nfsd_serv, "tcp", net, PF_INET, 0,
+				SVC_SOCK_ANONYMOUS, current_cred());
+	if (error < 0)
+		goto out_destroy;
+	nfsd_vers(nn, 2, NFSD_CLEAR);
+	nfsd_vers(nn, 3, NFSD_CLEAR);
+	nfsd_vers(nn, 4, NFSD_SET);
+	error = nfsd_svc(1, &threads, net, current_cred(), NULL);
+	if (error == 1)
+		error = 0;
+	else if (error >= 0)
+		error = -EIO;
+	goto out_unlock;
+
+out_destroy:
+	nfsd_destroy_serv(net);
+out_unlock:
+	mutex_unlock(&nfsd_mutex);
+	return error;
 }
 
 static struct nfsd_net *nfsd_ffv2_test_net(struct kunit *test)
@@ -382,11 +577,230 @@ fail:
 	KUNIT_FAIL(test, "failed to establish retirement race: %d", error);
 }
 
+static void nfsd_ffv2_service_integration_test(struct kunit *test)
+{
+	struct nfsd_ffv2_worker_ctx worker = {};
+	struct nfsd_ffv2_release_ctx release = {};
+	struct nfsd_ffv2_shutdown_ctx shutdown;
+	struct nfsd_ffv2_admission rejected = {};
+	struct task_struct *shutdown_task = NULL;
+	struct nfsd_net *nn;
+	struct net *net;
+	unsigned long timeout;
+	bool service_up = false;
+	bool worker_installed = false;
+	bool shutdown_started = false;
+	bool retired;
+	int threads = 1;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create test netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	atomic_set(&release.releases, 0);
+	init_completion(&release.started);
+	init_completion(&release.proceed);
+	error = nfsd_ffv2_worker_ctx_install(&worker, net);
+	if (error)
+		goto out_put_net;
+	worker_installed = true;
+
+	error = nfsd_ffv2_start_test_service(net);
+	if (error)
+		goto out_cleanup;
+	service_up = true;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_test_publish(nn, &release,
+				       nfsd_ffv2_blocking_release, NULL);
+	mutex_unlock(&nfsd_mutex);
+	if (error)
+		goto out_cleanup;
+	complete(&worker.run);
+	timeout = wait_for_completion_timeout(&worker.admitted, HZ);
+	if (!timeout || worker.admit_result) {
+		error = timeout ? worker.admit_result : -ETIMEDOUT;
+		goto out_cleanup;
+	}
+
+	shutdown.net = net;
+	init_completion(&shutdown.done);
+	shutdown_task = kthread_run(nfsd_ffv2_shutdown_thread, &shutdown,
+				    "nfsd-ffv2-shutdown-test");
+	if (IS_ERR(shutdown_task)) {
+		error = PTR_ERR(shutdown_task);
+		shutdown_task = NULL;
+		goto out_cleanup;
+	}
+	shutdown_started = true;
+	error = read_poll_timeout(nfsd_ffv2_worker_admission_retired,
+				  retired, retired, 10, USEC_PER_SEC, false,
+				  &worker);
+	/*
+	 * The worker owns the production admission, so observe STOPPING via a
+	 * rejected test admission while the SUNRPC drain is blocked on it.
+	 */
+	if (error) {
+		error = -ETIMEDOUT;
+		goto out_cleanup;
+	}
+	KUNIT_EXPECT_FALSE(test, completion_done(&shutdown.done));
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_admit(nn, &rejected),
+			-ESHUTDOWN);
+
+	complete(&worker.allow_complete);
+	timeout = wait_for_completion_timeout(&worker.returned, HZ);
+	if (!timeout) {
+		error = -ETIMEDOUT;
+		goto out_cleanup;
+	}
+	timeout = wait_for_completion_timeout(&release.started, HZ);
+	if (!timeout) {
+		error = -ETIMEDOUT;
+		goto out_cleanup;
+	}
+
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_TRUE(test, nn->nfsd_shutdown_in_progress);
+	KUNIT_EXPECT_EQ(test, nfsd_create_serv(net), -EAGAIN);
+	KUNIT_EXPECT_EQ(test, nfsd_set_nrthreads(1, &threads, net), -EAGAIN);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_svc(1, &threads, net, current_cred(), NULL),
+			-EAGAIN);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_register(nn), -EOPNOTSUPP);
+	mutex_unlock(&nfsd_mutex);
+
+	complete(&release.proceed);
+	timeout = wait_for_completion_timeout(&shutdown.done, HZ);
+	if (!timeout) {
+		error = -ETIMEDOUT;
+		goto out_cleanup;
+	}
+	kthread_stop(shutdown_task);
+	shutdown_task = NULL;
+	shutdown_started = false;
+	service_up = false;
+	KUNIT_EXPECT_EQ(test, atomic_read(&release.releases), 1);
+	KUNIT_EXPECT_FALSE(test, nn->nfsd_shutdown_in_progress);
+	KUNIT_EXPECT_PTR_EQ(test, nn->nfsd_serv, NULL);
+
+	error = nfsd_ffv2_start_test_service(net);
+	if (error)
+		goto out_cleanup;
+	service_up = true;
+	nfsd_shutdown_threads(net);
+	service_up = false;
+	KUNIT_EXPECT_FALSE(test, nn->nfsd_shutdown_in_progress);
+	error = 0;
+
+out_cleanup:
+	complete_all(&worker.run);
+	complete_all(&worker.allow_complete);
+	complete_all(&release.proceed);
+	if (shutdown_started) {
+		wait_for_completion(&shutdown.done);
+		kthread_stop(shutdown_task);
+		service_up = false;
+	}
+	if (service_up)
+		nfsd_shutdown_threads(net);
+	if (worker_installed)
+		nfsd_ffv2_worker_ctx_remove(&worker);
+out_put_net:
+	put_net(net);
+	net_ns_barrier();
+	if (error)
+		KUNIT_FAIL(test, "integrated service lifecycle failed: %d", error);
+}
+
+static void nfsd_ffv2_netns_integration_test(struct kunit *test)
+{
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_net *nn;
+	struct net *net;
+	atomic_t releases;
+	bool retired;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create test netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	atomic_set(&releases, 0);
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_up(nn);
+	if (!error)
+		error = nfsd_ffv2_test_publish(nn, &releases,
+					       nfsd_ffv2_count_release, NULL);
+	mutex_unlock(&nfsd_mutex);
+	if (error)
+		goto out_put_net;
+
+	error = nfsd_ffv2_test_admit(nn, &admission);
+	if (error)
+		goto out_put_net;
+	put_net(net);
+	net = NULL;
+	error = read_poll_timeout(nfsd_ffv2_test_admission_retired,
+				  retired, retired, 10, USEC_PER_SEC, false,
+				  &admission);
+	KUNIT_EXPECT_EQ(test, atomic_read(&releases), 0);
+	nfsd_ffv2_test_complete(&admission);
+	net_ns_barrier();
+	KUNIT_EXPECT_EQ(test, atomic_read(&releases), 1);
+	if (error)
+		KUNIT_FAIL(test, "registered netns pre-exit did not retire");
+	return;
+
+out_put_net:
+	if (net) {
+		put_net(net);
+		net_ns_barrier();
+	}
+	KUNIT_FAIL(test, "integrated netns lifecycle failed: %d", error);
+}
+
+static void nfsd_ffv2_listener_only_integration_test(struct kunit *test)
+{
+	struct nfsd_net *nn;
+	struct net *net;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create test netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_create_serv(net);
+	if (!error) {
+		KUNIT_EXPECT_FALSE(test, nn->nfsd_net_up);
+		KUNIT_EXPECT_PTR_NE(test, nn->nfsd_serv, NULL);
+		nfsd_destroy_serv(net);
+		KUNIT_EXPECT_PTR_EQ(test, nn->nfsd_serv, NULL);
+		KUNIT_EXPECT_FALSE(test, nn->nfsd_shutdown_in_progress);
+	}
+	mutex_unlock(&nfsd_mutex);
+	put_net(net);
+	net_ns_barrier();
+	if (error)
+		KUNIT_FAIL(test, "listener-only lifecycle failed: %d", error);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
 	KUNIT_CASE(nfsd_ffv2_zero_threads_test),
 	KUNIT_CASE(nfsd_ffv2_multi_retirement_test),
+	KUNIT_CASE(nfsd_ffv2_service_integration_test),
+	KUNIT_CASE(nfsd_ffv2_netns_integration_test),
+	KUNIT_CASE(nfsd_ffv2_listener_only_integration_test),
 	{}
 };
 

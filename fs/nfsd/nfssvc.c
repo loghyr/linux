@@ -961,6 +961,10 @@ nfsd(void *vrqstp)
 	static_assert(sizeof(struct nfsd_thread_local_info) < 256);
 	rqstp->rq_private = &ntli;
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	nfsd_ffv2_test_worker(rqstp, perm_sock);
+#endif
+
 	/*
 	 * The main request loop
 	 */

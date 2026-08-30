@@ -97,9 +97,9 @@ config NFSD_FFV2_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Run tests for the fail-closed nfsd Flex Files v2 service lifecycle.
-	  The tests cover per-network-namespace initialization, service start,
-	  idempotent stop, restart, terminal namespace exit, and the private
-	  registration stub. No provider callback is enabled by these tests.
+	  The tests cover state-machine races, a real nfsd worker and service
+	  drain, service restart, and registered network-namespace teardown.
+	  No provider callback is enabled by these tests.
 
 	  If unsure, say N.
 
