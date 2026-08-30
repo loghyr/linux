@@ -227,6 +227,7 @@ static void nfsd_ffv2_admission_unregister_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(releases), 0);
 
 	nfsd_ffv2_test_complete(&admission);
+	nfsd_ffv2_test_complete(&admission);
 	timeout = wait_for_completion_timeout(&ctx.done, HZ);
 	KUNIT_EXPECT_NE(test, timeout, 0UL);
 	kthread_stop(task);

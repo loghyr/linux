@@ -444,15 +444,21 @@ int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 {
-	struct nfsd_ffv2_generation *generation = admission->generation;
-	struct nfsd_ffv2_anchor *anchor = admission->anchor;
-	struct net *net = admission->net;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_anchor *anchor;
+	struct net *net;
+
+	/* Completion owns and consumes the admission exactly once. */
+	generation = xchg(&admission->generation, NULL);
+	if (!generation)
+		return;
+	anchor = admission->anchor;
+	net = admission->net;
 
 	spin_lock(&generation->admissions_lock);
 	list_del_init(&admission->node);
 	spin_unlock(&generation->admissions_lock);
 	admission->anchor = NULL;
-	admission->generation = NULL;
 	admission->net = NULL;
 	admission->task = NULL;
 	if (atomic_dec_and_test(&generation->admitted))
