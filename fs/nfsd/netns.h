@@ -131,6 +131,8 @@ struct nfsd_net {
 	atomic_t nr_reclaim_complete;
 
 	bool nfsd_net_up;
+	/* Protected by nfsd_mutex. */
+	bool nfsd_shutdown_in_progress;
 	bool lockd_up;
 
 	seqlock_t writeverf_lock;

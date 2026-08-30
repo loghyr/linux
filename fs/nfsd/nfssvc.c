@@ -403,13 +403,22 @@ out_socks:
 	return ret;
 }
 
-static void nfsd_shutdown_net(struct net *net)
+static void
+nfsd_shutdown_net(struct net *net,
+		  struct nfsd_ffv2_generation *generation)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
+	lockdep_assert_held(&nfsd_mutex);
 	if (nn->nfsd_net_up) {
 		percpu_ref_kill_and_confirm(&nn->nfsd_net_ref, nfsd_net_done);
 		wait_for_completion(&nn->nfsd_net_confirm_done);
+
+		/* Provider payload release may sleep; keep teardown fenced. */
+		mutex_unlock(&nfsd_mutex);
+		nfsd_ffv2_service_stop_finish(nn, generation);
+		mutex_lock(&nfsd_mutex);
+		generation = NULL;
 
 		nfsd_export_flush(net);
 		nfs4_state_shutdown_net(net);
@@ -420,6 +429,11 @@ static void nfsd_shutdown_net(struct net *net)
 			nn->lockd_up = false;
 		}
 		wait_for_completion(&nn->nfsd_net_free_done);
+	}
+	if (generation) {
+		mutex_unlock(&nfsd_mutex);
+		nfsd_ffv2_service_stop_finish(nn, generation);
+		mutex_lock(&nfsd_mutex);
 	}
 
 	percpu_ref_exit(&nn->nfsd_net_ref);
@@ -496,15 +510,23 @@ static struct notifier_block nfsd_inet6addr_notifier = {
 static atomic_t nfsd_notifier_refcount = ATOMIC_INIT(0);
 
 /**
- * nfsd_destroy_serv - tear down NFSD's svc_serv for a namespace
+ * __nfsd_destroy_serv - tear down NFSD's svc_serv for a namespace
  * @net: network namespace the NFS service is associated with
+ * @generation: FFv2 generation fenced before the service worker drain
  */
-void nfsd_destroy_serv(struct net *net)
+static void
+__nfsd_destroy_serv(struct net *net,
+		    struct nfsd_ffv2_generation *generation)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 	struct svc_serv *serv = nn->nfsd_serv;
 
 	lockdep_assert_held(&nfsd_mutex);
+	if (WARN_ON_ONCE(nn->nfsd_shutdown_in_progress)) {
+		nfsd_ffv2_service_stop_put(generation);
+		return;
+	}
+	nn->nfsd_shutdown_in_progress = true;
 
 	spin_lock(&nfsd_notifier_lock);
 	nn->nfsd_serv = NULL;
@@ -525,9 +547,20 @@ void nfsd_destroy_serv(struct net *net)
 	 * other initialization has been done except the rpcb information.
 	 */
 	svc_xprt_destroy_all(serv, net, true);
-	nfsd_shutdown_net(net);
+	nfsd_shutdown_net(net, generation);
 	nfsd_ffv2_service_down(nn);
 	svc_destroy(&serv);
+	nn->nfsd_shutdown_in_progress = false;
+}
+
+void nfsd_destroy_serv(struct net *net)
+{
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	struct nfsd_ffv2_generation *generation;
+
+	lockdep_assert_held(&nfsd_mutex);
+	generation = nfsd_ffv2_service_stop_begin(nn);
+	__nfsd_destroy_serv(net, generation);
 }
 
 void nfsd_reset_versions(struct nfsd_net *nn)
@@ -585,8 +618,7 @@ void nfsd_shutdown_threads(struct net *net)
 	/* Kill outstanding nfsd threads */
 	generation = nfsd_ffv2_service_stop_begin(nn);
 	svc_set_num_threads(serv, 0, 0);
-	nfsd_ffv2_service_stop_finish(nn, generation);
-	nfsd_destroy_serv(net);
+	__nfsd_destroy_serv(net, generation);
 	mutex_unlock(&nfsd_mutex);
 }
 
@@ -604,6 +636,8 @@ int nfsd_create_serv(struct net *net)
 	struct svc_serv *serv;
 
 	WARN_ON(!mutex_is_locked(&nfsd_mutex));
+	if (nn->nfsd_shutdown_in_progress)
+		return -EAGAIN;
 	if (nn->nfsd_serv)
 		return 0;
 
@@ -689,6 +723,8 @@ int nfsd_set_nrthreads(int n, int *nthreads, struct net *net)
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
 	lockdep_assert_held(&nfsd_mutex);
+	if (nn->nfsd_shutdown_in_progress)
+		return -EAGAIN;
 
 	if (nn->nfsd_serv == NULL || n <= 0)
 		return 0;
@@ -775,8 +811,10 @@ nfsd_svc(int n, int *nthreads, struct net *net, const struct cred *cred, const c
 	error = nfsd_startup_net(net, cred);
 	if (error)
 		goto out_put;
-	nfsd_ffv2_service_up(nn);
 	stop = nfsd_ffv2_requested_zero_threads(n, nthreads, serv->sv_nrpools);
+	error = nfsd_ffv2_service_up(nn);
+	if (error && !stop)
+		goto out_put;
 	if (stop)
 		generation = nfsd_ffv2_service_stop_begin(nn);
 	error = nfsd_set_nrthreads(n, nthreads, net);
@@ -786,10 +824,13 @@ nfsd_svc(int n, int *nthreads, struct net *net, const struct cred *cred, const c
 		goto out_put;
 	error = serv->sv_nrthreads;
 out_put:
-	if (generation)
-		nfsd_ffv2_service_stop_finish(nn, generation);
-	if (serv->sv_nrthreads == 0)
-		nfsd_destroy_serv(net);
+	if (serv->sv_nrthreads == 0) {
+		if (!generation)
+			generation = nfsd_ffv2_service_stop_begin(nn);
+		__nfsd_destroy_serv(net, generation);
+	} else if (generation) {
+		nfsd_ffv2_service_stop_failed(nn, generation);
+	}
 out:
 	return error;
 }

@@ -474,8 +474,13 @@ static ssize_t write_pool_threads(struct file *file, char *buf, size_t size)
 	int npools;
 	int *nthreads;
 	struct net *net = netns(file);
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
 	mutex_lock(&nfsd_mutex);
+	if (size > 0 && nn->nfsd_shutdown_in_progress) {
+		mutex_unlock(&nfsd_mutex);
+		return -EAGAIN;
+	}
 	npools = nfsd_nrpools(net);
 	if (npools == 0) {
 		/*
@@ -1658,6 +1663,10 @@ int nfsd_nl_threads_set_doit(struct sk_buff *skb, struct genl_info *info)
 		nrpools++;
 
 	mutex_lock(&nfsd_mutex);
+	if (nn->nfsd_shutdown_in_progress) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
 
 	nthreads = kzalloc_objs(int, nrpools);
 	if (!nthreads) {
@@ -2445,6 +2454,7 @@ static __net_init int nfsd_net_init(struct net *net)
 		nn->nfsd4_minorversions[i] = nfsd_support_version(4);
 	nn->nfsd_info.mutex = &nfsd_mutex;
 	nn->nfsd_serv = NULL;
+	nn->nfsd_shutdown_in_progress = false;
 	nfsd4_init_leases_net(nn);
 	get_random_bytes(&nn->siphash_key, sizeof(nn->siphash_key));
 	seqlock_init(&nn->writeverf_lock);

@@ -86,7 +86,9 @@ static int nfsd_ffv2_exit_thread(void *data)
 
 static void nfsd_ffv2_lifecycle_test(struct kunit *test)
 {
+	struct nfsd_ffv2_admission admission = {};
 	struct nfsd_ffv2_generation *generation;
+	struct svc_rqst rqstp = {};
 	struct nfsd_net *nn;
 	atomic_t *releases;
 	u64 generation_id = 0;
@@ -102,12 +104,14 @@ static void nfsd_ffv2_lifecycle_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nn->ffv2.net_state, NFSD_FFV2_NET_LIVE);
 	KUNIT_EXPECT_EQ(test, nn->ffv2.service_state,
 			NFSD_FFV2_SERVICE_DOWN);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_admit(&rqstp, &admission),
+			-EOPNOTSUPP);
 
 	mutex_lock(&nfsd_mutex);
 	error = nfsd_ffv2_test_publish(nn, releases,
 				       nfsd_ffv2_count_release, NULL);
 	KUNIT_EXPECT_EQ(test, error, -ENXIO);
-	nfsd_ffv2_service_up(nn);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), 0);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_register(nn), -EOPNOTSUPP);
 	error = nfsd_ffv2_test_publish(nn, releases,
 				       nfsd_ffv2_count_release,
@@ -121,11 +125,19 @@ static void nfsd_ffv2_lifecycle_test(struct kunit *test)
 	KUNIT_EXPECT_NOT_NULL(test, generation);
 	if (generation)
 		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_generation_retired(generation));
+	nfsd_ffv2_service_stop_failed(nn, generation);
+	KUNIT_EXPECT_EQ(test, nn->ffv2.service_state,
+			NFSD_FFV2_SERVICE_DRAIN_FAILED);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), -EAGAIN);
+	generation = nfsd_ffv2_service_stop_begin(nn);
+	KUNIT_EXPECT_NOT_NULL(test, generation);
+	mutex_unlock(&nfsd_mutex);
 	nfsd_ffv2_service_stop_finish(nn, generation);
+	mutex_lock(&nfsd_mutex);
 	KUNIT_EXPECT_EQ(test, atomic_read(releases), 1);
 	nfsd_ffv2_service_down(nn);
 
-	nfsd_ffv2_service_up(nn);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), 0);
 	error = nfsd_ffv2_test_publish(nn, releases,
 				       nfsd_ffv2_count_release,
 				       &generation_id);
@@ -141,13 +153,15 @@ static void nfsd_ffv2_lifecycle_test(struct kunit *test)
 
 	mutex_lock(&nfsd_mutex);
 	nfsd_ffv2_service_down(nn);
-	nfsd_ffv2_service_up(nn);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), -ESHUTDOWN);
 	error = nfsd_ffv2_test_publish(nn, releases,
 				       nfsd_ffv2_count_release, NULL);
 	KUNIT_EXPECT_EQ(test, error, -ESHUTDOWN);
 	mutex_unlock(&nfsd_mutex);
 	KUNIT_EXPECT_EQ(test, nn->ffv2.service_state,
 			NFSD_FFV2_SERVICE_STOPPING);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_admit(nn, &admission),
+			-ESHUTDOWN);
 	nfsd_ffv2_test_net_destroy(test, nn);
 }
 
@@ -171,13 +185,14 @@ static void nfsd_ffv2_admission_unregister_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 	mutex_lock(&nfsd_mutex);
-	nfsd_ffv2_service_up(nn);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), 0);
 	error = nfsd_ffv2_test_publish(nn, releases,
 				       nfsd_ffv2_count_release,
 				       &generation_id);
 	mutex_unlock(&nfsd_mutex);
 	KUNIT_ASSERT_EQ(test, error, 0);
 	KUNIT_ASSERT_EQ(test, nfsd_ffv2_test_admit(nn, &admission), 0);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(nn), 2U);
 	mutex_lock(&nfsd_mutex);
 	error = nfsd_ffv2_test_unregister(nn, generation_id);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_register(nn), -EOPNOTSUPP);
@@ -242,6 +257,7 @@ static void nfsd_ffv2_multi_retirement_test(struct kunit *test)
 	struct task_struct *exit_task = NULL;
 	struct nfsd_net *nn;
 	atomic_t *releases;
+	unsigned int anchor_refs;
 	unsigned int refs;
 	u64 generation_id;
 	bool admitted = false;
@@ -257,7 +273,7 @@ static void nfsd_ffv2_multi_retirement_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, error, 0);
 
 	mutex_lock(&nfsd_mutex);
-	nfsd_ffv2_service_up(nn);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), 0);
 	error = nfsd_ffv2_test_publish(nn, releases,
 				       nfsd_ffv2_count_release,
 				       &generation_id);
@@ -296,6 +312,7 @@ static void nfsd_ffv2_multi_retirement_test(struct kunit *test)
 
 	mutex_lock(&nfsd_mutex);
 	stop_generation = nfsd_ffv2_service_stop_begin(nn);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), -EAGAIN);
 	mutex_unlock(&nfsd_mutex);
 	if (!stop_generation) {
 		error = -ENOENT;
@@ -320,12 +337,15 @@ static void nfsd_ffv2_multi_retirement_test(struct kunit *test)
 				  10, USEC_PER_SEC, false, &admission);
 	if (error)
 		goto fail;
+	error = read_poll_timeout(nfsd_ffv2_test_anchor_refcount,
+				  anchor_refs, anchor_refs >= 5,
+				  10, USEC_PER_SEC, false, nn);
+	if (error)
+		goto fail;
 
 	nfsd_ffv2_test_complete(&admission);
 	admitted = false;
-	mutex_lock(&nfsd_mutex);
 	nfsd_ffv2_service_stop_finish(nn, stop_generation);
-	mutex_unlock(&nfsd_mutex);
 	stop_generation = NULL;
 
 	for (i = 0; i < ARRAY_SIZE(unregister); i++) {
@@ -345,9 +365,7 @@ fail:
 	if (admitted)
 		nfsd_ffv2_test_complete(&admission);
 	if (stop_generation) {
-		mutex_lock(&nfsd_mutex);
 		nfsd_ffv2_service_stop_finish(nn, stop_generation);
-		mutex_unlock(&nfsd_mutex);
 	}
 	for (i = 0; i < ARRAY_SIZE(unregister_task); i++) {
 		if (!unregister_task[i])
