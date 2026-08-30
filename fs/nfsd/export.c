@@ -1026,27 +1026,13 @@ static int nfsd_nl_parse_one_export(struct cache_detail *cd,
 		nfsd4_setup_layout_type(&exp);
 	}
 
-	expp = svc_export_lookup(&exp);
-	if (!expp) {
-		err = -ENOMEM;
-		goto out_uuid;
-	}
-	err = nfsd_ffv2_export_update_begin(&exp, expp);
-	if (err) {
-		exp_put(expp);
-		goto out_uuid;
-	}
-	expp = svc_export_update(&exp, expp);
-	if (expp)
-		nfsd_ffv2_export_update_end(expp);
-	else
-		nfsd_ffv2_export_update_abort();
-	if (expp) {
+	expp = nfsd_export_cache_update(&exp);
+	if (!IS_ERR(expp)) {
 		trace_nfsd_export_update(expp);
 		cache_flush();
 		exp_put(expp);
 	} else {
-		err = -ENOMEM;
+		err = PTR_ERR(expp);
 	}
 
 out_uuid:
@@ -1451,27 +1437,14 @@ static int svc_export_parse(struct cache_detail *cd, char *mesg, int mlen)
 			nfsd4_setup_layout_type(&exp);
 	}
 
-	expp = svc_export_lookup(&exp);
-	if (!expp) {
-		err = -ENOMEM;
-		goto out4;
-	}
-	err = nfsd_ffv2_export_update_begin(&exp, expp);
-	if (err) {
-		exp_put(expp);
-		goto out4;
-	}
-	expp = svc_export_update(&exp, expp);
-	if (expp)
-		nfsd_ffv2_export_update_end(expp);
-	else
-		nfsd_ffv2_export_update_abort();
-	if (expp) {
+	expp = nfsd_export_cache_update(&exp);
+	if (!IS_ERR(expp)) {
 		trace_nfsd_export_update(expp);
 		cache_flush();
 		exp_put(expp);
-	} else
-		err = -ENOMEM;
+	} else {
+		err = PTR_ERR(expp);
+	}
 out4:
 	nfsd4_fslocs_free(&exp.ex_fslocs);
 	kfree(exp.ex_uuid);
@@ -1610,9 +1583,19 @@ static void export_update(struct cache_head *cnew, struct cache_head *citem)
 	RCU_INIT_POINTER(item->ex_ffv2_context, NULL);
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static atomic_t nfsd_ffv2_export_alloc_failure;
+#endif
+
 static struct cache_head *svc_export_alloc(void)
 {
-	struct svc_export *i = kmalloc_obj(*i);
+	struct svc_export *i;
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (atomic_xchg(&nfsd_ffv2_export_alloc_failure, 0))
+		return NULL;
+#endif
+	i = kmalloc_obj(*i);
 	if (!i)
 		return NULL;
 
@@ -1635,6 +1618,18 @@ static struct cache_head *svc_export_alloc(void)
 
 	return &i->h;
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_test_fail_export_alloc(bool fail)
+{
+	atomic_set(&nfsd_ffv2_export_alloc_failure, fail);
+}
+
+struct svc_export *nfsd_ffv2_test_export_lookup(struct svc_export *key)
+{
+	return svc_export_lookup(key);
+}
+#endif
 
 static const struct cache_detail svc_export_cache_template = {
 	.owner		= THIS_MODULE,
@@ -1687,6 +1682,55 @@ svc_export_update(struct svc_export *new, struct svc_export *old)
 		return container_of(ch, struct svc_export, h);
 	else
 		return NULL;
+}
+
+/* Serialize lookup and replacement so policy never validates a stale item. */
+static DEFINE_MUTEX(nfsd_export_update_lock);
+
+struct svc_export *nfsd_export_cache_update(struct svc_export *new)
+{
+	struct nfsd_ffv2_export_update update;
+	struct nfsd_ffv2_service_context *context =
+		rcu_access_pointer(new->ex_ffv2_context);
+	struct svc_export *old, *result;
+	int error;
+
+	mutex_lock(&nfsd_export_update_lock);
+	old = svc_export_lookup(new);
+	if (!old) {
+		result = ERR_PTR(-ENOMEM);
+		goto out_unlock;
+	}
+	error = nfsd_ffv2_export_update_begin(new, old, &update);
+	if (error) {
+		exp_put(old);
+		result = ERR_PTR(error);
+		goto out_unlock;
+	}
+	error = nfsd_ffv2_export_update_validate(&update);
+	if (error) {
+		nfsd_ffv2_export_update_abort(&update);
+		exp_put(old);
+		result = ERR_PTR(error);
+		goto out_unlock;
+	}
+	result = svc_export_update(new, old);
+	if (!result) {
+		nfsd_ffv2_export_update_abort(&update);
+		result = ERR_PTR(-ENOMEM);
+		goto out_unlock;
+	}
+	error = nfsd_ffv2_export_update_end(result, &update);
+	if (error) {
+		exp_put(result);
+		if (context)
+			nfsd_ffv2_export_update_rollback_wait(context);
+		result = ERR_PTR(error);
+	}
+
+out_unlock:
+	mutex_unlock(&nfsd_export_update_lock);
+	return result;
 }
 
 

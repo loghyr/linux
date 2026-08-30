@@ -87,6 +87,10 @@ struct svc_export {
 	struct completion	*ex_ffv2_context_released;
 };
 
+struct svc_export *nfsd_export_cache_update(struct svc_export *new);
+struct svc_export *nfsd_ffv2_test_export_lookup(struct svc_export *key);
+void nfsd_ffv2_test_fail_export_alloc(bool fail);
+
 /* an "export key" (expkey) maps a filehandlefragement to an
  * svc_export for a given client.  There can be several per export,
  * for the different fsid types.

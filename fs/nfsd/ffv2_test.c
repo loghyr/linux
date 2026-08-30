@@ -54,10 +54,26 @@ struct nfsd_ffv2_shutdown_ctx {
 	struct completion	done;
 };
 
+struct nfsd_ffv2_update_stop_ctx {
+	struct nfsd_net		*nn;
+	struct nfsd_ffv2_generation *generation;
+	struct completion	done;
+};
+
 static DEFINE_SPINLOCK(nfsd_ffv2_worker_lock);
 static struct nfsd_ffv2_worker_ctx *nfsd_ffv2_worker_ctx;
 
 static void nfsd_ffv2_test_thread_park(void);
+
+static int nfsd_ffv2_update_stop_thread(void *data)
+{
+	struct nfsd_ffv2_update_stop_ctx *ctx = data;
+
+	nfsd_ffv2_service_stop_finish(ctx->nn, ctx->generation);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
 
 static void nfsd_ffv2_worker_ctx_put(struct nfsd_ffv2_worker_ctx *ctx)
 {
@@ -1161,26 +1177,39 @@ static void nfsd_ffv2_partial_start_cleanup_test(struct kunit *test)
 	net_ns_barrier();
 }
 
+static void nfsd_ffv2_init_test_export(struct svc_export *exp,
+				       struct nfsd_net *nn,
+				       struct auth_domain *domain,
+				       const struct path *root)
+{
+	memset(exp, 0, sizeof(*exp));
+	exp->cd = nn->svc_export_cache;
+	exp->ex_client = domain;
+	exp->ex_path = *root;
+	exp->h.expiry_time = TIME64_MAX;
+	exp->ex_anon_uid = GLOBAL_ROOT_UID;
+	exp->ex_anon_gid = GLOBAL_ROOT_GID;
+	exp->ex_xprtsec_modes = NFSEXP_XPRTSEC_ALL;
+}
+
 static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 {
-	struct nfsd_ffv2_service_context *context = NULL;
-	struct nfsd_ffv2_reservation *duplicate;
-	struct nfsd_ffv2_reservation *reservation;
+	struct nfsd_ffv2_reservation *reservation = NULL;
 	struct nfsd_ffv2_generation *generation;
-	struct svc_export exp = {};
-	struct svc_export exp2 = {};
+	struct auth_domain *domain;
+	struct svc_export *published;
+	struct svc_export exp;
 	struct nfsd_net *nn;
 	struct nfsd_net *nn2;
 	struct path nonroot;
 	struct path root;
 	struct net *net;
 	struct net *net2;
-	bool inventory_live = false;
-	bool inventory2_live = false;
-	bool reservation_live = false;
 	bool service_up = false;
+	char domain_name[] = "ffv2-kunit";
 	u8 token[32] = { 1 };
 	u8 uuid[16] = { 2 };
+	u64 generation_id;
 	int error;
 
 	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
@@ -1199,132 +1228,144 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		return;
 	}
 	nn2 = net_generic(net2, nfsd_net_id);
+	domain = unix_domain_find(domain_name);
+	if (!domain) {
+		KUNIT_FAIL(test, "failed to create test auth domain");
+		goto out_nets;
+	}
 	get_fs_root(current->fs, &root);
 
-	error = nfsd_ffv2_reservation_claim(&root, uuid, token, &reservation);
+	error = nfsd_ffv2_reservation_claim(nn, &root, uuid, token,
+					    &reservation);
 	if (!error)
 		nfsd_ffv2_reservation_abort(reservation);
 	else
 		KUNIT_EXPECT_EQ(test, error, -EOPNOTSUPP);
-	error = nfsd_ffv2_test_reservation_claim(&root, uuid, token, &reservation);
-	if (error) {
-		KUNIT_FAIL(test, "initial reservation failed: %d", error);
-		goto out_root;
-	}
-	nfsd_ffv2_reservation_abort(reservation);
 
-	exp.cd = nn->svc_export_cache;
-	exp.ex_path = root;
-	INIT_LIST_HEAD(&exp.ex_ffv2_inventory);
-	error = nfsd_ffv2_export_update_begin(&exp, &exp);
-	if (error) {
-		KUNIT_FAIL(test, "inventory publication failed: %d", error);
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	published = nfsd_export_cache_update(&exp);
+	if (IS_ERR(published)) {
+		KUNIT_FAIL(test, "real inventory publication failed: %ld",
+			   PTR_ERR(published));
 		goto out_root;
 	}
-	nfsd_ffv2_export_update_end(&exp);
-	inventory_live = true;
+	exp_put(published);
 	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 1U);
-	set_bit(CACHE_NEGATIVE, &exp.h.flags);
-	error = nfsd_ffv2_export_update_begin(&exp, &exp);
-	if (!error) {
-		nfsd_ffv2_export_update_end(&exp);
-		inventory_live = false;
-	}
-	KUNIT_EXPECT_EQ(test, error, 0);
-	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 0U);
-	clear_bit(CACHE_NEGATIVE, &exp.h.flags);
-	error = nfsd_ffv2_export_update_begin(&exp, &exp);
-	if (!error) {
-		nfsd_ffv2_export_update_end(&exp);
-		inventory_live = true;
-	}
-	KUNIT_EXPECT_EQ(test, error, 0);
-
-	exp2.cd = nn2->svc_export_cache;
-	exp2.ex_path = root;
-	INIT_LIST_HEAD(&exp2.ex_ffv2_inventory);
-	error = nfsd_ffv2_export_update_begin(&exp2, &exp2);
-	if (!error) {
-		nfsd_ffv2_export_update_end(&exp2);
-		inventory2_live = true;
-	}
-	KUNIT_EXPECT_EQ(test, error, 0);
-	KUNIT_EXPECT_EQ(test, nn2->ffv2_participant.inventory_count, 1U);
-	error = nfsd_ffv2_test_reservation_claim(&root, uuid, token, &reservation);
+	error = nfsd_ffv2_test_reservation_claim(nn2, &root, uuid, token,
+						 &reservation);
 	KUNIT_EXPECT_EQ(test, error, -EBUSY);
-	nfsd_ffv2_export_release(&exp);
-	inventory_live = false;
-	nfsd_ffv2_export_release(&exp2);
-	inventory2_live = false;
+	nfsd_export_flush(net);
 	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 0U);
 
-	error = nfsd_ffv2_test_reservation_claim(&root, uuid, token, &reservation);
-	if (error) {
-		KUNIT_FAIL(test, "DS-first reservation failed: %d", error);
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	set_bit(CACHE_NEGATIVE, &exp.h.flags);
+	published = nfsd_export_cache_update(&exp);
+	if (IS_ERR(published)) {
+		KUNIT_FAIL(test, "negative seed publication failed: %ld",
+			   PTR_ERR(published));
 		goto out_root;
 	}
-	reservation_live = true;
-	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
-	error = nfsd_ffv2_test_reservation_claim(&root, uuid, token, &duplicate);
-	KUNIT_EXPECT_EQ(test, error, -EBUSY);
-	error = nfsd_ffv2_export_update_begin(&exp, &exp);
-	KUNIT_EXPECT_EQ(test, error, -EBUSY);
-	error = nfsd_ffv2_export_update_begin(&exp2, &exp2);
-	KUNIT_EXPECT_EQ(test, error, -EBUSY);
-
-	context = nfsd_ffv2_service_context_alloc(reservation, current_cred(),
-						  1);
-	if (!context) {
-		KUNIT_FAIL(test, "service-context allocation failed");
-		goto out_reservation;
-	}
-	nfsd_ffv2_service_context_prepare_export(context, &exp);
-	KUNIT_EXPECT_EQ(test, nfsd4_ffv2_export_policy_check(&exp, OP_GETATTR),
-			nfserr_notsupp);
-	RCU_INIT_POINTER(exp.ex_ffv2_context, NULL);
-	error = nfsd_ffv2_reservation_activate(reservation);
-	if (error) {
-		KUNIT_FAIL(test, "reservation activation failed: %d", error);
-		nfsd_ffv2_service_context_abort(context);
-		context = NULL;
-		goto out_reservation;
-	}
-	reservation_live = false;
+	exp_put(published);
 
 	mutex_lock(&nfsd_mutex);
 	error = nfsd_ffv2_service_up(nn);
-	if (!error) {
-		service_up = true;
-		error = nfsd_ffv2_test_publish(nn, context,
-					       nfsd_ffv2_service_context_release,
-					       NULL);
-	}
-	generation = error ? NULL : nfsd_ffv2_service_stop_begin(nn);
+	service_up = !error;
 	mutex_unlock(&nfsd_mutex);
 	if (error) {
-		KUNIT_FAIL(test, "context generation publication failed: %d",
-			   error);
-		nfsd_ffv2_service_context_release(context);
-		context = NULL;
-		goto out_service;
+		KUNIT_FAIL(test, "failed to start transaction service: %d", error);
+		goto out_root;
 	}
-	context = NULL;
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	nfsd_ffv2_test_fail_export_alloc(true);
+	error = nfsd_ffv2_test_service_export_publish(nn, &exp, &root, uuid,
+						      token, current_cred(), 1,
+						      &generation_id);
+	KUNIT_EXPECT_EQ(test, error, -ENOMEM);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(exp.ex_ffv2_context), NULL);
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+
+	error = nfsd_ffv2_test_service_export_publish(nn, &exp, &root, uuid,
+						      token, current_cred(), 1,
+						      &generation_id);
+	if (error) {
+		KUNIT_FAIL(test, "service transaction failed: %d", error);
+		goto out_root;
+	}
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	published = nfsd_ffv2_test_export_lookup(&exp);
+	if (!published) {
+		KUNIT_FAIL(test, "published service export not found");
+		goto out_root;
+	}
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(published, OP_GETATTR),
+			nfserr_notsupp);
+	exp_put(published);
+
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	published = nfsd_export_cache_update(&exp);
+	if (IS_ERR(published)) {
+		KUNIT_EXPECT_EQ(test, PTR_ERR(published), -EBUSY);
+	} else {
+		KUNIT_FAIL(test, "service export replacement was accepted");
+		exp_put(published);
+	}
+	set_bit(CACHE_NEGATIVE, &exp.h.flags);
+	published = nfsd_export_cache_update(&exp);
+	if (IS_ERR(published)) {
+		KUNIT_EXPECT_EQ(test, PTR_ERR(published), -EAGAIN);
+	} else {
+		KUNIT_FAIL(test, "service export negative update was accepted");
+		exp_put(published);
+	}
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_generation_retire(nn, generation_id);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	published = nfsd_export_cache_update(&exp);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(published));
+	if (!IS_ERR(published))
+		exp_put(published);
+
+	mutex_lock(&nfsd_mutex);
+	generation = nfsd_ffv2_service_stop_begin(nn);
+	mutex_unlock(&nfsd_mutex);
 	nfsd_ffv2_service_stop_finish(nn, generation);
 	service_up = false;
 	mutex_lock(&nfsd_mutex);
 	nfsd_ffv2_service_down(nn);
 	mutex_unlock(&nfsd_mutex);
+	nfsd_export_flush(net);
+
+	error = nfsd_ffv2_test_reservation_claim(nn2, &root, uuid, token,
+						 &reservation);
+	if (error) {
+		KUNIT_FAIL(test, "owner reservation failed: %d", error);
+		goto out_root;
+	}
+	nfsd_ffv2_participant_detach_begin(nn2);
+	nfsd_ffv2_participant_detach_finish(nn2);
 	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	nfsd_ffv2_reservation_abort(reservation);
+	reservation = NULL;
+	error = nfsd_ffv2_participant_register(nn2, net2);
+	if (error) {
+		KUNIT_FAIL(test, "failed to restore test participant: %d", error);
+		goto out_root;
+	}
 
 	error = kern_path("/proc/self", LOOKUP_FOLLOW, &nonroot);
 	if (!error) {
-		error = nfsd_ffv2_reservation_claim(&nonroot, uuid, token, &reservation);
+		error = nfsd_ffv2_reservation_claim(nn, &nonroot, uuid, token,
+						    &reservation);
 		KUNIT_EXPECT_EQ(test, error, -EOPNOTSUPP);
 		path_put(&nonroot);
 	}
 	goto out_root;
 
-out_service:
+out_root:
 	if (service_up) {
 		mutex_lock(&nfsd_mutex);
 		generation = nfsd_ffv2_service_stop_begin(nn);
@@ -1334,17 +1375,82 @@ out_service:
 		nfsd_ffv2_service_down(nn);
 		mutex_unlock(&nfsd_mutex);
 	}
-out_reservation:
-	if (reservation_live)
-		nfsd_ffv2_reservation_abort(reservation);
-
-out_root:
-	if (inventory_live)
-		nfsd_ffv2_export_release(&exp);
-	if (inventory2_live)
-		nfsd_ffv2_export_release(&exp2);
+	nfsd_ffv2_test_fail_export_alloc(false);
+	nfsd_export_flush(net);
 	path_put(&root);
-	put_net(net2);
+	auth_domain_put(domain);
+out_nets:
+	if (net2)
+		put_net(net2);
+	put_net(net);
+	net_ns_barrier();
+}
+
+static void nfsd_ffv2_export_update_stop_test(struct kunit *test)
+{
+	struct nfsd_ffv2_update_stop_ctx stop;
+	struct nfsd_ffv2_export_update update;
+	struct task_struct *task = NULL;
+	struct svc_export exp = {};
+	struct nfsd_net *nn;
+	struct path root;
+	struct net *net;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create update-stop netns: %ld",
+			   PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	get_fs_root(current->fs, &root);
+	exp.cd = nn->svc_export_cache;
+	exp.ex_path = root;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_up(nn);
+	mutex_unlock(&nfsd_mutex);
+	if (error) {
+		KUNIT_FAIL(test, "failed to open update epoch: %d", error);
+		goto out_root;
+	}
+	error = nfsd_ffv2_export_update_begin(&exp, &exp, &update);
+	if (error) {
+		KUNIT_FAIL(test, "failed to admit export update: %d", error);
+		goto out_down;
+	}
+	stop.nn = nn;
+	init_completion(&stop.done);
+	mutex_lock(&nfsd_mutex);
+	stop.generation = nfsd_ffv2_service_stop_begin(nn);
+	mutex_unlock(&nfsd_mutex);
+	task = kthread_run(nfsd_ffv2_update_stop_thread, &stop,
+			   "nfsd-ffv2-update-stop");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "failed to start update-stop thread: %ld",
+			   PTR_ERR(task));
+		task = NULL;
+		nfsd_ffv2_export_update_abort(&update);
+		nfsd_ffv2_service_stop_finish(nn, stop.generation);
+		goto out_down;
+	}
+	KUNIT_EXPECT_EQ(test,
+			wait_for_completion_timeout(&stop.done, 1), 0UL);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_update_validate(&update),
+			-ESHUTDOWN);
+	nfsd_ffv2_export_update_abort(&update);
+	KUNIT_EXPECT_NE(test,
+			wait_for_completion_timeout(&stop.done, 5 * HZ), 0UL);
+	kthread_stop(task);
+	task = NULL;
+
+out_down:
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_service_down(nn);
+	mutex_unlock(&nfsd_mutex);
+out_root:
+	path_put(&root);
 	put_net(net);
 	net_ns_barrier();
 }
@@ -1363,6 +1469,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_listener_only_integration_test),
 	KUNIT_CASE(nfsd_ffv2_partial_start_cleanup_test),
 	KUNIT_CASE(nfsd_ffv2_reservation_context_test),
+	KUNIT_CASE(nfsd_ffv2_export_update_stop_test),
 	{}
 };
 

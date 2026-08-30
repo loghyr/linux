@@ -6,6 +6,7 @@
 #include <linux/mutex.h>
 #include <linux/refcount.h>
 #include <linux/completion.h>
+#include <linux/spinlock.h>
 #include <linux/wait.h>
 
 struct net;
@@ -22,8 +23,15 @@ struct task_struct;
 
 struct nfsd_ffv2_participant {
 	struct list_head		node;
+	struct list_head		reservations;
 	refcount_t		ref;
 	struct completion	released;
+	/* Serializes export-update admission with service stop. */
+	spinlock_t		update_lock;
+	wait_queue_head_t	update_wait;
+	unsigned int		update_count;
+	u64			update_epoch;
+	bool			updates_open;
 	/* Protects the complete live-export inventory. */
 	struct mutex		inventory_lock;
 	struct list_head		inventory;
@@ -31,6 +39,15 @@ struct nfsd_ffv2_participant {
 	unsigned int		inventory_count;
 	struct net		*net;
 	bool			attached;
+};
+
+struct nfsd_ffv2_export_update {
+	struct nfsd_ffv2_participant *participant;
+	struct nfsd_ffv2_reservation *reservation;
+	u64				epoch;
+	bool				admitted;
+	bool				entry_locked;
+	bool				policy_locked;
 };
 
 enum nfsd_ffv2_net_state {
@@ -54,6 +71,7 @@ struct nfsd_ffv2_anchor {
 	enum nfsd_ffv2_net_state	net_state;
 	enum nfsd_ffv2_service_state	service_state;
 	u64				next_generation;
+	struct nfsd_ffv2_generation	*pending;
 	struct nfsd_ffv2_generation	*active;
 	struct nfsd_ffv2_generation	*retiring;
 };
@@ -65,24 +83,31 @@ int nfsd_ffv2_participant_register(struct nfsd_net *nn, struct net *net);
 void nfsd_ffv2_participant_detach_begin(struct nfsd_net *nn);
 void nfsd_ffv2_participant_detach_finish(struct nfsd_net *nn);
 int nfsd_ffv2_export_update_begin(struct svc_export *exp,
-				  struct svc_export *old);
-void nfsd_ffv2_export_update_end(struct svc_export *exp);
-void nfsd_ffv2_export_update_abort(void);
+				  struct svc_export *old,
+				  struct nfsd_ffv2_export_update *update);
+int nfsd_ffv2_export_update_validate(struct nfsd_ffv2_export_update *update);
+int nfsd_ffv2_export_update_end(struct svc_export *exp,
+				struct nfsd_ffv2_export_update *update);
+void nfsd_ffv2_export_update_abort(struct nfsd_ffv2_export_update *update);
+void
+nfsd_ffv2_export_update_rollback_wait(struct nfsd_ffv2_service_context *context);
 void nfsd_ffv2_export_release(struct svc_export *exp);
-int nfsd_ffv2_reservation_claim(const struct path *root,
+int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
 				const u8 store_uuid[16],
 				const u8 binding_token[32],
 				struct nfsd_ffv2_reservation **result);
-int nfsd_ffv2_reservation_activate(struct nfsd_ffv2_reservation *reservation);
 void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation);
 void nfsd_ffv2_reservation_fence(struct nfsd_ffv2_reservation *reservation);
 bool nfsd4_ffv2_mount_crossing_allowed(const struct path *path);
-struct nfsd_ffv2_service_context *
-nfsd_ffv2_service_context_alloc(struct nfsd_ffv2_reservation *reservation,
-				const struct cred *cred, u64 control_root);
-void nfsd_ffv2_service_context_prepare_export(struct nfsd_ffv2_service_context *context,
-					      struct svc_export *exp);
-void nfsd_ffv2_service_context_abort(struct nfsd_ffv2_service_context *context);
+int nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
+				     struct svc_export *exp,
+				     const struct path *root,
+				     const u8 store_uuid[16],
+				     const u8 binding_token[32],
+				     const struct cred *cred, u64 control_root,
+				     u64 *generation_id);
+int nfsd_ffv2_service_generation_retire(struct nfsd_net *nn,
+					u64 generation_id);
 void nfsd_ffv2_service_context_release(void *payload);
 __be32 nfsd4_ffv2_export_policy_check(struct svc_export *exp, u32 opnum);
 int nfsd_ffv2_service_up(struct nfsd_net *nn);
@@ -115,10 +140,19 @@ int nfsd_ffv2_test_admit(struct nfsd_net *nn,
 			 struct nfsd_ffv2_admission *admission);
 void nfsd_ffv2_test_complete(struct nfsd_ffv2_admission *admission);
 int nfsd_ffv2_test_unregister(struct nfsd_net *nn, u64 generation);
-int nfsd_ffv2_test_reservation_claim(const struct path *root,
+int nfsd_ffv2_test_reservation_claim(struct nfsd_net *owner,
+				     const struct path *root,
 				     const u8 store_uuid[16],
 				     const u8 binding_token[32],
 				     struct nfsd_ffv2_reservation **result);
+int
+nfsd_ffv2_test_service_export_publish(struct nfsd_net *owner,
+				      struct svc_export *exp,
+				      const struct path *root,
+				      const u8 store_uuid[16],
+				      const u8 binding_token[32],
+				      const struct cred *cred,
+				      u64 control_root, u64 *generation_id);
 bool nfsd_ffv2_test_generation_retired(struct nfsd_ffv2_generation *generation);
 bool nfsd_ffv2_test_admission_retired(struct nfsd_ffv2_admission *admission);
 unsigned int nfsd_ffv2_test_refcount(struct nfsd_ffv2_admission *admission);

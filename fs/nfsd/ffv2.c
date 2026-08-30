@@ -62,12 +62,15 @@ enum nfsd_ffv2_reservation_state {
 
 struct nfsd_ffv2_reservation {
 	struct list_head		node;
+	struct list_head		owner_node;
 	refcount_t		ref;
 	/* Serializes publication and rollback for this reservation. */
 	struct mutex		entry_lock;
 	struct path		root;
 	struct inode		*inode;
 	struct super_block	*sb;
+	struct nfsd_ffv2_participant *owner;
+	u64			owner_generation;
 	enum nfsd_ffv2_reservation_state state;
 	u8			store_uuid[16];
 	u8			binding_token[32];
@@ -76,10 +79,10 @@ struct nfsd_ffv2_reservation {
 struct nfsd_ffv2_service_context {
 	struct nfsd_ffv2_reservation *reservation;
 	struct svc_export	*export;
-	struct svc_export	*prepared_export;
 	const struct cred	*cred;
 	struct completion	export_released;
 	u64			control_root;
+	u64			owner_generation;
 	bool			published;
 };
 
@@ -90,6 +93,24 @@ struct nfsd_ffv2_participant_snapshot {
 
 static void
 nfsd_ffv2_participant_put(struct nfsd_ffv2_participant *participant);
+static int
+nfsd_ffv2_export_update_admit(struct nfsd_ffv2_participant *participant,
+			      struct nfsd_ffv2_export_update *update);
+static void
+nfsd_ffv2_export_update_put(struct nfsd_ffv2_export_update *update);
+static int
+nfsd_ffv2_generation_prepare(struct nfsd_net *nn, void *payload,
+			     void (*release)(void *),
+			     struct nfsd_ffv2_generation **result,
+			     u64 *generation_id);
+static int
+nfsd_ffv2_generation_commit(struct nfsd_net *nn,
+			    struct nfsd_ffv2_generation *generation);
+static void
+nfsd_ffv2_generation_cancel(struct nfsd_net *nn,
+			    struct nfsd_ffv2_generation *generation);
+static void
+nfsd_ffv2_generation_put(struct nfsd_ffv2_generation *generation);
 
 static void
 nfsd_ffv2_reservation_put(struct nfsd_ffv2_reservation *reservation)
@@ -206,6 +227,8 @@ nfsd_ffv2_reservation_unlink(struct nfsd_ffv2_reservation *reservation)
 	if (!list_empty(&reservation->node)) {
 		list_del_rcu(&reservation->node);
 		INIT_LIST_HEAD(&reservation->node);
+		list_del_init(&reservation->owner_node);
+		reservation->owner = NULL;
 		linked = true;
 	}
 	mutex_unlock(&nfsd_ffv2_registry_lock);
@@ -215,7 +238,8 @@ nfsd_ffv2_reservation_unlink(struct nfsd_ffv2_reservation *reservation)
 	}
 }
 
-static int __nfsd_ffv2_reservation_claim(const struct path *root,
+static int __nfsd_ffv2_reservation_claim(struct nfsd_net *owner,
+					 const struct path *root,
 					 const u8 store_uuid[16],
 					 const u8 binding_token[32],
 					 struct nfsd_ffv2_reservation **result,
@@ -227,7 +251,7 @@ static int __nfsd_ffv2_reservation_claim(const struct path *root,
 	unsigned int i;
 	int error;
 
-	if (!root || !root->dentry || !root->mnt || !store_uuid ||
+	if (!owner || !root || !root->dentry || !root->mnt || !store_uuid ||
 	    !binding_token || !result || !d_is_dir(root->dentry) ||
 	    !IS_ROOT(root->dentry))
 		return -EOPNOTSUPP;
@@ -246,6 +270,7 @@ static int __nfsd_ffv2_reservation_claim(const struct path *root,
 	refcount_set(&reservation->ref, 1);
 	mutex_init(&reservation->entry_lock);
 	INIT_LIST_HEAD(&reservation->node);
+	INIT_LIST_HEAD(&reservation->owner_node);
 	reservation->root = *root;
 	path_get(&reservation->root);
 	reservation->sb = root->mnt->mnt_sb;
@@ -256,6 +281,10 @@ static int __nfsd_ffv2_reservation_claim(const struct path *root,
 	       sizeof(reservation->binding_token));
 
 	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (!READ_ONCE(owner->ffv2_participant.attached)) {
+		error = -ESHUTDOWN;
+		goto out_unlock_registry;
+	}
 	list_for_each_entry(cursor, &nfsd_ffv2_reservations, node) {
 		if (cursor->sb == reservation->sb) {
 			error = -EBUSY;
@@ -263,6 +292,9 @@ static int __nfsd_ffv2_reservation_claim(const struct path *root,
 		}
 	}
 	refcount_inc(&reservation->ref);
+	reservation->owner = &owner->ffv2_participant;
+	list_add_tail(&reservation->owner_node,
+		      &owner->ffv2_participant.reservations);
 	list_add_tail_rcu(&reservation->node, &nfsd_ffv2_reservations);
 	mutex_unlock(&nfsd_ffv2_registry_lock);
 
@@ -298,49 +330,36 @@ out_unlink:
 	return error;
 }
 
-int nfsd_ffv2_reservation_claim(const struct path *root,
+int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
 				const u8 store_uuid[16],
 				const u8 binding_token[32],
 				struct nfsd_ffv2_reservation **result)
 {
-	return __nfsd_ffv2_reservation_claim(root, store_uuid, binding_token,
+	return __nfsd_ffv2_reservation_claim(owner, root, store_uuid, binding_token,
 					     result, true);
-}
-
-int nfsd_ffv2_reservation_activate(struct nfsd_ffv2_reservation *reservation)
-{
-	int error = 0;
-
-	mutex_lock(&nfsd_ffv2_registry_lock);
-	if (list_empty(&reservation->node) ||
-	    reservation->state != NFSD_FFV2_RESERVING) {
-		error = -ESHUTDOWN;
-	} else {
-		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_ACTIVE);
-	}
-	mutex_unlock(&nfsd_ffv2_registry_lock);
-	if (!error)
-		nfsd_ffv2_reservation_put(reservation);
-	return error;
 }
 
 void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation)
 {
+	mutex_lock(&reservation->entry_lock);
 	mutex_lock(&nfsd_ffv2_registry_lock);
 	if (!list_empty(&reservation->node))
 		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_QUIESCING);
 	mutex_unlock(&nfsd_ffv2_registry_lock);
 	nfsd_ffv2_reservation_unlink(reservation);
+	mutex_unlock(&reservation->entry_lock);
 	nfsd_ffv2_reservation_put(reservation);
 }
 
 void nfsd_ffv2_reservation_fence(struct nfsd_ffv2_reservation *reservation)
 {
+	mutex_lock(&reservation->entry_lock);
 	mutex_lock(&nfsd_ffv2_registry_lock);
 	if (!list_empty(&reservation->node))
 		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_FENCING);
 	mutex_unlock(&nfsd_ffv2_registry_lock);
 	nfsd_ffv2_reservation_unlink(reservation);
+	mutex_unlock(&reservation->entry_lock);
 	nfsd_ffv2_reservation_put(reservation);
 }
 
@@ -349,9 +368,10 @@ bool nfsd4_ffv2_mount_crossing_allowed(const struct path *path)
 	return !nfsd_ffv2_superblock_reserved(path->mnt->mnt_sb);
 }
 
-struct nfsd_ffv2_service_context *
+static struct nfsd_ffv2_service_context *
 nfsd_ffv2_service_context_alloc(struct nfsd_ffv2_reservation *reservation,
-				const struct cred *cred, u64 control_root)
+				const struct cred *cred, u64 control_root,
+				u64 owner_generation)
 {
 	struct nfsd_ffv2_service_context *context;
 
@@ -362,26 +382,114 @@ nfsd_ffv2_service_context_alloc(struct nfsd_ffv2_reservation *reservation,
 	context->reservation = reservation;
 	context->cred = get_cred(cred);
 	context->control_root = control_root;
+	context->owner_generation = owner_generation;
 	init_completion(&context->export_released);
 	return context;
 }
 
-void nfsd_ffv2_service_context_prepare_export(struct nfsd_ffv2_service_context *context,
-					      struct svc_export *exp)
+static void
+nfsd_ffv2_service_context_prepare_export(struct nfsd_ffv2_service_context *context,
+					 struct svc_export *exp)
 {
 	if (WARN_ON_ONCE(rcu_access_pointer(exp->ex_ffv2_context)))
 		return;
-	context->prepared_export = exp;
 	RCU_INIT_POINTER(exp->ex_ffv2_context, context);
 }
 
-void nfsd_ffv2_service_context_abort(struct nfsd_ffv2_service_context *context)
+static void
+nfsd_ffv2_service_context_abort(struct nfsd_ffv2_service_context *context,
+				struct svc_export *prepared)
 {
-	if (context->prepared_export)
-		RCU_INIT_POINTER(context->prepared_export->ex_ffv2_context, NULL);
+	if (prepared && rcu_access_pointer(prepared->ex_ffv2_context) == context)
+		RCU_INIT_POINTER(prepared->ex_ffv2_context, NULL);
 	nfsd_ffv2_reservation_put(context->reservation);
 	put_cred(context->cred);
 	kfree(context);
+}
+
+static int
+__nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
+				   struct svc_export *exp,
+				   const struct path *root,
+				   const u8 store_uuid[16],
+				   const u8 binding_token[32],
+				   const struct cred *cred,
+				   u64 control_root, u64 *generation_id,
+				   bool validate_backend)
+{
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_reservation *reservation;
+	struct nfsd_ffv2_export_update transaction = {};
+	struct svc_export *published;
+	u64 prepared_generation;
+	int error;
+
+	if (!exp || !cred || !generation_id ||
+	    exp->cd != owner->svc_export_cache)
+		return -EINVAL;
+	*generation_id = 0;
+	error = nfsd_ffv2_export_update_admit(&owner->ffv2_participant,
+					      &transaction);
+	if (error)
+		return error;
+	error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
+					      binding_token, &reservation,
+					      validate_backend);
+	if (error)
+		goto out_update;
+	context = nfsd_ffv2_service_context_alloc(reservation, cred,
+						  control_root, 0);
+	if (!context) {
+		nfsd_ffv2_reservation_abort(reservation);
+		error = -ENOMEM;
+		goto out_update;
+	}
+	error = nfsd_ffv2_generation_prepare(owner, context,
+					     nfsd_ffv2_service_context_release,
+					     &generation, &prepared_generation);
+	if (error) {
+		nfsd_ffv2_service_context_abort(context, NULL);
+		nfsd_ffv2_reservation_abort(reservation);
+		goto out_update;
+	}
+	context->owner_generation = prepared_generation;
+	nfsd_ffv2_service_context_prepare_export(context, exp);
+	published = nfsd_export_cache_update(exp);
+	if (IS_ERR(published)) {
+		error = PTR_ERR(published);
+		nfsd_ffv2_generation_cancel(owner, generation);
+		nfsd_ffv2_service_context_abort(context, exp);
+		nfsd_ffv2_reservation_abort(reservation);
+		goto out_update;
+	}
+	nfsd_export_put(published);
+	error = nfsd_ffv2_generation_commit(owner, generation);
+	if (error) {
+		nfsd_ffv2_generation_cancel(owner, generation);
+		nfsd_ffv2_service_context_release(context);
+		goto out_update;
+	}
+	nfsd_ffv2_generation_put(generation);
+	*generation_id = prepared_generation;
+
+out_update:
+	nfsd_ffv2_export_update_put(&transaction);
+	return error;
+}
+
+int nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
+				     struct svc_export *exp,
+				     const struct path *root,
+				     const u8 store_uuid[16],
+				     const u8 binding_token[32],
+				     const struct cred *cred, u64 control_root,
+				     u64 *generation_id)
+{
+	return __nfsd_ffv2_service_export_publish(owner, exp, root, store_uuid,
+						  binding_token, cred,
+						  control_root, generation_id,
+						  true);
 }
 
 void nfsd_ffv2_service_context_release(void *payload)
@@ -389,8 +497,6 @@ void nfsd_ffv2_service_context_release(void *payload)
 	struct nfsd_ffv2_service_context *context = payload;
 	struct svc_export *exp = context->export;
 
-	if (!exp && context->prepared_export)
-		RCU_INIT_POINTER(context->prepared_export->ex_ffv2_context, NULL);
 	if (exp) {
 		mutex_lock(&nfsd_ffv2_export_policy_lock);
 		rcu_assign_pointer(exp->ex_ffv2_context, NULL);
@@ -423,13 +529,61 @@ nfsd_ffv2_participant_put(struct nfsd_ffv2_participant *participant)
 		complete(&participant->released);
 }
 
+static void
+nfsd_ffv2_updates_set_open(struct nfsd_ffv2_participant *participant,
+			   bool open)
+{
+	spin_lock(&participant->update_lock);
+	if (participant->updates_open != open) {
+		participant->updates_open = open;
+		participant->update_epoch++;
+		if (!participant->update_epoch)
+			participant->update_epoch++;
+	}
+	spin_unlock(&participant->update_lock);
+}
+
+static void
+nfsd_ffv2_updates_wait(struct nfsd_ffv2_participant *participant)
+{
+	wait_event(participant->update_wait,
+		   !READ_ONCE(participant->update_count));
+}
+
+static void
+nfsd_ffv2_fence_owned_reservations(struct nfsd_ffv2_participant *participant)
+{
+	struct nfsd_ffv2_reservation *reservation;
+
+	for (;;) {
+		mutex_lock(&nfsd_ffv2_registry_lock);
+		if (list_empty(&participant->reservations)) {
+			mutex_unlock(&nfsd_ffv2_registry_lock);
+			break;
+		}
+		reservation = list_first_entry(&participant->reservations,
+					       struct nfsd_ffv2_reservation,
+					       owner_node);
+		refcount_inc(&reservation->ref);
+		mutex_unlock(&nfsd_ffv2_registry_lock);
+
+		nfsd_ffv2_reservation_fence(reservation);
+	}
+}
+
 int nfsd_ffv2_participant_register(struct nfsd_net *nn, struct net *net)
 {
 	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
 
 	INIT_LIST_HEAD(&participant->node);
+	INIT_LIST_HEAD(&participant->reservations);
 	refcount_set(&participant->ref, 1);
 	init_completion(&participant->released);
+	spin_lock_init(&participant->update_lock);
+	init_waitqueue_head(&participant->update_wait);
+	participant->update_count = 0;
+	participant->update_epoch = 1;
+	participant->updates_open = true;
 	mutex_init(&participant->inventory_lock);
 	INIT_LIST_HEAD(&participant->inventory);
 	init_waitqueue_head(&participant->inventory_wait);
@@ -447,15 +601,14 @@ void nfsd_ffv2_participant_detach_begin(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
 
-	/* Serialize the last export update before removing snapshot visibility. */
-	mutex_lock(&nfsd_ffv2_export_policy_lock);
-	WRITE_ONCE(participant->attached, false);
-	mutex_unlock(&nfsd_ffv2_export_policy_lock);
-
 	mutex_lock(&nfsd_ffv2_registry_lock);
+	WRITE_ONCE(participant->attached, false);
 	if (!list_empty(&participant->node))
 		list_del_init(&participant->node);
 	mutex_unlock(&nfsd_ffv2_registry_lock);
+	nfsd_ffv2_updates_set_open(participant, false);
+	nfsd_ffv2_updates_wait(participant);
+	nfsd_ffv2_fence_owned_reservations(participant);
 
 	nfsd_ffv2_participant_put(participant);
 	wait_for_completion(&participant->released);
@@ -467,48 +620,125 @@ void nfsd_ffv2_participant_detach_finish(struct nfsd_net *nn)
 
 	wait_event(participant->inventory_wait,
 		   !READ_ONCE(participant->inventory_count));
+	WARN_ON_ONCE(!list_empty(&participant->reservations));
 	participant->net = NULL;
 	mutex_destroy(&participant->inventory_lock);
 }
 
+static int
+nfsd_ffv2_export_update_admit(struct nfsd_ffv2_participant *participant,
+			      struct nfsd_ffv2_export_update *update)
+{
+	int error = 0;
+
+	spin_lock(&participant->update_lock);
+	if (!participant->updates_open || !READ_ONCE(participant->attached)) {
+		error = -ESHUTDOWN;
+	} else {
+		participant->update_count++;
+		update->participant = participant;
+		update->epoch = participant->update_epoch;
+		update->admitted = true;
+	}
+	spin_unlock(&participant->update_lock);
+	return error;
+}
+
+static void
+nfsd_ffv2_export_update_put(struct nfsd_ffv2_export_update *update)
+{
+	struct nfsd_ffv2_participant *participant = update->participant;
+	bool wake = false;
+
+	if (!update->admitted)
+		return;
+	spin_lock(&participant->update_lock);
+	if (WARN_ON_ONCE(!participant->update_count)) {
+		spin_unlock(&participant->update_lock);
+		return;
+	}
+	participant->update_count--;
+	wake = !participant->update_count;
+	update->admitted = false;
+	spin_unlock(&participant->update_lock);
+	if (wake)
+		wake_up_all(&participant->update_wait);
+}
+
 int nfsd_ffv2_export_update_begin(struct svc_export *exp,
-				  struct svc_export *old)
+				  struct svc_export *old,
+				  struct nfsd_ffv2_export_update *update)
 {
 	struct nfsd_net *nn = net_generic(exp->cd->net, nfsd_net_id);
 	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
 	struct nfsd_ffv2_service_context *context =
 		rcu_access_pointer(exp->ex_ffv2_context);
+	struct nfsd_ffv2_service_context *old_context;
+	int error;
 
 	lockdep_assert_not_held(&nfsd_mutex);
-	mutex_lock(&nfsd_ffv2_export_policy_lock);
-	if (!READ_ONCE(participant->attached)) {
-		mutex_unlock(&nfsd_ffv2_export_policy_lock);
-		return -ESHUTDOWN;
+	memset(update, 0, sizeof(*update));
+	error = nfsd_ffv2_export_update_admit(participant, update);
+	if (error)
+		return error;
+	if (context) {
+		update->reservation = context->reservation;
+		mutex_lock(&context->reservation->entry_lock);
+		update->entry_locked = true;
 	}
-	if (rcu_access_pointer(old->ex_ffv2_context) &&
-	    rcu_access_pointer(old->ex_ffv2_context) != context) {
-		mutex_unlock(&nfsd_ffv2_export_policy_lock);
-		return -EBUSY;
+	mutex_lock(&nfsd_ffv2_export_policy_lock);
+	update->policy_locked = true;
+	old_context = rcu_access_pointer(old->ex_ffv2_context);
+	if (!READ_ONCE(participant->attached)) {
+		error = -ESHUTDOWN;
+		goto out_abort;
+	}
+	if (old_context) {
+		error = test_bit(CACHE_NEGATIVE, &exp->h.flags) ?
+			-EAGAIN : -EBUSY;
+		goto out_abort;
 	}
 	if (context &&
 	    (test_bit(CACHE_NEGATIVE, &exp->h.flags) ||
 	     context->reservation->sb != exp->ex_path.mnt->mnt_sb ||
 	     READ_ONCE(context->reservation->state) != NFSD_FFV2_RESERVING)) {
-		mutex_unlock(&nfsd_ffv2_export_policy_lock);
-		return -EINVAL;
+		error = -EINVAL;
+		goto out_abort;
 	}
 	if (!test_bit(CACHE_NEGATIVE, &exp->h.flags) && !context &&
 	    nfsd_ffv2_superblock_reserved(exp->ex_path.mnt->mnt_sb)) {
-		mutex_unlock(&nfsd_ffv2_export_policy_lock);
-		return -EBUSY;
+		error = -EBUSY;
+		goto out_abort;
 	}
 	return 0;
+
+out_abort:
+	nfsd_ffv2_export_update_abort(update);
+	return error;
 }
 
-void nfsd_ffv2_export_update_end(struct svc_export *exp)
+int nfsd_ffv2_export_update_validate(struct nfsd_ffv2_export_update *update)
+{
+	struct nfsd_ffv2_participant *participant = update->participant;
+	int error = 0;
+
+	spin_lock(&participant->update_lock);
+	if (!participant->updates_open ||
+	    participant->update_epoch != update->epoch)
+		error = -ESHUTDOWN;
+	spin_unlock(&participant->update_lock);
+	return error;
+}
+
+int nfsd_ffv2_export_update_end(struct svc_export *exp,
+				struct nfsd_ffv2_export_update *update)
 {
 	struct nfsd_net *nn = net_generic(exp->cd->net, nfsd_net_id);
 	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
+	struct nfsd_ffv2_service_context *context =
+		rcu_access_pointer(exp->ex_ffv2_context);
+	struct nfsd_ffv2_reservation *reservation = update->reservation;
+	bool activated = false;
 
 	mutex_lock(&participant->inventory_lock);
 	if (test_bit(CACHE_NEGATIVE, &exp->h.flags)) {
@@ -528,23 +758,70 @@ void nfsd_ffv2_export_update_end(struct svc_export *exp)
 			      &participant->inventory);
 		participant->inventory_count++;
 	}
-	if (rcu_access_pointer(exp->ex_ffv2_context)) {
-		struct nfsd_ffv2_service_context *context =
-			rcu_access_pointer(exp->ex_ffv2_context);
-
+	if (context) {
 		WARN_ON_ONCE(context->published);
 		context->export = nfsd_export_get(exp);
-		context->prepared_export = NULL;
 		context->published = true;
 		exp->ex_ffv2_context_released = &context->export_released;
 	}
 	mutex_unlock(&participant->inventory_lock);
-	mutex_unlock(&nfsd_ffv2_export_policy_lock);
+
+	/* Revalidation must not nest the registry under sleeping policy locks. */
+	if (update->policy_locked) {
+		mutex_unlock(&nfsd_ffv2_export_policy_lock);
+		update->policy_locked = false;
+	}
+	if (update->entry_locked) {
+		mutex_unlock(&reservation->entry_lock);
+		update->entry_locked = false;
+	}
+	if (context) {
+		mutex_lock(&nfsd_ffv2_registry_lock);
+		if (!list_empty(&reservation->node) &&
+		    reservation->state == NFSD_FFV2_RESERVING &&
+		    reservation->owner == participant &&
+		    READ_ONCE(participant->attached)) {
+			reservation->state = NFSD_FFV2_RESERVATION_ACTIVE;
+			reservation->owner_generation = context->owner_generation;
+			activated = true;
+		}
+		mutex_unlock(&nfsd_ffv2_registry_lock);
+	}
+	if (context && !activated) {
+		mutex_lock(&nfsd_ffv2_export_policy_lock);
+		rcu_assign_pointer(exp->ex_ffv2_context, NULL);
+		mutex_unlock(&nfsd_ffv2_export_policy_lock);
+		synchronize_rcu();
+		nfsd_export_unhash(exp);
+		nfsd_export_put(context->export);
+		nfsd_ffv2_export_update_put(update);
+		return -ESHUTDOWN;
+	}
+	nfsd_ffv2_export_update_put(update);
+	if (activated)
+		nfsd_ffv2_reservation_put(reservation);
+	return 0;
 }
 
-void nfsd_ffv2_export_update_abort(void)
+void
+nfsd_ffv2_export_update_rollback_wait(struct nfsd_ffv2_service_context *context)
 {
-	mutex_unlock(&nfsd_ffv2_export_policy_lock);
+	wait_for_completion(&context->export_released);
+	context->export = NULL;
+	context->published = false;
+}
+
+void nfsd_ffv2_export_update_abort(struct nfsd_ffv2_export_update *update)
+{
+	if (update->policy_locked) {
+		mutex_unlock(&nfsd_ffv2_export_policy_lock);
+		update->policy_locked = false;
+	}
+	if (update->entry_locked) {
+		mutex_unlock(&update->reservation->entry_lock);
+		update->entry_locked = false;
+	}
+	nfsd_ffv2_export_update_put(update);
 }
 
 void nfsd_ffv2_export_release(struct svc_export *exp)
@@ -599,6 +876,7 @@ static void nfsd_ffv2_generation_put(struct nfsd_ffv2_generation *generation)
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 static atomic_t nfsd_ffv2_start_failure;
+#endif
 
 static struct nfsd_ffv2_generation *
 nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *))
@@ -630,7 +908,95 @@ nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *))
 	generation->release = release;
 	return generation;
 }
-#endif
+
+static int
+nfsd_ffv2_generation_prepare(struct nfsd_net *nn, void *payload,
+			     void (*release)(void *),
+			     struct nfsd_ffv2_generation **result,
+			     u64 *generation_id)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_generation *generation;
+	int error = 0;
+
+	generation = nfsd_ffv2_generation_alloc(payload, release);
+	if (!generation)
+		return -ENOMEM;
+	if (!nfsd_ffv2_anchor_get(anchor)) {
+		error = -ESHUTDOWN;
+		goto out_cancel;
+	}
+	mutex_lock(&anchor->lock);
+	if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
+	    anchor->service_state == NFSD_FFV2_SERVICE_STOPPING ||
+	    anchor->service_state == NFSD_FFV2_SERVICE_DRAIN_FAILED) {
+		error = -ESHUTDOWN;
+	} else if (anchor->service_state == NFSD_FFV2_SERVICE_DOWN) {
+		error = -ENXIO;
+	} else if (anchor->pending || anchor->active || anchor->retiring) {
+		error = -EBUSY;
+	} else if (!anchor->next_generation ||
+		   anchor->next_generation == U64_MAX) {
+		error = -EOVERFLOW;
+	} else {
+		generation->identity->generation = anchor->next_generation++;
+		refcount_inc(&generation->ref);
+		anchor->pending = generation;
+	}
+	mutex_unlock(&anchor->lock);
+	nfsd_ffv2_anchor_put(anchor);
+	if (error)
+		goto out_cancel;
+	*result = generation;
+	if (generation_id)
+		*generation_id = generation->identity->generation;
+	return 0;
+
+out_cancel:
+	generation->payload = NULL;
+	nfsd_ffv2_generation_put(generation);
+	return error;
+}
+
+static int
+nfsd_ffv2_generation_commit(struct nfsd_net *nn,
+			    struct nfsd_ffv2_generation *generation)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	int error = 0;
+
+	mutex_lock(&anchor->lock);
+	if (anchor->pending != generation) {
+		error = -ESTALE;
+	} else if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
+		   anchor->service_state != NFSD_FFV2_SERVICE_UP) {
+		error = -ESHUTDOWN;
+	} else {
+		anchor->pending = NULL;
+		anchor->active = generation;
+	}
+	mutex_unlock(&anchor->lock);
+	return error;
+}
+
+static void
+nfsd_ffv2_generation_cancel(struct nfsd_net *nn,
+			    struct nfsd_ffv2_generation *generation)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	bool pending = false;
+
+	mutex_lock(&anchor->lock);
+	if (anchor->pending == generation) {
+		anchor->pending = NULL;
+		pending = true;
+	}
+	mutex_unlock(&anchor->lock);
+	generation->payload = NULL;
+	if (pending)
+		nfsd_ffv2_generation_put(generation);
+	nfsd_ffv2_generation_put(generation);
+}
 
 static struct nfsd_ffv2_generation *
 nfsd_ffv2_retire_begin_locked(struct nfsd_ffv2_anchor *anchor)
@@ -708,37 +1074,6 @@ out_put:
 	nfsd_ffv2_generation_put(generation);
 }
 
-#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
-static int nfsd_ffv2_publish(struct nfsd_ffv2_anchor *anchor,
-			     struct nfsd_ffv2_generation *generation,
-			     u64 *generation_id)
-{
-	int error = 0;
-
-	mutex_lock(&anchor->lock);
-	if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
-	    anchor->service_state == NFSD_FFV2_SERVICE_STOPPING ||
-	    anchor->service_state == NFSD_FFV2_SERVICE_DRAIN_FAILED) {
-		error = -ESHUTDOWN;
-	} else if (anchor->service_state == NFSD_FFV2_SERVICE_DOWN) {
-		error = -ENXIO;
-	} else if (anchor->active || anchor->retiring) {
-		error = -EBUSY;
-	} else if (!anchor->next_generation ||
-		   anchor->next_generation == U64_MAX) {
-		error = -EOVERFLOW;
-	} else {
-		generation->identity->generation = anchor->next_generation++;
-		refcount_inc(&generation->ref);
-		anchor->active = generation;
-		if (generation_id)
-			*generation_id = generation->identity->generation;
-	}
-	mutex_unlock(&anchor->lock);
-	return error;
-}
-#endif
-
 void nfsd_ffv2_net_init(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
@@ -749,6 +1084,7 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 	anchor->net_state = NFSD_FFV2_NET_LIVE;
 	anchor->service_state = NFSD_FFV2_SERVICE_DOWN;
 	anchor->next_generation = 1;
+	anchor->pending = NULL;
 	anchor->active = NULL;
 	anchor->retiring = NULL;
 }
@@ -760,6 +1096,8 @@ void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
 
 	if (WARN_ON_ONCE(!nfsd_ffv2_anchor_get(anchor)))
 		return;
+	nfsd_ffv2_updates_set_open(&nn->ffv2_participant, false);
+	nfsd_ffv2_updates_wait(&nn->ffv2_participant);
 	mutex_lock(&anchor->lock);
 	/* Pair with admission's lockless rejection before taking ->lock. */
 	smp_store_release(&anchor->net_state, NFSD_FFV2_NET_EXITING);
@@ -780,6 +1118,7 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	WARN_ON_ONCE(anchor->service_state != NFSD_FFV2_SERVICE_STOPPING);
 	WARN_ON_ONCE(anchor->active);
 	WARN_ON_ONCE(anchor->retiring);
+	WARN_ON_ONCE(anchor->pending);
 	mutex_unlock(&anchor->lock);
 	nfsd_ffv2_anchor_put(anchor);
 	wait_for_completion(&anchor->released);
@@ -803,6 +1142,8 @@ int nfsd_ffv2_service_up(struct nfsd_net *nn)
 	else if (anchor->service_state == NFSD_FFV2_SERVICE_DOWN)
 		anchor->service_state = NFSD_FFV2_SERVICE_UP;
 	mutex_unlock(&anchor->lock);
+	if (!error)
+		nfsd_ffv2_updates_set_open(&nn->ffv2_participant, true);
 	nfsd_ffv2_anchor_put(anchor);
 	return error;
 }
@@ -816,6 +1157,7 @@ nfsd_ffv2_service_stop_begin(struct nfsd_net *nn)
 	lockdep_assert_held(&nfsd_mutex);
 	if (WARN_ON_ONCE(!nfsd_ffv2_anchor_get(anchor)))
 		return NULL;
+	nfsd_ffv2_updates_set_open(&nn->ffv2_participant, false);
 	mutex_lock(&anchor->lock);
 	if (anchor->service_state == NFSD_FFV2_SERVICE_UP)
 		anchor->service_state = NFSD_FFV2_SERVICE_STOPPING;
@@ -839,6 +1181,7 @@ void nfsd_ffv2_service_stop_finish(struct nfsd_net *nn,
 			nfsd_ffv2_generation_put(generation);
 		return;
 	}
+	nfsd_ffv2_updates_wait(&nn->ffv2_participant);
 	nfsd_ffv2_retire_finish(anchor, generation, true);
 	nfsd_ffv2_anchor_put(anchor);
 }
@@ -847,15 +1190,20 @@ void nfsd_ffv2_service_stop_failed(struct nfsd_net *nn,
 				   struct nfsd_ffv2_generation *generation)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	bool reopen = false;
 
 	lockdep_assert_held(&nfsd_mutex);
 	if (WARN_ON_ONCE(!nfsd_ffv2_anchor_get(anchor)))
 		goto out_put;
 	mutex_lock(&anchor->lock);
 	if (anchor->net_state == NFSD_FFV2_NET_LIVE &&
-	    anchor->service_state == NFSD_FFV2_SERVICE_STOPPING)
+	    anchor->service_state == NFSD_FFV2_SERVICE_STOPPING) {
 		anchor->service_state = NFSD_FFV2_SERVICE_DRAIN_FAILED;
+		reopen = true;
+	}
 	mutex_unlock(&anchor->lock);
+	if (reopen)
+		nfsd_ffv2_updates_set_open(&nn->ffv2_participant, true);
 	nfsd_ffv2_anchor_put(anchor);
 out_put:
 	nfsd_ffv2_service_stop_put(generation);
@@ -975,50 +1323,6 @@ void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 	nfsd_ffv2_anchor_put(anchor);
 }
 
-#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
-int nfsd_ffv2_test_reservation_claim(const struct path *root,
-				     const u8 store_uuid[16],
-				     const u8 binding_token[32],
-				     struct nfsd_ffv2_reservation **result)
-{
-	return __nfsd_ffv2_reservation_claim(root, store_uuid, binding_token,
-					     result, false);
-}
-
-int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
-			   void (*release)(void *), u64 *generation_id)
-{
-	struct nfsd_ffv2_generation *generation;
-	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
-	int error;
-
-	lockdep_assert_held(&nfsd_mutex);
-	if (!nfsd_ffv2_anchor_get(anchor))
-		return -ESHUTDOWN;
-	generation = nfsd_ffv2_generation_alloc(payload, release);
-	if (!generation) {
-		nfsd_ffv2_anchor_put(anchor);
-		return -ENOMEM;
-	}
-	error = nfsd_ffv2_publish(anchor, generation, generation_id);
-	if (error)
-		generation->payload = NULL;
-	nfsd_ffv2_generation_put(generation);
-	nfsd_ffv2_anchor_put(anchor);
-	return error;
-}
-
-int nfsd_ffv2_test_admit(struct nfsd_net *nn,
-			 struct nfsd_ffv2_admission *admission)
-{
-	return nfsd_ffv2_admit_generation(nn, admission);
-}
-
-void nfsd_ffv2_test_complete(struct nfsd_ffv2_admission *admission)
-{
-	nfsd_ffv2_complete(admission);
-}
-
 static bool
 nfsd_ffv2_generation_has_task(struct nfsd_ffv2_generation *generation,
 			      struct task_struct *task)
@@ -1037,7 +1341,8 @@ nfsd_ffv2_generation_has_task(struct nfsd_ffv2_generation *generation,
 	return found;
 }
 
-int nfsd_ffv2_test_unregister(struct nfsd_net *nn, u64 generation_id)
+int nfsd_ffv2_service_generation_retire(struct nfsd_net *nn,
+					u64 generation_id)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_generation *generation;
@@ -1073,6 +1378,68 @@ int nfsd_ffv2_test_unregister(struct nfsd_net *nn, u64 generation_id)
 	mutex_lock(&nfsd_mutex);
 	nfsd_ffv2_anchor_put(anchor);
 	return error;
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+int nfsd_ffv2_test_reservation_claim(struct nfsd_net *owner,
+				     const struct path *root,
+				     const u8 store_uuid[16],
+				     const u8 binding_token[32],
+				     struct nfsd_ffv2_reservation **result)
+{
+	return __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
+					     binding_token, result, false);
+}
+
+int
+nfsd_ffv2_test_service_export_publish(struct nfsd_net *owner,
+				      struct svc_export *exp,
+				      const struct path *root,
+				      const u8 store_uuid[16],
+				      const u8 binding_token[32],
+				      const struct cred *cred,
+				      u64 control_root, u64 *generation_id)
+{
+	return __nfsd_ffv2_service_export_publish(owner, exp, root, store_uuid,
+						  binding_token, cred,
+						  control_root, generation_id,
+						  false);
+}
+
+int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
+			   void (*release)(void *), u64 *generation_id)
+{
+	struct nfsd_ffv2_generation *generation;
+	int error;
+
+	lockdep_assert_held(&nfsd_mutex);
+	error = nfsd_ffv2_generation_prepare(nn, payload, release,
+					     &generation, generation_id);
+	if (error)
+		return error;
+	error = nfsd_ffv2_generation_commit(nn, generation);
+	if (error) {
+		nfsd_ffv2_generation_cancel(nn, generation);
+		return error;
+	}
+	nfsd_ffv2_generation_put(generation);
+	return 0;
+}
+
+int nfsd_ffv2_test_admit(struct nfsd_net *nn,
+			 struct nfsd_ffv2_admission *admission)
+{
+	return nfsd_ffv2_admit_generation(nn, admission);
+}
+
+void nfsd_ffv2_test_complete(struct nfsd_ffv2_admission *admission)
+{
+	nfsd_ffv2_complete(admission);
+}
+
+int nfsd_ffv2_test_unregister(struct nfsd_net *nn, u64 generation_id)
+{
+	return nfsd_ffv2_service_generation_retire(nn, generation_id);
 }
 
 bool
