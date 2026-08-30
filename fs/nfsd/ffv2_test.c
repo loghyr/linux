@@ -917,6 +917,104 @@ out_cleanup:
 		KUNIT_FAIL(test, "production netns lifecycle failed: %d", error);
 }
 
+static void nfsd_ffv2_production_pre_exit_overlap_test(struct kunit *test)
+{
+	struct nfsd_ffv2_worker_ctx worker = {};
+	struct nfsd_ffv2_exit_ctx exit_ctx;
+	struct task_struct *exit_task = NULL;
+	struct nfsd_net *nn;
+	struct net *net;
+	atomic_t releases;
+	unsigned long timeout;
+	bool worker_installed = false;
+	bool service_up = false;
+	bool retired;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create test netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	atomic_set(&releases, 0);
+	error = nfsd_ffv2_worker_ctx_install(&worker, net);
+	if (error)
+		goto out_cleanup;
+	worker_installed = true;
+	error = nfsd_ffv2_start_test_service(net, &worker);
+	if (error)
+		goto out_cleanup;
+	service_up = true;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_test_publish(nn, &releases,
+				       nfsd_ffv2_count_release, NULL);
+	mutex_unlock(&nfsd_mutex);
+	if (error)
+		goto out_cleanup;
+	complete(&worker.run);
+	timeout = wait_for_completion_timeout(&worker.admitted, HZ);
+	if (!timeout || worker.admit_result) {
+		error = timeout ? worker.admit_result : -ETIMEDOUT;
+		goto out_cleanup;
+	}
+
+	exit_ctx.nn = nn;
+	init_completion(&exit_ctx.done);
+	exit_task = kthread_run(nfsd_ffv2_exit_thread, &exit_ctx,
+				"nfsd-ffv2-production-exit-test");
+	if (IS_ERR(exit_task)) {
+		error = PTR_ERR(exit_task);
+		exit_task = NULL;
+		goto out_cleanup;
+	}
+	error = read_poll_timeout(nfsd_ffv2_worker_admission_retired,
+				  retired, retired, 10, USEC_PER_SEC, false,
+				  &worker);
+	if (error) {
+		error = -ETIMEDOUT;
+		goto out_cleanup;
+	}
+	KUNIT_EXPECT_FALSE(test, completion_done(&exit_ctx.done));
+	KUNIT_EXPECT_EQ(test, atomic_read(&releases), 0);
+	complete(&worker.allow_complete);
+	timeout = wait_for_completion_timeout(&worker.returned, HZ);
+	if (!timeout) {
+		error = -ETIMEDOUT;
+		goto out_cleanup;
+	}
+	timeout = wait_for_completion_timeout(&exit_ctx.done, HZ);
+	if (!timeout) {
+		error = -ETIMEDOUT;
+		goto out_cleanup;
+	}
+	kthread_stop(exit_task);
+	exit_task = NULL;
+	KUNIT_EXPECT_EQ(test, atomic_read(&releases), 1);
+	KUNIT_EXPECT_EQ(test, nn->ffv2.net_state, NFSD_FFV2_NET_EXITING);
+
+	nfsd_shutdown_threads(net);
+	service_up = false;
+	error = 0;
+
+out_cleanup:
+	complete_all(&worker.run);
+	complete_all(&worker.allow_complete);
+	if (exit_task) {
+		wait_for_completion(&exit_ctx.done);
+		kthread_stop(exit_task);
+	}
+	if (service_up)
+		nfsd_shutdown_threads(net);
+	if (worker_installed)
+		nfsd_ffv2_worker_ctx_remove(&worker);
+	put_net(net);
+	net_ns_barrier();
+	if (error)
+		KUNIT_FAIL(test, "production pre-exit overlap failed: %d", error);
+}
+
 static void nfsd_ffv2_shutdown_start_failure_test(struct kunit *test)
 {
 	struct nfsd_ffv2_shutdown_ctx shutdown;
@@ -1016,6 +1114,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_service_integration_test),
 	KUNIT_CASE(nfsd_ffv2_netns_integration_test),
 	KUNIT_CASE(nfsd_ffv2_production_netns_integration_test),
+	KUNIT_CASE(nfsd_ffv2_production_pre_exit_overlap_test),
 	KUNIT_CASE(nfsd_ffv2_shutdown_start_failure_test),
 	KUNIT_CASE(nfsd_ffv2_listener_only_integration_test),
 	KUNIT_CASE(nfsd_ffv2_partial_start_cleanup_test),
