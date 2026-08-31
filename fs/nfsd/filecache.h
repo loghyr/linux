@@ -72,7 +72,7 @@ struct nfsd_file {
 #define NFSD_FILE_RECENT	(4)
 	unsigned long		nf_flags;
 	refcount_t		nf_ref;
-	unsigned char		nf_may;
+	unsigned int		nf_may;
 
 	struct nfsd_file_mark	*nf_mark;
 	struct list_head	nf_lru;
@@ -136,6 +136,7 @@ int nfsd_file_cache_stats_show(struct seq_file *m, void *v);
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 int nfsd_file_ffv2_test_cache_start(void);
-struct nfsd_file *nfsd_file_ffv2_test_alloc(struct inode *inode);
+struct nfsd_file *nfsd_file_ffv2_test_alloc(struct inode *inode,
+					    unsigned int may, bool want_gc);
 #endif
 #endif /* _FS_NFSD_FILECACHE_H */

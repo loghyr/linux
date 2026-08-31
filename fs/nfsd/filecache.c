@@ -237,7 +237,7 @@ nfsd_file_mark_find_or_create(struct inode *inode)
 }
 
 static struct nfsd_file *
-nfsd_file_alloc(struct net *net, struct inode *inode, unsigned char need,
+nfsd_file_alloc(struct net *net, struct inode *inode, unsigned int need,
 		bool want_gc)
 {
 	struct nfsd_file *nf;
@@ -743,9 +743,24 @@ int nfsd_file_ffv2_gate_begin(struct nfsd_file_ffv2_gate *gate,
 	gate->export_ino = export_inode->i_ino;
 	gate->phase = NFSD_FILE_FFV2_GATE_BEGIN;
 #endif
-	list_for_each_entry(nf, &nfsd_file_ffv2_live, nf_ffv2_live)
-		if (nf->nf_sb == sb)
-			gate->live++;
+	list_for_each_entry(nf, &nfsd_file_ffv2_live, nf_ffv2_live) {
+		if (nf->nf_sb != sb)
+			continue;
+		/* Persistent NFSv4 state is not retired by cache invalidation. */
+		if (!test_bit(NFSD_FILE_GC, &nf->nf_flags) &&
+		    !(nf->nf_may & NFSD_MAY_LOCALIO)) {
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+			trace_nfsd_ffv2_file_gate(gate,
+						  NFSD_FILE_FFV2_GATE_ROLLBACK,
+						  nf);
+			put_task_struct(gate->task);
+			gate->task = NULL;
+#endif
+			mutex_unlock(&nfsd_file_ffv2_lock);
+			return -EBUSY;
+		}
+		gate->live++;
+	}
 	list_add_tail_rcu(&gate->list, &nfsd_file_ffv2_gates);
 #if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
 	trace_nfsd_ffv2_file_gate(gate, NFSD_FILE_FFV2_GATE_BEGIN, NULL);
@@ -887,11 +902,13 @@ int nfsd_file_ffv2_test_cache_start(void)
 	return nfsd_file_cache_init();
 }
 
-struct nfsd_file *nfsd_file_ffv2_test_alloc(struct inode *inode)
+struct nfsd_file *nfsd_file_ffv2_test_alloc(struct inode *inode,
+					    unsigned int may, bool want_gc)
 {
 	struct nfsd_file *nf;
 
-	nf = nfsd_file_alloc(&init_net, inode, NFSD_MAY_READ, false);
+	nf = nfsd_file_alloc(&init_net, inode, may & NFSD_FILE_MAY_MASK,
+			     want_gc);
 	if (nf)
 		clear_bit(NFSD_FILE_HASHED, &nf->nf_flags);
 	return nf;
@@ -1284,7 +1301,7 @@ nfsd_file_cache_shutdown(void)
 
 static struct nfsd_file *
 nfsd_file_lookup_locked(const struct net *net, const struct cred *cred,
-			struct inode *inode, unsigned char need,
+			struct inode *inode, unsigned int need,
 			bool want_gc)
 {
 	struct rhlist_head *tmp, *list;
@@ -1383,7 +1400,7 @@ nfsd_file_do_acquire(struct svc_rqst *rqstp, struct net *net,
 		     unsigned int may_flags, struct file *file,
 		     umode_t type, bool want_gc, struct nfsd_file **pnf)
 {
-	unsigned char need = may_flags & NFSD_FILE_MAY_MASK;
+	unsigned int need = may_flags & NFSD_FILE_MAY_MASK;
 	struct nfsd_file *new, *nf;
 	bool stale_retry = true;
 	bool open_retry = true;

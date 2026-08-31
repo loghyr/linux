@@ -19,6 +19,7 @@
 #include "nfsd.h"
 #include "nfsfh.h"
 #include "netns.h"
+#include "vfs.h"
 
 struct nfsd_ffv2_unregister_ctx {
 	struct nfsd_net	*nn;
@@ -2039,9 +2040,23 @@ static void nfsd_ffv2_filecache_gate_test(struct kunit *test)
 	}
 	get_fs_root(current->fs, &root);
 	inode = d_inode(root.dentry);
-	nf = nfsd_file_ffv2_test_alloc(inode);
+	nf = nfsd_file_ffv2_test_alloc(inode, NFSD_MAY_READ, false);
 	if (!nf) {
 		KUNIT_FAIL(test, "failed to allocate test nfsd_file");
+		goto out_root;
+	}
+	error = nfsd_file_ffv2_gate_begin(&gate, inode);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	nfsd_file_put(nf);
+	if (!error)
+		nfsd_file_ffv2_gate_end(&gate);
+	if (error != -EBUSY)
+		goto out_root;
+	nf = nfsd_file_ffv2_test_alloc(inode,
+				      NFSD_MAY_READ | NFSD_MAY_LOCALIO,
+				      false);
+	if (!nf) {
+		KUNIT_FAIL(test, "failed to allocate localio test nfsd_file");
 		goto out_root;
 	}
 	error = nfsd_file_ffv2_gate_begin(&gate, inode);
@@ -2051,7 +2066,7 @@ static void nfsd_ffv2_filecache_gate_test(struct kunit *test)
 		goto out_root;
 	}
 	KUNIT_EXPECT_EQ(test, gate.live, 1U);
-	blocked = nfsd_file_ffv2_test_alloc(inode);
+	blocked = nfsd_file_ffv2_test_alloc(inode, NFSD_MAY_READ, false);
 	KUNIT_EXPECT_PTR_EQ(test, blocked, NULL);
 	if (blocked)
 		nfsd_file_put(blocked);
@@ -2078,13 +2093,13 @@ static void nfsd_ffv2_filecache_gate_test(struct kunit *test)
 		KUNIT_FAIL(test, "failed to install reservation gates: %d", error);
 		goto out_reservation;
 	}
-	blocked = nfsd_file_ffv2_test_alloc(inode);
+	blocked = nfsd_file_ffv2_test_alloc(inode, NFSD_MAY_READ, false);
 	KUNIT_EXPECT_PTR_EQ(test, blocked, NULL);
 	if (blocked)
 		nfsd_file_put(blocked);
 	nfsd_ffv2_reservation_abort(reservation);
 	reservation = NULL;
-	nf = nfsd_file_ffv2_test_alloc(inode);
+	nf = nfsd_file_ffv2_test_alloc(inode, NFSD_MAY_READ, false);
 	KUNIT_EXPECT_NOT_NULL(test, nf);
 	if (nf)
 		nfsd_file_put(nf);
@@ -2095,7 +2110,7 @@ out_reservation:
 out_net:
 	put_net(net);
 	net_ns_barrier();
-	nf = nfsd_file_ffv2_test_alloc(inode);
+	nf = nfsd_file_ffv2_test_alloc(inode, NFSD_MAY_READ, false);
 	KUNIT_EXPECT_NOT_NULL(test, nf);
 	if (nf)
 		nfsd_file_put(nf);

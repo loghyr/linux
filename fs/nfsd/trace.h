@@ -1162,7 +1162,7 @@ TRACE_EVENT(nfsd_ffv2_file_gate,
 		MAJOR(__entry->dev), MINOR(__entry->dev),
 		__entry->export_ino, __entry->registration_pid,
 		show_ffv2_file_gate_phase(__entry->phase), __entry->live,
-		__entry->owner_may & NFSD_MAY_LOCALIO ? "localio" :
+		(__entry->owner_may & NFSD_MAY_LOCALIO) ? "localio" :
 			(__entry->owner_ino ?
 			 (__entry->owner_flags & BIT(NFSD_FILE_GC) ?
 			  "nfsd_file" : "nfs4_state") : "none"),
@@ -1180,7 +1180,7 @@ DECLARE_EVENT_CLASS(nfsd_file_class,
 		__field(void *, nf_inode)
 		__field(int, nf_ref)
 		__field(unsigned long, nf_flags)
-		__field(unsigned char, nf_may)
+		__field(unsigned int, nf_may)
 		__field(struct file *, nf_file)
 	),
 	TP_fast_assign(
