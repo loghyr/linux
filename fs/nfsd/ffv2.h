@@ -12,6 +12,7 @@
 struct net;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
+struct nfsd_ffv2_object;
 struct nfsd_ffv2_reservation;
 struct nfsd_ffv2_service_context;
 struct cred;
@@ -32,6 +33,16 @@ struct nfsd_ffv2_fh_info {
 	u8		export_uuid[16];
 	const u8	*inner;
 	u16		inner_len;
+};
+
+struct nfsd_ffv2_object_request {
+	const char	*auth_domain;
+	const char	*export_path;
+	const char	*object_path;
+	const u8	*object_uuid;
+	const u8	*store_uuid;
+	const u8	*binding_token;
+	u64		control_root;
 };
 
 struct nfsd_ffv2_participant {
@@ -108,6 +119,13 @@ int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
 				 struct nfsd_ffv2_export_update *registration);
 void nfsd_ffv2_registration_end(struct nfsd_net *nn,
 				struct nfsd_ffv2_export_update *registration);
+struct nfsd_ffv2_object *nfsd_ffv2_object_alloc(void);
+void nfsd_ffv2_object_free(struct nfsd_ffv2_object *object);
+int nfsd_ffv2_object_register(struct nfsd_net *nn,
+			      struct nfsd_ffv2_export_update *registration,
+			      struct nfsd_ffv2_object *object,
+			      const struct nfsd_ffv2_object_request *request,
+			      struct knfsd_fh *outer_fh, u64 *generation_id);
 void
 nfsd_ffv2_export_update_rollback_wait(struct nfsd_ffv2_service_context *context);
 void nfsd_ffv2_export_release(struct svc_export *exp);
@@ -190,6 +208,8 @@ nfsd_ffv2_test_service_export_publish(struct nfsd_net *owner,
 				      u64 control_root, u64 *generation_id);
 int nfsd_ffv2_test_transition_publish(struct nfsd_net *owner,
 				      struct nfsd_ffv2_export_update *registration,
+				      struct nfsd_ffv2_object *object,
+				      struct knfsd_fh *outer_fh,
 				      struct svc_export *template,
 				      struct svc_export *expected,
 				      const struct path *root,
@@ -197,6 +217,12 @@ int nfsd_ffv2_test_transition_publish(struct nfsd_net *owner,
 				      const u8 binding_token[32],
 				      const struct cred *cred,
 				      u64 control_root, u64 *generation_id);
+int nfsd_ffv2_test_object_init(struct nfsd_ffv2_object *object,
+			       struct auth_domain *client,
+			       const struct path *export_path,
+			       const struct path *object_path, const u8 *inner,
+			       u16 inner_len, const u8 object_uuid[16],
+			       const u8 export_uuid[16]);
 bool nfsd_ffv2_test_generation_retired(struct nfsd_ffv2_generation *generation);
 bool nfsd_ffv2_test_admission_retired(struct nfsd_ffv2_admission *admission);
 unsigned int nfsd_ffv2_test_refcount(struct nfsd_ffv2_admission *admission);

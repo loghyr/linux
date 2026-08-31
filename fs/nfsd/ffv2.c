@@ -9,6 +9,7 @@
 #include <linux/fs_context.h>
 #include <linux/lockd/bind.h>
 #include <linux/mount.h>
+#include <linux/namei.h>
 #include <linux/nfslocalio.h>
 #include <linux/sunrpc/svc_xprt.h>
 #include <linux/wait.h>
@@ -53,6 +54,19 @@ struct nfsd_ffv2_generation {
 	struct completion		retired;
 	void				*payload;
 	void				(*release)(void *payload);
+	bool				registry_generation;
+};
+
+struct nfsd_ffv2_object {
+	struct path		export_path;
+	struct path		object_path;
+	struct knfsd_fh		inner_fh;
+	struct auth_domain	*client;
+	u8			object_uuid[16];
+	u8			export_uuid[16];
+	bool			export_valid;
+	bool			object_valid;
+	bool			visible;
 };
 
 static DEFINE_MUTEX(nfsd_ffv2_registry_lock);
@@ -148,16 +162,13 @@ struct nfsd_ffv2_reservation {
 struct nfsd_ffv2_service_context {
 	struct nfsd_ffv2_reservation *reservation;
 	struct svc_export	*export;
-	struct path		object_path;
-	struct knfsd_fh		inner_fh;
-	u8			object_uuid[16];
-	u8			export_uuid[16];
+	struct nfsd_ffv2_object *object;
 	const struct cred	*cred;
 	struct completion	export_released;
 	u64			control_root;
 	u64			owner_generation;
 	bool			published;
-	bool			object_valid;
+	bool			object_owned;
 };
 
 struct nfsd_ffv2_participant_snapshot {
@@ -191,6 +202,8 @@ nfsd_ffv2_generation_commit(struct nfsd_net *nn,
 static void
 nfsd_ffv2_generation_cancel(struct nfsd_net *nn,
 			    struct nfsd_ffv2_generation *generation);
+static int nfsd_ffv2_object_validate(struct svc_export *exp,
+				     struct nfsd_ffv2_object *object);
 static void
 nfsd_ffv2_generation_put(struct nfsd_ffv2_generation *generation);
 
@@ -580,6 +593,24 @@ nfsd_ffv2_service_context_alloc(struct nfsd_ffv2_reservation *reservation,
 	return context;
 }
 
+struct nfsd_ffv2_object *nfsd_ffv2_object_alloc(void)
+{
+	return kzalloc_obj(struct nfsd_ffv2_object, GFP_KERNEL);
+}
+
+void nfsd_ffv2_object_free(struct nfsd_ffv2_object *object)
+{
+	if (!object)
+		return;
+	if (object->object_valid)
+		path_put(&object->object_path);
+	if (object->export_valid)
+		path_put(&object->export_path);
+	if (object->client)
+		auth_domain_put(object->client);
+	kfree(object);
+}
+
 static void
 nfsd_ffv2_service_context_prepare_export(struct nfsd_ffv2_service_context *context,
 					 struct svc_export *exp)
@@ -597,8 +628,6 @@ nfsd_ffv2_service_context_abort(struct nfsd_ffv2_service_context *context,
 	if (prepared && rcu_access_pointer(prepared->ex_ffv2_context) == context)
 		RCU_INIT_POINTER(prepared->ex_ffv2_context, NULL);
 	nfsd_ffv2_reservation_put(context->reservation);
-	if (context->object_valid)
-		path_put(&context->object_path);
 	put_cred(context->cred);
 	kfree(context);
 }
@@ -667,6 +696,10 @@ nfsd_ffv2_transition_publish(struct nfsd_net *owner,
 	mutex_lock(&nfsd_ffv2_registry_lock);
 	reservation->state = NFSD_FFV2_RESERVATION_ACTIVE;
 	reservation->owner_generation = generation->identity->generation;
+	if (context->object) {
+		context->object_owned = true;
+		context->object->visible = true;
+	}
 	anchor->pending = NULL;
 	anchor->active = generation;
 	if (registration) {
@@ -701,8 +734,11 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 				   u64 control_root, u64 *generation_id,
 				   bool validate_backend,
 				   struct svc_export *expected,
-				   struct nfsd_ffv2_export_update *registration)
+				   struct nfsd_ffv2_export_update *registration,
+				   struct nfsd_ffv2_object *object,
+				   struct knfsd_fh *outer_fh)
 {
+	struct nfsd_ffv2_fh_info fh_info;
 	struct nfsd_ffv2_service_context *context;
 	struct nfsd_ffv2_generation *generation;
 	struct nfsd_ffv2_reservation *reservation;
@@ -730,10 +766,22 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 	if (error)
 		goto out_update;
 	if (expected) {
+		error = nfsd_ffv2_export_transition_wait(expected);
+		if (error) {
+			nfsd_ffv2_reservation_abort(reservation);
+			goto out_reopen;
+		}
 		error = nfsd_ffv2_reservation_gate_io(reservation);
 		if (error) {
 			nfsd_ffv2_reservation_abort(reservation);
 			goto out_reopen;
+		}
+		if (object) {
+			error = nfsd_ffv2_object_validate(expected, object);
+			if (error) {
+				nfsd_ffv2_reservation_abort(reservation);
+				goto out_reopen;
+			}
 		}
 	}
 	context = nfsd_ffv2_service_context_alloc(reservation, cred,
@@ -743,14 +791,33 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 		error = -ENOMEM;
 		goto out_reopen;
 	}
+	context->object = object;
 	error = nfsd_ffv2_generation_prepare(owner, context,
 					     nfsd_ffv2_service_context_release,
-					     NULL, NULL,
+					     object ? object->object_uuid : NULL,
+					     object ? object->export_uuid : NULL,
 					     &generation, &prepared_generation);
 	if (error) {
 		nfsd_ffv2_service_context_abort(context, NULL);
 		nfsd_ffv2_reservation_abort(reservation);
 		goto out_reopen;
+	}
+	if (object && outer_fh) {
+		memset(&fh_info, 0, sizeof(fh_info));
+		fh_info.generation = prepared_generation;
+		memcpy(fh_info.object_uuid, object->object_uuid,
+		       sizeof(fh_info.object_uuid));
+		memcpy(fh_info.export_uuid, object->export_uuid,
+		       sizeof(fh_info.export_uuid));
+		fh_info.inner = object->inner_fh.fh_raw;
+		fh_info.inner_len = object->inner_fh.fh_size;
+		error = nfsd_ffv2_fh_encode(outer_fh, &fh_info);
+		if (error) {
+			nfsd_ffv2_generation_cancel(owner, generation);
+			nfsd_ffv2_service_context_abort(context, NULL);
+			nfsd_ffv2_reservation_abort(reservation);
+			goto out_reopen;
+		}
 	}
 	context->owner_generation = prepared_generation;
 	nfsd_ffv2_service_context_prepare_export(context, exp);
@@ -793,6 +860,124 @@ out_update:
 	return error;
 }
 
+static int nfsd_ffv2_object_validate(struct svc_export *exp,
+				     struct nfsd_ffv2_object *object)
+{
+	struct inode *inode = d_inode(object->object_path.dentry);
+
+	if (!path_equal(&exp->ex_path, &object->export_path) ||
+	    object->export_path.mnt != object->object_path.mnt ||
+	    object->export_path.mnt->mnt_sb !=
+					object->object_path.mnt->mnt_sb ||
+	    object->export_path.dentry == object->object_path.dentry ||
+	    !d_is_reg(object->object_path.dentry) ||
+	    d_unlinked(object->object_path.dentry) ||
+	    READ_ONCE(inode->i_nlink) != 1 ||
+	    !path_is_under(&object->object_path, &exp->ex_path))
+		return -ESTALE;
+	return 0;
+}
+
+int nfsd_ffv2_object_register(struct nfsd_net *nn,
+			      struct nfsd_ffv2_export_update *registration,
+			      struct nfsd_ffv2_object *object,
+			      const struct nfsd_ffv2_object_request *request,
+			      struct knfsd_fh *outer_fh, u64 *generation_id)
+{
+	struct svc_export template, *exp;
+	struct svc_fh ordinary;
+	__be32 status;
+	int error;
+
+	if (!nn || !registration || !object || !request || !outer_fh ||
+	    !generation_id || !request->auth_domain || !request->export_path ||
+	    !request->object_path || !request->object_uuid ||
+	    !request->store_uuid || !request->binding_token ||
+	    !registration->admitted || !registration->registration_slot ||
+	    !nn->svc_export_cache) {
+		error = -EINVAL;
+		goto out_free;
+	}
+
+	object->client = auth_domain_find((char *)request->auth_domain);
+	if (!object->client) {
+		error = -ENOENT;
+		goto out_free;
+	}
+	error = kern_path(request->export_path, LOOKUP_NO_SYMLINKS,
+			  &object->export_path);
+	if (error)
+		goto out_free;
+	object->export_valid = true;
+	error = kern_path(request->object_path, LOOKUP_NO_SYMLINKS,
+			  &object->object_path);
+	if (error)
+		goto out_free;
+	object->object_valid = true;
+	memcpy(object->object_uuid, request->object_uuid,
+	       sizeof(object->object_uuid));
+
+	exp = nfsd_ffv2_export_lookup(nn->svc_export_cache, object->client,
+				      &object->export_path);
+	if (IS_ERR(exp)) {
+		error = PTR_ERR(exp);
+		goto out_free;
+	}
+	error = nfsd_ffv2_object_validate(exp, object);
+	if (error)
+		goto out_put_exp;
+	memcpy(object->export_uuid, exp->ex_uuid, sizeof(object->export_uuid));
+
+	fh_init(&ordinary, NFS4_FHSIZE);
+	status = fh_compose(&ordinary, exp, object->object_path.dentry, NULL);
+	if (status) {
+		error = -ESTALE;
+		goto out_put_fh;
+	}
+	object->inner_fh = ordinary.fh_handle;
+	if (object->inner_fh.fh_size < 8 ||
+	    object->inner_fh.fh_size > NFSD_FFV2_FH_INNER_MAX ||
+	    object->inner_fh.fh_size & 3) {
+		error = -E2BIG;
+		goto out_put_fh;
+	}
+	fh_put(&ordinary);
+
+	error = nfsd_ffv2_export_transition_exact(exp);
+	if (error)
+		goto out_put_exp;
+	error = nfsd_ffv2_object_validate(exp, object);
+	if (error)
+		goto out_reopen;
+	error = nfsd_ffv2_export_template_clone(&template, exp);
+	if (error)
+		goto out_reopen;
+	error = __nfsd_ffv2_service_export_publish(nn, &template,
+						   &object->export_path,
+						   request->store_uuid,
+						   request->binding_token,
+						   current_cred(),
+						   request->control_root,
+						   generation_id, true, exp,
+						   registration, object, outer_fh);
+	nfsd_ffv2_export_template_free(&template);
+	if (error)
+		goto out_put_exp;
+	exp_put(exp);
+	return 0;
+
+out_reopen:
+	nfsd_ffv2_export_transition_abort_exact(exp);
+out_put_exp:
+	exp_put(exp);
+out_free:
+	nfsd_ffv2_object_free(object);
+	return error;
+out_put_fh:
+	fh_put(&ordinary);
+	goto out_put_exp;
+}
+
 int nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 				     struct svc_export *exp,
 				     const struct path *root,
@@ -804,7 +989,7 @@ int nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 	return __nfsd_ffv2_service_export_publish(owner, exp, root, store_uuid,
 						  binding_token, cred,
 						  control_root, generation_id,
-						  true, NULL, NULL);
+						  true, NULL, NULL, NULL, NULL);
 }
 
 void nfsd_ffv2_service_context_release(void *payload)
@@ -823,8 +1008,8 @@ void nfsd_ffv2_service_context_release(void *payload)
 	}
 	put_cred(context->cred);
 	nfsd_ffv2_reservation_fence(context->reservation);
-	if (context->object_valid)
-		path_put(&context->object_path);
+	if (context->object_owned)
+		nfsd_ffv2_object_free(context->object);
 	kfree(context);
 }
 
@@ -1277,6 +1462,7 @@ nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *),
 	init_completion(&generation->retired);
 	generation->payload = payload;
 	generation->release = release;
+	generation->registry_generation = object_uuid && export_uuid;
 	return generation;
 }
 
@@ -1379,6 +1565,15 @@ nfsd_ffv2_retire_begin_locked(struct nfsd_ffv2_anchor *anchor)
 
 	lockdep_assert_held(&anchor->lock);
 	if (generation) {
+		struct nfsd_ffv2_service_context *context;
+
+		if (generation->registry_generation) {
+			context = generation->payload;
+			mutex_lock(&nfsd_ffv2_registry_lock);
+			if (context && context->object)
+				context->object->visible = false;
+			mutex_unlock(&nfsd_ffv2_registry_lock);
+		}
 		anchor->active = NULL;
 		anchor->retiring = generation;
 		/* Publish the tombstone before a future binding rejects it. */
@@ -1791,11 +1986,13 @@ nfsd_ffv2_test_service_export_publish(struct nfsd_net *owner,
 	return __nfsd_ffv2_service_export_publish(owner, exp, root, store_uuid,
 						  binding_token, cred,
 						  control_root, generation_id,
-						  false, NULL, NULL);
+						  false, NULL, NULL, NULL, NULL);
 }
 
 int nfsd_ffv2_test_transition_publish(struct nfsd_net *owner,
 				      struct nfsd_ffv2_export_update *registration,
+				      struct nfsd_ffv2_object *object,
+				      struct knfsd_fh *outer_fh,
 				      struct svc_export *template,
 				      struct svc_export *expected,
 				      const struct path *root,
@@ -1808,7 +2005,34 @@ int nfsd_ffv2_test_transition_publish(struct nfsd_net *owner,
 						  store_uuid, binding_token,
 						  cred, control_root,
 						  generation_id, false,
-						  expected, registration);
+						  expected, registration, object,
+						  outer_fh);
+}
+
+int nfsd_ffv2_test_object_init(struct nfsd_ffv2_object *object,
+			       struct auth_domain *client,
+			       const struct path *export_path,
+			       const struct path *object_path, const u8 *inner,
+			       u16 inner_len, const u8 object_uuid[16],
+			       const u8 export_uuid[16])
+{
+	if (!object || !client || !export_path || !object_path || !inner ||
+	    inner_len < 8 ||
+	    inner_len > NFSD_FFV2_FH_INNER_MAX || inner_len & 3)
+		return -EINVAL;
+	kref_get(&client->ref);
+	object->client = client;
+	object->export_path = *export_path;
+	path_get(&object->export_path);
+	object->export_valid = true;
+	object->object_path = *object_path;
+	path_get(&object->object_path);
+	object->object_valid = true;
+	object->inner_fh.fh_size = inner_len;
+	memcpy(object->inner_fh.fh_raw, inner, inner_len);
+	memcpy(object->object_uuid, object_uuid, sizeof(object->object_uuid));
+	memcpy(object->export_uuid, export_uuid, sizeof(object->export_uuid));
+	return 0;
 }
 
 int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,

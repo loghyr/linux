@@ -62,6 +62,23 @@ struct nfsd_ffv2_update_stop_ctx {
 	struct completion	done;
 };
 
+struct nfsd_ffv2_transition_publish_ctx {
+	struct nfsd_net		*owner;
+	struct nfsd_ffv2_export_update *registration;
+	struct nfsd_ffv2_object *object;
+	struct knfsd_fh		*outer_fh;
+	struct svc_export	*template;
+	struct svc_export	*expected;
+	const struct path	*root;
+	const u8		*store_uuid;
+	const u8		*binding_token;
+	const struct cred	*cred;
+	u64			control_root;
+	u64			generation_id;
+	int			result;
+	struct completion	done;
+};
+
 static DEFINE_SPINLOCK(nfsd_ffv2_worker_lock);
 static struct nfsd_ffv2_worker_ctx *nfsd_ffv2_worker_ctx;
 
@@ -72,6 +89,27 @@ static int nfsd_ffv2_update_stop_thread(void *data)
 	struct nfsd_ffv2_update_stop_ctx *ctx = data;
 
 	nfsd_ffv2_service_stop_finish(ctx->nn, ctx->generation);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static int nfsd_ffv2_transition_publish_thread(void *data)
+{
+	struct nfsd_ffv2_transition_publish_ctx *ctx = data;
+
+	ctx->result = nfsd_ffv2_test_transition_publish(ctx->owner,
+							ctx->registration,
+							ctx->object,
+							ctx->outer_fh,
+							ctx->template,
+							ctx->expected,
+							ctx->root,
+							ctx->store_uuid,
+							ctx->binding_token,
+							ctx->cred,
+							ctx->control_root,
+							&ctx->generation_id);
 	complete(&ctx->done);
 	nfsd_ffv2_test_thread_park();
 	return 0;
@@ -1196,8 +1234,13 @@ static void nfsd_ffv2_init_test_export(struct svc_export *exp,
 
 static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 {
+	struct nfsd_ffv2_transition_publish_ctx publish_ctx = {};
+	struct nfsd_ffv2_object_request request;
 	struct nfsd_ffv2_export_update registration = {};
 	struct nfsd_ffv2_export_update second = {};
+	struct nfsd_ffv2_object *object = NULL;
+	struct nfsd_ffv2_object *published_object = NULL;
+	struct nfsd_ffv2_fh_info decoded;
 	struct nfsd_ffv2_reservation *reservation = NULL;
 	struct nfsd_ffv2_generation *generation;
 	struct auth_domain *domain;
@@ -1206,19 +1249,26 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct svc_export *selected;
 	struct svc_export *stale;
 	struct svc_export exp;
+	struct knfsd_fh outer_fh = {};
 	struct nfsd_net *nn;
 	struct nfsd_net *nn2;
+	struct dentry *object_dentry = NULL;
+	struct inode *object_inode;
 	struct path nonroot;
+	struct path object_path;
 	struct path root;
 	struct net *net;
 	struct net *net2;
+	struct task_struct *publish_task;
 	bool filecache_up = false;
+	bool mount_crossing_allowed;
 	bool registration_open = false;
 	bool service_up = false;
 	int second_error;
 	char domain_name[] = "ffv2-kunit";
 	u8 token[32] = { 1 };
 	u8 uuid[16] = { 2 };
+	const u8 inner[] = { 1, 0, 1, 1, 0xaa, 0xbb, 0xcc, 0xdd };
 	u64 generation_id;
 	int error;
 
@@ -1244,6 +1294,28 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		goto out_nets;
 	}
 	get_fs_root(current->fs, &root);
+	object_dentry = d_alloc_name(root.dentry, "ffv2-kunit-object");
+	if (!object_dentry) {
+		KUNIT_FAIL(test, "failed to allocate object dentry");
+		goto out_root;
+	}
+	object_inode = new_inode(root.mnt->mnt_sb);
+	if (!object_inode) {
+		KUNIT_FAIL(test, "failed to allocate object inode");
+		goto out_root;
+	}
+	object_inode->i_mode = S_IFREG | 0600;
+	object_inode->i_ino = get_next_ino();
+	set_nlink(object_inode, 1);
+	d_add(object_dentry, object_inode);
+	object_path.mnt = root.mnt;
+	object_path.dentry = object_dentry;
+	object = nfsd_ffv2_object_alloc();
+	published_object = nfsd_ffv2_object_alloc();
+	if (!object || !published_object) {
+		KUNIT_FAIL(test, "failed to preallocate registry objects");
+		goto out_root;
+	}
 
 	error = nfsd_ffv2_reservation_claim(nn, &root, uuid, token,
 					    &reservation);
@@ -1404,30 +1476,101 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		goto out_root;
 	}
 	exp_put(published);
+	memset(&request, 0, sizeof(request));
+	request.auth_domain = domain_name;
+	request.export_path = "/";
+	request.object_path = "/";
+	request.object_uuid = uuid;
+	request.store_uuid = uuid;
+	request.binding_token = token;
+	request.control_root = 1;
+	error = nfsd_ffv2_object_register(nn, &registration, object, &request,
+					  &outer_fh, &generation_id);
+	object = NULL;
+	KUNIT_EXPECT_EQ(test, error, -ESTALE);
 	selected = nfsd_ffv2_export_lookup(nn->svc_export_cache, domain, &root);
 	if (IS_ERR(selected)) {
 		KUNIT_FAIL(test, "transition export lookup failed: %ld",
 			   PTR_ERR(selected));
 		goto out_root;
 	}
+	error = nfsd_ffv2_export_access_get(selected);
+	if (error) {
+		KUNIT_FAIL(test, "ordinary export admission failed: %d", error);
+		exp_put(selected);
+		goto out_root;
+	}
 	error = nfsd_ffv2_export_transition_exact(selected);
 	if (error) {
 		KUNIT_FAIL(test, "exact export transition failed: %d", error);
+		nfsd_ffv2_export_access_put(selected);
 		exp_put(selected);
 		goto out_root;
 	}
 	error = nfsd_ffv2_export_template_clone(&exp, selected);
 	if (error) {
 		KUNIT_FAIL(test, "service template clone failed: %d", error);
+		nfsd_ffv2_export_access_put(selected);
 		nfsd_ffv2_export_transition_abort_exact(selected);
 		exp_put(selected);
 		goto out_root;
 	}
-	error = nfsd_ffv2_test_transition_publish(nn, &registration, &exp,
-						  selected, &root, uuid, token,
-						  current_cred(), 1, &generation_id);
+	error = nfsd_ffv2_test_object_init(published_object, domain, &root,
+					   &object_path, inner, sizeof(inner),
+					   uuid, uuid);
+	if (error) {
+		KUNIT_FAIL(test, "failed to initialize registry object: %d",
+			   error);
+		nfsd_ffv2_export_template_free(&exp);
+		nfsd_ffv2_export_access_put(selected);
+		nfsd_ffv2_export_transition_abort_exact(selected);
+		exp_put(selected);
+		goto out_root;
+	}
+	publish_ctx.owner = nn;
+	publish_ctx.registration = &registration;
+	publish_ctx.object = published_object;
+	publish_ctx.outer_fh = &outer_fh;
+	publish_ctx.template = &exp;
+	publish_ctx.expected = selected;
+	publish_ctx.root = &root;
+	publish_ctx.store_uuid = uuid;
+	publish_ctx.binding_token = token;
+	publish_ctx.cred = get_current_cred();
+	publish_ctx.control_root = 1;
+	publish_ctx.result = -EINPROGRESS;
+	init_completion(&publish_ctx.done);
+	publish_task = kthread_run(nfsd_ffv2_transition_publish_thread,
+				   &publish_ctx, "nfsd-ffv2-publish");
+	if (IS_ERR(publish_task)) {
+		error = PTR_ERR(publish_task);
+		KUNIT_FAIL(test, "failed to start transition publisher: %d",
+			   error);
+		nfsd_ffv2_export_access_put(selected);
+		put_cred(publish_ctx.cred);
+		nfsd_ffv2_export_template_free(&exp);
+		nfsd_ffv2_export_transition_abort_exact(selected);
+		exp_put(selected);
+		goto out_root;
+	}
+	error = read_poll_timeout(nfsd4_ffv2_mount_crossing_allowed,
+				  mount_crossing_allowed,
+				  !mount_crossing_allowed, 10,
+				  USEC_PER_SEC, false, &root);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&publish_ctx.done));
+	nfsd_ffv2_export_access_put(selected);
+	KUNIT_EXPECT_NE(test,
+			wait_for_completion_timeout(&publish_ctx.done, 5 * HZ),
+			0UL);
+	kthread_stop(publish_task);
+	put_cred(publish_ctx.cred);
+	error = publish_ctx.result;
+	generation_id = publish_ctx.generation_id;
 	nfsd_ffv2_export_template_free(&exp);
 	exp_put(selected);
+	if (!error)
+		published_object = NULL;
 	if (registration_open) {
 		nfsd_ffv2_registration_end(nn, &registration);
 		registration_open = false;
@@ -1436,6 +1579,11 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		KUNIT_FAIL(test, "atomic service transaction failed: %d", error);
 		goto out_root;
 	}
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&outer_fh, &decoded), 0);
+	KUNIT_EXPECT_EQ(test, decoded.generation, generation_id);
+	KUNIT_EXPECT_MEMEQ(test, decoded.object_uuid, uuid, sizeof(uuid));
+	KUNIT_EXPECT_MEMEQ(test, decoded.export_uuid, uuid, sizeof(uuid));
+	KUNIT_EXPECT_MEMEQ(test, decoded.inner, inner, sizeof(inner));
 	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	published = nfsd_ffv2_test_export_lookup(&exp);
@@ -1513,6 +1661,8 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	goto out_root;
 
 out_root:
+	nfsd_ffv2_object_free(object);
+	nfsd_ffv2_object_free(published_object);
 	if (registration_open)
 		nfsd_ffv2_registration_end(nn, &registration);
 	if (service_up) {
@@ -1531,6 +1681,7 @@ out_root:
 		nfsd_file_cache_shutdown();
 		mutex_unlock(&nfsd_mutex);
 	}
+	dput(object_dentry);
 	path_put(&root);
 	auth_domain_put(domain);
 out_nets:
