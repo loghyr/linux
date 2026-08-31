@@ -189,6 +189,7 @@ nfsd_ffv2_test_service_export_publish(struct nfsd_net *owner,
 				      const struct cred *cred,
 				      u64 control_root, u64 *generation_id);
 int nfsd_ffv2_test_transition_publish(struct nfsd_net *owner,
+				      struct nfsd_ffv2_export_update *registration,
 				      struct svc_export *template,
 				      struct svc_export *expected,
 				      const struct path *root,

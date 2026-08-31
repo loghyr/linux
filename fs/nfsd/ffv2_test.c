@@ -1213,6 +1213,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct net *net;
 	struct net *net2;
 	bool filecache_up = false;
+	bool registration_open = false;
 	bool service_up = false;
 	int second_error;
 	char domain_name[] = "ffv2-kunit";
@@ -1366,7 +1367,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	if (!error)
 		error = nfsd_ffv2_registration_begin(nn, &registration);
 	KUNIT_EXPECT_EQ(test, error, 0);
-	nfsd_ffv2_registration_end(nn, &registration);
+	registration_open = !error;
 	mutex_unlock(&nfsd_mutex);
 	if (error)
 		goto out_root;
@@ -1422,11 +1423,15 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		exp_put(selected);
 		goto out_root;
 	}
-	error = nfsd_ffv2_test_transition_publish(nn, &exp, selected, &root,
-						  uuid, token, current_cred(), 1,
-						  &generation_id);
+	error = nfsd_ffv2_test_transition_publish(nn, &registration, &exp,
+						  selected, &root, uuid, token,
+						  current_cred(), 1, &generation_id);
 	nfsd_ffv2_export_template_free(&exp);
 	exp_put(selected);
+	if (registration_open) {
+		nfsd_ffv2_registration_end(nn, &registration);
+		registration_open = false;
+	}
 	if (error) {
 		KUNIT_FAIL(test, "atomic service transaction failed: %d", error);
 		goto out_root;
@@ -1508,6 +1513,8 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	goto out_root;
 
 out_root:
+	if (registration_open)
+		nfsd_ffv2_registration_end(nn, &registration);
 	if (service_up) {
 		mutex_lock(&nfsd_mutex);
 		generation = nfsd_ffv2_service_stop_begin(nn);
