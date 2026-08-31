@@ -1196,6 +1196,8 @@ static void nfsd_ffv2_init_test_export(struct svc_export *exp,
 
 static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 {
+	struct nfsd_ffv2_export_update registration = {};
+	struct nfsd_ffv2_export_update second = {};
 	struct nfsd_ffv2_reservation *reservation = NULL;
 	struct nfsd_ffv2_generation *generation;
 	struct auth_domain *domain;
@@ -1212,6 +1214,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct net *net2;
 	bool filecache_up = false;
 	bool service_up = false;
+	int second_error;
 	char domain_name[] = "ffv2-kunit";
 	u8 token[32] = { 1 };
 	u8 uuid[16] = { 2 };
@@ -1352,6 +1355,21 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		KUNIT_FAIL(test, "failed to start transaction service: %d", error);
 		goto out_root;
 	}
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_registration_begin(nn, &registration);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	second_error = nfsd_ffv2_registration_begin(nn, &second);
+	KUNIT_EXPECT_EQ(test, second_error, -EBUSY);
+	if (!second_error)
+		nfsd_ffv2_registration_end(nn, &second);
+	nfsd_ffv2_registration_end(nn, &registration);
+	if (!error)
+		error = nfsd_ffv2_registration_begin(nn, &registration);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	nfsd_ffv2_registration_end(nn, &registration);
+	mutex_unlock(&nfsd_mutex);
+	if (error)
+		goto out_root;
 	mutex_lock(&nfsd_mutex);
 	error = nfsd_file_ffv2_test_cache_start();
 	mutex_unlock(&nfsd_mutex);

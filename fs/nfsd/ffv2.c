@@ -971,6 +971,51 @@ nfsd_ffv2_export_update_put(struct nfsd_ffv2_export_update *update)
 		wake_up_all(&participant->update_wait);
 }
 
+int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
+				 struct nfsd_ffv2_export_update *registration)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	int error;
+
+	lockdep_assert_held(&nfsd_mutex);
+	memset(registration, 0, sizeof(*registration));
+	error = nfsd_ffv2_export_update_admit(&nn->ffv2_participant,
+					      registration);
+	if (error)
+		return error;
+	mutex_lock(&anchor->lock);
+	if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
+	    anchor->service_state != NFSD_FFV2_SERVICE_UP) {
+		error = -ESHUTDOWN;
+	} else if (anchor->registration_pending || anchor->pending ||
+		   anchor->active || anchor->retiring) {
+		error = -EBUSY;
+	} else {
+		anchor->registration_pending = true;
+		registration->registration_slot = true;
+		error = 0;
+	}
+	mutex_unlock(&anchor->lock);
+	if (error)
+		nfsd_ffv2_export_update_put(registration);
+	return error;
+}
+
+void nfsd_ffv2_registration_end(struct nfsd_net *nn,
+				struct nfsd_ffv2_export_update *registration)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+
+	if (registration->registration_slot) {
+		mutex_lock(&anchor->lock);
+		WARN_ON_ONCE(!anchor->registration_pending);
+		anchor->registration_pending = false;
+		registration->registration_slot = false;
+		mutex_unlock(&anchor->lock);
+	}
+	nfsd_ffv2_export_update_put(registration);
+}
+
 int nfsd_ffv2_export_update_begin(struct svc_export *exp,
 				  struct svc_export *old,
 				  struct nfsd_ffv2_export_update *update)
@@ -1405,6 +1450,7 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 	anchor->pending = NULL;
 	anchor->active = NULL;
 	anchor->retiring = NULL;
+	anchor->registration_pending = false;
 }
 
 void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
@@ -1437,6 +1483,7 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	WARN_ON_ONCE(anchor->active);
 	WARN_ON_ONCE(anchor->retiring);
 	WARN_ON_ONCE(anchor->pending);
+	WARN_ON_ONCE(anchor->registration_pending);
 	mutex_unlock(&anchor->lock);
 	nfsd_ffv2_anchor_put(anchor);
 	wait_for_completion(&anchor->released);

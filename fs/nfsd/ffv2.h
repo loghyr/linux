@@ -61,6 +61,7 @@ struct nfsd_ffv2_export_update {
 	bool				admitted;
 	bool				entry_locked;
 	bool				policy_locked;
+	bool				registration_slot;
 };
 
 enum nfsd_ffv2_net_state {
@@ -87,6 +88,7 @@ struct nfsd_ffv2_anchor {
 	struct nfsd_ffv2_generation	*pending;
 	struct nfsd_ffv2_generation	*active;
 	struct nfsd_ffv2_generation	*retiring;
+	bool				registration_pending;
 };
 
 void nfsd_ffv2_net_init(struct nfsd_net *nn);
@@ -102,6 +104,10 @@ int nfsd_ffv2_export_update_validate(struct nfsd_ffv2_export_update *update);
 int nfsd_ffv2_export_update_end(struct svc_export *exp,
 				struct nfsd_ffv2_export_update *update);
 void nfsd_ffv2_export_update_abort(struct nfsd_ffv2_export_update *update);
+int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
+				 struct nfsd_ffv2_export_update *registration);
+void nfsd_ffv2_registration_end(struct nfsd_net *nn,
+				struct nfsd_ffv2_export_update *registration);
 void
 nfsd_ffv2_export_update_rollback_wait(struct nfsd_ffv2_service_context *context);
 void nfsd_ffv2_export_release(struct svc_export *exp);
