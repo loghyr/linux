@@ -16,6 +16,7 @@
 #include "ffv2.h"
 #include "export.h"
 #include "nfsd.h"
+#include "nfsfh.h"
 #include "netns.h"
 
 struct nfsd_ffv2_unregister_ctx {
@@ -1455,6 +1456,44 @@ out_root:
 	net_ns_barrier();
 }
 
+static void nfsd_ffv2_filehandle_format_test(struct kunit *test)
+{
+	const u8 inner[] = { 1, 0, 1, 1, 0xaa, 0xbb, 0xcc, 0xdd };
+	struct nfsd_ffv2_fh_info encoded = {
+		.generation = 7,
+		.object_uuid = { 1 },
+		.export_uuid = { 2 },
+		.inner = inner,
+		.inner_len = sizeof(inner),
+	};
+	struct nfsd_ffv2_fh_info decoded;
+	struct knfsd_fh fh = {};
+	u8 saved;
+
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_fh_encode(&fh, &encoded), 0);
+	KUNIT_ASSERT_EQ(test, fh.fh_size,
+			NFSD_FFV2_FH_HEADER_SIZE + sizeof(inner));
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), 0);
+	KUNIT_EXPECT_EQ(test, decoded.generation, 7ULL);
+	KUNIT_EXPECT_EQ(test, decoded.inner_len, (u16)sizeof(inner));
+	KUNIT_EXPECT_MEMEQ(test, decoded.object_uuid, encoded.object_uuid, 16);
+	KUNIT_EXPECT_MEMEQ(test, decoded.export_uuid, encoded.export_uuid, 16);
+	KUNIT_EXPECT_MEMEQ(test, decoded.inner, inner, sizeof(inner));
+
+	saved = fh.fh_raw[0];
+	fh.fh_raw[0] = 1;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
+	fh.fh_raw[0] = saved;
+	fh.fh_raw[9] = 1;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
+	fh.fh_raw[9] = 0;
+	fh.fh_raw[56] = 0xff;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
+	fh.fh_raw[56] = 1;
+	fh.fh_size--;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -1470,6 +1509,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_partial_start_cleanup_test),
 	KUNIT_CASE(nfsd_ffv2_reservation_context_test),
 	KUNIT_CASE(nfsd_ffv2_export_update_stop_test),
+	KUNIT_CASE(nfsd_ffv2_filehandle_format_test),
 	{}
 };
 

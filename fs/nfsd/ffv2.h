@@ -20,6 +20,19 @@ struct svc_rqst;
 struct svc_export;
 struct svc_xprt;
 struct task_struct;
+struct knfsd_fh;
+
+#define NFSD_FFV2_FH_HEADER_SIZE	56
+#define NFSD_FFV2_FH_INNER_MAX	72
+#define NFSD_FFV2_FH_MAX		128
+
+struct nfsd_ffv2_fh_info {
+	u64		generation;
+	u8		object_uuid[16];
+	u8		export_uuid[16];
+	const u8	*inner;
+	u16		inner_len;
+};
 
 struct nfsd_ffv2_participant {
 	struct list_head		node;
@@ -122,6 +135,9 @@ void nfsd_ffv2_service_down(struct nfsd_net *nn);
 bool nfsd_ffv2_requested_zero_threads(int n, const int *nthreads,
 				      unsigned int nrpools);
 int nfsd_ffv2_register(struct nfsd_net *nn);
+int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info);
+int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
+			const struct nfsd_ffv2_fh_info *info);
 
 struct nfsd_ffv2_admission {
 	struct list_head			node;
