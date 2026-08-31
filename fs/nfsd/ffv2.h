@@ -13,11 +13,13 @@ struct net;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
 struct nfsd_ffv2_object;
+struct nfsd_ffv2_binding;
 struct nfsd_ffv2_reservation;
 struct nfsd_ffv2_service_context;
 struct cred;
 struct path;
 struct svc_rqst;
+struct svc_fh;
 struct svc_export;
 struct svc_xprt;
 struct task_struct;
@@ -171,6 +173,9 @@ int nfsd_ffv2_register(struct nfsd_net *nn);
 int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info);
 int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
 			const struct nfsd_ffv2_fh_info *info);
+__be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp);
+void nfsd_ffv2_binding_get(struct nfsd_ffv2_binding *binding);
+void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding);
 
 struct nfsd_ffv2_admission {
 	struct list_head			node;
@@ -225,6 +230,9 @@ int nfsd_ffv2_test_object_init(struct nfsd_ffv2_object *object,
 			       const struct path *object_path, const u8 *inner,
 			       u16 inner_len, const u8 object_uuid[16],
 			       const u8 export_uuid[16]);
+struct nfsd_ffv2_binding *
+nfsd_ffv2_test_binding_create(struct nfsd_net *nn,
+			      const struct nfsd_ffv2_fh_info *info);
 bool nfsd_ffv2_test_generation_retired(struct nfsd_ffv2_generation *generation);
 bool nfsd_ffv2_test_admission_retired(struct nfsd_ffv2_admission *admission);
 unsigned int nfsd_ffv2_test_refcount(struct nfsd_ffv2_admission *admission);

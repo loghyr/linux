@@ -145,6 +145,8 @@ fh_dup2(struct svc_fh *dst, struct svc_fh *src)
 	if (src->fh_ffv2_admitted &&
 	    nfsd_ffv2_export_access_get(src->fh_export))
 		return nfserr_stale;
+	if (src->fh_ffv2_binding)
+		nfsd_ffv2_binding_get(src->fh_ffv2_binding);
 	fh_put(dst);
 	dget(src->fh_dentry);
 	if (src->fh_export)
@@ -725,15 +727,21 @@ nfsd4_putfh(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	    union nfsd4_op_u *u)
 {
 	struct nfsd4_putfh *putfh = &u->putfh;
+	bool ffv2;
 	__be32 ret;
 
 	fh_put(&cstate->current_fh);
 	cstate->current_fh.fh_handle.fh_size = putfh->pf_fhlen;
 	memcpy(&cstate->current_fh.fh_handle.fh_raw, putfh->pf_fhval,
 	       putfh->pf_fhlen);
-	ret = fh_verify(rqstp, &cstate->current_fh, 0, NFSD_MAY_BYPASS_GSS);
+	ffv2 = putfh->pf_fhlen && putfh->pf_fhval[0] == 0xff;
+	if (ffv2)
+		ret = nfsd_ffv2_fh_map(rqstp, &cstate->current_fh);
+	else
+		ret = fh_verify(rqstp, &cstate->current_fh, 0,
+				NFSD_MAY_BYPASS_GSS);
 #ifdef CONFIG_NFSD_V4_2_INTER_SSC
-	if (ret == nfserr_stale && putfh->no_verify) {
+	if (!ffv2 && ret == nfserr_stale && putfh->no_verify) {
 		SET_FH_FLAG(&cstate->current_fh, NFSD4_FH_FOREIGN);
 		ret = 0;
 	}

@@ -1580,6 +1580,16 @@ void nfsd_ffv2_export_access_put(struct svc_export *exp)
 		wake_up_all(&exp->ex_ffv2_access_wait);
 }
 
+bool nfsd_ffv2_export_is_service(struct svc_export *exp)
+{
+	bool service;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	service = exp->ex_ffv2_access_state == NFSD_FFV2_EXPORT_SERVICE;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	return service;
+}
+
 int nfsd_ffv2_export_transition_begin(struct svc_export *exp)
 {
 	int error = 0;

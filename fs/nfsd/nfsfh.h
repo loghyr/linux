@@ -54,6 +54,8 @@ struct knfsd_fh {
 	u8		fh_raw[NFS4_FHSIZE];
 };
 
+struct nfsd_ffv2_binding;
+
 #define fh_version		fh_raw[0]
 #define fh_auth_type		fh_raw[1]
 #define fh_fsid_type		fh_raw[2]
@@ -84,6 +86,7 @@ typedef struct svc_fh {
 	struct dentry *		fh_dentry;	/* validated dentry */
 	struct svc_export *	fh_export;	/* export pointer */
 	bool			fh_ffv2_admitted;
+	struct nfsd_ffv2_binding *fh_ffv2_binding;
 
 	bool			fh_want_write;	/* remount protection taken */
 	bool			fh_no_wcc;	/* no wcc data needed */
@@ -221,6 +224,8 @@ extern char * SVCFH_fmt(struct svc_fh *fhp);
  * Function prototypes
  */
 __be32	fh_verify(struct svc_rqst *, struct svc_fh *, umode_t, int);
+__be32	fh_verify_ffv2_mapped(struct svc_rqst *rqstp, struct svc_fh *fhp,
+			      umode_t type, int access);
 __be32	fh_verify_local(struct net *, struct svc_cred *, struct auth_domain *,
 			struct svc_fh *, umode_t, int);
 __be32	fh_getattr(const struct svc_fh *fhp, struct kstat *stat);

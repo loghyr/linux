@@ -201,7 +201,7 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct net *net,
 				 struct svc_cred *cred,
 				 struct auth_domain *client,
 				 struct auth_domain *gssclient,
-				 struct svc_fh *fhp)
+				 struct svc_fh *fhp, bool ffv2_mapped)
 {
 	struct knfsd_fh	*fh = &fhp->fh_handle;
 	struct fid *fid = NULL;
@@ -259,9 +259,14 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct net *net,
 
 		return nfserrno(PTR_ERR(exp));
 	}
-	if (nfsd_ffv2_export_access_get(exp))
-		goto out;
-	fhp->fh_ffv2_admitted = true;
+	if (ffv2_mapped) {
+		if (!nfsd_ffv2_export_is_service(exp))
+			goto out;
+	} else {
+		if (nfsd_ffv2_export_access_get(exp))
+			goto out;
+		fhp->fh_ffv2_admitted = true;
+	}
 
 	if (exp->ex_flags & NFSEXP_NOSUBTREECHECK) {
 		/* Elevate privileges so that the lack of 'r' or 'x'
@@ -381,6 +386,7 @@ out:
  * @fhp: filehandle to be verified
  * @type: expected type of object pointed to by filehandle
  * @access: type of access needed to object
+ * @ffv2_mapped: true only after FFv2 wrapper and registry validation
  *
  * See fh_verify() for further descriptions of @fhp, @type, and @access.
  */
@@ -389,7 +395,7 @@ __fh_verify(struct svc_rqst *rqstp,
 	    struct net *net, struct svc_cred *cred,
 	    struct auth_domain *client,
 	    struct auth_domain *gssclient,
-	    struct svc_fh *fhp, umode_t type, int access)
+	    struct svc_fh *fhp, umode_t type, int access, bool ffv2_mapped)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 	struct svc_export *exp = NULL;
@@ -399,7 +405,7 @@ __fh_verify(struct svc_rqst *rqstp,
 
 	if (!fhp->fh_dentry) {
 		error = nfsd_set_fh_dentry(rqstp, net, cred, client,
-					   gssclient, fhp);
+					   gssclient, fhp, ffv2_mapped);
 		if (error)
 			goto out;
 	}
@@ -507,7 +513,7 @@ fh_verify_local(struct net *net, struct svc_cred *cred,
 		umode_t type, int access)
 {
 	return __fh_verify(NULL, net, cred, client, NULL,
-			   fhp, type, access);
+			   fhp, type, access, false);
 }
 
 /**
@@ -542,7 +548,16 @@ fh_verify(struct svc_rqst *rqstp, struct svc_fh *fhp, umode_t type, int access)
 {
 	return __fh_verify(rqstp, SVC_NET(rqstp), &rqstp->rq_cred,
 			   rqstp->rq_client, rqstp->rq_gssclient,
-			   fhp, type, access);
+			   fhp, type, access, false);
+}
+
+__be32
+fh_verify_ffv2_mapped(struct svc_rqst *rqstp, struct svc_fh *fhp,
+		      umode_t type, int access)
+{
+	return __fh_verify(rqstp, SVC_NET(rqstp), &rqstp->rq_cred,
+			   rqstp->rq_client, rqstp->rq_gssclient,
+			   fhp, type, access, true);
 }
 
 /*
@@ -885,6 +900,10 @@ fh_put(struct svc_fh *fhp)
 		fh_clear_pre_post_attrs(fhp);
 	}
 	fh_drop_write(fhp);
+	if (fhp->fh_ffv2_binding) {
+		nfsd_ffv2_binding_put(fhp->fh_ffv2_binding);
+		fhp->fh_ffv2_binding = NULL;
+	}
 	if (exp) {
 		if (fhp->fh_ffv2_admitted) {
 			nfsd_ffv2_export_access_put(exp);

@@ -21,6 +21,7 @@
 #include "nfsfh.h"
 #include "nfsd.h"
 #include "netns.h"
+#include "vfs.h"
 
 enum nfsd_ffv2_identity_state {
 	NFSD_FFV2_IDENTITY_LIVE,
@@ -67,6 +68,13 @@ struct nfsd_ffv2_object {
 	bool			export_valid;
 	bool			object_valid;
 	bool			visible;
+};
+
+struct nfsd_ffv2_binding {
+	refcount_t		ref;
+	struct net		*net;
+	struct nfsd_ffv2_object *object;
+	struct nfsd_ffv2_admission admission;
 };
 
 static DEFINE_MUTEX(nfsd_ffv2_registry_lock);
@@ -204,6 +212,8 @@ nfsd_ffv2_generation_commit(struct nfsd_net *nn,
 static void
 nfsd_ffv2_generation_cancel(struct nfsd_net *nn,
 			    struct nfsd_ffv2_generation *generation);
+static bool nfsd_ffv2_anchor_get(struct nfsd_ffv2_anchor *anchor);
+static void nfsd_ffv2_anchor_put(struct nfsd_ffv2_anchor *anchor);
 static int nfsd_ffv2_object_validate(struct svc_export *exp,
 				     struct nfsd_ffv2_object *object);
 static void
@@ -978,6 +988,147 @@ out_free:
 out_put_fh:
 	fh_put(&ordinary);
 	goto out_put_exp;
+}
+
+void nfsd_ffv2_binding_get(struct nfsd_ffv2_binding *binding)
+{
+	refcount_inc(&binding->ref);
+}
+
+void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding)
+{
+	if (!refcount_dec_and_test(&binding->ref))
+		return;
+	nfsd_ffv2_complete(&binding->admission);
+	put_net(binding->net);
+	kfree(binding);
+}
+
+static int nfsd_ffv2_binding_admit(struct nfsd_net *nn,
+				   const struct nfsd_ffv2_fh_info *info,
+				   struct nfsd_ffv2_binding *binding)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_object *object;
+	int error = -ESTALE;
+
+	INIT_LIST_HEAD(&binding->admission.node);
+	if (!nfsd_ffv2_anchor_get(anchor))
+		return -ESHUTDOWN;
+	mutex_lock(&anchor->lock);
+	generation = anchor->active;
+	if (!generation || !generation->registry_generation ||
+	    generation->identity->generation != info->generation ||
+	    memcmp(generation->identity->object_uuid, info->object_uuid,
+		   sizeof(generation->identity->object_uuid)) ||
+	    memcmp(generation->identity->export_uuid, info->export_uuid,
+		   sizeof(generation->identity->export_uuid)))
+		goto out_unlock;
+	context = generation->payload;
+	if (!context || !context->object)
+		goto out_unlock;
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	object = context->object;
+	if (!object->visible || object->inner_fh.fh_size != info->inner_len ||
+	    memcmp(object->inner_fh.fh_raw, info->inner, info->inner_len)) {
+		mutex_unlock(&nfsd_ffv2_registry_lock);
+		goto out_unlock;
+	}
+	refcount_inc(&generation->ref);
+	atomic_inc(&generation->admitted);
+	binding->object = object;
+	binding->admission.anchor = anchor;
+	binding->admission.generation = generation;
+	binding->admission.task = current;
+	spin_lock(&generation->admissions_lock);
+	list_add(&binding->admission.node, &generation->admissions);
+	spin_unlock(&generation->admissions_lock);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	error = 0;
+out_unlock:
+	mutex_unlock(&anchor->lock);
+	if (error)
+		nfsd_ffv2_anchor_put(anchor);
+	return error;
+}
+
+static bool nfsd_ffv2_binding_current(struct nfsd_net *nn,
+				      struct nfsd_ffv2_binding *binding)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	bool valid;
+
+	mutex_lock(&anchor->lock);
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	valid = anchor->active == binding->admission.generation &&
+		binding->object->visible;
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	mutex_unlock(&anchor->lock);
+	return valid;
+}
+
+__be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp)
+{
+	struct nfsd_ffv2_binding *binding;
+	struct nfsd_ffv2_fh_info info;
+	struct knfsd_fh outer;
+	struct nfsd_net *nn;
+	struct net *net;
+	__be32 status;
+	int error;
+
+	outer = fhp->fh_handle;
+	error = nfsd_ffv2_fh_parse(&outer, &info);
+	if (error)
+		return nfserr_badhandle;
+	binding = kzalloc_obj(*binding, GFP_KERNEL);
+	if (!binding)
+		return nfserr_jukebox;
+	refcount_set(&binding->ref, 1);
+	net = maybe_get_net(SVC_NET(rqstp));
+	if (!net) {
+		kfree(binding);
+		return nfserr_stale;
+	}
+	binding->net = net;
+	nn = net_generic(net, nfsd_net_id);
+	error = nfsd_ffv2_binding_admit(nn, &info, binding);
+	if (error) {
+		status = nfserr_stale;
+		goto out_binding;
+	}
+
+	fhp->fh_handle = binding->object->inner_fh;
+	status = fh_verify_ffv2_mapped(rqstp, fhp, 0,
+				       NFSD_MAY_BYPASS_GSS);
+	if (status)
+		goto out_fh;
+	if (!fhp->fh_export->ex_uuid ||
+	    memcmp(fhp->fh_export->ex_uuid, binding->object->export_uuid,
+		   sizeof(binding->object->export_uuid)) ||
+	    fhp->fh_export->ex_client != binding->object->client ||
+	    fhp->fh_dentry != binding->object->object_path.dentry ||
+	    nfsd_ffv2_object_validate(fhp->fh_export, binding->object)) {
+		status = nfserr_stale;
+		goto out_fh;
+	}
+	if (!nfsd_ffv2_binding_current(nn, binding)) {
+		status = nfserr_stale;
+		goto out_fh;
+	}
+	fhp->fh_handle = outer;
+	fhp->fh_ffv2_binding = binding;
+	return nfs_ok;
+
+out_fh:
+	fh_put(fhp);
+	nfsd_ffv2_complete(&binding->admission);
+out_binding:
+	put_net(binding->net);
+	kfree(binding);
+	return status;
 }
 
 int nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
@@ -2061,6 +2212,31 @@ int nfsd_ffv2_test_object_init(struct nfsd_ffv2_object *object,
 	memcpy(object->object_uuid, object_uuid, sizeof(object->object_uuid));
 	memcpy(object->export_uuid, export_uuid, sizeof(object->export_uuid));
 	return 0;
+}
+
+struct nfsd_ffv2_binding *
+nfsd_ffv2_test_binding_create(struct nfsd_net *nn,
+			      const struct nfsd_ffv2_fh_info *info)
+{
+	struct nfsd_ffv2_binding *binding;
+	int error;
+
+	binding = kzalloc_obj(*binding, GFP_KERNEL);
+	if (!binding)
+		return ERR_PTR(-ENOMEM);
+	refcount_set(&binding->ref, 1);
+	binding->net = maybe_get_net(nn->ffv2_participant.net);
+	if (!binding->net) {
+		kfree(binding);
+		return ERR_PTR(-ESHUTDOWN);
+	}
+	error = nfsd_ffv2_binding_admit(nn, info, binding);
+	if (error) {
+		put_net(binding->net);
+		kfree(binding);
+		return ERR_PTR(error);
+	}
+	return binding;
 }
 
 int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,

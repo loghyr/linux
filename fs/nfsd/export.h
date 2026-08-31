@@ -120,6 +120,7 @@ void nfsd_ffv2_export_template_mark_service(struct svc_export *template);
 int nfsd_ffv2_export_access_get(struct svc_export *exp);
 int nfsd_ffv2_export_access_clone(struct svc_export *exp);
 void nfsd_ffv2_export_access_put(struct svc_export *exp);
+bool nfsd_ffv2_export_is_service(struct svc_export *exp);
 int nfsd_ffv2_export_transition_begin(struct svc_export *exp);
 int nfsd_ffv2_export_transition_wait(struct svc_export *exp);
 bool nfsd_ffv2_export_is_transitioning(struct svc_export *exp);

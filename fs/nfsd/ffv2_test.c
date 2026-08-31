@@ -1240,7 +1240,9 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct nfsd_ffv2_export_update second = {};
 	struct nfsd_ffv2_object *object = NULL;
 	struct nfsd_ffv2_object *published_object = NULL;
+	struct nfsd_ffv2_binding *binding;
 	struct nfsd_ffv2_fh_info decoded;
+	struct nfsd_ffv2_fh_info wrong;
 	struct nfsd_ffv2_reservation *reservation = NULL;
 	struct nfsd_ffv2_generation *generation;
 	struct auth_domain *domain;
@@ -1585,6 +1587,21 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, decoded.object_uuid, uuid, sizeof(uuid));
 	KUNIT_EXPECT_MEMEQ(test, decoded.export_uuid, uuid, sizeof(uuid));
 	KUNIT_EXPECT_MEMEQ(test, decoded.inner, inner, sizeof(inner));
+	wrong = decoded;
+	wrong.object_uuid[0] ^= 0xff;
+	binding = nfsd_ffv2_test_binding_create(nn, &wrong);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(binding));
+	if (!IS_ERR(binding))
+		nfsd_ffv2_binding_put(binding);
+	binding = nfsd_ffv2_test_binding_create(nn, &decoded);
+	if (IS_ERR(binding)) {
+		KUNIT_FAIL(test, "binding admission failed: %ld",
+			   PTR_ERR(binding));
+		goto out_root;
+	}
+	nfsd_ffv2_binding_get(binding);
+	nfsd_ffv2_binding_put(binding);
+	nfsd_ffv2_binding_put(binding);
 	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	published = nfsd_ffv2_test_export_lookup(&exp);
