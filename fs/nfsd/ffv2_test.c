@@ -1385,10 +1385,16 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		goto out_root;
 	}
 	exp_put(published);
-	selected = nfsd_ffv2_export_select(nn->svc_export_cache, domain, &root);
+	selected = nfsd_ffv2_export_lookup(nn->svc_export_cache, domain, &root);
 	if (IS_ERR(selected)) {
-		KUNIT_FAIL(test, "transition export selection failed: %ld",
+		KUNIT_FAIL(test, "transition export lookup failed: %ld",
 			   PTR_ERR(selected));
+		goto out_root;
+	}
+	error = nfsd_ffv2_export_transition_exact(selected);
+	if (error) {
+		KUNIT_FAIL(test, "exact export transition failed: %d", error);
+		exp_put(selected);
 		goto out_root;
 	}
 	error = nfsd_ffv2_export_template_clone(&exp, selected);

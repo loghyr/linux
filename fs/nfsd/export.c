@@ -1909,7 +1909,7 @@ void nfsd_ffv2_export_template_mark_service(struct svc_export *template)
 }
 
 struct svc_export *
-nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
+nfsd_ffv2_export_lookup(struct cache_detail *cd, struct auth_domain *client,
 			const struct path *path)
 {
 	struct svc_export key = {
@@ -1937,9 +1937,6 @@ nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
 		error = -EINVAL;
 		goto out_put;
 	}
-	error = nfsd_ffv2_export_transition_begin(exp);
-	if (error)
-		goto out_put;
 	mutex_unlock(&nfsd_export_update_lock);
 	return exp;
 
@@ -1949,6 +1946,41 @@ out_put:
 out_unlock:
 	mutex_unlock(&nfsd_export_update_lock);
 	return exp;
+}
+
+int nfsd_ffv2_export_transition_exact(struct svc_export *exp)
+{
+	int error;
+
+	mutex_lock(&nfsd_export_update_lock);
+	if (!sunrpc_cache_is_current(exp->cd, &exp->h, &exp->h,
+				     svc_export_hash(exp))) {
+		error = -ESTALE;
+		goto out_unlock;
+	}
+	error = cache_check(exp->cd, &exp->h, NULL);
+	if (!error)
+		error = nfsd_ffv2_export_transition_begin(exp);
+out_unlock:
+	mutex_unlock(&nfsd_export_update_lock);
+	return error;
+}
+
+struct svc_export *
+nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
+			const struct path *path)
+{
+	struct svc_export *exp;
+	int error;
+
+	exp = nfsd_ffv2_export_lookup(cd, client, path);
+	if (IS_ERR(exp))
+		return exp;
+	error = nfsd_ffv2_export_transition_exact(exp);
+	if (!error)
+		return exp;
+	exp_put(exp);
+	return ERR_PTR(error);
 }
 
 bool nfsd_ffv2_export_is_current(struct svc_export *exp)

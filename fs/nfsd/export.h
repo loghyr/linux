@@ -101,6 +101,10 @@ struct svc_export *nfsd_export_cache_update(struct svc_export *new);
 struct svc_export *
 nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
 			const struct path *path);
+struct svc_export *
+nfsd_ffv2_export_lookup(struct cache_detail *cd, struct auth_domain *client,
+			const struct path *path);
+int nfsd_ffv2_export_transition_exact(struct svc_export *exp);
 bool nfsd_ffv2_export_is_current(struct svc_export *exp);
 bool nfsd_ffv2_export_transition_abort_exact(struct svc_export *exp);
 void nfsd_ffv2_export_update_lock(void);
