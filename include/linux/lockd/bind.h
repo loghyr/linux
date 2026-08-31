@@ -10,12 +10,19 @@
 #ifndef LINUX_LOCKD_BIND_H
 #define LINUX_LOCKD_BIND_H
 
+#include <linux/list.h>
+
 struct file_lock;
 struct nfs_fh;
 struct svc_rqst;
+struct super_block;
+
+struct nlmsvc_ffv2_gate {
+	struct list_head	list;
+	struct super_block *sb;
+};
 struct rpc_task;
 struct rpc_clnt;
-struct super_block;
 
 /*
  * This is the set of functions for lockd->nfsd communication
@@ -80,6 +87,9 @@ extern void	lockd_down(struct net *net);
  * Cluster failover support
  */
 int nlmsvc_unlock_all_by_sb(struct super_block *sb);
+int nlmsvc_ffv2_gate_begin(struct nlmsvc_ffv2_gate *gate,
+			   struct super_block *sb);
+void nlmsvc_ffv2_gate_end(struct nlmsvc_ffv2_gate *gate);
 int nlmsvc_unlock_all_by_ip(struct sockaddr *server_addr);
 
 #endif /* LINUX_LOCKD_BIND_H */

@@ -31,6 +31,18 @@
 #define FILE_NRHASH		(1<<FILE_HASH_BITS)
 static struct hlist_head	nlm_files[FILE_NRHASH];
 static DEFINE_MUTEX(nlm_file_mutex);
+static LIST_HEAD(nlm_ffv2_gates);
+
+static bool nlmsvc_ffv2_blocked(struct super_block *sb)
+{
+	struct nlmsvc_ffv2_gate *gate;
+
+	lockdep_assert_held(&nlm_file_mutex);
+	list_for_each_entry(gate, &nlm_ffv2_gates, list)
+		if (gate->sb == sb)
+			return true;
+	return false;
+}
 
 #ifdef CONFIG_SUNRPC_DEBUG
 static inline void nlm_debug_print_fh(char *msg, struct nfs_fh *f)
@@ -146,6 +158,10 @@ nlm_lookup_file(struct svc_rqst *rqstp, struct nlm_file **result,
 
 	hlist_for_each_entry(file, &nlm_files[hash], f_list)
 		if (!nfs_compare_fh(&file->f_handle, &lock->fh)) {
+			if (nlmsvc_ffv2_blocked(nlmsvc_file_inode(file)->i_sb)) {
+				nfserr = nlm_lck_denied_nolocks;
+				goto out_unlock;
+			}
 			mutex_lock(&file->f_mutex);
 			nfserr = nlm_do_fopen(rqstp, file, mode);
 			mutex_unlock(&file->f_mutex);
@@ -168,6 +184,10 @@ nlm_lookup_file(struct svc_rqst *rqstp, struct nlm_file **result,
 	nfserr = nlm_do_fopen(rqstp, file, mode);
 	if (nfserr)
 		goto out_free;
+	if (nlmsvc_ffv2_blocked(nlmsvc_file_inode(file)->i_sb)) {
+		nfserr = nlm_lck_denied_nolocks;
+		goto out_free;
+	}
 
 	hlist_add_head(&file->f_list, &nlm_files[hash]);
 
@@ -508,6 +528,42 @@ nlmsvc_unlock_all_by_sb(struct super_block *sb)
 	return ret ? -EIO : 0;
 }
 EXPORT_SYMBOL_GPL(nlmsvc_unlock_all_by_sb);
+
+int nlmsvc_ffv2_gate_begin(struct nlmsvc_ffv2_gate *gate,
+			   struct super_block *sb)
+{
+	struct nlm_file *file;
+	unsigned int i;
+	int error = 0;
+
+	INIT_LIST_HEAD(&gate->list);
+	gate->sb = sb;
+	mutex_lock(&nlm_file_mutex);
+	if (nlmsvc_ffv2_blocked(sb)) {
+		error = -EBUSY;
+		goto out_unlock;
+	}
+	for (i = 0; i < FILE_NRHASH; i++)
+		hlist_for_each_entry(file, &nlm_files[i], f_list)
+			if (nlmsvc_file_inode(file)->i_sb == sb) {
+				error = -EBUSY;
+				goto out_unlock;
+			}
+	list_add_tail(&gate->list, &nlm_ffv2_gates);
+out_unlock:
+	mutex_unlock(&nlm_file_mutex);
+	return error;
+}
+EXPORT_SYMBOL_GPL(nlmsvc_ffv2_gate_begin);
+
+void nlmsvc_ffv2_gate_end(struct nlmsvc_ffv2_gate *gate)
+{
+	mutex_lock(&nlm_file_mutex);
+	if (!list_empty(&gate->list))
+		list_del_init(&gate->list);
+	mutex_unlock(&nlm_file_mutex);
+}
+EXPORT_SYMBOL_GPL(nlmsvc_ffv2_gate_end);
 
 static int
 nlmsvc_match_ip(void *datap, struct nlm_host *host)
