@@ -62,6 +62,33 @@ static DEFINE_PER_CPU(unsigned long, nfsd_file_releases);
 static DEFINE_PER_CPU(unsigned long, nfsd_file_total_age);
 static DEFINE_PER_CPU(unsigned long, nfsd_file_evictions);
 
+static DEFINE_MUTEX(nfsd_file_ffv2_lock);
+static LIST_HEAD(nfsd_file_ffv2_gates);
+static LIST_HEAD(nfsd_file_ffv2_live);
+
+static struct nfsd_file_ffv2_gate *
+nfsd_file_ffv2_find_gate(struct super_block *sb)
+{
+	struct nfsd_file_ffv2_gate *gate;
+
+	lockdep_assert_held(&nfsd_file_ffv2_lock);
+	list_for_each_entry(gate, &nfsd_file_ffv2_gates, list)
+		if (gate->sb == sb)
+			return gate;
+	return NULL;
+}
+
+static bool nfsd_file_ffv2_blocked(struct super_block *sb)
+{
+	struct nfsd_file_ffv2_gate *gate;
+
+	lockdep_assert_in_rcu_read_lock();
+	list_for_each_entry_rcu(gate, &nfsd_file_ffv2_gates, list)
+		if (gate->sb == sb)
+			return true;
+	return false;
+}
+
 struct nfsd_fcache_disposal {
 	spinlock_t lock;
 	struct list_head freeme;
@@ -217,9 +244,9 @@ nfsd_file_alloc(struct net *net, struct inode *inode, unsigned char need,
 	if (unlikely(!nf))
 		return NULL;
 
-	this_cpu_inc(nfsd_file_allocations);
 	INIT_LIST_HEAD(&nf->nf_lru);
 	INIT_LIST_HEAD(&nf->nf_gc);
+	INIT_LIST_HEAD(&nf->nf_ffv2_live);
 	nf->nf_birthtime = ktime_get();
 	nf->nf_file = NULL;
 	nf->nf_cred = get_current_cred();
@@ -228,12 +255,23 @@ nfsd_file_alloc(struct net *net, struct inode *inode, unsigned char need,
 		BIT(NFSD_FILE_HASHED) | BIT(NFSD_FILE_PENDING) | BIT(NFSD_FILE_GC) :
 		BIT(NFSD_FILE_HASHED) | BIT(NFSD_FILE_PENDING);
 	nf->nf_inode = inode;
+	nf->nf_sb = inode->i_sb;
 	refcount_set(&nf->nf_ref, 1);
 	nf->nf_may = need;
 	nf->nf_mark = NULL;
 	nf->nf_dio_mem_align = 0;
 	nf->nf_dio_offset_align = 0;
 	nf->nf_dio_read_offset_align = 0;
+	mutex_lock(&nfsd_file_ffv2_lock);
+	if (nfsd_file_ffv2_find_gate(nf->nf_sb)) {
+		mutex_unlock(&nfsd_file_ffv2_lock);
+		put_cred(nf->nf_cred);
+		kmem_cache_free(nfsd_file_slab, nf);
+		return NULL;
+	}
+	list_add_tail(&nf->nf_ffv2_live, &nfsd_file_ffv2_live);
+	mutex_unlock(&nfsd_file_ffv2_lock);
+	this_cpu_inc(nfsd_file_allocations);
 	return nf;
 }
 
@@ -275,6 +313,7 @@ nfsd_file_unhash(struct nfsd_file *nf)
 static void
 nfsd_file_free(struct nfsd_file *nf)
 {
+	struct nfsd_file_ffv2_gate *gate;
 	s64 age = ktime_to_ms(ktime_sub(ktime_get(), nf->nf_birthtime));
 
 	trace_nfsd_file_free(nf);
@@ -289,6 +328,17 @@ nfsd_file_free(struct nfsd_file *nf)
 		nfsd_file_check_write_error(nf);
 		nfsd_filp_close(nf->nf_file);
 	}
+
+	mutex_lock(&nfsd_file_ffv2_lock);
+	if (!list_empty(&nf->nf_ffv2_live)) {
+		list_del_init(&nf->nf_ffv2_live);
+		gate = nfsd_file_ffv2_find_gate(nf->nf_sb);
+		if (gate && WARN_ON_ONCE(!gate->live))
+			gate = NULL;
+		if (gate && !--gate->live)
+			wake_up_all(&gate->wait);
+	}
+	mutex_unlock(&nfsd_file_ffv2_lock);
 
 	/*
 	 * If this item is still linked via nf_lru, that's a bug.
@@ -651,6 +701,87 @@ nfsd_file_cond_queue(struct nfsd_file *nf, struct list_head *dispose)
 		trace_nfsd_file_closing(nf);
 	}
 }
+
+int nfsd_file_ffv2_gate_begin(struct nfsd_file_ffv2_gate *gate,
+			      struct super_block *sb)
+{
+	struct rhashtable_iter iter;
+	struct nfsd_file *nf;
+	LIST_HEAD(dispose);
+
+	INIT_LIST_HEAD(&gate->list);
+	init_waitqueue_head(&gate->wait);
+	gate->sb = sb;
+	gate->live = 0;
+
+	mutex_lock(&nfsd_file_ffv2_lock);
+	if (nfsd_file_ffv2_find_gate(sb)) {
+		mutex_unlock(&nfsd_file_ffv2_lock);
+		return -EBUSY;
+	}
+	list_for_each_entry(nf, &nfsd_file_ffv2_live, nf_ffv2_live)
+		if (nf->nf_sb == sb)
+			gate->live++;
+	list_add_tail_rcu(&gate->list, &nfsd_file_ffv2_gates);
+	mutex_unlock(&nfsd_file_ffv2_lock);
+
+	rhltable_walk_enter(&nfsd_file_rhltable, &iter);
+	do {
+		rhashtable_walk_start(&iter);
+		nf = rhashtable_walk_next(&iter);
+		while (!IS_ERR_OR_NULL(nf)) {
+			if (nf->nf_sb == sb)
+				nfsd_file_cond_queue(nf, &dispose);
+			nf = rhashtable_walk_next(&iter);
+		}
+		rhashtable_walk_stop(&iter);
+	} while (nf == ERR_PTR(-EAGAIN));
+	rhashtable_walk_exit(&iter);
+	nfsd_file_dispose_list(&dispose);
+
+	return 0;
+}
+
+int nfsd_file_ffv2_gate_wait(struct nfsd_file_ffv2_gate *gate)
+{
+	return wait_event_interruptible(gate->wait, !READ_ONCE(gate->live));
+}
+
+void nfsd_file_ffv2_gate_end(struct nfsd_file_ffv2_gate *gate)
+{
+	bool removed = false;
+
+	mutex_lock(&nfsd_file_ffv2_lock);
+	if (!list_empty(&gate->list)) {
+		list_del_rcu(&gate->list);
+		removed = true;
+	}
+	mutex_unlock(&nfsd_file_ffv2_lock);
+	if (removed) {
+		synchronize_rcu();
+		INIT_LIST_HEAD(&gate->list);
+	}
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+int nfsd_file_ffv2_test_cache_start(void)
+{
+	lockdep_assert_held(&nfsd_mutex);
+	if (test_bit(NFSD_FILE_CACHE_UP, &nfsd_file_flags))
+		return -EBUSY;
+	return nfsd_file_cache_init();
+}
+
+struct nfsd_file *nfsd_file_ffv2_test_alloc(struct inode *inode)
+{
+	struct nfsd_file *nf;
+
+	nf = nfsd_file_alloc(&init_net, inode, NFSD_MAY_READ, false);
+	if (nf)
+		clear_bit(NFSD_FILE_HASHED, &nf->nf_flags);
+	return nf;
+}
+#endif
 
 /**
  * nfsd_file_queue_for_close: try to close out any open nfsd_files for an inode
@@ -1043,6 +1174,9 @@ nfsd_file_lookup_locked(const struct net *net, const struct cred *cred,
 {
 	struct rhlist_head *tmp, *list;
 	struct nfsd_file *nf;
+
+	if (nfsd_file_ffv2_blocked(inode->i_sb))
+		return NULL;
 
 	list = rhltable_lookup(&nfsd_file_rhltable, &inode,
 			       nfsd_file_rhash_params);

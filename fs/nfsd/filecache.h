@@ -3,6 +3,13 @@
 
 #include <linux/fsnotify_backend.h>
 
+struct nfsd_file_ffv2_gate {
+	struct list_head	list;
+	struct super_block *sb;
+	wait_queue_head_t wait;
+	unsigned int	live;
+};
+
 /*
  * Limit the time that the list_lru_one lock is held during
  * an LRU scan.
@@ -52,6 +59,8 @@ struct nfsd_file {
 	struct nfsd_file_mark	*nf_mark;
 	struct list_head	nf_lru;
 	struct list_head	nf_gc;
+	struct list_head	nf_ffv2_live;
+	struct super_block	*nf_sb;
 	struct rcu_head		nf_rcu;
 	ktime_t			nf_birthtime;
 
@@ -72,6 +81,10 @@ struct file *nfsd_file_file(struct nfsd_file *nf);
 void nfsd_file_close_inode_sync(struct inode *inode);
 void nfsd_file_close_export(struct net *net, const struct path *path);
 void nfsd_file_net_dispose(struct nfsd_net *nn);
+int nfsd_file_ffv2_gate_begin(struct nfsd_file_ffv2_gate *gate,
+			      struct super_block *sb);
+int nfsd_file_ffv2_gate_wait(struct nfsd_file_ffv2_gate *gate);
+void nfsd_file_ffv2_gate_end(struct nfsd_file_ffv2_gate *gate);
 bool nfsd_file_is_cached(struct inode *inode);
 __be32 nfsd_file_acquire_gc(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		  unsigned int may_flags, struct nfsd_file **nfp);
@@ -86,4 +99,9 @@ __be32 nfsd_file_acquire_local(struct net *net, struct svc_cred *cred,
 __be32 nfsd_file_acquire_dir(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		  struct nfsd_file **pnf);
 int nfsd_file_cache_stats_show(struct seq_file *m, void *v);
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+int nfsd_file_ffv2_test_cache_start(void);
+struct nfsd_file *nfsd_file_ffv2_test_alloc(struct inode *inode);
+#endif
 #endif /* _FS_NFSD_FILECACHE_H */

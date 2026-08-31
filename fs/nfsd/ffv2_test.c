@@ -15,6 +15,7 @@
 
 #include "ffv2.h"
 #include "export.h"
+#include "filecache.h"
 #include "nfsd.h"
 #include "nfsfh.h"
 #include "netns.h"
@@ -1494,6 +1495,54 @@ static void nfsd_ffv2_filehandle_format_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
 }
 
+static void nfsd_ffv2_filecache_gate_test(struct kunit *test)
+{
+	struct nfsd_file_ffv2_gate gate;
+	struct nfsd_file *blocked, *nf;
+	struct inode *inode;
+	struct path root;
+	int error;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_file_ffv2_test_cache_start();
+	mutex_unlock(&nfsd_mutex);
+	if (error) {
+		KUNIT_FAIL(test, "failed to start test filecache: %d", error);
+		return;
+	}
+	get_fs_root(current->fs, &root);
+	inode = d_inode(root.dentry);
+	nf = nfsd_file_ffv2_test_alloc(inode);
+	if (!nf) {
+		KUNIT_FAIL(test, "failed to allocate test nfsd_file");
+		goto out_root;
+	}
+	error = nfsd_file_ffv2_gate_begin(&gate, inode->i_sb);
+	if (error) {
+		KUNIT_FAIL(test, "failed to install filecache gate: %d", error);
+		nfsd_file_put(nf);
+		goto out_root;
+	}
+	KUNIT_EXPECT_EQ(test, gate.live, 1U);
+	blocked = nfsd_file_ffv2_test_alloc(inode);
+	KUNIT_EXPECT_PTR_EQ(test, blocked, NULL);
+	if (blocked)
+		nfsd_file_put(blocked);
+	nfsd_file_put(nf);
+	KUNIT_EXPECT_EQ(test, nfsd_file_ffv2_gate_wait(&gate), 0);
+	KUNIT_EXPECT_EQ(test, gate.live, 0U);
+	nfsd_file_ffv2_gate_end(&gate);
+	nf = nfsd_file_ffv2_test_alloc(inode);
+	KUNIT_EXPECT_NOT_NULL(test, nf);
+	if (nf)
+		nfsd_file_put(nf);
+out_root:
+	path_put(&root);
+	mutex_lock(&nfsd_mutex);
+	nfsd_file_cache_shutdown();
+	mutex_unlock(&nfsd_mutex);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -1510,6 +1559,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_reservation_context_test),
 	KUNIT_CASE(nfsd_ffv2_export_update_stop_test),
 	KUNIT_CASE(nfsd_ffv2_filehandle_format_test),
+	KUNIT_CASE(nfsd_ffv2_filecache_gate_test),
 	{}
 };
 
