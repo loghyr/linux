@@ -1785,6 +1785,73 @@ svc_export_update(struct svc_export *new, struct svc_export *old)
 /* Serialize lookup and replacement so policy never validates a stale item. */
 static DEFINE_MUTEX(nfsd_export_update_lock);
 
+struct svc_export *
+nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
+			const struct path *path)
+{
+	struct svc_export key = {
+		.cd = cd,
+		.ex_client = client,
+		.ex_path = *path,
+	};
+	struct svc_export *exp;
+	int error;
+
+	mutex_lock(&nfsd_export_update_lock);
+	exp = svc_export_lookup(&key);
+	if (!exp) {
+		exp = ERR_PTR(-ENOMEM);
+		goto out_unlock;
+	}
+	error = cache_check(cd, &exp->h, NULL);
+	if (error) {
+		exp = ERR_PTR(error);
+		goto out_unlock;
+	}
+	if (!exp->ex_uuid ||
+	    (exp->ex_flags & NFSEXP_V4ROOT) ||
+	    ((exp->ex_flags & NFSEXP_FSID) && !exp->ex_fsid)) {
+		error = -EINVAL;
+		goto out_put;
+	}
+	error = nfsd_ffv2_export_transition_begin(exp);
+	if (error)
+		goto out_put;
+	mutex_unlock(&nfsd_export_update_lock);
+	return exp;
+
+out_put:
+	exp_put(exp);
+	exp = ERR_PTR(error);
+out_unlock:
+	mutex_unlock(&nfsd_export_update_lock);
+	return exp;
+}
+
+bool nfsd_ffv2_export_is_current(struct svc_export *exp)
+{
+	bool is_current;
+
+	mutex_lock(&nfsd_export_update_lock);
+	is_current = sunrpc_cache_is_current(exp->cd, &exp->h, &exp->h,
+					     svc_export_hash(exp));
+	mutex_unlock(&nfsd_export_update_lock);
+	return is_current;
+}
+
+bool nfsd_ffv2_export_transition_abort_exact(struct svc_export *exp)
+{
+	bool is_current;
+
+	mutex_lock(&nfsd_export_update_lock);
+	is_current = sunrpc_cache_is_current(exp->cd, &exp->h, &exp->h,
+					     svc_export_hash(exp));
+	if (is_current)
+		nfsd_ffv2_export_transition_abort(exp);
+	mutex_unlock(&nfsd_export_update_lock);
+	return is_current;
+}
+
 struct svc_export *nfsd_export_cache_update(struct svc_export *new)
 {
 	struct nfsd_ffv2_export_update update;

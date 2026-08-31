@@ -1201,6 +1201,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct auth_domain *domain;
 	struct svc_export *published;
 	struct svc_export *replacement;
+	struct svc_export *selected;
 	struct svc_export *stale;
 	struct svc_export exp;
 	struct nfsd_net *nn;
@@ -1247,10 +1248,17 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, error, -EOPNOTSUPP);
 
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	exp.ex_uuid = kmemdup(uuid, sizeof(uuid), GFP_KERNEL);
+	if (!exp.ex_uuid) {
+		KUNIT_FAIL(test, "failed to allocate test export UUID");
+		goto out_root;
+	}
 	published = nfsd_export_cache_update(&exp);
 	if (IS_ERR(published)) {
 		KUNIT_FAIL(test, "real inventory publication failed: %ld",
 			   PTR_ERR(published));
+		kfree(exp.ex_uuid);
+		exp.ex_uuid = NULL;
 		goto out_root;
 	}
 	error = nfsd_ffv2_export_access_get(published);
@@ -1259,17 +1267,21 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		exp_put(published);
 		goto out_root;
 	}
-	error = nfsd_ffv2_export_transition_begin(published);
-	if (error) {
-		KUNIT_FAIL(test, "ordinary export transition failed: %d", error);
+	selected = nfsd_ffv2_export_select(nn->svc_export_cache, domain, &root);
+	if (IS_ERR(selected)) {
+		KUNIT_FAIL(test, "ordinary export selection failed: %ld",
+			   PTR_ERR(selected));
 		nfsd_ffv2_export_access_put(published);
 		exp_put(published);
 		goto out_root;
 	}
+	KUNIT_EXPECT_PTR_EQ(test, selected, published);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_get(published), -ESTALE);
 	nfsd_ffv2_export_access_put(published);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_wait(published), 0);
-	nfsd_ffv2_export_transition_abort(published);
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_export_transition_abort_exact(published));
+	exp_put(selected);
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	replacement = nfsd_ffv2_test_export_update_exact(&exp, published);
 	if (IS_ERR(replacement)) {

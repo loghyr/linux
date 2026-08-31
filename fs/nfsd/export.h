@@ -98,6 +98,11 @@ struct svc_export {
 };
 
 struct svc_export *nfsd_export_cache_update(struct svc_export *new);
+struct svc_export *
+nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
+			const struct path *path);
+bool nfsd_ffv2_export_is_current(struct svc_export *exp);
+bool nfsd_ffv2_export_transition_abort_exact(struct svc_export *exp);
 int nfsd_ffv2_export_access_get(struct svc_export *exp);
 int nfsd_ffv2_export_access_clone(struct svc_export *exp);
 void nfsd_ffv2_export_access_put(struct svc_export *exp);
