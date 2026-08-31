@@ -40,6 +40,8 @@
 #include <linux/seq_file.h>
 #include <linux/rhashtable.h>
 #include <linux/nfslocalio.h>
+#include <linux/sched/task.h>
+#include <linux/stacktrace.h>
 
 #include "vfs.h"
 #include "nfsd.h"
@@ -256,6 +258,12 @@ nfsd_file_alloc(struct net *net, struct inode *inode, unsigned char need,
 		BIT(NFSD_FILE_HASHED) | BIT(NFSD_FILE_PENDING);
 	nf->nf_inode = inode;
 	nf->nf_sb = inode->i_sb;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+	nf->nf_ffv2_ino = inode->i_ino;
+	nf->nf_ffv2_alloc_pid = task_pid_nr(current);
+	strscpy(nf->nf_ffv2_alloc_comm, current->comm,
+		sizeof(nf->nf_ffv2_alloc_comm));
+#endif
 	refcount_set(&nf->nf_ref, 1);
 	nf->nf_may = need;
 	nf->nf_mark = NULL;
@@ -335,8 +343,14 @@ nfsd_file_free(struct nfsd_file *nf)
 		gate = nfsd_file_ffv2_find_gate(nf->nf_sb);
 		if (gate && WARN_ON_ONCE(!gate->live))
 			gate = NULL;
-		if (gate && !--gate->live)
-			wake_up_all(&gate->wait);
+		if (gate) {
+			gate->live--;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+			trace_nfsd_ffv2_file_gate(gate, READ_ONCE(gate->phase), nf);
+#endif
+			if (!gate->live)
+				wake_up_all(&gate->wait);
+		}
 	}
 	mutex_unlock(&nfsd_file_ffv2_lock);
 
@@ -703,8 +717,9 @@ nfsd_file_cond_queue(struct nfsd_file *nf, struct list_head *dispose)
 }
 
 int nfsd_file_ffv2_gate_begin(struct nfsd_file_ffv2_gate *gate,
-			      struct super_block *sb)
+			      struct inode *export_inode)
 {
+	struct super_block *sb = export_inode->i_sb;
 	struct rhashtable_iter iter;
 	struct nfsd_file *nf;
 	LIST_HEAD(dispose);
@@ -713,16 +728,28 @@ int nfsd_file_ffv2_gate_begin(struct nfsd_file_ffv2_gate *gate,
 	init_waitqueue_head(&gate->wait);
 	gate->sb = sb;
 	gate->live = 0;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+	gate->task = NULL;
+#endif
 
 	mutex_lock(&nfsd_file_ffv2_lock);
 	if (nfsd_file_ffv2_find_gate(sb)) {
 		mutex_unlock(&nfsd_file_ffv2_lock);
 		return -EBUSY;
 	}
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+	gate->task = current;
+	get_task_struct(gate->task);
+	gate->export_ino = export_inode->i_ino;
+	gate->phase = NFSD_FILE_FFV2_GATE_BEGIN;
+#endif
 	list_for_each_entry(nf, &nfsd_file_ffv2_live, nf_ffv2_live)
 		if (nf->nf_sb == sb)
 			gate->live++;
 	list_add_tail_rcu(&gate->list, &nfsd_file_ffv2_gates);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+	trace_nfsd_ffv2_file_gate(gate, NFSD_FILE_FFV2_GATE_BEGIN, NULL);
+#endif
 	mutex_unlock(&nfsd_file_ffv2_lock);
 
 	rhltable_walk_enter(&nfsd_file_rhltable, &iter);
@@ -760,8 +787,96 @@ void nfsd_file_ffv2_gate_end(struct nfsd_file_ffv2_gate *gate)
 	if (removed) {
 		synchronize_rcu();
 		INIT_LIST_HEAD(&gate->list);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+		put_task_struct(gate->task);
+		gate->task = NULL;
+#endif
 	}
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+static const char *nfsd_file_ffv2_gate_phase_name(unsigned int phase)
+{
+	switch (phase) {
+	case NFSD_FILE_FFV2_GATE_BEGIN:
+		return "begin";
+	case NFSD_FILE_FFV2_GATE_INVALIDATE:
+		return "invalidate";
+	case NFSD_FILE_FFV2_GATE_INVALIDATED:
+		return "invalidated";
+	case NFSD_FILE_FFV2_GATE_WAIT:
+		return "wait";
+	case NFSD_FILE_FFV2_GATE_DRAINED:
+		return "drained";
+	case NFSD_FILE_FFV2_GATE_PRE_PUBLISH:
+		return "pre_publish";
+	case NFSD_FILE_FFV2_GATE_ROLLBACK:
+		return "rollback";
+	default:
+		return "unknown";
+	}
+}
+
+static const char *nfsd_file_ffv2_owner_name(const struct nfsd_file *nf)
+{
+	if (nf->nf_may & NFSD_MAY_LOCALIO)
+		return "localio";
+	if (!test_bit(NFSD_FILE_GC, &nf->nf_flags))
+		return "nfs4_state";
+	return "nfsd_file";
+}
+
+void nfsd_file_ffv2_gate_phase(struct nfsd_file_ffv2_gate *gate,
+			       unsigned int phase)
+{
+	WRITE_ONCE(gate->phase, phase);
+	trace_nfsd_ffv2_file_gate(gate, phase, NULL);
+}
+
+int nfsd_file_ffv2_gate_diag_show(struct seq_file *m, void *v)
+{
+	struct nfsd_file_ffv2_gate *gate;
+	struct nfsd_file *nf;
+	unsigned long entries[8];
+	unsigned int nr_entries;
+	unsigned int i;
+	char comm[TASK_COMM_LEN];
+
+	mutex_lock(&nfsd_file_ffv2_lock);
+	list_for_each_entry(gate, &nfsd_file_ffv2_gates, list) {
+		get_task_comm(comm, gate->task);
+		seq_printf(m,
+			   "gate dev=%u:%u magic=%lx export_ino=%llu pid=%d comm=%s phase=%s live=%u\n",
+			   MAJOR(gate->sb->s_dev), MINOR(gate->sb->s_dev),
+			   gate->sb->s_magic, gate->export_ino,
+			   task_pid_nr(gate->task), comm,
+			   nfsd_file_ffv2_gate_phase_name(gate->phase),
+			   gate->live);
+		nr_entries = stack_trace_save_tsk(gate->task, entries,
+						  ARRAY_SIZE(entries), 0);
+		for (i = 0; i < nr_entries; i++)
+			seq_printf(m, "stack[%u]=%pS\n", i,
+				   (void *)entries[i]);
+		list_for_each_entry(nf, &nfsd_file_ffv2_live, nf_ffv2_live) {
+			s64 age;
+
+			if (nf->nf_sb != gate->sb)
+				continue;
+			age = ktime_to_ms(ktime_sub(ktime_get(), nf->nf_birthtime));
+			seq_printf(m,
+				   "owner=%s ino=%llu ref=%u flags=%lx may=%x alloc_pid=%d alloc_comm=%s age_ms=%lld\n",
+				   nfsd_file_ffv2_owner_name(nf),
+				   nf->nf_ffv2_ino,
+				   refcount_read(&nf->nf_ref), nf->nf_flags,
+				   nf->nf_may, nf->nf_ffv2_alloc_pid,
+				   nf->nf_ffv2_alloc_comm,
+				   age);
+		}
+	}
+	mutex_unlock(&nfsd_file_ffv2_lock);
+	return 0;
+}
+#endif
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 int nfsd_file_ffv2_test_cache_start(void)

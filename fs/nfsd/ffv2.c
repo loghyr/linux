@@ -252,6 +252,7 @@ int
 nfsd_ffv2_reservation_gate_io(struct nfsd_ffv2_reservation *reservation)
 {
 	struct nfsd_ffv2_participant_snapshot *snapshots = NULL;
+	struct nfsd_file_ffv2_gate *file_gate = &reservation->file_gate;
 	unsigned int count = 0;
 #if IS_ENABLED(CONFIG_NFS_LOCALIO)
 	unsigned int i;
@@ -269,8 +270,7 @@ nfsd_ffv2_reservation_gate_io(struct nfsd_ffv2_reservation *reservation)
 	if (error)
 		goto out_unlock;
 	reservation->nlm_gated = true;
-	error = nfsd_file_ffv2_gate_begin(&reservation->file_gate,
-					  reservation->sb);
+	error = nfsd_file_ffv2_gate_begin(file_gate, reservation->inode);
 	if (error)
 		goto out_ungate;
 	reservation->file_gated = true;
@@ -282,21 +282,27 @@ nfsd_ffv2_reservation_gate_io(struct nfsd_ffv2_reservation *reservation)
 	for (i = 0; i < count; i++) {
 		struct nfsd_net *nn = net_generic(snapshots[i].net, nfsd_net_id);
 
+		nfsd_file_ffv2_gate_phase(file_gate, NFSD_FILE_FFV2_GATE_INVALIDATE);
 		nfs_localio_invalidate_clients(&nn->local_clients,
 					       &nn->local_clients_lock);
+		nfsd_file_ffv2_gate_phase(file_gate, NFSD_FILE_FFV2_GATE_INVALIDATED);
 	}
 #endif
 	nfsd_ffv2_release_snapshots(snapshots, count);
 	snapshots = NULL;
 	count = 0;
-	error = nfsd_file_ffv2_gate_wait(&reservation->file_gate);
+	nfsd_file_ffv2_gate_phase(file_gate, NFSD_FILE_FFV2_GATE_WAIT);
+	error = nfsd_file_ffv2_gate_wait(file_gate);
 	if (error)
 		goto out_ungate;
+	nfsd_file_ffv2_gate_phase(file_gate, NFSD_FILE_FFV2_GATE_DRAINED);
 	mutex_unlock(&reservation->entry_lock);
 	return 0;
 
 out_ungate:
 	nfsd_ffv2_release_snapshots(snapshots, count);
+	if (reservation->file_gated)
+		nfsd_file_ffv2_gate_phase(file_gate, NFSD_FILE_FFV2_GATE_ROLLBACK);
 	nfsd_ffv2_reservation_ungate_io(reservation);
 out_unlock:
 	mutex_unlock(&reservation->entry_lock);
@@ -562,6 +568,8 @@ nfsd_ffv2_reservation_claim_expected(struct nfsd_net *owner,
 void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation)
 {
 	mutex_lock(&reservation->entry_lock);
+	if (reservation->file_gated)
+		nfsd_file_ffv2_gate_phase(&reservation->file_gate, NFSD_FILE_FFV2_GATE_ROLLBACK);
 	mutex_lock(&nfsd_ffv2_registry_lock);
 	if (!list_empty(&reservation->node))
 		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_QUIESCING);
@@ -837,6 +845,8 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 	}
 	context->owner_generation = prepared_generation;
 	nfsd_ffv2_service_context_prepare_export(context, exp);
+	if (reservation->file_gated)
+		nfsd_file_ffv2_gate_phase(&reservation->file_gate, NFSD_FILE_FFV2_GATE_PRE_PUBLISH);
 	error = nfsd_ffv2_live_test_checkpoint(NFSD_FFV2_LIVE_TEST_PRE_PUBLISH,
 					       expected ?: exp);
 	if (error) {

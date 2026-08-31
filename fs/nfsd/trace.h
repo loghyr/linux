@@ -1113,6 +1113,66 @@ DEFINE_CLID_EVENT(confirmed_r);
 		{ 1 << NFSD_FILE_RECENT,	"RECENT" },		\
 		{ 1 << NFSD_FILE_GC,		"GC" })
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+#define show_ffv2_file_gate_phase(val)					\
+	__print_symbolic(val,						\
+		{ NFSD_FILE_FFV2_GATE_BEGIN,		"begin" },	\
+		{ NFSD_FILE_FFV2_GATE_INVALIDATE,	"invalidate" },	\
+		{ NFSD_FILE_FFV2_GATE_INVALIDATED,	"invalidated" },	\
+		{ NFSD_FILE_FFV2_GATE_WAIT,		"wait" },	\
+		{ NFSD_FILE_FFV2_GATE_DRAINED,		"drained" },	\
+		{ NFSD_FILE_FFV2_GATE_PRE_PUBLISH,	"pre_publish" },\
+		{ NFSD_FILE_FFV2_GATE_ROLLBACK,		"rollback" })
+
+TRACE_EVENT(nfsd_ffv2_file_gate,
+	TP_PROTO(const struct nfsd_file_ffv2_gate *gate,
+		 unsigned int phase, const struct nfsd_file *nf),
+	TP_ARGS(gate, phase, nf),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(u64, export_ino)
+		__field(pid_t, registration_pid)
+		__field(unsigned int, phase)
+		__field(unsigned int, live)
+		__field(u64, owner_ino)
+		__field(unsigned int, owner_ref)
+		__field(unsigned long, owner_flags)
+		__field(unsigned long, owner_may)
+		__field(pid_t, owner_alloc_pid)
+		__array(char, owner_alloc_comm, 16)
+	),
+	TP_fast_assign(
+		__entry->dev = gate->sb->s_dev;
+		__entry->export_ino = gate->export_ino;
+		__entry->registration_pid = task_pid_nr(gate->task);
+		__entry->phase = phase;
+		__entry->live = gate->live;
+		__entry->owner_ino = nf ? nf->nf_ffv2_ino : 0;
+		__entry->owner_ref = nf ? refcount_read(&nf->nf_ref) : 0;
+		__entry->owner_flags = nf ? nf->nf_flags : 0;
+		__entry->owner_may = nf ? nf->nf_may : 0;
+		__entry->owner_alloc_pid = nf ? nf->nf_ffv2_alloc_pid : 0;
+		if (nf)
+			memcpy(__entry->owner_alloc_comm, nf->nf_ffv2_alloc_comm,
+			       sizeof(__entry->owner_alloc_comm));
+		else
+			__entry->owner_alloc_comm[0] = '\0';
+	),
+	TP_printk("dev=%u:%u export_ino=%llu registration_pid=%d phase=%s live=%u owner=%s owner_ino=%llu owner_ref=%u owner_flags=%s owner_may=%s owner_alloc_pid=%d owner_alloc_comm=%s",
+		MAJOR(__entry->dev), MINOR(__entry->dev),
+		__entry->export_ino, __entry->registration_pid,
+		show_ffv2_file_gate_phase(__entry->phase), __entry->live,
+		__entry->owner_may & NFSD_MAY_LOCALIO ? "localio" :
+			(__entry->owner_ino ?
+			 (__entry->owner_flags & BIT(NFSD_FILE_GC) ?
+			  "nfsd_file" : "nfs4_state") : "none"),
+		__entry->owner_ino, __entry->owner_ref,
+		show_nf_flags(__entry->owner_flags),
+		show_nfsd_may_flags(__entry->owner_may),
+		__entry->owner_alloc_pid, __entry->owner_alloc_comm)
+);
+#endif
+
 DECLARE_EVENT_CLASS(nfsd_file_class,
 	TP_PROTO(struct nfsd_file *nf),
 	TP_ARGS(nf),

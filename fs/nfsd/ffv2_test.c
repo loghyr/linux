@@ -2044,7 +2044,7 @@ static void nfsd_ffv2_filecache_gate_test(struct kunit *test)
 		KUNIT_FAIL(test, "failed to allocate test nfsd_file");
 		goto out_root;
 	}
-	error = nfsd_file_ffv2_gate_begin(&gate, inode->i_sb);
+	error = nfsd_file_ffv2_gate_begin(&gate, inode);
 	if (error) {
 		KUNIT_FAIL(test, "failed to install filecache gate: %d", error);
 		nfsd_file_put(nf);

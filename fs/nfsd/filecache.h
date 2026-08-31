@@ -3,11 +3,29 @@
 
 #include <linux/fsnotify_backend.h>
 
+struct seq_file;
+struct task_struct;
+
+enum nfsd_file_ffv2_gate_phase {
+	NFSD_FILE_FFV2_GATE_BEGIN,
+	NFSD_FILE_FFV2_GATE_INVALIDATE,
+	NFSD_FILE_FFV2_GATE_INVALIDATED,
+	NFSD_FILE_FFV2_GATE_WAIT,
+	NFSD_FILE_FFV2_GATE_DRAINED,
+	NFSD_FILE_FFV2_GATE_PRE_PUBLISH,
+	NFSD_FILE_FFV2_GATE_ROLLBACK,
+};
+
 struct nfsd_file_ffv2_gate {
 	struct list_head	list;
 	struct super_block *sb;
 	wait_queue_head_t wait;
 	unsigned int	live;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+	struct task_struct *task;
+	u64		export_ino;
+	unsigned int	phase;
+#endif
 };
 
 /*
@@ -61,6 +79,11 @@ struct nfsd_file {
 	struct list_head	nf_gc;
 	struct list_head	nf_ffv2_live;
 	struct super_block	*nf_sb;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+	u64			nf_ffv2_ino;
+	pid_t			nf_ffv2_alloc_pid;
+	char			nf_ffv2_alloc_comm[16];
+#endif
 	struct rcu_head		nf_rcu;
 	ktime_t			nf_birthtime;
 
@@ -82,9 +105,20 @@ void nfsd_file_close_inode_sync(struct inode *inode);
 void nfsd_file_close_export(struct net *net, const struct path *path);
 void nfsd_file_net_dispose(struct nfsd_net *nn);
 int nfsd_file_ffv2_gate_begin(struct nfsd_file_ffv2_gate *gate,
-			      struct super_block *sb);
+			      struct inode *export_inode);
 int nfsd_file_ffv2_gate_wait(struct nfsd_file_ffv2_gate *gate);
 void nfsd_file_ffv2_gate_end(struct nfsd_file_ffv2_gate *gate);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+void nfsd_file_ffv2_gate_phase(struct nfsd_file_ffv2_gate *gate,
+			       unsigned int phase);
+int nfsd_file_ffv2_gate_diag_show(struct seq_file *m, void *v);
+#else
+static inline void
+nfsd_file_ffv2_gate_phase(struct nfsd_file_ffv2_gate *gate,
+			  unsigned int phase)
+{
+}
+#endif
 bool nfsd_file_is_cached(struct inode *inode);
 __be32 nfsd_file_acquire_gc(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		  unsigned int may_flags, struct nfsd_file **nfp);
