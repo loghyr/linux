@@ -27,6 +27,14 @@ struct nfsd_ffv2_unregister_ctx {
 	struct completion done;
 };
 
+struct nfsd_ffv2_object_unregister_ctx {
+	struct nfsd_net	*nn;
+	u64		generation;
+	u8		object_uuid[16];
+	int		result;
+	struct completion done;
+};
+
 struct nfsd_ffv2_exit_ctx {
 	struct nfsd_net	*nn;
 	struct completion done;
@@ -367,6 +375,43 @@ static int nfsd_ffv2_unregister_thread(void *data)
 	complete(&ctx->done);
 	nfsd_ffv2_test_thread_park();
 	return 0;
+}
+
+static int nfsd_ffv2_object_unregister_thread(void *data)
+{
+	struct nfsd_ffv2_object_unregister_ctx *ctx = data;
+
+	mutex_lock(&nfsd_mutex);
+	ctx->result = nfsd_ffv2_object_unregister(ctx->nn, ctx->generation,
+						  ctx->object_uuid);
+	mutex_unlock(&nfsd_mutex);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static bool nfsd_ffv2_test_export_has_context(struct svc_export *exp)
+{
+	bool has_context;
+
+	rcu_read_lock();
+	has_context = rcu_access_pointer(exp->ex_ffv2_context);
+	rcu_read_unlock();
+	return has_context;
+}
+
+static bool
+nfsd_ffv2_test_binding_rejected(struct nfsd_net *nn,
+				const struct nfsd_ffv2_fh_info *info)
+{
+	struct nfsd_ffv2_binding *binding = NULL;
+
+	binding = nfsd_ffv2_test_binding_create(nn, info);
+	if (!IS_ERR(binding)) {
+		nfsd_ffv2_binding_put(binding);
+		return false;
+	}
+	return PTR_ERR(binding) == -ESTALE;
 }
 
 static int nfsd_ffv2_exit_thread(void *data)
@@ -1234,13 +1279,14 @@ static void nfsd_ffv2_init_test_export(struct svc_export *exp,
 
 static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 {
+	struct nfsd_ffv2_object_unregister_ctx retire_ctx = {};
 	struct nfsd_ffv2_transition_publish_ctx publish_ctx = {};
 	struct nfsd_ffv2_object_request request;
 	struct nfsd_ffv2_export_update registration = {};
 	struct nfsd_ffv2_export_update second = {};
 	struct nfsd_ffv2_object *object = NULL;
 	struct nfsd_ffv2_object *published_object = NULL;
-	struct nfsd_ffv2_binding *binding;
+	struct nfsd_ffv2_binding *binding = NULL;
 	struct nfsd_ffv2_fh_info decoded;
 	struct nfsd_ffv2_fh_info wrong;
 	struct nfsd_ffv2_reservation *reservation = NULL;
@@ -1250,7 +1296,12 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct svc_export *replacement;
 	struct svc_export *selected;
 	struct svc_export *stale;
+	struct svc_export *retained = NULL;
 	struct svc_export exp;
+	struct svc_fh *derived;
+	struct svc_fh *duplicate;
+	struct svc_fh *mapped;
+	struct svc_fh *ordinary;
 	struct knfsd_fh outer_fh = {};
 	struct nfsd_net *nn;
 	struct nfsd_net *nn2;
@@ -1262,6 +1313,8 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct net *net;
 	struct net *net2;
 	struct task_struct *publish_task;
+	struct task_struct *retire_task = NULL;
+	struct completion retire_waiting;
 	bool filecache_up = false;
 	bool mount_crossing_allowed;
 	bool registration_open = false;
@@ -1273,8 +1326,17 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	u8 wrong_uuid[16] = { 9 };
 	const u8 inner[] = { 1, 0, 1, 1, 0xaa, 0xbb, 0xcc, 0xdd };
 	u64 generation_id;
+	__be32 status;
 	int error;
 
+	ordinary = kunit_kzalloc(test, sizeof(*ordinary), GFP_KERNEL);
+	derived = kunit_kzalloc(test, sizeof(*derived), GFP_KERNEL);
+	duplicate = kunit_kzalloc(test, sizeof(*duplicate), GFP_KERNEL);
+	mapped = kunit_kzalloc(test, sizeof(*mapped), GFP_KERNEL);
+	if (!ordinary || !derived || !duplicate || !mapped) {
+		KUNIT_FAIL(test, "failed to allocate transition handles");
+		return;
+	}
 	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
 	if (IS_ERR(net)) {
 		KUNIT_FAIL(test, "failed to create reservation test netns: %ld",
@@ -1497,23 +1559,41 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 			   PTR_ERR(selected));
 		goto out_root;
 	}
-	error = nfsd_ffv2_export_access_get(selected);
-	if (error) {
-		KUNIT_FAIL(test, "ordinary export admission failed: %d", error);
+	fh_init(ordinary, NFS4_FHSIZE);
+	status = fh_compose(ordinary, selected, root.dentry, NULL);
+	if (status) {
+		KUNIT_FAIL(test, "ordinary handle composition failed: %u",
+			   be32_to_cpu(status));
 		exp_put(selected);
 		goto out_root;
 	}
 	error = nfsd_ffv2_export_transition_exact(selected);
 	if (error) {
 		KUNIT_FAIL(test, "exact export transition failed: %d", error);
-		nfsd_ffv2_export_access_put(selected);
+		exp_put(selected);
+		goto out_root;
+	}
+	fh_init(derived, NFS4_FHSIZE);
+	status = fh_compose(derived, selected, root.dentry, ordinary);
+	if (status) {
+		KUNIT_FAIL(test, "transition handle composition failed: %u",
+			   be32_to_cpu(status));
+		nfsd_ffv2_export_transition_abort_exact(selected);
+		exp_put(selected);
+		goto out_root;
+	}
+	fh_init(duplicate, NFS4_FHSIZE);
+	status = nfsd_ffv2_test_fh_dup2(duplicate, ordinary);
+	if (status) {
+		KUNIT_FAIL(test, "transition handle duplication failed: %u",
+			   be32_to_cpu(status));
+		nfsd_ffv2_export_transition_abort_exact(selected);
 		exp_put(selected);
 		goto out_root;
 	}
 	error = nfsd_ffv2_export_template_clone(&exp, selected);
 	if (error) {
 		KUNIT_FAIL(test, "service template clone failed: %d", error);
-		nfsd_ffv2_export_access_put(selected);
 		nfsd_ffv2_export_transition_abort_exact(selected);
 		exp_put(selected);
 		goto out_root;
@@ -1525,7 +1605,6 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		KUNIT_FAIL(test, "failed to initialize registry object: %d",
 			   error);
 		nfsd_ffv2_export_template_free(&exp);
-		nfsd_ffv2_export_access_put(selected);
 		nfsd_ffv2_export_transition_abort_exact(selected);
 		exp_put(selected);
 		goto out_root;
@@ -1549,7 +1628,6 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		error = PTR_ERR(publish_task);
 		KUNIT_FAIL(test, "failed to start transition publisher: %d",
 			   error);
-		nfsd_ffv2_export_access_put(selected);
 		put_cred(publish_ctx.cred);
 		nfsd_ffv2_export_template_free(&exp);
 		nfsd_ffv2_export_transition_abort_exact(selected);
@@ -1562,7 +1640,11 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 				  USEC_PER_SEC, false, &root);
 	KUNIT_EXPECT_EQ(test, error, 0);
 	KUNIT_EXPECT_FALSE(test, completion_done(&publish_ctx.done));
-	nfsd_ffv2_export_access_put(selected);
+	fh_put(ordinary);
+	KUNIT_EXPECT_FALSE(test, completion_done(&publish_ctx.done));
+	fh_put(derived);
+	KUNIT_EXPECT_FALSE(test, completion_done(&publish_ctx.done));
+	fh_put(duplicate);
 	KUNIT_EXPECT_NE(test,
 			wait_for_completion_timeout(&publish_ctx.done, 5 * HZ),
 			0UL);
@@ -1593,14 +1675,15 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, IS_ERR(binding));
 	if (!IS_ERR(binding))
 		nfsd_ffv2_binding_put(binding);
+	binding = NULL;
 	binding = nfsd_ffv2_test_binding_create(nn, &decoded);
 	if (IS_ERR(binding)) {
 		KUNIT_FAIL(test, "binding admission failed: %ld",
 			   PTR_ERR(binding));
+		binding = NULL;
 		goto out_root;
 	}
 	nfsd_ffv2_binding_get(binding);
-	nfsd_ffv2_binding_put(binding);
 	nfsd_ffv2_binding_put(binding);
 	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
@@ -1612,8 +1695,31 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			nfsd4_ffv2_export_policy_check(published, OP_GETATTR),
 			nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(published, OP_PUTFH),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(published, OP_PUTROOTFH),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(published, OP_PUTPUBFH),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(published, OP_SAVEFH),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(published, OP_RESTOREFH),
+			nfs_ok);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_get(published), -ESTALE);
-	exp_put(published);
+
+	/* Model a successfully mapped handle retaining both owners. */
+	fh_init(mapped, NFS4_FHSIZE);
+	mapped->fh_handle = outer_fh;
+	mapped->fh_export = nfsd_export_get(published);
+	mapped->fh_dentry = dget(object_dentry);
+	mapped->fh_ffv2_binding = binding;
+	binding = NULL;
+	retained = published;
 
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	published = nfsd_export_cache_update(&exp);
@@ -1635,9 +1741,70 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	mutex_lock(&nfsd_mutex);
 	error = nfsd_ffv2_object_unregister(nn, generation_id, wrong_uuid);
 	KUNIT_EXPECT_EQ(test, error, -ENOENT);
-	error = nfsd_ffv2_object_unregister(nn, generation_id, uuid);
 	mutex_unlock(&nfsd_mutex);
+	retire_ctx.nn = nn;
+	retire_ctx.generation = generation_id;
+	memcpy(retire_ctx.object_uuid, uuid, sizeof(uuid));
+	retire_ctx.result = -EINPROGRESS;
+	init_completion(&retire_ctx.done);
+	init_completion(&retire_waiting);
+	error = nfsd_ffv2_test_retire_waiting(nn, generation_id,
+					      &retire_waiting);
+	if (error) {
+		KUNIT_FAIL(test, "failed to arm retirement wait: %d", error);
+		goto out_root;
+	}
+	retire_task = kthread_run(nfsd_ffv2_object_unregister_thread,
+				  &retire_ctx, "nfsd-ffv2-object-retire");
+	if (IS_ERR(retire_task)) {
+		error = PTR_ERR(retire_task);
+		retire_task = NULL;
+		nfsd_ffv2_test_retire_waiting(nn, generation_id, NULL);
+		KUNIT_FAIL(test, "failed to start object retirement: %d", error);
+		goto out_root;
+	}
+	KUNIT_EXPECT_NE(test,
+			wait_for_completion_timeout(&retire_waiting, 5 * HZ),
+			0UL);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_binding_rejected(nn, &decoded));
+	KUNIT_EXPECT_FALSE(test, completion_done(&retire_ctx.done));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_export_has_context(retained));
+
+	/* The binding admission must delay payload release. */
+	fh_put(mapped);
+	error = read_poll_timeout(nfsd_ffv2_test_export_has_context,
+				  mount_crossing_allowed,
+				  !mount_crossing_allowed, 10,
+				  USEC_PER_SEC, false, retained);
 	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&retire_ctx.done));
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(retained, OP_GETATTR),
+			nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(retained, OP_PUTFH),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(retained, OP_PUTROOTFH),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(retained, OP_PUTPUBFH),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(retained, OP_SAVEFH),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(retained, OP_RESTOREFH),
+			nfs_ok);
+	exp_put(retained);
+	retained = NULL;
+	if (!wait_for_completion_timeout(&retire_ctx.done, 5 * HZ)) {
+		KUNIT_FAIL(test, "object retirement did not complete");
+		goto out_root;
+	}
+	kthread_stop(retire_task);
+	retire_task = NULL;
+	KUNIT_EXPECT_EQ(test, retire_ctx.result, 0);
 	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
 	published = nfsd_export_cache_update(&exp);
 	KUNIT_EXPECT_FALSE(test, IS_ERR(published));
@@ -1681,6 +1848,22 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	goto out_root;
 
 out_root:
+	if (retire_task) {
+		fh_put(mapped);
+		if (retained) {
+			exp_put(retained);
+			retained = NULL;
+		}
+		kthread_stop(retire_task);
+	}
+	if (binding)
+		nfsd_ffv2_binding_put(binding);
+	if (retained)
+		exp_put(retained);
+	fh_put(mapped);
+	fh_put(duplicate);
+	fh_put(derived);
+	fh_put(ordinary);
 	nfsd_ffv2_object_free(object);
 	nfsd_ffv2_object_free(published_object);
 	if (registration_open)
@@ -1783,6 +1966,8 @@ out_root:
 static void nfsd_ffv2_filehandle_format_test(struct kunit *test)
 {
 	const u8 inner[] = { 1, 0, 1, 1, 0xaa, 0xbb, 0xcc, 0xdd };
+	const u8 unaligned_inner[] = { 1, 0, 1, 1, 0xaa, 0xbb, 0xcc,
+				       0xdd, 0xee };
 	struct nfsd_ffv2_fh_info encoded = {
 		.generation = 7,
 		.object_uuid = { 1 },
@@ -1804,6 +1989,12 @@ static void nfsd_ffv2_filehandle_format_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, decoded.export_uuid, encoded.export_uuid, 16);
 	KUNIT_EXPECT_MEMEQ(test, decoded.inner, inner, sizeof(inner));
 
+	encoded.inner = unaligned_inner;
+	encoded.inner_len = sizeof(unaligned_inner);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_encode(&fh, &encoded), -EINVAL);
+	encoded.inner = inner;
+	encoded.inner_len = sizeof(inner);
+
 	saved = fh.fh_raw[0];
 	fh.fh_raw[0] = 1;
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
@@ -1819,6 +2010,10 @@ static void nfsd_ffv2_filehandle_format_test(struct kunit *test)
 	fh.fh_size = NFSD_FFV2_FH_HEADER_SIZE + 4;
 	put_unaligned_be16(fh.fh_size, fh.fh_raw + 12);
 	put_unaligned_be16(4, fh.fh_raw + 14);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
+	fh.fh_size = NFSD_FFV2_FH_HEADER_SIZE + sizeof(unaligned_inner);
+	put_unaligned_be16(fh.fh_size, fh.fh_raw + 12);
+	put_unaligned_be16(sizeof(unaligned_inner), fh.fh_raw + 14);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
 }
 

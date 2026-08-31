@@ -143,7 +143,7 @@ static inline __be32
 fh_dup2(struct svc_fh *dst, struct svc_fh *src)
 {
 	if (src->fh_ffv2_admitted &&
-	    nfsd_ffv2_export_access_get(src->fh_export))
+	    nfsd_ffv2_export_access_clone(src->fh_export))
 		return nfserr_stale;
 	if (src->fh_ffv2_binding)
 		nfsd_ffv2_binding_get(src->fh_ffv2_binding);
@@ -154,6 +154,13 @@ fh_dup2(struct svc_fh *dst, struct svc_fh *src)
 	*dst = *src;
 	return nfs_ok;
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd_ffv2_test_fh_dup2(struct svc_fh *dst, struct svc_fh *src)
+{
+	return fh_dup2(dst, src);
+}
+#endif
 
 static __be32
 do_open_permission(struct svc_rqst *rqstp, struct svc_fh *current_fh, struct nfsd4_open *open, int accmode)

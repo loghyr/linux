@@ -2,6 +2,7 @@
 #include <linux/completion.h>
 #include <linux/cred.h>
 #include <linux/lockdep.h>
+#include <linux/kthread.h>
 #include <linux/refcount.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -56,6 +57,9 @@ struct nfsd_ffv2_generation {
 	void				*payload;
 	void				(*release)(void *payload);
 	bool				registry_generation;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	struct completion		*test_retire_waiting;
+#endif
 };
 
 struct nfsd_ffv2_object {
@@ -1168,13 +1172,18 @@ void nfsd_ffv2_service_context_release(void *payload)
 
 __be32 nfsd4_ffv2_export_policy_check(struct svc_export *exp, u32 opnum)
 {
-	bool service_context;
-
-	(void)opnum;
-	rcu_read_lock();
-	service_context = rcu_access_pointer(exp->ex_ffv2_context);
-	rcu_read_unlock();
-	return service_context ? nfserr_notsupp : nfs_ok;
+	if (!nfsd_ffv2_export_is_service(exp))
+		return nfs_ok;
+	switch (opnum) {
+	case OP_PUTFH:
+	case OP_PUTROOTFH:
+	case OP_PUTPUBFH:
+	case OP_SAVEFH:
+	case OP_RESTOREFH:
+		return nfs_ok;
+	default:
+		return nfserr_notsupp;
+	}
 }
 
 static void
@@ -1751,6 +1760,22 @@ nfsd_ffv2_release_payload(struct nfsd_ffv2_generation *generation)
 		generation->release(payload);
 }
 
+static bool
+nfsd_ffv2_retire_admissions_drained(struct nfsd_ffv2_generation *generation)
+{
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	struct completion *waiting =
+		READ_ONCE(generation->test_retire_waiting);
+
+	if (waiting) {
+		complete_all(waiting);
+		if (kthread_should_stop())
+			return true;
+	}
+#endif
+	return atomic_read(&generation->admitted) == 0;
+}
+
 static void nfsd_ffv2_retire_finish(struct nfsd_ffv2_anchor *anchor,
 				    struct nfsd_ffv2_generation *generation,
 				    bool wait)
@@ -1762,7 +1787,14 @@ static void nfsd_ffv2_retire_finish(struct nfsd_ffv2_anchor *anchor,
 
 	if (wait) {
 		wait_event(generation->admitted_wait,
-			   atomic_read(&generation->admitted) == 0);
+			   nfsd_ffv2_retire_admissions_drained(generation));
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		if (READ_ONCE(generation->test_retire_waiting)) {
+			WRITE_ONCE(generation->test_retire_waiting, NULL);
+			if (kthread_should_stop())
+				goto out_put;
+		}
+#endif
 	} else if (WARN_ON_ONCE(atomic_read(&generation->admitted))) {
 		goto out_put;
 	}
@@ -2273,6 +2305,23 @@ void nfsd_ffv2_test_complete(struct nfsd_ffv2_admission *admission)
 int nfsd_ffv2_test_unregister(struct nfsd_net *nn, u64 generation_id)
 {
 	return nfsd_ffv2_service_generation_retire(nn, generation_id);
+}
+
+int nfsd_ffv2_test_retire_waiting(struct nfsd_net *nn, u64 generation_id,
+				  struct completion *waiting)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_generation *generation;
+	int error = -ENOENT;
+
+	mutex_lock(&anchor->lock);
+	generation = anchor->active;
+	if (generation && generation->identity->generation == generation_id) {
+		WRITE_ONCE(generation->test_retire_waiting, waiting);
+		error = 0;
+	}
+	mutex_unlock(&anchor->lock);
+	return error;
 }
 
 bool

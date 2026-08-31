@@ -194,6 +194,8 @@ int nfsd_ffv2_test_admit(struct nfsd_net *nn,
 			 struct nfsd_ffv2_admission *admission);
 void nfsd_ffv2_test_complete(struct nfsd_ffv2_admission *admission);
 int nfsd_ffv2_test_unregister(struct nfsd_net *nn, u64 generation);
+int nfsd_ffv2_test_retire_waiting(struct nfsd_net *nn, u64 generation,
+				  struct completion *waiting);
 int nfsd_ffv2_test_reservation_claim(struct nfsd_net *owner,
 				     const struct path *root,
 				     const u8 store_uuid[16],
