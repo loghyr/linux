@@ -2410,6 +2410,31 @@ int nfsd_nl_unlock_export_doit(struct sk_buff *skb, struct genl_info *info)
 	return error;
 }
 
+int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
+				      struct genl_info *info)
+{
+	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_AUTH_DOMAIN) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_EXPORT_PATH) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_OBJECT_PATH) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_OBJECT_UUID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_STORE_UUID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_BINDING_TOKEN) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_CONTROL_ROOT))
+		return -EINVAL;
+
+	return -EOPNOTSUPP;
+}
+
+int nfsd_nl_ffv2_object_unregister_doit(struct sk_buff *skb,
+					struct genl_info *info)
+{
+	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_OBJECT_UUID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_GENERATION))
+		return -EINVAL;
+
+	return -EOPNOTSUPP;
+}
+
 /**
  * nfsd_net_init - Prepare the nfsd_net portion of a new net namespace
  * @net: a freshly-created network namespace

@@ -118,6 +118,23 @@ static const struct nla_policy nfsd_unlock_export_nl_policy[NFSD_A_UNLOCK_EXPORT
 	[NFSD_A_UNLOCK_EXPORT_PATH] = { .type = NLA_NUL_STRING, },
 };
 
+/* NFSD_CMD_FFV2_OBJECT_REGISTER - do */
+static const struct nla_policy nfsd_ffv2_object_register_nl_policy[NFSD_A_FFV2_OBJECT_CONTROL_ROOT + 1] = {
+	[NFSD_A_FFV2_OBJECT_AUTH_DOMAIN] = { .type = NLA_NUL_STRING, },
+	[NFSD_A_FFV2_OBJECT_EXPORT_PATH] = { .type = NLA_NUL_STRING, },
+	[NFSD_A_FFV2_OBJECT_OBJECT_PATH] = { .type = NLA_NUL_STRING, },
+	[NFSD_A_FFV2_OBJECT_OBJECT_UUID] = NLA_POLICY_EXACT_LEN(16),
+	[NFSD_A_FFV2_OBJECT_STORE_UUID] = NLA_POLICY_EXACT_LEN(16),
+	[NFSD_A_FFV2_OBJECT_BINDING_TOKEN] = NLA_POLICY_EXACT_LEN(32),
+	[NFSD_A_FFV2_OBJECT_CONTROL_ROOT] = { .type = NLA_U64, },
+};
+
+/* NFSD_CMD_FFV2_OBJECT_UNREGISTER - do */
+static const struct nla_policy nfsd_ffv2_object_unregister_nl_policy[NFSD_A_FFV2_OBJECT_GENERATION + 1] = {
+	[NFSD_A_FFV2_OBJECT_OBJECT_UUID] = NLA_POLICY_EXACT_LEN(16),
+	[NFSD_A_FFV2_OBJECT_GENERATION] = { .type = NLA_U64, },
+};
+
 /* Ops table for nfsd */
 static const struct genl_split_ops nfsd_nl_ops[] = {
 	{
@@ -223,6 +240,20 @@ static const struct genl_split_ops nfsd_nl_ops[] = {
 		.doit		= nfsd_nl_unlock_export_doit,
 		.policy		= nfsd_unlock_export_nl_policy,
 		.maxattr	= NFSD_A_UNLOCK_EXPORT_PATH,
+		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+	},
+	{
+		.cmd		= NFSD_CMD_FFV2_OBJECT_REGISTER,
+		.doit		= nfsd_nl_ffv2_object_register_doit,
+		.policy		= nfsd_ffv2_object_register_nl_policy,
+		.maxattr	= NFSD_A_FFV2_OBJECT_CONTROL_ROOT,
+		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+	},
+	{
+		.cmd		= NFSD_CMD_FFV2_OBJECT_UNREGISTER,
+		.doit		= nfsd_nl_ffv2_object_unregister_doit,
+		.policy		= nfsd_ffv2_object_unregister_nl_policy,
+		.maxattr	= NFSD_A_FFV2_OBJECT_GENERATION,
 		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
 	},
 };

@@ -330,6 +330,44 @@ attribute-sets:
           of which client holds the state. Intended for use after
           all clients have been unexported from a given path,
           enabling the underlying filesystem to be unmounted.
+  -
+    name: ffv2-object
+    attributes:
+      -
+        name: auth-domain
+        type: string
+      -
+        name: export-path
+        type: string
+      -
+        name: object-path
+        type: string
+      -
+        name: object-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: store-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: binding-token
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: control-root
+        type: u64
+      -
+        name: generation
+        type: u64
+      -
+        name: filehandle
+        type: binary
+        checks:
+          max-len: 128
 
 operations:
   list:
@@ -516,6 +554,35 @@ operations:
         request:
           attributes:
             - path
+    -
+      name: ffv2-object-register
+      doc: register one Flex Files v2 logical object
+      attribute-set: ffv2-object
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - auth-domain
+            - export-path
+            - object-path
+            - object-uuid
+            - store-uuid
+            - binding-token
+            - control-root
+        reply:
+          attributes:
+            - generation
+            - filehandle
+    -
+      name: ffv2-object-unregister
+      doc: unregister one Flex Files v2 logical object
+      attribute-set: ffv2-object
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - object-uuid
+            - generation
 
 mcast-groups:
   list:
