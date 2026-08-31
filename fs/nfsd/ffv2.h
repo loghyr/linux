@@ -126,6 +126,8 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 			      struct nfsd_ffv2_object *object,
 			      const struct nfsd_ffv2_object_request *request,
 			      struct knfsd_fh *outer_fh, u64 *generation_id);
+int nfsd_ffv2_object_unregister(struct nfsd_net *nn, u64 generation_id,
+				const u8 object_uuid[16]);
 void
 nfsd_ffv2_export_update_rollback_wait(struct nfsd_ffv2_service_context *context);
 void nfsd_ffv2_export_release(struct svc_export *exp);

@@ -28,6 +28,7 @@
 #include "netns.h"
 #include "pnfs.h"
 #include "filecache.h"
+#include "ffv2.h"
 #include "trace.h"
 #include "netlink.h"
 
@@ -2410,9 +2411,40 @@ int nfsd_nl_unlock_export_doit(struct sk_buff *skb, struct genl_info *info)
 	return error;
 }
 
+static int nfsd_ffv2_nla_string(const struct nlattr *attr, size_t maxlen,
+				bool absolute)
+{
+	const char *string = nla_data(attr);
+	size_t len = nla_len(attr);
+
+	if (len < 2 || len > maxlen + 1 || string[len - 1] ||
+	    strnlen(string, len) != len - 1 || (absolute && string[0] != '/'))
+		return -EINVAL;
+	return 0;
+}
+
+static void nfsd_ffv2_retire_failed_reply(struct nfsd_net *nn,
+					  u64 generation_id)
+{
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_service_generation_retire(nn, generation_id);
+	mutex_unlock(&nfsd_mutex);
+}
+
 int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 				      struct genl_info *info)
 {
+	struct nfsd_ffv2_object_request request;
+	struct nfsd_ffv2_export_update registration;
+	struct net *net = genl_info_net(info);
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	struct nfsd_ffv2_object *object;
+	struct knfsd_fh outer_fh = {};
+	struct nlattr **attrs = info->attrs;
+	u64 generation_id = 0;
+	void *hdr;
+	int error;
+
 	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_AUTH_DOMAIN) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_EXPORT_PATH) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_OBJECT_PATH) ||
@@ -2421,18 +2453,100 @@ int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_BINDING_TOKEN) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_CONTROL_ROOT))
 		return -EINVAL;
+	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_OBJECT_AUTH_DOMAIN],
+				     NAME_MAX, false);
+	if (error)
+		return error;
+	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_OBJECT_EXPORT_PATH],
+				     PATH_MAX - 1, true);
+	if (error)
+		return error;
+	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_OBJECT_OBJECT_PATH],
+				     PATH_MAX - 1, true);
+	if (error)
+		return error;
 
-	return -EOPNOTSUPP;
+	object = nfsd_ffv2_object_alloc();
+	if (!object)
+		return -ENOMEM;
+	skb = genlmsg_new(nla_total_size_64bit(sizeof(generation_id)) +
+			  nla_total_size(NFSD_FFV2_FH_MAX), GFP_KERNEL);
+	if (!skb) {
+		nfsd_ffv2_object_free(object);
+		return -ENOMEM;
+	}
+	hdr = genlmsg_iput(skb, info);
+	if (!hdr) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+
+	memset(&request, 0, sizeof(request));
+	request.auth_domain = nla_data(attrs[NFSD_A_FFV2_OBJECT_AUTH_DOMAIN]);
+	request.export_path = nla_data(attrs[NFSD_A_FFV2_OBJECT_EXPORT_PATH]);
+	request.object_path = nla_data(attrs[NFSD_A_FFV2_OBJECT_OBJECT_PATH]);
+	request.object_uuid = nla_data(attrs[NFSD_A_FFV2_OBJECT_OBJECT_UUID]);
+	request.store_uuid = nla_data(attrs[NFSD_A_FFV2_OBJECT_STORE_UUID]);
+	request.binding_token = nla_data(attrs[NFSD_A_FFV2_OBJECT_BINDING_TOKEN]);
+	request.control_root = nla_get_u64(attrs[NFSD_A_FFV2_OBJECT_CONTROL_ROOT]);
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_registration_begin(nn, &registration);
+	mutex_unlock(&nfsd_mutex);
+	if (error)
+		goto out_free;
+	error = nfsd_ffv2_object_register(nn, &registration, object, &request,
+					  &outer_fh, &generation_id);
+	object = NULL;
+	if (error)
+		goto out_registration;
+	if (nla_put_u64_64bit(skb, NFSD_A_FFV2_OBJECT_GENERATION,
+			      generation_id, 0) ||
+	    nla_put(skb, NFSD_A_FFV2_OBJECT_FILEHANDLE, outer_fh.fh_size,
+		    outer_fh.fh_raw)) {
+		error = -EMSGSIZE;
+		goto out_retire;
+	}
+	genlmsg_end(skb, hdr);
+	nfsd_ffv2_registration_end(nn, &registration);
+	error = genlmsg_reply(skb, info);
+	if (error)
+		nfsd_ffv2_retire_failed_reply(nn, generation_id);
+	return error;
+
+out_retire:
+	nfsd_ffv2_retire_failed_reply(nn, generation_id);
+out_registration:
+	nfsd_ffv2_registration_end(nn, &registration);
+out_free:
+	nfsd_ffv2_object_free(object);
+	nlmsg_free(skb);
+	return error;
 }
 
 int nfsd_nl_ffv2_object_unregister_doit(struct sk_buff *skb,
 					struct genl_info *info)
 {
+	struct net *net = genl_info_net(info);
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	struct nlattr **attrs = info->attrs;
+	const u8 *object_uuid;
+	u64 generation_id;
+	int error;
+
+	(void)skb;
 	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_OBJECT_UUID) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_GENERATION))
 		return -EINVAL;
+	object_uuid = nla_data(attrs[NFSD_A_FFV2_OBJECT_OBJECT_UUID]);
+	generation_id = nla_get_u64(attrs[NFSD_A_FFV2_OBJECT_GENERATION]);
+	if (!generation_id)
+		return -EINVAL;
 
-	return -EOPNOTSUPP;
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_object_unregister(nn, generation_id, object_uuid);
+	mutex_unlock(&nfsd_mutex);
+	return error;
 }
 
 /**

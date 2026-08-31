@@ -1268,6 +1268,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	char domain_name[] = "ffv2-kunit";
 	u8 token[32] = { 1 };
 	u8 uuid[16] = { 2 };
+	u8 wrong_uuid[16] = { 9 };
 	const u8 inner[] = { 1, 0, 1, 1, 0xaa, 0xbb, 0xcc, 0xdd };
 	u64 generation_id;
 	int error;
@@ -1615,7 +1616,9 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	}
 
 	mutex_lock(&nfsd_mutex);
-	error = nfsd_ffv2_service_generation_retire(nn, generation_id);
+	error = nfsd_ffv2_object_unregister(nn, generation_id, wrong_uuid);
+	KUNIT_EXPECT_EQ(test, error, -ENOENT);
+	error = nfsd_ffv2_object_unregister(nn, generation_id, uuid);
 	mutex_unlock(&nfsd_mutex);
 	KUNIT_EXPECT_EQ(test, error, 0);
 	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));

@@ -1951,6 +1951,32 @@ int nfsd_ffv2_service_generation_retire(struct nfsd_net *nn,
 	return error;
 }
 
+int nfsd_ffv2_object_unregister(struct nfsd_net *nn, u64 generation_id,
+				const u8 object_uuid[16])
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_generation *generation;
+	int error = 0;
+
+	lockdep_assert_held(&nfsd_mutex);
+	if (!generation_id || !object_uuid)
+		return -EINVAL;
+	mutex_lock(&anchor->lock);
+	generation = anchor->active;
+	if (!generation ||
+	    generation->identity->generation != generation_id)
+		generation = anchor->retiring;
+	if (!generation ||
+	    generation->identity->generation != generation_id ||
+	    memcmp(generation->identity->object_uuid, object_uuid,
+		   sizeof(generation->identity->object_uuid)))
+		error = -ENOENT;
+	mutex_unlock(&anchor->lock);
+	if (error)
+		return error;
+	return nfsd_ffv2_service_generation_retire(nn, generation_id);
+}
+
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 int nfsd_ffv2_test_reservation_claim(struct nfsd_net *owner,
 				     const struct path *root,
