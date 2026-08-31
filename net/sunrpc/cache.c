@@ -248,6 +248,62 @@ struct cache_head *sunrpc_cache_update(struct cache_detail *detail,
 }
 EXPORT_SYMBOL_GPL(sunrpc_cache_update);
 
+/**
+ * sunrpc_cache_update_exact - replace an exact current cache object
+ * @detail: cache to update
+ * @new: update payload
+ * @old: object that must still be current
+ * @hash: bucket containing @old
+ *
+ * Unlike sunrpc_cache_update(), this helper does not consume the caller's
+ * reference to @old and never resurrects an object that lost a replacement,
+ * expiry, or purge race.  It returns the replacement with a caller reference,
+ * or an ERR_PTR() result.
+ */
+struct cache_head *
+sunrpc_cache_update_exact(struct cache_detail *detail,
+			  struct cache_head *new, struct cache_head *old,
+			  int hash)
+{
+	struct hlist_head *head = &detail->hash_table[hash];
+	struct cache_head *cursor = NULL;
+	struct cache_head *tmp;
+	bool found = false;
+
+	tmp = detail->alloc();
+	if (!tmp)
+		return ERR_PTR(-ENOMEM);
+	cache_init(tmp, detail);
+	detail->init(tmp, old);
+
+	spin_lock(&detail->hash_lock);
+	hlist_for_each_entry(cursor, head, cache_list) {
+		if (!detail->match(cursor, old))
+			continue;
+		if (test_bit(CACHE_VALID, &cursor->flags) &&
+		    cache_is_expired(detail, cursor))
+			continue;
+		found = true;
+		break;
+	}
+	if (!found || cursor != old) {
+		spin_unlock(&detail->hash_lock);
+		cache_put(tmp, detail);
+		return ERR_PTR(-ESTALE);
+	}
+	cache_entry_update(detail, tmp, new);
+	cache_get(tmp);
+	hlist_add_head_rcu(&tmp->cache_list, head);
+	detail->entries++;
+	cache_fresh_locked(tmp, new->expiry_time, detail);
+	cache_fresh_locked(old, 0, detail);
+	spin_unlock(&detail->hash_lock);
+	cache_fresh_unlocked(tmp, detail);
+	cache_fresh_unlocked(old, detail);
+	return tmp;
+}
+EXPORT_SYMBOL_GPL(sunrpc_cache_update_exact);
+
 static inline int cache_is_valid(struct cache_head *h)
 {
 	if (!test_bit(CACHE_VALID, &h->flags))
