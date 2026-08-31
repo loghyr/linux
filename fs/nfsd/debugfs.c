@@ -3,6 +3,7 @@
 #include <linux/debugfs.h>
 
 #include "nfsd.h"
+#include "ffv2.h"
 
 static struct dentry *nfsd_top_dir __read_mostly;
 
@@ -124,6 +125,7 @@ DEFINE_DEBUGFS_ATTRIBUTE(nfsd_io_cache_write_fops, nfsd_io_cache_write_get,
 
 void nfsd_debugfs_exit(void)
 {
+	nfsd_ffv2_live_test_exit();
 	debugfs_remove_recursive(nfsd_top_dir);
 	nfsd_top_dir = NULL;
 }
@@ -144,4 +146,5 @@ void nfsd_debugfs_init(void)
 	debugfs_create_bool("delegated_timestamps", 0644, nfsd_top_dir,
 			    &nfsd_delegts_enabled);
 #endif
+	nfsd_ffv2_live_test_debugfs_init(nfsd_top_dir);
 }

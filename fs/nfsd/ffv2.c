@@ -837,6 +837,14 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 	}
 	context->owner_generation = prepared_generation;
 	nfsd_ffv2_service_context_prepare_export(context, exp);
+	error = nfsd_ffv2_live_test_checkpoint(NFSD_FFV2_LIVE_TEST_PRE_PUBLISH,
+					       expected ?: exp);
+	if (error) {
+		nfsd_ffv2_generation_cancel(owner, generation);
+		nfsd_ffv2_service_context_abort(context, exp);
+		nfsd_ffv2_reservation_abort(reservation);
+		goto out_reopen;
+	}
 	if (expected)
 		published = nfsd_ffv2_transition_publish(owner, &transaction,
 							 registration,
@@ -962,6 +970,10 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 	error = nfsd_ffv2_export_transition_exact(exp);
 	if (error)
 		goto out_put_exp;
+	error = nfsd_ffv2_live_test_checkpoint(NFSD_FFV2_LIVE_TEST_TRANSITION,
+					       exp);
+	if (error)
+		goto out_reopen;
 	error = nfsd_ffv2_object_validate(exp, object);
 	if (error)
 		goto out_reopen;
@@ -1159,6 +1171,8 @@ void nfsd_ffv2_service_context_release(void *payload)
 		rcu_assign_pointer(exp->ex_ffv2_context, NULL);
 		mutex_unlock(&nfsd_ffv2_export_policy_lock);
 		synchronize_rcu();
+		nfsd_ffv2_live_test_checkpoint(NFSD_FFV2_LIVE_TEST_CONTEXT_CLEAR,
+					       exp);
 		nfsd_export_unhash(exp);
 		nfsd_export_put(exp);
 		wait_for_completion(&context->export_released);
@@ -1174,6 +1188,7 @@ __be32 nfsd4_ffv2_export_policy_check(struct svc_export *exp, u32 opnum)
 {
 	if (!nfsd_ffv2_export_is_service(exp))
 		return nfs_ok;
+	nfsd_ffv2_live_test_checkpoint(NFSD_FFV2_LIVE_TEST_POLICY, exp);
 	switch (opnum) {
 	case OP_PUTFH:
 	case OP_PUTROOTFH:

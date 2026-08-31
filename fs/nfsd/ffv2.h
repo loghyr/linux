@@ -24,6 +24,7 @@ struct svc_export;
 struct svc_xprt;
 struct task_struct;
 struct knfsd_fh;
+struct dentry;
 
 #define NFSD_FFV2_FH_HEADER_SIZE	56
 #define NFSD_FFV2_FH_INNER_MAX	72
@@ -187,6 +188,31 @@ struct nfsd_ffv2_admission {
 int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 		    struct nfsd_ffv2_admission *admission);
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission);
+
+enum nfsd_ffv2_live_test_stage {
+	NFSD_FFV2_LIVE_TEST_NONE,
+	NFSD_FFV2_LIVE_TEST_TRANSITION,
+	NFSD_FFV2_LIVE_TEST_PRE_PUBLISH,
+	NFSD_FFV2_LIVE_TEST_POLICY,
+	NFSD_FFV2_LIVE_TEST_CONTEXT_CLEAR,
+};
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+int nfsd_ffv2_live_test_checkpoint(enum nfsd_ffv2_live_test_stage stage,
+				   struct svc_export *exp);
+void nfsd_ffv2_live_test_debugfs_init(struct dentry *parent);
+void nfsd_ffv2_live_test_exit(void);
+#else
+static inline int
+nfsd_ffv2_live_test_checkpoint(enum nfsd_ffv2_live_test_stage stage,
+			       struct svc_export *exp)
+{
+	return 0;
+}
+
+static inline void nfsd_ffv2_live_test_debugfs_init(struct dentry *parent) { }
+static inline void nfsd_ffv2_live_test_exit(void) { }
+#endif
 
 int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
 			   void (*release)(void *), u64 *generation);

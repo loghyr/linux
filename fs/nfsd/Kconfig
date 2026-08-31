@@ -103,6 +103,16 @@ config NFSD_FFV2_KUNIT_TEST
 
 	  If unsure, say N.
 
+config NFSD_FFV2_LIVE_TEST
+	bool "Live test controls for nfsd Flex Files v2"
+	depends on DEBUG_FS && NFSD=y && NFSD_V4
+	help
+	  Expose one-shot debugfs pause points for disposable virtual-machine
+	  tests of the nfsd Flex Files v2 registration and retirement paths.
+	  These controls do not enable provider registration or FFv2 operations.
+
+	  If unsure, say N.
+
 config NFSD_PNFS
 	bool
 
