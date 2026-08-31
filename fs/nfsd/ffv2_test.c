@@ -1210,6 +1210,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct path root;
 	struct net *net;
 	struct net *net2;
+	bool filecache_up = false;
 	bool service_up = false;
 	char domain_name[] = "ffv2-kunit";
 	u8 token[32] = { 1 };
@@ -1351,6 +1352,15 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		KUNIT_FAIL(test, "failed to start transaction service: %d", error);
 		goto out_root;
 	}
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_file_ffv2_test_cache_start();
+	mutex_unlock(&nfsd_mutex);
+	if (error) {
+		KUNIT_FAIL(test, "failed to start transaction filecache: %d",
+			   error);
+		goto out_root;
+	}
+	filecache_up = true;
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	nfsd_ffv2_test_fail_export_alloc(true);
 	error = nfsd_ffv2_test_service_export_publish(nn, &exp, &root, uuid,
@@ -1360,14 +1370,45 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(exp.ex_ffv2_context), NULL);
 	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
 
-	error = nfsd_ffv2_test_service_export_publish(nn, &exp, &root, uuid,
-						      token, current_cred(), 1,
-						      &generation_id);
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	exp.ex_uuid = kmemdup(uuid, sizeof(uuid), GFP_KERNEL);
+	if (!exp.ex_uuid) {
+		KUNIT_FAIL(test, "failed to allocate transition export UUID");
+		goto out_root;
+	}
+	published = nfsd_export_cache_update(&exp);
+	if (IS_ERR(published)) {
+		KUNIT_FAIL(test, "ordinary transition seed failed: %ld",
+			   PTR_ERR(published));
+		kfree(exp.ex_uuid);
+		exp.ex_uuid = NULL;
+		goto out_root;
+	}
+	exp_put(published);
+	selected = nfsd_ffv2_export_select(nn->svc_export_cache, domain, &root);
+	if (IS_ERR(selected)) {
+		KUNIT_FAIL(test, "transition export selection failed: %ld",
+			   PTR_ERR(selected));
+		goto out_root;
+	}
+	error = nfsd_ffv2_export_template_clone(&exp, selected);
 	if (error) {
-		KUNIT_FAIL(test, "service transaction failed: %d", error);
+		KUNIT_FAIL(test, "service template clone failed: %d", error);
+		nfsd_ffv2_export_transition_abort_exact(selected);
+		exp_put(selected);
+		goto out_root;
+	}
+	error = nfsd_ffv2_test_transition_publish(nn, &exp, selected, &root,
+						  uuid, token, current_cred(), 1,
+						  &generation_id);
+	nfsd_ffv2_export_template_free(&exp);
+	exp_put(selected);
+	if (error) {
+		KUNIT_FAIL(test, "atomic service transaction failed: %d", error);
 		goto out_root;
 	}
 	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	published = nfsd_ffv2_test_export_lookup(&exp);
 	if (!published) {
 		KUNIT_FAIL(test, "published service export not found");
@@ -1454,6 +1495,11 @@ out_root:
 	}
 	nfsd_ffv2_test_fail_export_alloc(false);
 	nfsd_export_flush(net);
+	if (filecache_up) {
+		mutex_lock(&nfsd_mutex);
+		nfsd_file_cache_shutdown();
+		mutex_unlock(&nfsd_mutex);
+	}
 	path_put(&root);
 	auth_domain_put(domain);
 out_nets:

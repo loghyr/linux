@@ -36,6 +36,8 @@ enum nfsd_ffv2_generation_state {
 struct nfsd_ffv2_identity {
 	refcount_t	ref;
 	u64		generation;
+	u8		object_uuid[16];
+	u8		export_uuid[16];
 	int		state;
 };
 
@@ -146,11 +148,16 @@ struct nfsd_ffv2_reservation {
 struct nfsd_ffv2_service_context {
 	struct nfsd_ffv2_reservation *reservation;
 	struct svc_export	*export;
+	struct path		object_path;
+	struct knfsd_fh		inner_fh;
+	u8			object_uuid[16];
+	u8			export_uuid[16];
 	const struct cred	*cred;
 	struct completion	export_released;
 	u64			control_root;
 	u64			owner_generation;
 	bool			published;
+	bool			object_valid;
 };
 
 struct nfsd_ffv2_participant_snapshot {
@@ -174,6 +181,8 @@ nfsd_ffv2_export_update_put(struct nfsd_ffv2_export_update *update);
 static int
 nfsd_ffv2_generation_prepare(struct nfsd_net *nn, void *payload,
 			     void (*release)(void *),
+			     const u8 object_uuid[16],
+			     const u8 export_uuid[16],
 			     struct nfsd_ffv2_generation **result,
 			     u64 *generation_id);
 static int
@@ -487,13 +496,13 @@ int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
 					     result, true, NULL);
 }
 
-int
-nfsd_ffv2_reservation_claim_expected(struct nfsd_net *owner,
-				     const struct path *root,
-				     const u8 store_uuid[16],
-				     const u8 binding_token[32],
-				     struct svc_export *expected,
-				     struct nfsd_ffv2_reservation **result)
+static int nfsd_ffv2_claim_expected(struct nfsd_net *owner,
+				    const struct path *root,
+				    const u8 store_uuid[16],
+				    const u8 binding_token[32],
+				    struct svc_export *expected,
+				    struct nfsd_ffv2_reservation **result,
+				    bool validate_backend)
 {
 	int error;
 
@@ -503,10 +512,22 @@ nfsd_ffv2_reservation_claim_expected(struct nfsd_net *owner,
 		error = -ESTALE;
 	else
 		error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
-						      binding_token, result, true,
-						      expected);
+						      binding_token, result,
+						      validate_backend, expected);
 	nfsd_ffv2_export_update_unlock();
 	return error;
+}
+
+int
+nfsd_ffv2_reservation_claim_expected(struct nfsd_net *owner,
+				     const struct path *root,
+				     const u8 store_uuid[16],
+				     const u8 binding_token[32],
+				     struct svc_export *expected,
+				     struct nfsd_ffv2_reservation **result)
+{
+	return nfsd_ffv2_claim_expected(owner, root, store_uuid, binding_token,
+					 expected, result, true);
 }
 
 void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation)
@@ -565,6 +586,7 @@ nfsd_ffv2_service_context_prepare_export(struct nfsd_ffv2_service_context *conte
 {
 	if (WARN_ON_ONCE(rcu_access_pointer(exp->ex_ffv2_context)))
 		return;
+	nfsd_ffv2_export_template_mark_service(exp);
 	RCU_INIT_POINTER(exp->ex_ffv2_context, context);
 }
 
@@ -575,8 +597,89 @@ nfsd_ffv2_service_context_abort(struct nfsd_ffv2_service_context *context,
 	if (prepared && rcu_access_pointer(prepared->ex_ffv2_context) == context)
 		RCU_INIT_POINTER(prepared->ex_ffv2_context, NULL);
 	nfsd_ffv2_reservation_put(context->reservation);
+	if (context->object_valid)
+		path_put(&context->object_path);
 	put_cred(context->cred);
 	kfree(context);
+}
+
+static struct svc_export *
+nfsd_ffv2_transition_publish(struct nfsd_net *owner,
+			     struct nfsd_ffv2_export_update *transaction,
+			     struct nfsd_ffv2_reservation *reservation,
+			     struct nfsd_ffv2_service_context *context,
+			     struct nfsd_ffv2_generation *generation,
+			     struct svc_export *old,
+			     struct svc_export *template)
+{
+	struct nfsd_ffv2_participant *participant = &owner->ffv2_participant;
+	struct nfsd_ffv2_anchor *anchor = &owner->ffv2;
+	struct svc_export *published;
+	int error;
+
+	nfsd_ffv2_export_update_lock();
+	if (!nfsd_ffv2_export_is_current_locked(old) ||
+	    !nfsd_ffv2_export_is_transitioning(old)) {
+		error = -ESTALE;
+		goto out_update;
+	}
+	mutex_lock(&reservation->entry_lock);
+	mutex_lock(&nfsd_ffv2_export_policy_lock);
+	mutex_lock(&anchor->lock);
+	error = nfsd_ffv2_export_update_validate(transaction);
+	if (error || anchor->pending != generation ||
+	    anchor->net_state != NFSD_FFV2_NET_LIVE ||
+	    anchor->service_state != NFSD_FFV2_SERVICE_UP ||
+	    reservation->state != NFSD_FFV2_RESERVING ||
+	    reservation->owner != participant ||
+	    !READ_ONCE(participant->attached)) {
+		if (!error)
+			error = -ESHUTDOWN;
+		goto out_anchor;
+	}
+
+	published = nfsd_ffv2_export_update_exact_locked(template, old);
+	if (IS_ERR(published)) {
+		error = PTR_ERR(published);
+		goto out_anchor;
+	}
+
+	/* No fallible operation is permitted after exact cache replacement. */
+	nfsd_ffv2_export_transition_commit(old);
+	mutex_lock(&participant->inventory_lock);
+	if (!published->ex_ffv2_listed) {
+		published->ex_ffv2_path = published->ex_path;
+		path_get(&published->ex_ffv2_path);
+		published->ex_ffv2_participant = participant;
+		published->ex_ffv2_listed = true;
+		list_add_tail(&published->ex_ffv2_inventory,
+			      &participant->inventory);
+		participant->inventory_count++;
+	}
+	context->export = nfsd_export_get(published);
+	context->published = true;
+	published->ex_ffv2_context_released = &context->export_released;
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	reservation->state = NFSD_FFV2_RESERVATION_ACTIVE;
+	reservation->owner_generation = generation->identity->generation;
+	anchor->pending = NULL;
+	anchor->active = generation;
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	mutex_unlock(&participant->inventory_lock);
+	mutex_unlock(&anchor->lock);
+	mutex_unlock(&nfsd_ffv2_export_policy_lock);
+	mutex_unlock(&reservation->entry_lock);
+	nfsd_ffv2_export_update_unlock();
+	nfsd_ffv2_reservation_put(reservation);
+	return published;
+
+out_anchor:
+	mutex_unlock(&anchor->lock);
+	mutex_unlock(&nfsd_ffv2_export_policy_lock);
+	mutex_unlock(&reservation->entry_lock);
+out_update:
+	nfsd_ffv2_export_update_unlock();
+	return ERR_PTR(error);
 }
 
 static int
@@ -587,7 +690,8 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 				   const u8 binding_token[32],
 				   const struct cred *cred,
 				   u64 control_root, u64 *generation_id,
-				   bool validate_backend)
+				   bool validate_backend,
+				   struct svc_export *expected)
 {
 	struct nfsd_ffv2_service_context *context;
 	struct nfsd_ffv2_generation *generation;
@@ -605,37 +709,60 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 					      &transaction);
 	if (error)
 		return error;
-	error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
-					      binding_token, &reservation,
-					      validate_backend, NULL);
+	if (expected)
+		error = nfsd_ffv2_claim_expected(owner, root, store_uuid,
+						 binding_token, expected,
+						 &reservation, validate_backend);
+	else
+		error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
+						      binding_token, &reservation,
+						      validate_backend, NULL);
 	if (error)
 		goto out_update;
+	if (expected) {
+		error = nfsd_ffv2_reservation_gate_io(reservation);
+		if (error) {
+			nfsd_ffv2_reservation_abort(reservation);
+			goto out_reopen;
+		}
+	}
 	context = nfsd_ffv2_service_context_alloc(reservation, cred,
 						  control_root, 0);
 	if (!context) {
 		nfsd_ffv2_reservation_abort(reservation);
 		error = -ENOMEM;
-		goto out_update;
+		goto out_reopen;
 	}
 	error = nfsd_ffv2_generation_prepare(owner, context,
 					     nfsd_ffv2_service_context_release,
+					     NULL, NULL,
 					     &generation, &prepared_generation);
 	if (error) {
 		nfsd_ffv2_service_context_abort(context, NULL);
 		nfsd_ffv2_reservation_abort(reservation);
-		goto out_update;
+		goto out_reopen;
 	}
 	context->owner_generation = prepared_generation;
 	nfsd_ffv2_service_context_prepare_export(context, exp);
-	published = nfsd_export_cache_update(exp);
+	if (expected)
+		published = nfsd_ffv2_transition_publish(owner, &transaction,
+							 reservation, context, generation,
+							 expected, exp);
+	else
+		published = nfsd_export_cache_update(exp);
 	if (IS_ERR(published)) {
 		error = PTR_ERR(published);
 		nfsd_ffv2_generation_cancel(owner, generation);
 		nfsd_ffv2_service_context_abort(context, exp);
 		nfsd_ffv2_reservation_abort(reservation);
-		goto out_update;
+		goto out_reopen;
 	}
 	nfsd_export_put(published);
+	if (expected) {
+		nfsd_ffv2_generation_put(generation);
+		*generation_id = prepared_generation;
+		goto out_update;
+	}
 	error = nfsd_ffv2_generation_commit(owner, generation);
 	if (error) {
 		nfsd_ffv2_generation_cancel(owner, generation);
@@ -644,6 +771,11 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 	}
 	nfsd_ffv2_generation_put(generation);
 	*generation_id = prepared_generation;
+	goto out_update;
+
+out_reopen:
+	if (expected)
+		nfsd_ffv2_export_transition_abort_exact(expected);
 
 out_update:
 	nfsd_ffv2_export_update_put(&transaction);
@@ -661,7 +793,7 @@ int nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 	return __nfsd_ffv2_service_export_publish(owner, exp, root, store_uuid,
 						  binding_token, cred,
 						  control_root, generation_id,
-						  true);
+						  true, NULL);
 }
 
 void nfsd_ffv2_service_context_release(void *payload)
@@ -680,6 +812,8 @@ void nfsd_ffv2_service_context_release(void *payload)
 	}
 	put_cred(context->cred);
 	nfsd_ffv2_reservation_fence(context->reservation);
+	if (context->object_valid)
+		path_put(&context->object_path);
 	kfree(context);
 }
 
@@ -1052,7 +1186,9 @@ static atomic_t nfsd_ffv2_start_failure;
 #endif
 
 static struct nfsd_ffv2_generation *
-nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *))
+nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *),
+			   const u8 object_uuid[16],
+			   const u8 export_uuid[16])
 {
 	struct nfsd_ffv2_generation *generation;
 	struct nfsd_ffv2_identity *identity;
@@ -1068,6 +1204,12 @@ nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *))
 	}
 
 	refcount_set(&identity->ref, 1);
+	if (object_uuid)
+		memcpy(identity->object_uuid, object_uuid,
+		       sizeof(identity->object_uuid));
+	if (export_uuid)
+		memcpy(identity->export_uuid, export_uuid,
+		       sizeof(identity->export_uuid));
 	WRITE_ONCE(identity->state, NFSD_FFV2_IDENTITY_LIVE);
 	refcount_set(&generation->ref, 1);
 	generation->identity = identity;
@@ -1085,6 +1227,8 @@ nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *))
 static int
 nfsd_ffv2_generation_prepare(struct nfsd_net *nn, void *payload,
 			     void (*release)(void *),
+			     const u8 object_uuid[16],
+			     const u8 export_uuid[16],
 			     struct nfsd_ffv2_generation **result,
 			     u64 *generation_id)
 {
@@ -1092,7 +1236,8 @@ nfsd_ffv2_generation_prepare(struct nfsd_net *nn, void *payload,
 	struct nfsd_ffv2_generation *generation;
 	int error = 0;
 
-	generation = nfsd_ffv2_generation_alloc(payload, release);
+	generation = nfsd_ffv2_generation_alloc(payload, release, object_uuid,
+						export_uuid);
 	if (!generation)
 		return -ENOMEM;
 	if (!nfsd_ffv2_anchor_get(anchor)) {
@@ -1572,18 +1717,8 @@ nfsd_ffv2_test_reservation_claim_expected(struct nfsd_net *owner,
 					  struct svc_export *expected,
 					  struct nfsd_ffv2_reservation **result)
 {
-	int error;
-
-	nfsd_ffv2_export_update_lock();
-	if (!nfsd_ffv2_export_is_current_locked(expected) ||
-	    !nfsd_ffv2_export_is_transitioning(expected))
-		error = -ESTALE;
-	else
-		error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
-						      binding_token, result, false,
-						      expected);
-	nfsd_ffv2_export_update_unlock();
-	return error;
+	return nfsd_ffv2_claim_expected(owner, root, store_uuid, binding_token,
+					 expected, result, false);
 }
 
 int
@@ -1598,7 +1733,23 @@ nfsd_ffv2_test_service_export_publish(struct nfsd_net *owner,
 	return __nfsd_ffv2_service_export_publish(owner, exp, root, store_uuid,
 						  binding_token, cred,
 						  control_root, generation_id,
-						  false);
+						  false, NULL);
+}
+
+int nfsd_ffv2_test_transition_publish(struct nfsd_net *owner,
+				      struct svc_export *template,
+				      struct svc_export *expected,
+				      const struct path *root,
+				      const u8 store_uuid[16],
+				      const u8 binding_token[32],
+				      const struct cred *cred,
+				      u64 control_root, u64 *generation_id)
+{
+	return __nfsd_ffv2_service_export_publish(owner, template, root,
+						  store_uuid, binding_token,
+						  cred, control_root,
+						  generation_id, false,
+						  expected);
 }
 
 int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
@@ -1608,7 +1759,7 @@ int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
 	int error;
 
 	lockdep_assert_held(&nfsd_mutex);
-	error = nfsd_ffv2_generation_prepare(nn, payload, release,
+	error = nfsd_ffv2_generation_prepare(nn, payload, release, NULL, NULL,
 					     &generation, generation_id);
 	if (error)
 		return error;

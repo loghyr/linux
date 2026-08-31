@@ -1627,8 +1627,7 @@ void nfsd_ffv2_export_transition_commit(struct svc_export *exp)
 {
 	spin_lock(&exp->ex_ffv2_access_lock);
 	WARN_ON_ONCE(exp->ex_ffv2_access_count);
-	if (WARN_ON_ONCE(exp->ex_ffv2_access_state ==
-			 NFSD_FFV2_EXPORT_SERVICE)) {
+	if (exp->ex_ffv2_access_state == NFSD_FFV2_EXPORT_SERVICE) {
 		spin_unlock(&exp->ex_ffv2_access_lock);
 		return;
 	}
@@ -1686,6 +1685,8 @@ static void export_update(struct cache_head *cnew, struct cache_head *citem)
 		new->ex_flavors[i] = item->ex_flavors[i];
 	}
 	new->ex_xprtsec_modes = item->ex_xprtsec_modes;
+	if (item->ex_ffv2_access_state == NFSD_FFV2_EXPORT_SERVICE)
+		new->ex_ffv2_access_state = NFSD_FFV2_EXPORT_SERVICE;
 	RCU_INIT_POINTER(new->ex_ffv2_context,
 			 rcu_access_pointer(item->ex_ffv2_context));
 	RCU_INIT_POINTER(item->ex_ffv2_context, NULL);
@@ -1900,6 +1901,11 @@ void nfsd_ffv2_export_template_free(struct svc_export *template)
 	if (template->ex_client)
 		auth_domain_put(template->ex_client);
 	template->ex_client = NULL;
+}
+
+void nfsd_ffv2_export_template_mark_service(struct svc_export *template)
+{
+	template->ex_ffv2_access_state = NFSD_FFV2_EXPORT_SERVICE;
 }
 
 struct svc_export *

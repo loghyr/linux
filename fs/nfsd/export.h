@@ -112,6 +112,7 @@ nfsd_ffv2_export_update_exact_locked(struct svc_export *new,
 int nfsd_ffv2_export_template_clone(struct svc_export *template,
 				    struct svc_export *source);
 void nfsd_ffv2_export_template_free(struct svc_export *template);
+void nfsd_ffv2_export_template_mark_service(struct svc_export *template);
 int nfsd_ffv2_export_access_get(struct svc_export *exp);
 int nfsd_ffv2_export_access_clone(struct svc_export *exp);
 void nfsd_ffv2_export_access_put(struct svc_export *exp);

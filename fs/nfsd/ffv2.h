@@ -182,6 +182,14 @@ nfsd_ffv2_test_service_export_publish(struct nfsd_net *owner,
 				      const u8 binding_token[32],
 				      const struct cred *cred,
 				      u64 control_root, u64 *generation_id);
+int nfsd_ffv2_test_transition_publish(struct nfsd_net *owner,
+				      struct svc_export *template,
+				      struct svc_export *expected,
+				      const struct path *root,
+				      const u8 store_uuid[16],
+				      const u8 binding_token[32],
+				      const struct cred *cred,
+				      u64 control_root, u64 *generation_id);
 bool nfsd_ffv2_test_generation_retired(struct nfsd_ffv2_generation *generation);
 bool nfsd_ffv2_test_admission_retired(struct nfsd_ffv2_admission *admission);
 unsigned int nfsd_ffv2_test_refcount(struct nfsd_ffv2_admission *admission);
