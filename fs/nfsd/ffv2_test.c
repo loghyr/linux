@@ -1799,6 +1799,10 @@ static void nfsd_ffv2_filehandle_format_test(struct kunit *test)
 	fh.fh_raw[56] = 1;
 	fh.fh_size--;
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
+	fh.fh_size = NFSD_FFV2_FH_HEADER_SIZE + 4;
+	put_unaligned_be16(fh.fh_size, fh.fh_raw + 12);
+	put_unaligned_be16(4, fh.fh_raw + 14);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&fh, &decoded), -EBADMSG);
 }
 
 static void nfsd_ffv2_filecache_gate_test(struct kunit *test)

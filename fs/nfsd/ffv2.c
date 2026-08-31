@@ -94,7 +94,8 @@ int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info
 	inner_len = get_unaligned_be16(raw + 14);
 	if (header_len != NFSD_FFV2_FH_HEADER_SIZE ||
 	    total_len != fh->fh_size ||
-	    inner_len < 4 || inner_len > NFSD_FFV2_FH_INNER_MAX ||
+	    inner_len < 8 || inner_len > NFSD_FFV2_FH_INNER_MAX ||
+	    inner_len & 3 ||
 	    total_len != header_len + inner_len || raw[56] != 1)
 		return -EBADMSG;
 
@@ -113,8 +114,9 @@ int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
 {
 	u16 total_len;
 
-	if (!info->generation || !info->inner || info->inner_len < 4 ||
-	    info->inner_len > NFSD_FFV2_FH_INNER_MAX || info->inner[0] != 1)
+	if (!info->generation || !info->inner || info->inner_len < 8 ||
+	    info->inner_len > NFSD_FFV2_FH_INNER_MAX || info->inner_len & 3 ||
+	    info->inner[0] != 1)
 		return -EINVAL;
 	total_len = NFSD_FFV2_FH_HEADER_SIZE + info->inner_len;
 	memcpy(fh->fh_raw, nfsd_ffv2_fh_magic, sizeof(nfsd_ffv2_fh_magic));
