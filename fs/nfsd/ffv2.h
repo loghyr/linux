@@ -18,6 +18,7 @@ struct nfsd_ffv2_reservation;
 struct nfsd_ffv2_service_context;
 struct cred;
 struct path;
+struct seq_file;
 struct svc_rqst;
 struct svc_fh;
 struct svc_export;
@@ -197,9 +198,44 @@ enum nfsd_ffv2_live_test_stage {
 	NFSD_FFV2_LIVE_TEST_CONTEXT_CLEAR,
 };
 
+enum nfsd_ffv2_fault_phase {
+	NFSD_FFV2_FAULT_NONE,
+	NFSD_FFV2_FAULT_REPLY_SKB,
+	NFSD_FFV2_FAULT_OBJECT_ALLOC,
+	NFSD_FFV2_FAULT_AUTH_DOMAIN,
+	NFSD_FFV2_FAULT_EXPORT_PATH,
+	NFSD_FFV2_FAULT_OBJECT_PATH,
+	NFSD_FFV2_FAULT_EXPORT_LOOKUP,
+	NFSD_FFV2_FAULT_FH_COMPOSE,
+	NFSD_FFV2_FAULT_RESERVATION_CLAIM,
+	NFSD_FFV2_FAULT_CONTEXT_ALLOC,
+	NFSD_FFV2_FAULT_GENERATION_ALLOC,
+	NFSD_FFV2_FAULT_TEMPLATE_CLONE,
+	NFSD_FFV2_FAULT_EXACT_CURRENT,
+	NFSD_FFV2_FAULT_CACHE_REPLACE,
+	NFSD_FFV2_FAULT_REGISTRY_INSERT,
+	NFSD_FFV2_FAULT_GENERATION_ACTIVATE,
+	NFSD_FFV2_FAULT_REPLY_BUILD,
+};
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST) || \
+	IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+bool nfsd_ffv2_fault_inject(enum nfsd_ffv2_fault_phase phase);
+void nfsd_ffv2_fault_arm(enum nfsd_ffv2_fault_phase phase);
+enum nfsd_ffv2_fault_phase nfsd_ffv2_fault_armed(void);
+enum nfsd_ffv2_fault_phase nfsd_ffv2_fault_hit(void);
+#else
+static inline bool
+nfsd_ffv2_fault_inject(enum nfsd_ffv2_fault_phase phase)
+{
+	return false;
+}
+#endif
+
 #if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
 int nfsd_ffv2_live_test_checkpoint(enum nfsd_ffv2_live_test_stage stage,
 				   struct svc_export *exp);
+int nfsd_ffv2_live_state_show(struct seq_file *m, void *v);
 void nfsd_ffv2_live_test_debugfs_init(struct dentry *parent);
 void nfsd_ffv2_live_test_exit(void);
 #else
@@ -268,5 +304,6 @@ unsigned int nfsd_ffv2_test_anchor_refcount(struct nfsd_net *nn);
 void nfsd_ffv2_test_worker(struct svc_rqst *rqstp, struct svc_xprt *xprt);
 void nfsd_ffv2_test_set_start_failure(bool fail);
 bool nfsd_ffv2_test_start_failure(void);
+void nfsd_ffv2_test_fault_arm(enum nfsd_ffv2_fault_phase phase);
 
 #endif /* _NFSD_FFV2_H */

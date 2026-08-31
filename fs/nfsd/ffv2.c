@@ -4,6 +4,7 @@
 #include <linux/lockdep.h>
 #include <linux/kthread.h>
 #include <linux/refcount.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
 #include <linux/fs.h>
@@ -85,6 +86,37 @@ static DEFINE_MUTEX(nfsd_ffv2_registry_lock);
 static DEFINE_MUTEX(nfsd_ffv2_export_policy_lock);
 static LIST_HEAD(nfsd_ffv2_participants);
 static LIST_HEAD(nfsd_ffv2_reservations);
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST) || \
+	IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static atomic_t nfsd_ffv2_fault_armed_phase = ATOMIC_INIT(NFSD_FFV2_FAULT_NONE);
+static atomic_t nfsd_ffv2_fault_hit_phase = ATOMIC_INIT(NFSD_FFV2_FAULT_NONE);
+
+bool nfsd_ffv2_fault_inject(enum nfsd_ffv2_fault_phase phase)
+{
+	if (atomic_cmpxchg(&nfsd_ffv2_fault_armed_phase, phase,
+			   NFSD_FFV2_FAULT_NONE) != phase)
+		return false;
+	atomic_set(&nfsd_ffv2_fault_hit_phase, phase);
+	return true;
+}
+
+void nfsd_ffv2_fault_arm(enum nfsd_ffv2_fault_phase phase)
+{
+	atomic_set(&nfsd_ffv2_fault_hit_phase, NFSD_FFV2_FAULT_NONE);
+	atomic_set(&nfsd_ffv2_fault_armed_phase, phase);
+}
+
+enum nfsd_ffv2_fault_phase nfsd_ffv2_fault_armed(void)
+{
+	return atomic_read(&nfsd_ffv2_fault_armed_phase);
+}
+
+enum nfsd_ffv2_fault_phase nfsd_ffv2_fault_hit(void)
+{
+	return atomic_read(&nfsd_ffv2_fault_hit_phase);
+}
+#endif
 
 static const u8 nfsd_ffv2_fh_magic[8] = {
 	0xff, 'F', 'F', 'V', '2', 'F', 'H', 0,
@@ -408,6 +440,61 @@ nfsd_ffv2_release_snapshots(struct nfsd_ffv2_participant_snapshot *snapshots,
 	kfree(snapshots);
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST)
+int nfsd_ffv2_live_state_show(struct seq_file *m, void *v)
+{
+	struct nfsd_ffv2_participant_snapshot *snapshots;
+	unsigned int count, i;
+	int error;
+
+	error = nfsd_ffv2_snapshot_participants(&snapshots, &count);
+	if (error)
+		return error;
+	for (i = 0; i < count; i++) {
+		struct nfsd_ffv2_participant *participant =
+			snapshots[i].participant;
+		struct nfsd_net *nn = net_generic(snapshots[i].net,
+						  nfsd_net_id);
+		struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+		struct nfsd_ffv2_reservation *reservation;
+		unsigned int reservations = 0;
+		unsigned int inventory;
+		unsigned int updates;
+		u64 pending = 0, active = 0, retiring = 0;
+		bool registration;
+
+		mutex_lock(&anchor->lock);
+		if (anchor->pending)
+			pending = anchor->pending->identity->generation;
+		if (anchor->active)
+			active = anchor->active->identity->generation;
+		if (anchor->retiring)
+			retiring = anchor->retiring->identity->generation;
+		registration = anchor->registration_pending;
+		mutex_unlock(&anchor->lock);
+
+		spin_lock(&participant->update_lock);
+		updates = participant->update_count;
+		spin_unlock(&participant->update_lock);
+		mutex_lock(&participant->inventory_lock);
+		inventory = participant->inventory_count;
+		mutex_unlock(&participant->inventory_lock);
+		mutex_lock(&nfsd_ffv2_registry_lock);
+		list_for_each_entry(reservation, &participant->reservations,
+				    owner_node)
+			reservations++;
+		mutex_unlock(&nfsd_ffv2_registry_lock);
+
+		seq_printf(m,
+			   "netns=%u registration=%u updates=%u reservations=%u inventory=%u pending=%llu active=%llu retiring=%llu\n",
+			   snapshots[i].net->ns.inum, registration, updates,
+			   reservations, inventory, pending, active, retiring);
+	}
+	nfsd_ffv2_release_snapshots(snapshots, count);
+	return 0;
+}
+#endif
+
 static void
 nfsd_ffv2_reservation_unlink(struct nfsd_ffv2_reservation *reservation)
 {
@@ -672,7 +759,8 @@ nfsd_ffv2_transition_publish(struct nfsd_net *owner,
 	int error;
 
 	nfsd_ffv2_export_update_lock();
-	if (!nfsd_ffv2_export_is_current_locked(old) ||
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_EXACT_CURRENT) ||
+	    !nfsd_ffv2_export_is_current_locked(old) ||
 	    !nfsd_ffv2_export_is_transitioning(old)) {
 		error = -ESTALE;
 		goto out_update;
@@ -696,6 +784,24 @@ nfsd_ffv2_transition_publish(struct nfsd_net *owner,
 		goto out_anchor;
 	}
 
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_CACHE_REPLACE)) {
+		error = -ENOMEM;
+		goto out_anchor;
+	}
+	/*
+	 * Registry insertion and generation activation are non-failing parts of
+	 * the atomic publication below. Exercise their prepared-state unwinds at
+	 * the last reversible point rather than inventing a post-replacement
+	 * failure that production cannot reach.
+	 */
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_REGISTRY_INSERT)) {
+		error = -ENOMEM;
+		goto out_anchor;
+	}
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_GENERATION_ACTIVATE)) {
+		error = -ENOMEM;
+		goto out_anchor;
+	}
 	published = nfsd_ffv2_export_update_exact_locked(template, old);
 	if (IS_ERR(published)) {
 		error = PTR_ERR(published);
@@ -779,6 +885,10 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 					      &transaction);
 	if (error)
 		return error;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_RESERVATION_CLAIM)) {
+		error = -ENOMEM;
+		goto out_update;
+	}
 	if (expected)
 		error = nfsd_ffv2_claim_expected(owner, root, store_uuid,
 						 binding_token, expected,
@@ -808,6 +918,11 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 			}
 		}
 	}
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_CONTEXT_ALLOC)) {
+		nfsd_ffv2_reservation_abort(reservation);
+		error = -ENOMEM;
+		goto out_reopen;
+	}
 	context = nfsd_ffv2_service_context_alloc(reservation, cred,
 						  control_root, 0);
 	if (!context) {
@@ -816,6 +931,12 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 		goto out_reopen;
 	}
 	context->object = object;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_GENERATION_ALLOC)) {
+		nfsd_ffv2_service_context_abort(context, NULL);
+		nfsd_ffv2_reservation_abort(reservation);
+		error = -ENOMEM;
+		goto out_reopen;
+	}
 	error = nfsd_ffv2_generation_prepare(owner, context,
 					     nfsd_ffv2_service_context_release,
 					     object ? object->object_uuid : NULL,
@@ -933,9 +1054,17 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 		goto out_free;
 	}
 
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_AUTH_DOMAIN)) {
+		error = -ENOMEM;
+		goto out_free;
+	}
 	object->client = auth_domain_find((char *)request->auth_domain);
 	if (!object->client) {
 		error = -ENOENT;
+		goto out_free;
+	}
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_EXPORT_PATH)) {
+		error = -EIO;
 		goto out_free;
 	}
 	error = kern_path(request->export_path, LOOKUP_NO_SYMLINKS,
@@ -943,6 +1072,10 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 	if (error)
 		goto out_free;
 	object->export_valid = true;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_OBJECT_PATH)) {
+		error = -EIO;
+		goto out_free;
+	}
 	error = kern_path(request->object_path, LOOKUP_NO_SYMLINKS,
 			  &object->object_path);
 	if (error)
@@ -951,6 +1084,10 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 	memcpy(object->object_uuid, request->object_uuid,
 	       sizeof(object->object_uuid));
 
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_EXPORT_LOOKUP)) {
+		error = -EIO;
+		goto out_free;
+	}
 	exp = nfsd_ffv2_export_lookup(nn->svc_export_cache, object->client,
 				      &object->export_path);
 	if (IS_ERR(exp)) {
@@ -963,6 +1100,10 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 	memcpy(object->export_uuid, exp->ex_uuid, sizeof(object->export_uuid));
 
 	fh_init(&ordinary, NFS4_FHSIZE);
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_FH_COMPOSE)) {
+		error = -EIO;
+		goto out_put_fh;
+	}
 	status = fh_compose(&ordinary, exp, object->object_path.dentry, NULL);
 	if (status) {
 		error = -ESTALE;
@@ -987,6 +1128,10 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 	error = nfsd_ffv2_object_validate(exp, object);
 	if (error)
 		goto out_reopen;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_TEMPLATE_CLONE)) {
+		error = -ENOMEM;
+		goto out_reopen;
+	}
 	error = nfsd_ffv2_export_template_clone(&template, exp);
 	if (error)
 		goto out_reopen;
@@ -2390,5 +2535,10 @@ void nfsd_ffv2_test_set_start_failure(bool fail)
 bool nfsd_ffv2_test_start_failure(void)
 {
 	return atomic_xchg(&nfsd_ffv2_start_failure, 0);
+}
+
+void nfsd_ffv2_test_fault_arm(enum nfsd_ffv2_fault_phase phase)
+{
+	nfsd_ffv2_fault_arm(phase);
 }
 #endif

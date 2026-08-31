@@ -2466,9 +2466,15 @@ int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 	if (error)
 		return error;
 
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_OBJECT_ALLOC))
+		return -ENOMEM;
 	object = nfsd_ffv2_object_alloc();
 	if (!object)
 		return -ENOMEM;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_REPLY_SKB)) {
+		nfsd_ffv2_object_free(object);
+		return -ENOMEM;
+	}
 	skb = genlmsg_new(nla_total_size_64bit(sizeof(generation_id)) +
 			  nla_total_size(NFSD_FFV2_FH_MAX), GFP_KERNEL);
 	if (!skb) {
@@ -2500,6 +2506,10 @@ int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 	object = NULL;
 	if (error)
 		goto out_registration;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_REPLY_BUILD)) {
+		error = -ENOMEM;
+		goto out_retire;
+	}
 	if (nla_put_u64_64bit(skb, NFSD_A_FFV2_OBJECT_GENERATION,
 			      generation_id, 0) ||
 	    nla_put(skb, NFSD_A_FFV2_OBJECT_FILEHANDLE, outer_fh.fh_size,
