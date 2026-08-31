@@ -7,13 +7,16 @@
 #include <linux/unaligned.h>
 #include <linux/fs.h>
 #include <linux/fs_context.h>
+#include <linux/lockd/bind.h>
 #include <linux/mount.h>
+#include <linux/nfslocalio.h>
 #include <linux/sunrpc/svc_xprt.h>
 #include <linux/wait.h>
 #include <net/net_namespace.h>
 
 #include "export.h"
 #include "ffv2.h"
+#include "filecache.h"
 #include "nfsfh.h"
 #include "nfsd.h"
 #include "netns.h"
@@ -134,6 +137,10 @@ struct nfsd_ffv2_reservation {
 	enum nfsd_ffv2_reservation_state state;
 	u8			store_uuid[16];
 	u8			binding_token[32];
+	struct nlmsvc_ffv2_gate nlm_gate;
+	struct nfsd_file_ffv2_gate file_gate;
+	bool			nlm_gated;
+	bool			file_gated;
 };
 
 struct nfsd_ffv2_service_context {
@@ -153,6 +160,12 @@ struct nfsd_ffv2_participant_snapshot {
 
 static void
 nfsd_ffv2_participant_put(struct nfsd_ffv2_participant *participant);
+static int
+nfsd_ffv2_snapshot_participants(struct nfsd_ffv2_participant_snapshot **result,
+				unsigned int *count);
+static void
+nfsd_ffv2_release_snapshots(struct nfsd_ffv2_participant_snapshot *snapshots,
+			    unsigned int count);
 static int
 nfsd_ffv2_export_update_admit(struct nfsd_ffv2_participant *participant,
 			      struct nfsd_ffv2_export_update *update);
@@ -177,10 +190,79 @@ nfsd_ffv2_reservation_put(struct nfsd_ffv2_reservation *reservation)
 {
 	if (!refcount_dec_and_test(&reservation->ref))
 		return;
+	WARN_ON_ONCE(reservation->nlm_gated || reservation->file_gated);
 	iput(reservation->inode);
 	path_put(&reservation->root);
 	mutex_destroy(&reservation->entry_lock);
 	kfree(reservation);
+}
+
+static void
+nfsd_ffv2_reservation_ungate_io(struct nfsd_ffv2_reservation *reservation)
+{
+	if (reservation->file_gated) {
+		nfsd_file_ffv2_gate_end(&reservation->file_gate);
+		reservation->file_gated = false;
+	}
+	if (reservation->nlm_gated) {
+		nlmsvc_ffv2_gate_end(&reservation->nlm_gate);
+		reservation->nlm_gated = false;
+	}
+}
+
+int
+nfsd_ffv2_reservation_gate_io(struct nfsd_ffv2_reservation *reservation)
+{
+	struct nfsd_ffv2_participant_snapshot *snapshots = NULL;
+	unsigned int count = 0;
+#if IS_ENABLED(CONFIG_NFS_LOCALIO)
+	unsigned int i;
+#endif
+	int error;
+
+	mutex_lock(&reservation->entry_lock);
+	if (READ_ONCE(reservation->state) != NFSD_FFV2_RESERVING ||
+	    reservation->nlm_gated || reservation->file_gated) {
+		error = -EBUSY;
+		goto out_unlock;
+	}
+	error = nlmsvc_ffv2_gate_begin(&reservation->nlm_gate,
+				       reservation->sb);
+	if (error)
+		goto out_unlock;
+	reservation->nlm_gated = true;
+	error = nfsd_file_ffv2_gate_begin(&reservation->file_gate,
+					  reservation->sb);
+	if (error)
+		goto out_ungate;
+	reservation->file_gated = true;
+
+	error = nfsd_ffv2_snapshot_participants(&snapshots, &count);
+	if (error)
+		goto out_ungate;
+#if IS_ENABLED(CONFIG_NFS_LOCALIO)
+	for (i = 0; i < count; i++) {
+		struct nfsd_net *nn = net_generic(snapshots[i].net, nfsd_net_id);
+
+		nfs_localio_invalidate_clients(&nn->local_clients,
+					       &nn->local_clients_lock);
+	}
+#endif
+	nfsd_ffv2_release_snapshots(snapshots, count);
+	snapshots = NULL;
+	count = 0;
+	error = nfsd_file_ffv2_gate_wait(&reservation->file_gate);
+	if (error)
+		goto out_ungate;
+	mutex_unlock(&reservation->entry_lock);
+	return 0;
+
+out_ungate:
+	nfsd_ffv2_release_snapshots(snapshots, count);
+	nfsd_ffv2_reservation_ungate_io(reservation);
+out_unlock:
+	mutex_unlock(&reservation->entry_lock);
+	return error;
 }
 
 static bool nfsd_ffv2_superblock_reserved(struct super_block *sb)
@@ -406,6 +488,7 @@ void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation)
 	if (!list_empty(&reservation->node))
 		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_QUIESCING);
 	mutex_unlock(&nfsd_ffv2_registry_lock);
+	nfsd_ffv2_reservation_ungate_io(reservation);
 	nfsd_ffv2_reservation_unlink(reservation);
 	mutex_unlock(&reservation->entry_lock);
 	nfsd_ffv2_reservation_put(reservation);
@@ -418,6 +501,7 @@ void nfsd_ffv2_reservation_fence(struct nfsd_ffv2_reservation *reservation)
 	if (!list_empty(&reservation->node))
 		WRITE_ONCE(reservation->state, NFSD_FFV2_RESERVATION_FENCING);
 	mutex_unlock(&nfsd_ffv2_registry_lock);
+	nfsd_ffv2_reservation_ungate_io(reservation);
 	nfsd_ffv2_reservation_unlink(reservation);
 	mutex_unlock(&reservation->entry_lock);
 	nfsd_ffv2_reservation_put(reservation);

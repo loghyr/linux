@@ -1497,10 +1497,15 @@ static void nfsd_ffv2_filehandle_format_test(struct kunit *test)
 
 static void nfsd_ffv2_filecache_gate_test(struct kunit *test)
 {
+	struct nfsd_ffv2_reservation *reservation = NULL;
 	struct nfsd_file_ffv2_gate gate;
 	struct nfsd_file *blocked, *nf;
+	struct nfsd_net *nn;
 	struct inode *inode;
 	struct path root;
+	struct net *net;
+	u8 token[32] = { 3 };
+	u8 uuid[16] = { 4 };
 	int error;
 
 	mutex_lock(&nfsd_mutex);
@@ -1532,6 +1537,42 @@ static void nfsd_ffv2_filecache_gate_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nfsd_file_ffv2_gate_wait(&gate), 0);
 	KUNIT_EXPECT_EQ(test, gate.live, 0U);
 	nfsd_file_ffv2_gate_end(&gate);
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create reservation gate netns: %ld",
+			   PTR_ERR(net));
+		goto out_root;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	error = nfsd_ffv2_test_reservation_claim(nn, &root, uuid, token,
+						 &reservation);
+	if (error) {
+		KUNIT_FAIL(test, "failed to claim gate reservation: %d", error);
+		goto out_net;
+	}
+	error = nfsd_ffv2_reservation_gate_io(reservation);
+	if (error) {
+		KUNIT_FAIL(test, "failed to install reservation gates: %d", error);
+		goto out_reservation;
+	}
+	blocked = nfsd_file_ffv2_test_alloc(inode);
+	KUNIT_EXPECT_PTR_EQ(test, blocked, NULL);
+	if (blocked)
+		nfsd_file_put(blocked);
+	nfsd_ffv2_reservation_abort(reservation);
+	reservation = NULL;
+	nf = nfsd_file_ffv2_test_alloc(inode);
+	KUNIT_EXPECT_NOT_NULL(test, nf);
+	if (nf)
+		nfsd_file_put(nf);
+
+out_reservation:
+	if (reservation)
+		nfsd_ffv2_reservation_abort(reservation);
+out_net:
+	put_net(net);
+	net_ns_barrier();
 	nf = nfsd_file_ffv2_test_alloc(inode);
 	KUNIT_EXPECT_NOT_NULL(test, nf);
 	if (nf)
