@@ -248,6 +248,39 @@ struct cache_head *sunrpc_cache_update(struct cache_detail *detail,
 }
 EXPORT_SYMBOL_GPL(sunrpc_cache_update);
 
+static bool
+sunrpc_cache_is_current_locked(struct cache_detail *detail,
+			       struct cache_head *key,
+			       struct cache_head *expected, int hash)
+{
+	struct hlist_head *head = &detail->hash_table[hash];
+	struct cache_head *cursor;
+
+	lockdep_assert_held(&detail->hash_lock);
+	hlist_for_each_entry(cursor, head, cache_list) {
+		if (!detail->match(cursor, key))
+			continue;
+		if (test_bit(CACHE_VALID, &cursor->flags) &&
+		    cache_is_expired(detail, cursor))
+			continue;
+		return cursor == expected;
+	}
+	return false;
+}
+
+bool sunrpc_cache_is_current(struct cache_detail *detail,
+			     struct cache_head *key,
+			     struct cache_head *expected, int hash)
+{
+	bool is_current;
+
+	spin_lock(&detail->hash_lock);
+	is_current = sunrpc_cache_is_current_locked(detail, key, expected, hash);
+	spin_unlock(&detail->hash_lock);
+	return is_current;
+}
+EXPORT_SYMBOL_GPL(sunrpc_cache_is_current);
+
 /**
  * sunrpc_cache_update_exact - replace an exact current cache object
  * @detail: cache to update
@@ -266,9 +299,7 @@ sunrpc_cache_update_exact(struct cache_detail *detail,
 			  int hash)
 {
 	struct hlist_head *head = &detail->hash_table[hash];
-	struct cache_head *cursor = NULL;
 	struct cache_head *tmp;
-	bool found = false;
 
 	tmp = detail->alloc();
 	if (!tmp)
@@ -277,16 +308,7 @@ sunrpc_cache_update_exact(struct cache_detail *detail,
 	detail->init(tmp, old);
 
 	spin_lock(&detail->hash_lock);
-	hlist_for_each_entry(cursor, head, cache_list) {
-		if (!detail->match(cursor, old))
-			continue;
-		if (test_bit(CACHE_VALID, &cursor->flags) &&
-		    cache_is_expired(detail, cursor))
-			continue;
-		found = true;
-		break;
-	}
-	if (!found || cursor != old) {
+	if (!sunrpc_cache_is_current_locked(detail, old, old, hash)) {
 		spin_unlock(&detail->hash_lock);
 		cache_put(tmp, detail);
 		return ERR_PTR(-ESTALE);
