@@ -259,6 +259,9 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct net *net,
 
 		return nfserrno(PTR_ERR(exp));
 	}
+	if (nfsd_ffv2_export_access_get(exp))
+		goto out;
+	fhp->fh_ffv2_admitted = true;
 
 	if (exp->ex_flags & NFSEXP_NOSUBTREECHECK) {
 		/* Elevate privileges so that the lack of 'r' or 'x'
@@ -360,6 +363,10 @@ static __be32 nfsd_set_fh_dentry(struct svc_rqst *rqstp, struct net *net,
 
 	return 0;
 out:
+	if (fhp->fh_ffv2_admitted) {
+		nfsd_ffv2_export_access_put(exp);
+		fhp->fh_ffv2_admitted = false;
+	}
 	exp_put(exp);
 	return error;
 }
@@ -685,8 +692,16 @@ fh_compose(struct svc_fh *fhp, struct svc_export *exp, struct dentry *dentry,
 	/* If we have a ref_fh, then copy the fh_no_wcc setting from it. */
 	fhp->fh_no_wcc = ref_fh ? ref_fh->fh_no_wcc : false;
 
+	if (ref_fh && ref_fh->fh_export == exp &&
+	    ref_fh->fh_ffv2_admitted) {
+		if (nfsd_ffv2_export_access_clone(exp))
+			return nfserr_stale;
+	} else if (nfsd_ffv2_export_access_get(exp)) {
+		return nfserr_stale;
+	}
 	if (ref_fh == fhp)
 		fh_put(ref_fh);
+	fhp->fh_ffv2_admitted = true;
 
 	if (fhp->fh_dentry) {
 		printk(KERN_ERR "fh_compose: fh %pd2 not initialized!\n",
@@ -871,6 +886,10 @@ fh_put(struct svc_fh *fhp)
 	}
 	fh_drop_write(fhp);
 	if (exp) {
+		if (fhp->fh_ffv2_admitted) {
+			nfsd_ffv2_export_access_put(exp);
+			fhp->fh_ffv2_admitted = false;
+		}
 		exp_put(exp);
 		fhp->fh_export = NULL;
 	}

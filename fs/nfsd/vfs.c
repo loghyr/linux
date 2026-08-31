@@ -2010,7 +2010,7 @@ nfsd_symlink(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	host_err = vfs_symlink(&nop_mnt_idmap, d_inode(dentry), dnew, path, NULL);
 	err = nfserrno(host_err);
 	cerr = fh_compose(resfhp, fhp->fh_export, dnew, fhp);
-	if (!err)
+	if (!err && !cerr)
 		nfsd_create_setattr(rqstp, fhp, resfhp, attrs);
 	fh_fill_post_attrs(fhp);
 out_unlock:

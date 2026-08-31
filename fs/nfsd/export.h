@@ -61,6 +61,12 @@ struct export_stats {
 	struct percpu_counter	counter[EXP_STATS_COUNTERS_NUM];
 };
 
+enum nfsd_ffv2_export_access_state {
+	NFSD_FFV2_EXPORT_OPEN,
+	NFSD_FFV2_EXPORT_TRANSITIONING,
+	NFSD_FFV2_EXPORT_SERVICE,
+};
+
 struct svc_export {
 	struct cache_head	h;
 	struct auth_domain *	ex_client;
@@ -85,9 +91,20 @@ struct svc_export {
 	bool			ex_ffv2_listed;
 	struct nfsd_ffv2_service_context __rcu *ex_ffv2_context;
 	struct completion	*ex_ffv2_context_released;
+	spinlock_t		ex_ffv2_access_lock; /* protects state and count */
+	wait_queue_head_t	ex_ffv2_access_wait;
+	enum nfsd_ffv2_export_access_state ex_ffv2_access_state;
+	unsigned int		ex_ffv2_access_count;
 };
 
 struct svc_export *nfsd_export_cache_update(struct svc_export *new);
+int nfsd_ffv2_export_access_get(struct svc_export *exp);
+int nfsd_ffv2_export_access_clone(struct svc_export *exp);
+void nfsd_ffv2_export_access_put(struct svc_export *exp);
+int nfsd_ffv2_export_transition_begin(struct svc_export *exp);
+int nfsd_ffv2_export_transition_wait(struct svc_export *exp);
+void nfsd_ffv2_export_transition_abort(struct svc_export *exp);
+void nfsd_ffv2_export_transition_commit(struct svc_export *exp);
 struct svc_export *nfsd_ffv2_test_export_lookup(struct svc_export *key);
 void nfsd_ffv2_test_fail_export_alloc(bool fail);
 

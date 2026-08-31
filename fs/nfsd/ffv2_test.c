@@ -1251,6 +1251,23 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 			   PTR_ERR(published));
 		goto out_root;
 	}
+	error = nfsd_ffv2_export_access_get(published);
+	if (error) {
+		KUNIT_FAIL(test, "ordinary export admission failed: %d", error);
+		exp_put(published);
+		goto out_root;
+	}
+	error = nfsd_ffv2_export_transition_begin(published);
+	if (error) {
+		KUNIT_FAIL(test, "ordinary export transition failed: %d", error);
+		nfsd_ffv2_export_access_put(published);
+		exp_put(published);
+		goto out_root;
+	}
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_get(published), -ESTALE);
+	nfsd_ffv2_export_access_put(published);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_wait(published), 0);
+	nfsd_ffv2_export_transition_abort(published);
 	exp_put(published);
 	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 1U);
 	error = nfsd_ffv2_test_reservation_claim(nn2, &root, uuid, token,
@@ -1302,6 +1319,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			nfsd4_ffv2_export_policy_check(published, OP_GETATTR),
 			nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_get(published), -ESTALE);
 	exp_put(published);
 
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);

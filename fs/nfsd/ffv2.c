@@ -907,6 +907,7 @@ int nfsd_ffv2_export_update_end(struct svc_export *exp,
 		context->export = nfsd_export_get(exp);
 		context->published = true;
 		exp->ex_ffv2_context_released = &context->export_released;
+		nfsd_ffv2_export_transition_commit(exp);
 	}
 	mutex_unlock(&participant->inventory_lock);
 
