@@ -106,6 +106,9 @@ int nfsd_ffv2_export_transition_wait(struct svc_export *exp);
 void nfsd_ffv2_export_transition_abort(struct svc_export *exp);
 void nfsd_ffv2_export_transition_commit(struct svc_export *exp);
 struct svc_export *nfsd_ffv2_test_export_lookup(struct svc_export *key);
+struct svc_export *
+nfsd_ffv2_test_export_update_exact(struct svc_export *new,
+				   struct svc_export *old);
 void nfsd_ffv2_test_fail_export_alloc(bool fail);
 
 /* an "export key" (expkey) maps a filehandlefragement to an

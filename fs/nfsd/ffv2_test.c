@@ -1200,6 +1200,8 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct nfsd_ffv2_generation *generation;
 	struct auth_domain *domain;
 	struct svc_export *published;
+	struct svc_export *replacement;
+	struct svc_export *stale;
 	struct svc_export exp;
 	struct nfsd_net *nn;
 	struct nfsd_net *nn2;
@@ -1268,6 +1270,22 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	nfsd_ffv2_export_access_put(published);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_wait(published), 0);
 	nfsd_ffv2_export_transition_abort(published);
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	replacement = nfsd_ffv2_test_export_update_exact(&exp, published);
+	if (IS_ERR(replacement)) {
+		KUNIT_FAIL(test, "exact export replacement failed: %ld",
+			   PTR_ERR(replacement));
+		exp_put(published);
+		goto out_root;
+	}
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	stale = nfsd_ffv2_test_export_update_exact(&exp, published);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(stale));
+	if (IS_ERR(stale))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(stale), -ESTALE);
+	else
+		exp_put(stale);
+	exp_put(replacement);
 	exp_put(published);
 	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 1U);
 	error = nfsd_ffv2_test_reservation_claim(nn2, &root, uuid, token,

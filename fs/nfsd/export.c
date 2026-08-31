@@ -1831,6 +1831,23 @@ out_unlock:
 	return result;
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct svc_export *
+nfsd_ffv2_test_export_update_exact(struct svc_export *new,
+				   struct svc_export *old)
+{
+	struct cache_head *head;
+
+	mutex_lock(&nfsd_export_update_lock);
+	head = sunrpc_cache_update_exact(old->cd, &new->h, &old->h,
+					 svc_export_hash(old));
+	mutex_unlock(&nfsd_export_update_lock);
+	if (IS_ERR(head))
+		return ERR_CAST(head);
+	return container_of(head, struct svc_export, h);
+}
+#endif
+
 
 static struct svc_expkey *
 exp_find_key(struct cache_detail *cd, struct auth_domain *clp, int fsid_type,

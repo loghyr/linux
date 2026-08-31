@@ -745,13 +745,13 @@ void nfsd_ffv2_participant_detach_begin(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_participant *participant = &nn->ffv2_participant;
 
+	nfsd_ffv2_updates_set_open(participant, false);
+	nfsd_ffv2_updates_wait(participant);
 	mutex_lock(&nfsd_ffv2_registry_lock);
 	WRITE_ONCE(participant->attached, false);
 	if (!list_empty(&participant->node))
 		list_del_init(&participant->node);
 	mutex_unlock(&nfsd_ffv2_registry_lock);
-	nfsd_ffv2_updates_set_open(participant, false);
-	nfsd_ffv2_updates_wait(participant);
 	nfsd_ffv2_fence_owned_reservations(participant);
 
 	nfsd_ffv2_participant_put(participant);
