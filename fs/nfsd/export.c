@@ -1599,6 +1599,17 @@ int nfsd_ffv2_export_transition_wait(struct svc_export *exp)
 					!READ_ONCE(exp->ex_ffv2_access_count));
 }
 
+bool nfsd_ffv2_export_is_transitioning(struct svc_export *exp)
+{
+	bool transitioning;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	transitioning = exp->ex_ffv2_access_state ==
+			NFSD_FFV2_EXPORT_TRANSITIONING;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	return transitioning;
+}
+
 void nfsd_ffv2_export_transition_abort(struct svc_export *exp)
 {
 	spin_lock(&exp->ex_ffv2_access_lock);
@@ -1784,6 +1795,112 @@ svc_export_update(struct svc_export *new, struct svc_export *old)
 
 /* Serialize lookup and replacement so policy never validates a stale item. */
 static DEFINE_MUTEX(nfsd_export_update_lock);
+
+void nfsd_ffv2_export_update_lock(void)
+{
+	mutex_lock(&nfsd_export_update_lock);
+}
+
+void nfsd_ffv2_export_update_unlock(void)
+{
+	mutex_unlock(&nfsd_export_update_lock);
+}
+
+bool nfsd_ffv2_export_is_current_locked(struct svc_export *exp)
+{
+	lockdep_assert_held(&nfsd_export_update_lock);
+	return sunrpc_cache_is_current(exp->cd, &exp->h, &exp->h,
+				       svc_export_hash(exp));
+}
+
+struct svc_export *
+nfsd_ffv2_export_update_exact_locked(struct svc_export *new,
+				     struct svc_export *old)
+{
+	struct cache_head *head;
+
+	lockdep_assert_held(&nfsd_export_update_lock);
+	head = sunrpc_cache_update_exact(old->cd, &new->h, &old->h,
+					 svc_export_hash(old));
+	if (IS_ERR(head))
+		return ERR_CAST(head);
+	return container_of(head, struct svc_export, h);
+}
+
+static int
+nfsd_ffv2_fslocs_clone(struct nfsd4_fs_locations *dst,
+		       const struct nfsd4_fs_locations *src)
+{
+	unsigned int i;
+
+	dst->locations_count = src->locations_count;
+	dst->migrated = src->migrated;
+	if (!src->locations_count)
+		return 0;
+	dst->locations = kcalloc(src->locations_count,
+				 sizeof(*dst->locations), GFP_KERNEL);
+	if (!dst->locations)
+		return -ENOMEM;
+	for (i = 0; i < src->locations_count; i++) {
+		dst->locations[i].hosts = kstrdup(src->locations[i].hosts,
+						  GFP_KERNEL);
+		dst->locations[i].path = kstrdup(src->locations[i].path,
+						 GFP_KERNEL);
+		if (!dst->locations[i].hosts || !dst->locations[i].path)
+			return -ENOMEM;
+	}
+	return 0;
+}
+
+int nfsd_ffv2_export_template_clone(struct svc_export *template,
+				    struct svc_export *source)
+{
+	int error;
+
+	memset(template, 0, sizeof(*template));
+	kref_get(&source->ex_client->ref);
+	template->ex_client = source->ex_client;
+	template->ex_path = source->ex_path;
+	path_get(&template->ex_path);
+	template->cd = source->cd;
+	template->h.expiry_time = source->h.expiry_time;
+	template->ex_flags = source->ex_flags;
+	template->ex_fsid = source->ex_fsid;
+	template->ex_anon_uid = source->ex_anon_uid;
+	template->ex_anon_gid = source->ex_anon_gid;
+	template->ex_layout_types = source->ex_layout_types;
+	template->ex_devid_map = source->ex_devid_map;
+	template->ex_nflavors = source->ex_nflavors;
+	memcpy(template->ex_flavors, source->ex_flavors,
+	       sizeof(template->ex_flavors));
+	template->ex_xprtsec_modes = source->ex_xprtsec_modes;
+	template->ex_uuid = kmemdup(source->ex_uuid, EX_UUID_LEN, GFP_KERNEL);
+	if (!template->ex_uuid) {
+		error = -ENOMEM;
+		goto out_free;
+	}
+	error = nfsd_ffv2_fslocs_clone(&template->ex_fslocs,
+				       &source->ex_fslocs);
+	if (error)
+		goto out_free;
+	return 0;
+
+out_free:
+	nfsd_ffv2_export_template_free(template);
+	return error;
+}
+
+void nfsd_ffv2_export_template_free(struct svc_export *template)
+{
+	nfsd4_fslocs_free(&template->ex_fslocs);
+	kfree(template->ex_uuid);
+	template->ex_uuid = NULL;
+	if (template->ex_path.dentry)
+		path_put(&template->ex_path);
+	if (template->ex_client)
+		auth_domain_put(template->ex_client);
+	template->ex_client = NULL;
+}
 
 struct svc_export *
 nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,

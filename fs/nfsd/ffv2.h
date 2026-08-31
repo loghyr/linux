@@ -110,6 +110,12 @@ int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
 				const u8 binding_token[32],
 				struct nfsd_ffv2_reservation **result);
 int nfsd_ffv2_reservation_gate_io(struct nfsd_ffv2_reservation *reservation);
+int nfsd_ffv2_reservation_claim_expected(struct nfsd_net *owner,
+					 const struct path *root,
+					 const u8 store_uuid[16],
+					 const u8 binding_token[32],
+					 struct svc_export *expected,
+					 struct nfsd_ffv2_reservation **result);
 void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation);
 void nfsd_ffv2_reservation_fence(struct nfsd_ffv2_reservation *reservation);
 bool nfsd4_ffv2_mount_crossing_allowed(const struct path *path);
@@ -162,6 +168,12 @@ int nfsd_ffv2_test_reservation_claim(struct nfsd_net *owner,
 				     const u8 store_uuid[16],
 				     const u8 binding_token[32],
 				     struct nfsd_ffv2_reservation **result);
+int nfsd_ffv2_test_reservation_claim_expected(struct nfsd_net *owner,
+					      const struct path *root,
+					      const u8 store_uuid[16],
+					      const u8 binding_token[32],
+					      struct svc_export *expected,
+					      struct nfsd_ffv2_reservation **result);
 int
 nfsd_ffv2_test_service_export_publish(struct nfsd_net *owner,
 				      struct svc_export *exp,

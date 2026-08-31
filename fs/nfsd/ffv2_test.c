@@ -1242,10 +1242,12 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 
 	error = nfsd_ffv2_reservation_claim(nn, &root, uuid, token,
 					    &reservation);
-	if (!error)
+	if (!error) {
 		nfsd_ffv2_reservation_abort(reservation);
-	else
+		reservation = NULL;
+	} else {
 		KUNIT_EXPECT_EQ(test, error, -EOPNOTSUPP);
+	}
 
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	exp.ex_uuid = kmemdup(uuid, sizeof(uuid), GFP_KERNEL);
@@ -1279,19 +1281,44 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_get(published), -ESTALE);
 	nfsd_ffv2_export_access_put(published);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_wait(published), 0);
+	error = nfsd_ffv2_test_reservation_claim_expected(nn2, &root, uuid,
+							  token, published,
+							  &reservation);
+	if (error) {
+		KUNIT_FAIL(test, "exact-E0 reservation failed: %d", error);
+		nfsd_ffv2_export_transition_abort_exact(published);
+		exp_put(selected);
+		exp_put(published);
+		goto out_root;
+	}
+	nfsd_ffv2_reservation_abort(reservation);
+	reservation = NULL;
 	KUNIT_EXPECT_TRUE(test,
 			  nfsd_ffv2_export_transition_abort_exact(published));
 	exp_put(selected);
-	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	error = nfsd_ffv2_export_template_clone(&exp, published);
+	if (error) {
+		KUNIT_FAIL(test, "export template clone failed: %d", error);
+		exp_put(published);
+		goto out_root;
+	}
 	replacement = nfsd_ffv2_test_export_update_exact(&exp, published);
+	nfsd_ffv2_export_template_free(&exp);
 	if (IS_ERR(replacement)) {
 		KUNIT_FAIL(test, "exact export replacement failed: %ld",
 			   PTR_ERR(replacement));
 		exp_put(published);
 		goto out_root;
 	}
-	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	error = nfsd_ffv2_export_template_clone(&exp, replacement);
+	if (error) {
+		KUNIT_FAIL(test, "stale template clone failed: %d", error);
+		exp_put(replacement);
+		exp_put(published);
+		goto out_root;
+	}
 	stale = nfsd_ffv2_test_export_update_exact(&exp, published);
+	nfsd_ffv2_export_template_free(&exp);
 	KUNIT_EXPECT_TRUE(test, IS_ERR(stale));
 	if (IS_ERR(stale))
 		KUNIT_EXPECT_EQ(test, PTR_ERR(stale), -ESTALE);

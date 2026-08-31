@@ -329,7 +329,8 @@ nfsd_ffv2_snapshot_participants(struct nfsd_ffv2_participant_snapshot **result,
 
 static bool
 nfsd_ffv2_snapshot_conflicts(struct nfsd_ffv2_participant_snapshot *snapshots,
-			     unsigned int count, struct super_block *sb)
+			     unsigned int count, struct super_block *sb,
+			     struct svc_export *expected)
 {
 	unsigned int i;
 
@@ -341,6 +342,9 @@ nfsd_ffv2_snapshot_conflicts(struct nfsd_ffv2_participant_snapshot *snapshots,
 		mutex_lock(&participant->inventory_lock);
 		list_for_each_entry(exp, &participant->inventory,
 				    ex_ffv2_inventory) {
+			if (exp == expected &&
+			    nfsd_ffv2_export_is_transitioning(exp))
+				continue;
 			if (exp->ex_ffv2_path.mnt->mnt_sb == sb) {
 				mutex_unlock(&participant->inventory_lock);
 				return true;
@@ -385,7 +389,8 @@ static int __nfsd_ffv2_reservation_claim(struct nfsd_net *owner,
 					 const u8 store_uuid[16],
 					 const u8 binding_token[32],
 					 struct nfsd_ffv2_reservation **result,
-					 bool validate_backend)
+					 bool validate_backend,
+					 struct svc_export *expected)
 {
 	struct nfsd_ffv2_participant_snapshot *snapshots = NULL;
 	struct nfsd_ffv2_reservation *reservation, *cursor;
@@ -446,7 +451,8 @@ static int __nfsd_ffv2_reservation_claim(struct nfsd_net *owner,
 
 	mutex_lock(&reservation->entry_lock);
 	mutex_lock(&nfsd_ffv2_export_policy_lock);
-	if (nfsd_ffv2_snapshot_conflicts(snapshots, count, reservation->sb))
+	if (nfsd_ffv2_snapshot_conflicts(snapshots, count, reservation->sb,
+					 expected))
 		error = -EBUSY;
 	else
 		error = 0;
@@ -478,7 +484,29 @@ int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
 				struct nfsd_ffv2_reservation **result)
 {
 	return __nfsd_ffv2_reservation_claim(owner, root, store_uuid, binding_token,
-					     result, true);
+					     result, true, NULL);
+}
+
+int
+nfsd_ffv2_reservation_claim_expected(struct nfsd_net *owner,
+				     const struct path *root,
+				     const u8 store_uuid[16],
+				     const u8 binding_token[32],
+				     struct svc_export *expected,
+				     struct nfsd_ffv2_reservation **result)
+{
+	int error;
+
+	nfsd_ffv2_export_update_lock();
+	if (!nfsd_ffv2_export_is_current_locked(expected) ||
+	    !nfsd_ffv2_export_is_transitioning(expected))
+		error = -ESTALE;
+	else
+		error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
+						      binding_token, result, true,
+						      expected);
+	nfsd_ffv2_export_update_unlock();
+	return error;
 }
 
 void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation)
@@ -579,7 +607,7 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 		return error;
 	error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
 					      binding_token, &reservation,
-					      validate_backend);
+					      validate_backend, NULL);
 	if (error)
 		goto out_update;
 	context = nfsd_ffv2_service_context_alloc(reservation, cred,
@@ -1533,7 +1561,29 @@ int nfsd_ffv2_test_reservation_claim(struct nfsd_net *owner,
 				     struct nfsd_ffv2_reservation **result)
 {
 	return __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
-					     binding_token, result, false);
+					     binding_token, result, false, NULL);
+}
+
+int
+nfsd_ffv2_test_reservation_claim_expected(struct nfsd_net *owner,
+					  const struct path *root,
+					  const u8 store_uuid[16],
+					  const u8 binding_token[32],
+					  struct svc_export *expected,
+					  struct nfsd_ffv2_reservation **result)
+{
+	int error;
+
+	nfsd_ffv2_export_update_lock();
+	if (!nfsd_ffv2_export_is_current_locked(expected) ||
+	    !nfsd_ffv2_export_is_transitioning(expected))
+		error = -ESTALE;
+	else
+		error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
+						      binding_token, result, false,
+						      expected);
+	nfsd_ffv2_export_update_unlock();
+	return error;
 }
 
 int

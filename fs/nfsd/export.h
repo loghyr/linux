@@ -103,11 +103,21 @@ nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
 			const struct path *path);
 bool nfsd_ffv2_export_is_current(struct svc_export *exp);
 bool nfsd_ffv2_export_transition_abort_exact(struct svc_export *exp);
+void nfsd_ffv2_export_update_lock(void);
+void nfsd_ffv2_export_update_unlock(void);
+bool nfsd_ffv2_export_is_current_locked(struct svc_export *exp);
+struct svc_export *
+nfsd_ffv2_export_update_exact_locked(struct svc_export *new,
+				     struct svc_export *old);
+int nfsd_ffv2_export_template_clone(struct svc_export *template,
+				    struct svc_export *source);
+void nfsd_ffv2_export_template_free(struct svc_export *template);
 int nfsd_ffv2_export_access_get(struct svc_export *exp);
 int nfsd_ffv2_export_access_clone(struct svc_export *exp);
 void nfsd_ffv2_export_access_put(struct svc_export *exp);
 int nfsd_ffv2_export_transition_begin(struct svc_export *exp);
 int nfsd_ffv2_export_transition_wait(struct svc_export *exp);
+bool nfsd_ffv2_export_is_transitioning(struct svc_export *exp);
 void nfsd_ffv2_export_transition_abort(struct svc_export *exp);
 void nfsd_ffv2_export_transition_commit(struct svc_export *exp);
 struct svc_export *nfsd_ffv2_test_export_lookup(struct svc_export *key);
