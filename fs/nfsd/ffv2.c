@@ -887,7 +887,7 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 		return error;
 	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_RESERVATION_CLAIM)) {
 		error = -ENOMEM;
-		goto out_update;
+		goto out_reopen;
 	}
 	if (expected)
 		error = nfsd_ffv2_claim_expected(owner, root, store_uuid,
@@ -897,6 +897,8 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 		error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
 						      binding_token, &reservation,
 						      validate_backend, NULL);
+	if (error && expected)
+		goto out_reopen;
 	if (error)
 		goto out_update;
 	if (expected) {
