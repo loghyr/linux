@@ -388,6 +388,8 @@ struct nfsd4_session {
 	u16			se_slot_gen;
 	bool			se_dead;
 	u32			se_target_maxslots;
+	/* FFv2 control authorities derived from this session. */
+	struct list_head	se_ffv2_authorities;
 };
 
 /* formatted contents of nfs4_sessionid */
@@ -847,6 +849,11 @@ extern void nfsd4_shutdown_callback(struct nfs4_client *);
 extern void nfsd4_shutdown_copy(struct nfs4_client *clp);
 void nfsd4_put_client(struct nfs4_client *clp);
 void nfsd4_async_copy_reaper(struct nfsd_net *nn);
+struct nfsd4_session *nfsd4_session_lookup_get(struct net *net,
+					       const u8 *sessionid);
+void nfsd4_session_put_ref(struct nfsd4_session *ses);
+bool nfsd4_session_is_live_locked(struct nfsd4_session *ses);
+int nfsd4_copy_cred(struct svc_cred *target, struct svc_cred *source);
 bool nfsd4_has_active_async_copies(struct nfs4_client *clp);
 void nfsd_update_cmtime_attr(struct file *f, unsigned int flags);
 extern struct nfs4_client_reclaim *nfs4_client_to_reclaim(struct xdr_netobj name,

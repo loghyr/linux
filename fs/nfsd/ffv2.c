@@ -13,6 +13,9 @@
 #include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/nfslocalio.h>
+#include <linux/sunrpc/gss_api.h>
+#include <linux/sunrpc/auth_gss.h>
+#include <linux/sunrpc/msg_prot.h>
 #include <linux/sunrpc/svc_xprt.h>
 #include <linux/wait.h>
 #include <net/net_namespace.h>
@@ -23,6 +26,7 @@
 #include "nfsfh.h"
 #include "nfsd.h"
 #include "netns.h"
+#include "state.h"
 #include "vfs.h"
 
 enum nfsd_ffv2_identity_state {
@@ -220,6 +224,7 @@ struct nfsd_ffv2_service_context {
 	struct nfsd_ffv2_reservation *reservation;
 	struct svc_export	*export;
 	struct nfsd_ffv2_object *object;
+	struct nfsd_ffv2_authority *authority;
 	const struct cred	*cred;
 	struct completion	export_released;
 	u64			control_root;
@@ -824,6 +829,19 @@ nfsd_ffv2_transition_publish(struct nfsd_net *owner,
 		error = -ENOMEM;
 		goto out_anchor;
 	}
+	/*
+	 * Last reversible point for the authority: consume PREPARED into
+	 * PUBLISHED, or abort here because the session died first.  Session
+	 * death takes the same leaf lock, so exactly one of the two
+	 * linearizations wins and no generation is published with an
+	 * authority that was already dead.
+	 */
+	if (registration && registration->authority &&
+	    !nfsd_ffv2_authority_publish(registration->authority,
+					 generation->identity->generation)) {
+		error = -ENOENT;
+		goto out_anchor;
+	}
 	published = nfsd_ffv2_export_update_exact_locked(template, old);
 	if (IS_ERR(published)) {
 		error = PTR_ERR(published);
@@ -857,6 +875,9 @@ nfsd_ffv2_transition_publish(struct nfsd_net *owner,
 	if (registration) {
 		anchor->registration_pending = false;
 		registration->registration_slot = false;
+		/* The generation payload now owns the authority. */
+		context->authority = registration->authority;
+		registration->authority = NULL;
 	}
 	mutex_unlock(&nfsd_ffv2_registry_lock);
 	mutex_unlock(&participant->inventory_lock);
@@ -1408,6 +1429,10 @@ void nfsd_ffv2_service_context_release(void *payload)
 		nfsd_export_put(exp);
 		wait_for_completion(&context->export_released);
 	}
+	if (context->authority) {
+		nfsd_ffv2_authority_detach(context->authority);
+		nfsd_ffv2_authority_put(context->authority);
+	}
 	put_cred(context->cred);
 	nfsd_ffv2_reservation_fence(context->reservation);
 	if (context->object_owned)
@@ -1618,6 +1643,17 @@ void nfsd_ffv2_registration_end(struct nfsd_net *nn,
 		anchor->registration_pending = false;
 		registration->registration_slot = false;
 		mutex_unlock(&anchor->lock);
+	}
+	/*
+	 * Registration cancellation: an authority that never reached
+	 * publication is detached here through the common helper.  After a
+	 * successful publication the generation payload owns it and this is a
+	 * no-op.
+	 */
+	if (registration->authority) {
+		nfsd_ffv2_authority_detach(registration->authority);
+		nfsd_ffv2_authority_put(registration->authority);
+		registration->authority = NULL;
 	}
 	nfsd_ffv2_export_update_put(registration);
 }
@@ -2076,6 +2112,569 @@ out_put:
 	nfsd_ffv2_generation_put(generation);
 }
 
+enum nfsd_ffv2_authority_state {
+	NFSD_FFV2_AUTHORITY_PREPARED,
+	NFSD_FFV2_AUTHORITY_PUBLISHED,
+	NFSD_FFV2_AUTHORITY_DEAD,
+};
+
+/*
+ * Control authority derived from one live NFSv4.1 or later MDS session.
+ * Every identity field is read from the session and its client under
+ * ->client_lock, so a caller cannot assert an identity it does not already
+ * hold on the wire.  The object never pins the network namespace: ->nn is a
+ * non-owning pointer valid only while the pernet anchor drains authorities.
+ */
+struct nfsd_ffv2_authority {
+	refcount_t			ref;
+	struct nfsd_net			*nn;
+	struct nfs4_sessionid		sessionid;
+	clientid_t			clientid;
+	u64				epoch;
+	u64				generation_id;
+	struct svc_cred			machine_cred;
+	u32				exchange_flags;
+	/* Leaf lock, nested under ->client_lock or the publication locks. */
+	spinlock_t			state_lock;
+	enum nfsd_ffv2_authority_state	state;
+	bool				linked;
+	struct list_head		session_link;
+};
+
+/*
+ * FFv2 MDS control authority.
+ *
+ * A registering caller names one session locator and nothing else.  Every
+ * identity fact recorded below is read from the live session and its owning
+ * client, so a caller cannot assert an MDS identity it does not already hold
+ * on the wire.  The object never takes get_net(): ->nn stays valid only while
+ * the pernet anchor still drains authorities, which pre-exit guarantees.
+ */
+
+static bool nfsd_ffv2_cred_integrity_protected(const struct svc_cred *cred)
+{
+	u32 service;
+
+	if (!cred->cr_gss_mech)
+		return false;
+	service = gss_pseudoflavor_to_service(cred->cr_gss_mech,
+					      cred->cr_flavor);
+	return service == RPC_GSS_SVC_INTEGRITY ||
+	       service == RPC_GSS_SVC_PRIVACY;
+}
+
+/**
+ * nfsd_ffv2_authority_qualify - may this client act as an MDS control root?
+ * @clp: the client owning the located session
+ *
+ * The self-declared PNFS-MDS flag is necessary but not sufficient: the
+ * client must also hold an active machine credential established with
+ * RPCSEC_GSS integrity or privacy and present a principal.  AUTH_SYS and an
+ * unreviewed transport identity are deliberately not accepted here.
+ *
+ * Returns 0 when the client qualifies, or -EACCES.
+ */
+int nfsd_ffv2_authority_qualify(const struct nfs4_client *clp)
+{
+	if (clp->cl_minorversion < 1)
+		return -EACCES;
+	if (!(clp->cl_exchange_flags & EXCHGID4_FLAG_USE_PNFS_MDS))
+		return -EACCES;
+	if (!clp->cl_mach_cred)
+		return -EACCES;
+	if (!nfsd_ffv2_cred_integrity_protected(&clp->cl_cred))
+		return -EACCES;
+	if (!clp->cl_cred.cr_raw_principal && !clp->cl_cred.cr_principal)
+		return -EACCES;
+	return 0;
+}
+
+void nfsd_ffv2_session_init(struct nfsd4_session *session)
+{
+	INIT_LIST_HEAD(&session->se_ffv2_authorities);
+}
+
+void nfsd_ffv2_session_free(struct nfsd4_session *session)
+{
+	WARN_ON_ONCE(!list_empty(&session->se_ffv2_authorities));
+}
+
+static void nfsd_ffv2_authority_free(struct nfsd_ffv2_authority *authority)
+{
+	free_svc_cred(&authority->machine_cred);
+	kfree(authority);
+}
+
+void nfsd_ffv2_authority_get(struct nfsd_ffv2_authority *authority)
+{
+	refcount_inc(&authority->ref);
+}
+
+void nfsd_ffv2_authority_put(struct nfsd_ffv2_authority *authority)
+{
+	if (authority && refcount_dec_and_test(&authority->ref))
+		nfsd_ffv2_authority_free(authority);
+}
+
+/* Admit one authority retirement work item.  Returns false once closed. */
+static bool nfsd_ffv2_authority_work_admit(struct nfsd_ffv2_anchor *anchor)
+{
+	bool admitted = false;
+
+	spin_lock(&anchor->authority_tokens_lock);
+	if (anchor->authority_work_open) {
+		anchor->authority_work++;
+		admitted = true;
+	}
+	spin_unlock(&anchor->authority_tokens_lock);
+	return admitted;
+}
+
+static void nfsd_ffv2_authority_work_done(struct nfsd_ffv2_anchor *anchor)
+{
+	spin_lock(&anchor->authority_tokens_lock);
+	if (!WARN_ON_ONCE(!anchor->authority_work) &&
+	    --anchor->authority_work == 0)
+		wake_up_all(&anchor->authority_wait);
+	spin_unlock(&anchor->authority_tokens_lock);
+}
+
+struct nfsd_ffv2_authority_retire {
+	struct work_struct		work;
+	struct nfsd_ffv2_authority	*authority;
+	u64				generation_id;
+};
+
+static void nfsd_ffv2_authority_retire_work(struct work_struct *work)
+{
+	struct nfsd_ffv2_authority_retire *retire =
+		container_of(work, struct nfsd_ffv2_authority_retire, work);
+	struct nfsd_ffv2_authority *authority = retire->authority;
+	struct nfsd_ffv2_anchor *anchor = &authority->nn->ffv2;
+
+	nfsd_ffv2_service_generation_retire(authority->nn,
+					    retire->generation_id);
+	nfsd_ffv2_authority_put(authority);
+	kfree(retire);
+	/* Signals pre-exit last, once ->nn is no longer used here. */
+	nfsd_ffv2_authority_work_done(anchor);
+}
+
+/*
+ * Queue exact-generation retirement for an authority whose session just
+ * died.  Retirement waits for users, so it must not run under
+ * ->client_lock; the work item runs it with no lock held.  Admission is
+ * taken before the item is published and released by the worker, so pre-exit
+ * cannot free the anchor underneath it.
+ *
+ * Caller holds nn->client_lock.
+ */
+static void
+nfsd_ffv2_authority_retire_queue(struct nfsd_ffv2_authority *authority,
+				 u64 generation_id)
+{
+	struct nfsd_ffv2_anchor *anchor = &authority->nn->ffv2;
+	struct nfsd_ffv2_authority_retire *retire;
+
+	if (!nfsd_ffv2_authority_work_admit(anchor))
+		return;
+	retire = kzalloc_obj(*retire, GFP_ATOMIC);
+	if (!retire) {
+		/*
+		 * Service stop and namespace exit still retire this
+		 * generation; only the prompt out-of-line retirement is lost.
+		 */
+		nfsd_ffv2_authority_work_done(anchor);
+		return;
+	}
+	nfsd_ffv2_authority_get(authority);
+	retire->authority = authority;
+	retire->generation_id = generation_id;
+	INIT_WORK(&retire->work, nfsd_ffv2_authority_retire_work);
+	queue_work(system_wq, &retire->work);
+}
+
+/*
+ * Kill one authority and unlink it from its session.  Returns the session
+ * list reference when this call performed the unlink, so the caller can drop
+ * that reference once it has released its locks.  Repeated calls are no-ops,
+ * so concurrent retirement and session death cannot double drop.
+ *
+ * Caller holds nn->client_lock; ->state_lock nests inside it.
+ */
+static struct nfsd_ffv2_authority *
+nfsd_ffv2_authority_kill_locked(struct nfsd_ffv2_authority *authority,
+				u64 *retire_generation)
+{
+	struct nfsd_ffv2_authority *dropped = NULL;
+
+	spin_lock(&authority->state_lock);
+	if (retire_generation &&
+	    authority->state == NFSD_FFV2_AUTHORITY_PUBLISHED)
+		*retire_generation = authority->generation_id;
+	authority->state = NFSD_FFV2_AUTHORITY_DEAD;
+	if (authority->linked) {
+		authority->linked = false;
+		list_del_init(&authority->session_link);
+		dropped = authority;
+	}
+	spin_unlock(&authority->state_lock);
+	return dropped;
+}
+
+/**
+ * nfsd_ffv2_session_dead_locked - kill every authority derived from a session
+ * @session: the session being removed
+ *
+ * Runs from every path that removes a session: DESTROY_SESSION, client
+ * expiry, administrative expiry, and namespace session-table teardown.
+ * Releasing the authority here takes no further lock and queues no work.
+ *
+ * Caller holds nn->client_lock.
+ */
+void nfsd_ffv2_session_dead_locked(struct nfsd4_session *session)
+{
+	struct nfsd_ffv2_authority *authority, *tmp;
+
+	list_for_each_entry_safe(authority, tmp,
+				 &session->se_ffv2_authorities, session_link) {
+		u64 retire_generation = 0;
+		struct nfsd_ffv2_authority *dropped;
+
+		dropped = nfsd_ffv2_authority_kill_locked(authority,
+							  &retire_generation);
+		if (retire_generation)
+			nfsd_ffv2_authority_retire_queue(authority,
+							 retire_generation);
+		nfsd_ffv2_authority_put(dropped);
+	}
+}
+
+/**
+ * nfsd_ffv2_authority_detach - retire one authority from any context
+ * @authority: the authority to kill
+ *
+ * The single idempotent detach used by registration cancellation, generation
+ * retirement and replacement, service stop, and namespace pre-exit.
+ *
+ * Caller holds no anchor, session, or FFv2 lock.
+ */
+void nfsd_ffv2_authority_detach(struct nfsd_ffv2_authority *authority)
+{
+	struct nfsd_net *nn = authority->nn;
+	struct nfsd_ffv2_authority *dropped;
+
+	spin_lock(&nn->client_lock);
+	dropped = nfsd_ffv2_authority_kill_locked(authority, NULL);
+	spin_unlock(&nn->client_lock);
+	nfsd_ffv2_authority_put(dropped);
+}
+
+/**
+ * nfsd_ffv2_authority_publish - consume a prepared authority at publication
+ * @authority: the prepared authority
+ * @generation_id: nonzero identifier of the generation being published
+ *
+ * Returns true when the authority was still prepared, meaning the caller may
+ * proceed with the non-failing generation commit.  Returns false when the
+ * session died first, so the caller must abort before replacing the exact
+ * export.  Session death takes the same lock, so these are the only two
+ * linearizations.
+ *
+ * May be called with the FFv2 publication locks held: ->state_lock is a leaf
+ * and nothing waits under it.
+ */
+bool nfsd_ffv2_authority_publish(struct nfsd_ffv2_authority *authority,
+				 u64 generation_id)
+{
+	bool published = false;
+
+	spin_lock(&authority->state_lock);
+	if (authority->state == NFSD_FFV2_AUTHORITY_PREPARED) {
+		authority->state = NFSD_FFV2_AUTHORITY_PUBLISHED;
+		authority->generation_id = generation_id;
+		published = true;
+	}
+	spin_unlock(&authority->state_lock);
+	return published;
+}
+
+/*
+ * Allocate one epoch from the per-namespace counter.  The counter never
+ * wraps and never reissues zero or a prior value: exhaustion fails closed so
+ * that no generation is published with a reused epoch.
+ */
+static int nfsd_ffv2_authority_epoch(struct nfsd_ffv2_anchor *anchor,
+				     u64 *epoch)
+{
+	int error = 0;
+
+	spin_lock(&anchor->authority_tokens_lock);
+	if (!anchor->next_authority_epoch ||
+	    anchor->next_authority_epoch == U64_MAX)
+		error = -EOVERFLOW;
+	else
+		*epoch = anchor->next_authority_epoch++;
+	spin_unlock(&anchor->authority_tokens_lock);
+	return error;
+}
+
+/**
+ * nfsd_ffv2_authority_register - derive an authority from a session locator
+ * @nn: nfsd namespace receiving the registration
+ * @net: the registering request's own network namespace
+ * @sessionid: exact 16-byte session locator, the only caller-supplied input
+ * @result: returns the prepared authority on success
+ *
+ * Resolves the locator in @net and derives the authority from the live
+ * session and its owning client.  A session in another namespace is not
+ * visible in @net's table and is reported like an unknown locator.
+ *
+ * Returns 0 with a prepared, linked authority, or a negative errno.
+ */
+int nfsd_ffv2_authority_register(struct nfsd_net *nn, struct net *net,
+				 const u8 sessionid[NFS4_MAX_SESSIONID_LEN],
+				 struct nfsd_ffv2_authority **result)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_authority *authority;
+	struct nfsd4_session *session;
+	struct nfs4_client *clp;
+	u32 exchange_flags;
+	clientid_t clientid;
+	int error;
+
+	spin_lock(&nn->client_lock);
+	session = nfsd4_session_lookup_get(net, sessionid);
+	if (!session) {
+		spin_unlock(&nn->client_lock);
+		return -ENOENT;
+	}
+	clp = session->se_client;
+	exchange_flags = clp->cl_exchange_flags;
+	clientid = clp->cl_clientid;
+	error = nfsd_ffv2_authority_qualify(clp);
+	spin_unlock(&nn->client_lock);
+	if (error)
+		goto out_put_session;
+
+	/*
+	 * The session reference pins the client, so the establishing
+	 * credential stays valid for the deep copy taken outside the lock.
+	 */
+	authority = kzalloc_obj(*authority, GFP_KERNEL);
+	if (!authority) {
+		error = -ENOMEM;
+		goto out_put_session;
+	}
+	refcount_set(&authority->ref, 1);
+	spin_lock_init(&authority->state_lock);
+	INIT_LIST_HEAD(&authority->session_link);
+	authority->nn = nn;
+	authority->state = NFSD_FFV2_AUTHORITY_PREPARED;
+	memcpy(&authority->sessionid.data, sessionid,
+	       NFS4_MAX_SESSIONID_LEN);
+	authority->clientid = clientid;
+	authority->exchange_flags = exchange_flags;
+
+	error = nfsd4_copy_cred(&authority->machine_cred, &clp->cl_cred);
+	if (error)
+		goto out_free;
+	error = nfsd_ffv2_authority_epoch(anchor, &authority->epoch);
+	if (error)
+		goto out_free;
+
+	/*
+	 * Link only while the session is still live.  A session that died
+	 * during the copy has already run its detach hook and would never run
+	 * it again for a late link.
+	 */
+	spin_lock(&nn->client_lock);
+	if (nfsd4_session_is_live_locked(session)) {
+		refcount_inc(&authority->ref);
+		authority->linked = true;
+		list_add(&authority->session_link,
+			 &session->se_ffv2_authorities);
+	} else {
+		error = -ENOENT;
+	}
+	spin_unlock(&nn->client_lock);
+	if (error)
+		goto out_free;
+
+	nfsd4_session_put_ref(session);
+	*result = authority;
+	return 0;
+
+out_free:
+	nfsd_ffv2_authority_put(authority);
+out_put_session:
+	nfsd4_session_put_ref(session);
+	return error;
+}
+
+/**
+ * nfsd_ffv2_authority_token_get - admit one temporary authority token
+ * @authority: authority the caller wants to use
+ *
+ * A token holder may use the non-owning ->nn pointer until it releases the
+ * admission.  Returns 0, or -ESHUTDOWN once the gate has closed.
+ */
+int nfsd_ffv2_authority_token_get(struct nfsd_ffv2_authority *authority)
+{
+	struct nfsd_ffv2_anchor *anchor = &authority->nn->ffv2;
+	int error = -ESHUTDOWN;
+
+	spin_lock(&anchor->authority_tokens_lock);
+	if (anchor->authority_tokens_open) {
+		anchor->authority_tokens++;
+		refcount_inc(&authority->ref);
+		error = 0;
+	}
+	spin_unlock(&anchor->authority_tokens_lock);
+	return error;
+}
+
+/**
+ * nfsd_ffv2_authority_token_put - release one temporary authority token
+ * @authority: authority whose token is being released
+ */
+void nfsd_ffv2_authority_token_put(struct nfsd_ffv2_authority *authority)
+{
+	struct nfsd_ffv2_anchor *anchor = &authority->nn->ffv2;
+
+	nfsd_ffv2_authority_put(authority);
+	spin_lock(&anchor->authority_tokens_lock);
+	if (!WARN_ON_ONCE(!anchor->authority_tokens) &&
+	    --anchor->authority_tokens == 0)
+		wake_up_all(&anchor->authority_wait);
+	spin_unlock(&anchor->authority_tokens_lock);
+}
+
+static void
+nfsd_ffv2_authority_admissions_close(struct nfsd_ffv2_anchor *anchor)
+{
+	spin_lock(&anchor->authority_tokens_lock);
+	anchor->authority_tokens_open = false;
+	anchor->authority_work_open = false;
+	spin_unlock(&anchor->authority_tokens_lock);
+}
+
+static bool
+nfsd_ffv2_authority_admissions_idle(struct nfsd_ffv2_anchor *anchor)
+{
+	bool idle;
+
+	spin_lock(&anchor->authority_tokens_lock);
+	idle = !anchor->authority_tokens && !anchor->authority_work;
+	spin_unlock(&anchor->authority_tokens_lock);
+	return idle;
+}
+
+/*
+ * Wait for every admitted authority token and retirement work item to drain.
+ * No FFv2, anchor, or session lock is held here, and no authority pins the
+ * namespace, so this cannot deadlock against a token holder.
+ */
+static void
+nfsd_ffv2_authority_admissions_drain(struct nfsd_ffv2_anchor *anchor)
+{
+	wait_event(anchor->authority_wait,
+		   nfsd_ffv2_authority_admissions_idle(anchor));
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/*
+ * Build a prepared authority linked to @session without a live NFS client.
+ * The epoch allocation and session linkage are the production paths; only
+ * the session lookup and credential copy are bypassed.
+ */
+struct nfsd_ffv2_authority *
+nfsd_ffv2_test_authority_create(struct nfsd_net *nn,
+				struct nfsd4_session *session)
+{
+	struct nfsd_ffv2_authority *authority;
+
+	authority = kzalloc_obj(*authority, GFP_KERNEL);
+	if (!authority)
+		return NULL;
+	refcount_set(&authority->ref, 1);
+	spin_lock_init(&authority->state_lock);
+	INIT_LIST_HEAD(&authority->session_link);
+	authority->nn = nn;
+	authority->state = NFSD_FFV2_AUTHORITY_PREPARED;
+	if (nfsd_ffv2_authority_epoch(&nn->ffv2, &authority->epoch)) {
+		kfree(authority);
+		return NULL;
+	}
+	spin_lock(&nn->client_lock);
+	refcount_inc(&authority->ref);
+	authority->linked = true;
+	list_add(&authority->session_link, &session->se_ffv2_authorities);
+	spin_unlock(&nn->client_lock);
+	return authority;
+}
+
+u64 nfsd_ffv2_test_authority_epoch(const struct nfsd_ffv2_authority *authority)
+{
+	return authority->epoch;
+}
+
+u64 nfsd_ffv2_test_authority_gen(const struct nfsd_ffv2_authority *authority)
+{
+	return authority->generation_id;
+}
+
+bool nfsd_ffv2_test_authority_dead(const struct nfsd_ffv2_authority *authority)
+{
+	return READ_ONCE(authority->state) == NFSD_FFV2_AUTHORITY_DEAD;
+}
+
+bool
+nfsd_ffv2_test_authority_published(const struct nfsd_ffv2_authority *authority)
+{
+	return READ_ONCE(authority->state) == NFSD_FFV2_AUTHORITY_PUBLISHED;
+}
+
+bool
+nfsd_ffv2_test_authority_linked(const struct nfsd_ffv2_authority *authority)
+{
+	return READ_ONCE(authority->linked);
+}
+
+int nfsd_ffv2_test_authority_epoch_alloc(struct nfsd_net *nn, u64 *epoch)
+{
+	return nfsd_ffv2_authority_epoch(&nn->ffv2, epoch);
+}
+
+void nfsd_ffv2_test_authority_epoch_set(struct nfsd_net *nn, u64 next)
+{
+	spin_lock(&nn->ffv2.authority_tokens_lock);
+	nn->ffv2.next_authority_epoch = next;
+	spin_unlock(&nn->ffv2.authority_tokens_lock);
+}
+
+bool nfsd_ffv2_test_authority_work_admit(struct nfsd_net *nn)
+{
+	return nfsd_ffv2_authority_work_admit(&nn->ffv2);
+}
+
+void nfsd_ffv2_test_authority_work_done(struct nfsd_net *nn)
+{
+	nfsd_ffv2_authority_work_done(&nn->ffv2);
+}
+
+void nfsd_ffv2_test_authority_admissions_close(struct nfsd_net *nn)
+{
+	nfsd_ffv2_authority_admissions_close(&nn->ffv2);
+}
+
+bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn)
+{
+	return nfsd_ffv2_authority_admissions_idle(&nn->ffv2);
+}
+#endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
+
 void nfsd_ffv2_net_init(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
@@ -2090,6 +2689,13 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 	anchor->active = NULL;
 	anchor->retiring = NULL;
 	anchor->registration_pending = false;
+	spin_lock_init(&anchor->authority_tokens_lock);
+	init_waitqueue_head(&anchor->authority_wait);
+	anchor->next_authority_epoch = 1;
+	anchor->authority_tokens = 0;
+	anchor->authority_work = 0;
+	anchor->authority_tokens_open = true;
+	anchor->authority_work_open = true;
 }
 
 void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
@@ -2101,6 +2707,11 @@ void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
 		return;
 	nfsd_ffv2_updates_set_open(&nn->ffv2_participant, false);
 	nfsd_ffv2_updates_wait(&nn->ffv2_participant);
+	/*
+	 * Close new authority-token and retirement-work admission before the
+	 * generation retires, so nothing new can reach ->nn afterwards.
+	 */
+	nfsd_ffv2_authority_admissions_close(anchor);
 	mutex_lock(&anchor->lock);
 	/* Pair with admission's lockless rejection before taking ->lock. */
 	smp_store_release(&anchor->net_state, NFSD_FFV2_NET_EXITING);
@@ -2109,6 +2720,12 @@ void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
 	mutex_unlock(&anchor->lock);
 
 	nfsd_ffv2_retire_finish(anchor, generation, true);
+	/*
+	 * Drain every admitted token and worker before the session tables and
+	 * the anchor go away: the non-owning ->nn pointer must not outlive its
+	 * last user.
+	 */
+	nfsd_ffv2_authority_admissions_drain(anchor);
 	nfsd_ffv2_anchor_put(anchor);
 }
 
@@ -2124,6 +2741,7 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	WARN_ON_ONCE(anchor->pending);
 	WARN_ON_ONCE(anchor->registration_pending);
 	mutex_unlock(&anchor->lock);
+	WARN_ON_ONCE(!nfsd_ffv2_authority_admissions_idle(anchor));
 	nfsd_ffv2_anchor_put(anchor);
 	wait_for_completion(&anchor->released);
 	mutex_destroy(&anchor->lock);

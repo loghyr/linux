@@ -2441,6 +2441,7 @@ int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 	struct nfsd_ffv2_object *object;
 	struct knfsd_fh outer_fh = {};
 	struct nlattr **attrs = info->attrs;
+	const int sessionid_attr = NFSD_A_FFV2_OBJECT_MDS_SESSIONID;
 	u64 generation_id = 0;
 	void *hdr;
 	int error;
@@ -2451,7 +2452,8 @@ int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_OBJECT_UUID) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_STORE_UUID) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_BINDING_TOKEN) ||
-	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_CONTROL_ROOT))
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_CONTROL_ROOT) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_OBJECT_MDS_SESSIONID))
 		return -EINVAL;
 	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_OBJECT_AUTH_DOMAIN],
 				     NAME_MAX, false);
@@ -2501,6 +2503,15 @@ int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 	mutex_unlock(&nfsd_mutex);
 	if (error)
 		goto out_free;
+	/*
+	 * The caller supplies only the session locator.  nfsd derives the
+	 * whole control identity from that live session.
+	 */
+	error = nfsd_ffv2_authority_register(nn, net,
+					     nla_data(attrs[sessionid_attr]),
+					     &registration.authority);
+	if (error)
+		goto out_registration;
 	error = nfsd_ffv2_object_register(nn, &registration, object, &request,
 					  &outer_fh, &generation_id);
 	object = NULL;

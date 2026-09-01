@@ -119,7 +119,7 @@ static const struct nla_policy nfsd_unlock_export_nl_policy[NFSD_A_UNLOCK_EXPORT
 };
 
 /* NFSD_CMD_FFV2_OBJECT_REGISTER - do */
-static const struct nla_policy nfsd_ffv2_object_register_nl_policy[NFSD_A_FFV2_OBJECT_CONTROL_ROOT + 1] = {
+static const struct nla_policy nfsd_ffv2_object_register_nl_policy[NFSD_A_FFV2_OBJECT_MDS_SESSIONID + 1] = {
 	[NFSD_A_FFV2_OBJECT_AUTH_DOMAIN] = { .type = NLA_NUL_STRING, },
 	[NFSD_A_FFV2_OBJECT_EXPORT_PATH] = { .type = NLA_NUL_STRING, },
 	[NFSD_A_FFV2_OBJECT_OBJECT_PATH] = { .type = NLA_NUL_STRING, },
@@ -127,6 +127,7 @@ static const struct nla_policy nfsd_ffv2_object_register_nl_policy[NFSD_A_FFV2_O
 	[NFSD_A_FFV2_OBJECT_STORE_UUID] = NLA_POLICY_EXACT_LEN(16),
 	[NFSD_A_FFV2_OBJECT_BINDING_TOKEN] = NLA_POLICY_EXACT_LEN(32),
 	[NFSD_A_FFV2_OBJECT_CONTROL_ROOT] = { .type = NLA_U64, },
+	[NFSD_A_FFV2_OBJECT_MDS_SESSIONID] = NLA_POLICY_EXACT_LEN(16),
 };
 
 /* NFSD_CMD_FFV2_OBJECT_UNREGISTER - do */
@@ -246,7 +247,7 @@ static const struct genl_split_ops nfsd_nl_ops[] = {
 		.cmd		= NFSD_CMD_FFV2_OBJECT_REGISTER,
 		.doit		= nfsd_nl_ffv2_object_register_doit,
 		.policy		= nfsd_ffv2_object_register_nl_policy,
-		.maxattr	= NFSD_A_FFV2_OBJECT_CONTROL_ROOT,
+		.maxattr	= NFSD_A_FFV2_OBJECT_MDS_SESSIONID,
 		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
 	},
 	{

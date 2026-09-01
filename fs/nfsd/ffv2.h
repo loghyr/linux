@@ -4,6 +4,7 @@
 
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/nfs4.h>
 #include <linux/refcount.h>
 #include <linux/completion.h>
 #include <linux/spinlock.h>
@@ -26,6 +27,9 @@ struct svc_xprt;
 struct task_struct;
 struct knfsd_fh;
 struct dentry;
+struct nfsd4_session;
+struct nfs4_client;
+struct nfsd_ffv2_authority;
 
 #define NFSD_FFV2_FH_HEADER_SIZE	56
 #define NFSD_FFV2_FH_INNER_MAX	72
@@ -77,6 +81,8 @@ struct nfsd_ffv2_export_update {
 	bool				entry_locked;
 	bool				policy_locked;
 	bool				registration_slot;
+	/* Prepared authority owned by the caller until publication. */
+	struct nfsd_ffv2_authority	*authority;
 };
 
 enum nfsd_ffv2_net_state {
@@ -104,6 +110,19 @@ struct nfsd_ffv2_anchor {
 	struct nfsd_ffv2_generation	*active;
 	struct nfsd_ffv2_generation	*retiring;
 	bool				registration_pending;
+	/*
+	 * Authority epoch allocation and the closeable authority-token and
+	 * retirement-work admissions.  One lock covers both gates and the
+	 * per-net token count so the gates cannot invert against each other.
+	 */
+	u64				next_authority_epoch;
+	/* Protects both admission gates and the per-net token count. */
+	spinlock_t			authority_tokens_lock;
+	wait_queue_head_t		authority_wait;
+	unsigned int			authority_tokens;
+	unsigned int			authority_work;
+	bool				authority_tokens_open;
+	bool				authority_work_open;
 };
 
 void nfsd_ffv2_net_init(struct nfsd_net *nn);
@@ -172,6 +191,20 @@ void nfsd_ffv2_service_down(struct nfsd_net *nn);
 bool nfsd_ffv2_requested_zero_threads(int n, const int *nthreads,
 				      unsigned int nrpools);
 int nfsd_ffv2_register(struct nfsd_net *nn);
+int nfsd_ffv2_authority_register(struct nfsd_net *nn, struct net *net,
+				 const u8 sessionid[NFS4_MAX_SESSIONID_LEN],
+				 struct nfsd_ffv2_authority **result);
+void nfsd_ffv2_authority_get(struct nfsd_ffv2_authority *authority);
+void nfsd_ffv2_authority_put(struct nfsd_ffv2_authority *authority);
+void nfsd_ffv2_authority_detach(struct nfsd_ffv2_authority *authority);
+bool nfsd_ffv2_authority_publish(struct nfsd_ffv2_authority *authority,
+				 u64 generation_id);
+void nfsd_ffv2_session_init(struct nfsd4_session *session);
+void nfsd_ffv2_session_dead_locked(struct nfsd4_session *session);
+void nfsd_ffv2_session_free(struct nfsd4_session *session);
+int nfsd_ffv2_authority_token_get(struct nfsd_ffv2_authority *authority);
+void nfsd_ffv2_authority_token_put(struct nfsd_ffv2_authority *authority);
+int nfsd_ffv2_authority_qualify(const struct nfs4_client *clp);
 int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info);
 int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
 			const struct nfsd_ffv2_fh_info *info);
@@ -308,5 +341,21 @@ void nfsd_ffv2_test_worker(struct svc_rqst *rqstp, struct svc_xprt *xprt);
 void nfsd_ffv2_test_set_start_failure(bool fail);
 bool nfsd_ffv2_test_start_failure(void);
 void nfsd_ffv2_test_fault_arm(enum nfsd_ffv2_fault_phase phase);
+struct nfsd_ffv2_authority *
+nfsd_ffv2_test_authority_create(struct nfsd_net *nn,
+				struct nfsd4_session *session);
+u64 nfsd_ffv2_test_authority_epoch(const struct nfsd_ffv2_authority *authority);
+u64 nfsd_ffv2_test_authority_gen(const struct nfsd_ffv2_authority *authority);
+bool nfsd_ffv2_test_authority_dead(const struct nfsd_ffv2_authority *authority);
+bool
+nfsd_ffv2_test_authority_published(const struct nfsd_ffv2_authority *authority);
+bool
+nfsd_ffv2_test_authority_linked(const struct nfsd_ffv2_authority *authority);
+int nfsd_ffv2_test_authority_epoch_alloc(struct nfsd_net *nn, u64 *epoch);
+void nfsd_ffv2_test_authority_epoch_set(struct nfsd_net *nn, u64 next);
+bool nfsd_ffv2_test_authority_work_admit(struct nfsd_net *nn);
+void nfsd_ffv2_test_authority_work_done(struct nfsd_net *nn);
+void nfsd_ffv2_test_authority_admissions_close(struct nfsd_net *nn);
+bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn);
 
 #endif /* _NFSD_FFV2_H */

@@ -55,6 +55,7 @@
 #include "netns.h"
 #include "pnfs.h"
 #include "filecache.h"
+#include "ffv2.h"
 #include "trace.h"
 
 #define NFSDDBG_FACILITY                NFSDDBG_PROC
@@ -2161,6 +2162,7 @@ static struct nfsd4_session *alloc_session(struct nfsd4_channel_attrs *fattrs,
 	if (!new)
 		return NULL;
 	xa_init(&new->se_slots);
+	nfsd_ffv2_session_init(new);
 
 	slot = nfsd4_alloc_slot(fattrs, 0, GFP_KERNEL);
 	if (!slot || xa_is_err(xa_store(&new->se_slots, 0, slot, GFP_KERNEL)))
@@ -2293,6 +2295,7 @@ static void nfsd4_del_conns(struct nfsd4_session *s)
 
 static void __free_session(struct nfsd4_session *ses)
 {
+	nfsd_ffv2_session_free(ses);
 	free_session_slots(ses, 0);
 	xa_destroy(&ses->se_slots);
 	kfree(ses);
@@ -2418,6 +2421,53 @@ out:
 	return session;
 }
 
+/**
+ * nfsd4_session_lookup_get - resolve a session locator and take a reference
+ * @net: network namespace whose session table is searched
+ * @sessionid: exact 16-byte session locator
+ *
+ * Returns a referenced live session, or NULL when @net has no live session
+ * with that locator.  A session belonging to another namespace is not
+ * visible here, so it is reported the same way as an unknown locator.
+ *
+ * Caller must hold nn->client_lock.
+ */
+struct nfsd4_session *nfsd4_session_lookup_get(struct net *net,
+					       const u8 *sessionid)
+{
+	struct nfs4_sessionid locator;
+	__be32 status;
+
+	memcpy(&locator.data, sessionid, NFS4_MAX_SESSIONID_LEN);
+	return find_in_sessionid_hashtbl(&locator, net, &status);
+}
+
+/**
+ * nfsd4_session_is_live_locked - is this session still usable?
+ * @ses: session to test
+ *
+ * A session stops being usable once DESTROY_SESSION has marked it dead or
+ * client expiry has unhashed it.  Both removal paths run under
+ * nn->client_lock, so a caller holding that lock sees a stable answer.
+ *
+ * Caller must hold nn->client_lock.
+ */
+bool nfsd4_session_is_live_locked(struct nfsd4_session *ses)
+{
+	return !is_session_dead(ses) && !list_empty(&ses->se_hash);
+}
+
+/**
+ * nfsd4_session_put_ref - release a reference taken by session lookup
+ * @ses: the session to release
+ *
+ * Caller must not hold nn->client_lock.
+ */
+void nfsd4_session_put_ref(struct nfsd4_session *ses)
+{
+	nfsd4_put_session(ses);
+}
+
 /* caller must hold client_lock */
 static void
 unhash_session(struct nfsd4_session *ses)
@@ -2427,6 +2477,7 @@ unhash_session(struct nfsd4_session *ses)
 
 	lockdep_assert_held(&nn->client_lock);
 
+	nfsd_ffv2_session_dead_locked(ses);
 	list_del(&ses->se_hash);
 	spin_lock(&ses->se_client->cl_lock);
 	list_del(&ses->se_perclnt);
@@ -2578,6 +2629,12 @@ unhash_client_locked(struct nfs4_client *clp)
 	}
 	list_del_init(&clp->cl_lru);
 	spin_lock(&clp->cl_lock);
+	/*
+	 * Separate pass: the authority leaf lock must not be taken while the
+	 * global session list lock is held.
+	 */
+	list_for_each_entry(ses, &clp->cl_sessions, se_perclnt)
+		nfsd_ffv2_session_dead_locked(ses);
 	spin_lock(&nfsd_session_list_lock);
 	list_for_each_entry(ses, &clp->cl_sessions, se_perclnt) {
 		list_del_init(&ses->se_hash);
@@ -2706,7 +2763,7 @@ static void copy_clid(struct nfs4_client *target, struct nfs4_client *source)
 	target->cl_clientid.cl_id = source->cl_clientid.cl_id; 
 }
 
-static int copy_cred(struct svc_cred *target, struct svc_cred *source)
+int nfsd4_copy_cred(struct svc_cred *target, struct svc_cred *source)
 {
 	target->cr_principal = kstrdup(source->cr_principal, GFP_KERNEL);
 	target->cr_raw_principal = kstrdup(source->cr_raw_principal,
@@ -3403,7 +3460,7 @@ static struct nfs4_client *create_client(struct xdr_netobj name,
 	if (clp == NULL)
 		return NULL;
 
-	ret = copy_cred(&clp->cl_cred, &rqstp->rq_cred);
+	ret = nfsd4_copy_cred(&clp->cl_cred, &rqstp->rq_cred);
 	if (ret) {
 		free_client(clp);
 		return NULL;
@@ -3631,7 +3688,7 @@ nfsd4_store_cache_entry(struct nfsd4_compoundres *resp)
 	slot->sl_opcnt = resp->opcnt;
 	slot->sl_status = resp->cstate.status;
 	free_svc_cred(&slot->sl_cred);
-	copy_cred(&slot->sl_cred, &resp->rqstp->rq_cred);
+	nfsd4_copy_cred(&slot->sl_cred, &resp->rqstp->rq_cred);
 
 	if (!(resp->cstate.slot->sl_flags & NFSD4_SLOT_CACHETHIS)) {
 		slot->sl_flags &= ~NFSD4_SLOT_CACHED;

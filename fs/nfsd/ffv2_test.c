@@ -9,6 +9,7 @@
 #include <linux/namei.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
+#include <linux/sunrpc/gss_api.h>
 #include <linux/sunrpc/svcsock.h>
 #include <linux/sunrpc/svc_xprt.h>
 #include <net/net_namespace.h>
@@ -2303,6 +2304,322 @@ static void nfsd_ffv2_malformed_later_op_test(struct kunit *test)
 	nfsd4_release_compoundargs(rqstp);
 }
 
+/*
+ * Authority tests.  These drive the production epoch, link, publication, and
+ * admission paths; only the session lookup and credential copy are bypassed,
+ * because a live NFS client cannot be established inside KUnit.
+ */
+
+static struct nfsd_net *nfsd_ffv2_authority_test_net(struct kunit *test)
+{
+	struct nfsd_net *nn = nfsd_ffv2_test_net(test);
+
+	if (!nn)
+		return NULL;
+	/* The authority paths nest ->client_lock outside the leaf lock. */
+	spin_lock_init(&nn->client_lock);
+	return nn;
+}
+
+static struct nfsd4_session *nfsd_ffv2_test_session(struct kunit *test)
+{
+	struct nfsd4_session *session;
+
+	session = kunit_kzalloc(test, sizeof(*session), GFP_KERNEL);
+	if (session)
+		nfsd_ffv2_session_init(session);
+	return session;
+}
+
+static void nfsd_ffv2_authority_qualify_test(struct kunit *test)
+{
+	struct gss_api_mech *mech;
+	struct nfs4_client clp;
+
+	mech = gss_mech_get_by_pseudoflavor(RPC_AUTH_GSS_KRB5I);
+	if (!mech)
+		kunit_skip(test, "krb5 GSS mechanism unavailable");
+
+	/* A fully qualified MDS control client. */
+	memset(&clp, 0, sizeof(clp));
+	clp.cl_minorversion = 1;
+	clp.cl_exchange_flags = EXCHGID4_FLAG_USE_PNFS_MDS;
+	clp.cl_mach_cred = true;
+	clp.cl_cred.cr_gss_mech = mech;
+	clp.cl_cred.cr_flavor = RPC_AUTH_GSS_KRB5I;
+	clp.cl_cred.cr_principal = "nfs@ds.example.net";
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_authority_qualify(&clp));
+
+	/* Privacy also qualifies. */
+	clp.cl_cred.cr_flavor = RPC_AUTH_GSS_KRB5P;
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_authority_qualify(&clp));
+
+	/* A raw principal alone is sufficient. */
+	clp.cl_cred.cr_principal = NULL;
+	clp.cl_cred.cr_raw_principal = "nfs/ds.example.net@EXAMPLE.NET";
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_authority_qualify(&clp));
+	clp.cl_cred.cr_principal = "nfs@ds.example.net";
+
+	/* Minor version 0 has no session and cannot be a control root. */
+	clp.cl_minorversion = 0;
+	KUNIT_EXPECT_EQ(test, -EACCES, nfsd_ffv2_authority_qualify(&clp));
+	clp.cl_minorversion = 1;
+
+	/* The self-declared PNFS-MDS flag is necessary. */
+	clp.cl_exchange_flags = 0;
+	KUNIT_EXPECT_EQ(test, -EACCES, nfsd_ffv2_authority_qualify(&clp));
+	clp.cl_exchange_flags = EXCHGID4_FLAG_USE_PNFS_MDS;
+
+	/* ... but not sufficient without an active machine credential. */
+	clp.cl_mach_cred = false;
+	KUNIT_EXPECT_EQ(test, -EACCES, nfsd_ffv2_authority_qualify(&clp));
+	clp.cl_mach_cred = true;
+
+	/* AUTH_SYS is not accepted as MDS control authority. */
+	clp.cl_cred.cr_gss_mech = NULL;
+	clp.cl_cred.cr_flavor = RPC_AUTH_UNIX;
+	KUNIT_EXPECT_EQ(test, -EACCES, nfsd_ffv2_authority_qualify(&clp));
+	clp.cl_cred.cr_gss_mech = mech;
+
+	/* GSS without integrity or privacy is not accepted either. */
+	clp.cl_cred.cr_flavor = RPC_AUTH_GSS_KRB5;
+	KUNIT_EXPECT_EQ(test, -EACCES, nfsd_ffv2_authority_qualify(&clp));
+	clp.cl_cred.cr_flavor = RPC_AUTH_GSS_KRB5I;
+
+	/* A missing principal is rejected. */
+	clp.cl_cred.cr_principal = NULL;
+	clp.cl_cred.cr_raw_principal = NULL;
+	KUNIT_EXPECT_EQ(test, -EACCES, nfsd_ffv2_authority_qualify(&clp));
+
+	gss_mech_put(mech);
+}
+
+static void nfsd_ffv2_authority_epoch_test(struct kunit *test)
+{
+	struct nfsd_net *nn;
+	u64 first = 0, second = 0;
+
+	nn = nfsd_ffv2_authority_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+
+	/* Epochs start nonzero and increment. */
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_test_authority_epoch_alloc(nn,
+								      &first));
+	KUNIT_EXPECT_NE(test, 0ULL, first);
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_test_authority_epoch_alloc(nn,
+								      &second));
+	KUNIT_EXPECT_EQ(test, first + 1, second);
+
+	/* A zero counter never issues zero. */
+	nfsd_ffv2_test_authority_epoch_set(nn, 0);
+	KUNIT_EXPECT_EQ(test, -EOVERFLOW,
+			nfsd_ffv2_test_authority_epoch_alloc(nn, &second));
+
+	/* Exhaustion fails closed rather than wrapping or reusing. */
+	nfsd_ffv2_test_authority_epoch_set(nn, U64_MAX);
+	KUNIT_EXPECT_EQ(test, -EOVERFLOW,
+			nfsd_ffv2_test_authority_epoch_alloc(nn, &second));
+
+	/* The last usable epoch is still issued exactly once. */
+	nfsd_ffv2_test_authority_epoch_set(nn, U64_MAX - 1);
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_test_authority_epoch_alloc(nn,
+								      &second));
+	KUNIT_EXPECT_EQ(test, U64_MAX - 1, second);
+	KUNIT_EXPECT_EQ(test, -EOVERFLOW,
+			nfsd_ffv2_test_authority_epoch_alloc(nn, &second));
+
+	nfsd_ffv2_test_net_destroy(test, nn);
+}
+
+static void nfsd_ffv2_authority_unknown_locator_test(struct kunit *test)
+{
+	static const u8 locator[NFS4_MAX_SESSIONID_LEN] = {
+		0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4,
+		5, 6, 7, 8, 9, 10, 11, 12,
+	};
+	struct nfsd_ffv2_authority *authority = NULL;
+	struct nfsd_ffv2_worker_ctx worker = {};
+	bool worker_installed = false;
+	bool service_up = false;
+	struct nfsd_net *nn;
+	struct net *net;
+	int error;
+
+	/*
+	 * A running service is required: registration is only reachable once
+	 * nfsd has started in this namespace and the session table exists.
+	 */
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create test netns: %ld",
+			   PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	error = nfsd_ffv2_worker_ctx_install(&worker, net);
+	if (error)
+		goto out_cleanup;
+	worker_installed = true;
+	error = nfsd_ffv2_start_test_service(net, &worker);
+	if (error)
+		goto out_cleanup;
+	service_up = true;
+
+	/*
+	 * An unknown locator, and one naming a session in another namespace,
+	 * are indistinguishable here: neither is visible in this table.
+	 */
+	KUNIT_EXPECT_EQ(test, -ENOENT,
+			nfsd_ffv2_authority_register(nn, net, locator,
+						     &authority));
+	KUNIT_EXPECT_NULL(test, authority);
+	error = 0;
+
+out_cleanup:
+	complete_all(&worker.run);
+	complete_all(&worker.allow_complete);
+	if (service_up)
+		nfsd_shutdown_threads(net);
+	if (worker_installed)
+		nfsd_ffv2_worker_ctx_remove(&worker);
+	put_net(net);
+	net_ns_barrier();
+	if (error)
+		KUNIT_FAIL(test, "unknown locator lifecycle failed: %d", error);
+}
+
+static void nfsd_ffv2_authority_publish_test(struct kunit *test)
+{
+	struct nfsd_ffv2_authority *authority;
+	struct nfsd4_session *session;
+	struct nfsd_net *nn;
+
+	nn = nfsd_ffv2_authority_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	session = nfsd_ffv2_test_session(test);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+
+	authority = nfsd_ffv2_test_authority_create(nn, session);
+	KUNIT_ASSERT_NOT_NULL(test, authority);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_linked(authority));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_authority_published(authority));
+	KUNIT_EXPECT_NE(test, 0ULL,
+			nfsd_ffv2_test_authority_epoch(authority));
+
+	/* PREPARED is consumed exactly once, recording the generation. */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_authority_publish(authority, 7));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_published(authority));
+	KUNIT_EXPECT_EQ(test, 7ULL,
+			nfsd_ffv2_test_authority_gen(authority));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_authority_publish(authority, 9));
+	KUNIT_EXPECT_EQ(test, 7ULL,
+			nfsd_ffv2_test_authority_gen(authority));
+
+	/* Detach is idempotent from every trigger. */
+	nfsd_ffv2_authority_detach(authority);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_dead(authority));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_authority_linked(authority));
+	nfsd_ffv2_authority_detach(authority);
+	nfsd_ffv2_authority_detach(authority);
+	spin_lock(&nn->client_lock);
+	nfsd_ffv2_session_dead_locked(session);
+	spin_unlock(&nn->client_lock);
+	KUNIT_EXPECT_TRUE(test, list_empty(&session->se_ffv2_authorities));
+
+	nfsd_ffv2_authority_put(authority);
+	nfsd_ffv2_test_net_destroy(test, nn);
+}
+
+static void nfsd_ffv2_authority_death_race_test(struct kunit *test)
+{
+	struct nfsd_ffv2_authority *authority;
+	struct nfsd4_session *session;
+	struct nfsd_net *nn;
+
+	nn = nfsd_ffv2_authority_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	session = nfsd_ffv2_test_session(test);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+
+	/* Linearization 1: session death wins, so publication must abort. */
+	authority = nfsd_ffv2_test_authority_create(nn, session);
+	KUNIT_ASSERT_NOT_NULL(test, authority);
+	spin_lock(&nn->client_lock);
+	nfsd_ffv2_session_dead_locked(session);
+	spin_unlock(&nn->client_lock);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_dead(authority));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_authority_publish(authority, 11));
+	KUNIT_EXPECT_EQ(test, 0ULL,
+			nfsd_ffv2_test_authority_gen(authority));
+	nfsd_ffv2_authority_put(authority);
+
+	/* Linearization 2: publication wins, then death makes it unusable. */
+	authority = nfsd_ffv2_test_authority_create(nn, session);
+	KUNIT_ASSERT_NOT_NULL(test, authority);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_authority_publish(authority, 12));
+	spin_lock(&nn->client_lock);
+	nfsd_ffv2_session_dead_locked(session);
+	spin_unlock(&nn->client_lock);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_dead(authority));
+	KUNIT_EXPECT_TRUE(test, list_empty(&session->se_ffv2_authorities));
+	nfsd_ffv2_authority_put(authority);
+
+	/* Drains the retirement work queued by the second linearization. */
+	nfsd_ffv2_test_net_destroy(test, nn);
+}
+
+static void nfsd_ffv2_authority_admission_test(struct kunit *test)
+{
+	struct nfsd_ffv2_authority *authority;
+	struct nfsd4_session *session;
+	struct nfsd_net *nn;
+
+	nn = nfsd_ffv2_authority_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	session = nfsd_ffv2_test_session(test);
+	KUNIT_ASSERT_NOT_NULL(test, session);
+	authority = nfsd_ffv2_test_authority_create(nn, session);
+	KUNIT_ASSERT_NOT_NULL(test, authority);
+
+	/* Tokens and work are admitted while the gates are open. */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_admissions_idle(nn));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_authority_token_get(authority));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_authority_admissions_idle(nn));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_work_admit(nn));
+
+	/* Closing the gates rejects new admissions but not existing ones. */
+	nfsd_ffv2_test_authority_admissions_close(nn);
+	KUNIT_EXPECT_EQ(test, -ESHUTDOWN,
+			nfsd_ffv2_authority_token_get(authority));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_authority_work_admit(nn));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_authority_admissions_idle(nn));
+
+	/* Both counters must reach zero before teardown may proceed. */
+	nfsd_ffv2_authority_token_put(authority);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_authority_admissions_idle(nn));
+	nfsd_ffv2_test_authority_work_done(nn);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_admissions_idle(nn));
+
+	nfsd_ffv2_authority_detach(authority);
+	nfsd_ffv2_authority_put(authority);
+	nfsd_ffv2_test_net_destroy(test, nn);
+}
+
+static void nfsd_ffv2_authority_provider_gate_test(struct kunit *test)
+{
+	struct nfsd_net *nn;
+
+	nn = nfsd_ffv2_authority_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+
+	/* Authority registration does not open the provider gate. */
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP, nfsd_ffv2_register(nn));
+	mutex_unlock(&nfsd_mutex);
+
+	nfsd_ffv2_test_net_destroy(test, nn);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -2323,6 +2640,13 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_compound_digest_test),
 	KUNIT_CASE(nfsd_ffv2_replay_identity_test),
 	KUNIT_CASE(nfsd_ffv2_malformed_later_op_test),
+	KUNIT_CASE(nfsd_ffv2_authority_qualify_test),
+	KUNIT_CASE(nfsd_ffv2_authority_epoch_test),
+	KUNIT_CASE(nfsd_ffv2_authority_unknown_locator_test),
+	KUNIT_CASE(nfsd_ffv2_authority_publish_test),
+	KUNIT_CASE(nfsd_ffv2_authority_death_race_test),
+	KUNIT_CASE(nfsd_ffv2_authority_admission_test),
+	KUNIT_CASE(nfsd_ffv2_authority_provider_gate_test),
 	{}
 };
 
