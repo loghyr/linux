@@ -2482,9 +2482,6 @@ nfsd4_decode_removexattr(struct nfsd4_compoundargs *argp,
 #define NFSD4_FFV2_MAX_ITEMS	4096U
 #define NFSD4_FFV2_MAX_PAYLOAD	(4U * 1024U * 1024U)
 #define NFSD4_FFV2_MAX_HEADER_READ 1024U
-#define NFSD4_FFV2_MAX_COOKIE	256U
-#define NFSD4_FFV2_MAX_ESCROWS	256U
-#define NFSD4_FFV2_MAX_PROOF	4096U
 
 static __be32
 nfsd4_decode_ffv2_range(struct nfsd4_compoundargs *argp,
@@ -2757,44 +2754,6 @@ nfsd4_decode_bulk_revoke_stateid(struct nfsd4_compoundargs *argp,
 }
 
 static __be32
-nfsd4_decode_chunk_escrow(struct nfsd4_compoundargs *argp,
-			  union nfsd4_op_u *u)
-{
-	memset(&u->ffv2, 0, sizeof(u->ffv2));
-	/* MDS epoch, offset, count, and escrow ID */
-	return xdr_inline_decode(argp->xdr, 10 * XDR_UNIT) ?
-		nfs_ok : nfserr_bad_xdr;
-}
-
-static __be32
-nfsd4_decode_chunk_escrow_enumerate(struct nfsd4_compoundargs *argp,
-				    union nfsd4_op_u *u)
-{
-	u32 maxcount;
-
-	memset(&u->ffv2, 0, sizeof(u->ffv2));
-	/* MDS epoch, offset, and count */
-	if (!xdr_inline_decode(argp->xdr, 6 * XDR_UNIT))
-		return nfserr_bad_xdr;
-	if (xdr_stream_decode_u32(argp->xdr, &maxcount) < 0)
-		return nfserr_bad_xdr;
-	if (maxcount > NFSD4_FFV2_MAX_ESCROWS)
-		return nfserr_inval;
-	return nfsd4_decode_ignored_string(argp, NFSD4_FFV2_MAX_COOKIE);
-}
-
-static __be32
-nfsd4_decode_chunk_escrow_takeover(struct nfsd4_compoundargs *argp,
-				   union nfsd4_op_u *u)
-{
-	memset(&u->ffv2, 0, sizeof(u->ffv2));
-	/* expected epoch, new epoch, and proof profile */
-	if (!xdr_inline_decode(argp->xdr, 5 * XDR_UNIT))
-		return nfserr_bad_xdr;
-	return nfsd4_decode_ignored_string(argp, NFSD4_FFV2_MAX_PROOF);
-}
-
-static __be32
 nfsd4_decode_noop(struct nfsd4_compoundargs *argp, union nfsd4_op_u *p)
 {
 	return nfs_ok;
@@ -2911,10 +2870,6 @@ static const nfsd4_dec nfsd4_dec_ops[] = {
 	[OP_TRUST_STATEID]	= nfsd4_decode_trust_stateid,
 	[OP_REVOKE_STATEID]	= nfsd4_decode_revoke_stateid,
 	[OP_BULK_REVOKE_STATEID] = nfsd4_decode_bulk_revoke_stateid,
-	[OP_CHUNK_ESCROW_INSTALL] = nfsd4_decode_chunk_escrow,
-	[OP_CHUNK_ESCROW_RELEASE] = nfsd4_decode_chunk_escrow,
-	[OP_CHUNK_ESCROW_ENUMERATE] = nfsd4_decode_chunk_escrow_enumerate,
-	[OP_CHUNK_ESCROW_TAKEOVER] = nfsd4_decode_chunk_escrow_takeover,
 };
 
 static inline bool
@@ -6613,10 +6568,6 @@ static const nfsd4_enc nfsd4_enc_ops[] = {
 	[OP_TRUST_STATEID]	= nfsd4_encode_noop,
 	[OP_REVOKE_STATEID]	= nfsd4_encode_noop,
 	[OP_BULK_REVOKE_STATEID] = nfsd4_encode_noop,
-	[OP_CHUNK_ESCROW_INSTALL] = nfsd4_encode_noop,
-	[OP_CHUNK_ESCROW_RELEASE] = nfsd4_encode_noop,
-	[OP_CHUNK_ESCROW_ENUMERATE] = nfsd4_encode_noop,
-	[OP_CHUNK_ESCROW_TAKEOVER] = nfsd4_encode_noop,
 };
 
 /*

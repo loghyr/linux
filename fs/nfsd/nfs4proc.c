@@ -4132,29 +4132,6 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_name = "OP_BULK_REVOKE_STATEID",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
-	[OP_CHUNK_ESCROW_INSTALL] = {
-		.op_func = nfsd4_ffv2_notsupp,
-		.op_flags = OP_MODIFIES_SOMETHING,
-		.op_name = "OP_CHUNK_ESCROW_INSTALL",
-		.op_rsize_bop = nfsd4_only_status_rsize,
-	},
-	[OP_CHUNK_ESCROW_RELEASE] = {
-		.op_func = nfsd4_ffv2_notsupp,
-		.op_flags = OP_MODIFIES_SOMETHING,
-		.op_name = "OP_CHUNK_ESCROW_RELEASE",
-		.op_rsize_bop = nfsd4_only_status_rsize,
-	},
-	[OP_CHUNK_ESCROW_ENUMERATE] = {
-		.op_func = nfsd4_ffv2_notsupp,
-		.op_name = "OP_CHUNK_ESCROW_ENUMERATE",
-		.op_rsize_bop = nfsd4_only_status_rsize,
-	},
-	[OP_CHUNK_ESCROW_TAKEOVER] = {
-		.op_func = nfsd4_ffv2_notsupp,
-		.op_flags = OP_MODIFIES_SOMETHING,
-		.op_name = "OP_CHUNK_ESCROW_TAKEOVER",
-		.op_rsize_bop = nfsd4_only_status_rsize,
-	},
 };
 
 /**
