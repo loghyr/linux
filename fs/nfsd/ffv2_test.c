@@ -20,6 +20,7 @@
 #include "nfsfh.h"
 #include "netns.h"
 #include "vfs.h"
+#include "xdr4.h"
 
 struct nfsd_ffv2_unregister_ctx {
 	struct nfsd_net	*nn;
@@ -2144,6 +2145,164 @@ out_root:
 	mutex_unlock(&nfsd_mutex);
 }
 
+static void nfsd_ffv2_compound_digest_test(struct kunit *test)
+{
+	static const u8 expected[NFSD4_FFV2_DIGEST_SIZE] = {
+		0xa8, 0x97, 0x8f, 0xb3, 0xb7, 0x5b, 0xba, 0x40,
+		0x2f, 0xce, 0x4b, 0x78, 0xb0, 0xbb, 0x68, 0xa5,
+		0xf2, 0xfa, 0x34, 0x9f, 0xae, 0x98, 0x33, 0xfe,
+		0x68, 0x13, 0x6a, 0x8a, 0x65, 0x3d, 0x32, 0x0d,
+	};
+	u8 wire[] = {
+		0xde, 0xad, 0xbe, 0xef,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x02,
+		0x00, 0x00, 0x00, 0x00,
+	};
+	u8 changed[NFSD4_FFV2_DIGEST_SIZE];
+	u8 digest[NFSD4_FFV2_DIGEST_SIZE];
+	struct xdr_buf buf;
+
+	xdr_buf_init(&buf, wire, sizeof(wire));
+	buf.len = sizeof(wire);
+	KUNIT_ASSERT_EQ(test,
+			nfsd4_ffv2_compound_digest(&buf, 4, sizeof(wire) - 4,
+						   digest),
+			0);
+	KUNIT_EXPECT_MEMEQ(test, digest, expected, sizeof(expected));
+
+	wire[sizeof(wire) - 1] = 1;
+	KUNIT_ASSERT_EQ(test,
+			nfsd4_ffv2_compound_digest(&buf, 4, sizeof(wire) - 4,
+						   changed),
+			0);
+	KUNIT_EXPECT_MEMNEQ(test, digest, changed, sizeof(digest));
+}
+
+static void nfsd_ffv2_replay_identity_test(struct kunit *test)
+{
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_slot *slot;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	slot = kunit_kzalloc(test, sizeof(*slot), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd4_ffv2_replay_identity_match(args, slot));
+	args->ffv2_present = true;
+	args->ffv2_digest_valid = true;
+	memset(args->ffv2_digest, 0x5a, sizeof(args->ffv2_digest));
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd4_ffv2_replay_identity_match(args, slot));
+	slot->sl_ffv2_present = true;
+	memcpy(slot->sl_ffv2_digest, args->ffv2_digest,
+	       sizeof(slot->sl_ffv2_digest));
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd4_ffv2_replay_identity_match(args, slot));
+	args->ffv2_digest[0] ^= 1;
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd4_ffv2_replay_identity_match(args, slot));
+	args->ffv2_digest[0] ^= 1;
+	args->ffv2_digest_valid = false;
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd4_ffv2_replay_identity_match(args, slot));
+}
+
+static void nfsd_ffv2_malformed_later_op_test(struct kunit *test)
+{
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_compound_state *cstate;
+	struct nfsd_thread_local_info *ntli;
+	struct svc_rqst *rqstp;
+	struct auth_ops auth = {
+		.flavour = RPC_AUTH_NULL,
+	};
+	struct xdr_stream xdr;
+	struct xdr_buf buf;
+	__be32 request[32];
+	__be32 *later_op;
+	__be32 *p = request;
+	__be32 status;
+	size_t request_len;
+	int i;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	cstate = kunit_kzalloc(test, sizeof(*cstate), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, cstate);
+	ntli = kunit_kzalloc(test, sizeof(*ntli), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ntli);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+
+	*p++ = cpu_to_be32(0);		/* tag */
+	*p++ = cpu_to_be32(2);		/* minorversion */
+	*p++ = cpu_to_be32(4);		/* opcount */
+	*p++ = cpu_to_be32(OP_SEQUENCE);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(0);	/* sessionid */
+	*p++ = cpu_to_be32(1);		/* sequenceid */
+	*p++ = cpu_to_be32(0);		/* slotid */
+	*p++ = cpu_to_be32(0);		/* highest slotid */
+	*p++ = cpu_to_be32(1);		/* cachethis */
+	*p++ = cpu_to_be32(OP_PUTFH);
+	*p++ = cpu_to_be32(4);
+	*p++ = cpu_to_be32(0x01020304);
+	*p++ = cpu_to_be32(OP_CHUNK_READ);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(i);	/* stateid */
+	*p++ = cpu_to_be32(0);		/* offset */
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(1);		/* count */
+	later_op = p;
+	*p++ = cpu_to_be32(OP_GETATTR);	/* missing bitmap */
+
+	request_len = (char *)p - (char *)request;
+	xdr_buf_init(&buf, request, request_len);
+	buf.len = request_len;
+	xdr_init_decode(&xdr, &buf, request, NULL);
+	rqstp->rq_argp = args;
+	rqstp->rq_private = ntli;
+	rqstp->rq_authop = &auth;
+	KUNIT_ASSERT_TRUE(test, nfs4svc_decode_compoundargs(rqstp, &xdr));
+	KUNIT_EXPECT_TRUE(test, args->ffv2_present);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	KUNIT_EXPECT_EQ(test, args->ffv2_decode_class,
+			NFSD4_FFV2_DECODE_BADXDR);
+	KUNIT_ASSERT_EQ(test, args->opcnt, 4U);
+	KUNIT_ASSERT_NOT_NULL(test, args->ops[2].opdesc);
+	status = args->ops[2].opdesc->op_func(rqstp, cstate,
+					     &args->ops[2].u);
+	KUNIT_EXPECT_EQ(test, status, nfserr_bad_xdr);
+	nfsd4_release_compoundargs(rqstp);
+
+	p = later_op;
+	*p++ = cpu_to_be32(OP_CHUNK_FINALIZE);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(i);	/* stateid */
+	*p++ = cpu_to_be32(0);		/* offset */
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(U32_MAX);
+	request_len = (char *)p - (char *)request;
+	xdr_buf_init(&buf, request, request_len);
+	buf.len = request_len;
+	xdr_init_decode(&xdr, &buf, request, NULL);
+	KUNIT_ASSERT_TRUE(test, nfs4svc_decode_compoundargs(rqstp, &xdr));
+	KUNIT_EXPECT_TRUE(test, args->ffv2_present);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	KUNIT_EXPECT_EQ(test, args->ffv2_decode_class,
+			NFSD4_FFV2_DECODE_ERROR);
+	KUNIT_EXPECT_EQ(test, args->ffv2_decode_status, nfserr_inval);
+	KUNIT_ASSERT_EQ(test, args->opcnt, 4U);
+	KUNIT_ASSERT_NOT_NULL(test, args->ops[2].opdesc);
+	status = args->ops[2].opdesc->op_func(rqstp, cstate,
+					     &args->ops[2].u);
+	KUNIT_EXPECT_EQ(test, status, nfserr_inval);
+	nfsd4_release_compoundargs(rqstp);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -2161,6 +2320,9 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_export_update_stop_test),
 	KUNIT_CASE(nfsd_ffv2_filehandle_format_test),
 	KUNIT_CASE(nfsd_ffv2_filecache_gate_test),
+	KUNIT_CASE(nfsd_ffv2_compound_digest_test),
+	KUNIT_CASE(nfsd_ffv2_replay_identity_test),
+	KUNIT_CASE(nfsd_ffv2_malformed_later_op_test),
 	{}
 };
 

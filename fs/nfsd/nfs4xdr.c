@@ -44,6 +44,7 @@
 #include <linux/xattr.h>
 #include <linux/vmalloc.h>
 #include <linux/nfsacl.h>
+#include <crypto/sha2.h>
 
 #include <uapi/linux/xattr.h>
 
@@ -66,6 +67,35 @@
 
 
 #define NFSDDBG_FACILITY		NFSDDBG_XDR
+
+static const u8 nfsd4_ffv2_compound_domain[] =
+	"NFSD-FFV2-COMPOUND-V1";
+
+int nfsd4_ffv2_compound_digest(const struct xdr_buf *buf, unsigned int offset,
+			       size_t len,
+			       u8 digest[NFSD4_FFV2_DIGEST_SIZE])
+{
+	struct sha256_ctx ctx;
+	u8 block[256];
+
+	sha256_init(&ctx);
+	sha256_update(&ctx, nfsd4_ffv2_compound_domain,
+		      sizeof(nfsd4_ffv2_compound_domain) - 1);
+	while (len) {
+		unsigned int count = min_t(unsigned int, len, sizeof(block));
+
+		if (read_bytes_from_xdr_buf(buf, offset, block, count)) {
+			memzero_explicit(block, sizeof(block));
+			return -EBADMSG;
+		}
+		sha256_update(&ctx, block, count);
+		offset += count;
+		len -= count;
+	}
+	sha256_final(&ctx, digest);
+	memzero_explicit(block, sizeof(block));
+	return 0;
+}
 
 const u32 nfsd_suppattrs[3][3] = {
 	{NFSD4_SUPPORTED_ATTRS_WORD0,
@@ -2534,6 +2564,35 @@ static __be32 nfsd4_decode_ffv2_u32s(struct nfsd4_compoundargs *argp)
 		nfs_ok : nfserr_bad_xdr;
 }
 
+static __be32 nfsd4_decode_ffv2_opaque(struct nfsd4_compoundargs *argp,
+				       u32 len)
+{
+	unsigned int offset = xdr_stream_pos(argp->xdr);
+	u8 padding[XDR_UNIT - 1];
+	u32 pad = -len & (XDR_UNIT - 1);
+
+	if (!xdr_inline_decode(argp->xdr, len))
+		return nfserr_bad_xdr;
+	if (pad &&
+	    (read_bytes_from_xdr_buf(argp->xdr->buf, offset + len,
+				     padding, pad) ||
+	     memchr_inv(padding, 0, pad)))
+		return nfserr_bad_xdr;
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_decode_ffv2_ignored_string(struct nfsd4_compoundargs *argp, u32 maxlen)
+{
+	u32 len;
+
+	if (xdr_stream_decode_u32(argp->xdr, &len) < 0)
+		return nfserr_bad_xdr;
+	if (len > maxlen)
+		return nfserr_bad_xdr;
+	return nfsd4_decode_ffv2_opaque(argp, len);
+}
+
 static __be32 nfsd4_decode_ffv2_checksums(struct nfsd4_compoundargs *argp)
 {
 	u32 count;
@@ -2546,7 +2605,7 @@ static __be32 nfsd4_decode_ffv2_checksums(struct nfsd4_compoundargs *argp)
 	while (count--) {
 		if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
 			return nfserr_bad_xdr;
-		status = nfsd4_decode_ignored_string(argp, 64);
+		status = nfsd4_decode_ffv2_ignored_string(argp, 64);
 		if (status)
 			return status;
 	}
@@ -2561,7 +2620,7 @@ static __be32 nfsd4_decode_ffv2_payload(struct nfsd4_compoundargs *argp)
 		return nfserr_bad_xdr;
 	if (len > NFSD4_FFV2_MAX_PAYLOAD)
 		return nfserr_inval;
-	return xdr_inline_decode(argp->xdr, len) ? nfs_ok : nfserr_bad_xdr;
+	return nfsd4_decode_ffv2_opaque(argp, len);
 }
 
 static __be32
@@ -2740,7 +2799,7 @@ nfsd4_decode_trust_stateid(struct nfsd4_compoundargs *argp,
 	status = nfsd4_decode_nfstime4(argp, &expires);
 	if (status)
 		return status;
-	return nfsd4_decode_ignored_string(argp, NFS4_OPAQUE_LIMIT);
+	return nfsd4_decode_ffv2_ignored_string(argp, NFS4_OPAQUE_LIMIT);
 }
 
 static __be32
@@ -2897,6 +2956,26 @@ nfsd4_opnum_in_range(struct nfsd4_compoundargs *argp, struct nfsd4_op *op)
 	return true;
 }
 
+static bool nfsd4_opnum_is_ffv2(u32 opnum)
+{
+	return opnum >= OP_CHUNK_COMMIT && opnum <= OP_BULK_REVOKE_STATEID;
+}
+
+static void nfsd4_ffv2_record_decode_error(struct nfsd4_compoundargs *argp,
+					   __be32 status)
+{
+	if (!argp->ffv2_present)
+		return;
+	if (status == nfserr_bad_xdr) {
+		argp->ffv2_decode_class = NFSD4_FFV2_DECODE_BADXDR;
+	} else if (status == nfserr_op_illegal || status == nfserr_notsupp) {
+		argp->ffv2_decode_class = NFSD4_FFV2_DECODE_NOTSUPP;
+	} else {
+		argp->ffv2_decode_class = NFSD4_FFV2_DECODE_ERROR;
+		argp->ffv2_decode_status = status;
+	}
+}
+
 static bool
 nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 {
@@ -2907,8 +2986,21 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 	int max_reply = auth_slack + 8; /* opcnt, status */
 	int readcount = 0;
 	int readbytes = 0;
+	bool decode_complete = true;
+	unsigned int transcript_offset;
+	size_t transcript_len;
 	__be32 *p;
 	int i;
+
+	transcript_offset = xdr_stream_pos(argp->xdr);
+	transcript_len = xdr_stream_remaining(argp->xdr);
+	/*
+	 * Capture the immutable wire identity before any operation decoder can
+	 * consume the transcript. Ordinary compounds never publish this digest.
+	 */
+	if (nfsd4_ffv2_compound_digest(argp->xdr->buf, transcript_offset,
+				       transcript_len, argp->ffv2_digest))
+		return false;
 
 	if (xdr_stream_decode_u32(argp->xdr, &argp->taglen) < 0)
 		return false;
@@ -2932,6 +3024,8 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 		return false;
 	argp->opcnt = min_t(u32, argp->client_opcnt,
 			    NFSD_MAX_OPS_PER_COMPOUND);
+	if (argp->opcnt != argp->client_opcnt)
+		decode_complete = false;
 
 	if (argp->opcnt > ARRAY_SIZE(argp->iops)) {
 		argp->ops = vcalloc(argp->opcnt, sizeof(*argp->ops));
@@ -2941,8 +3035,10 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 		}
 	}
 
-	if (argp->minorversion > NFSD_SUPPORTED_MINOR_VERSION)
+	if (argp->minorversion > NFSD_SUPPORTED_MINOR_VERSION) {
 		argp->opcnt = 0;
+		decode_complete = false;
+	}
 
 	for (i = 0; i < argp->opcnt; i++) {
 		op = &argp->ops[i];
@@ -2951,6 +3047,8 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 
 		if (xdr_stream_decode_u32(argp->xdr, &op->opnum) < 0)
 			return false;
+		if (nfsd4_opnum_is_ffv2(op->opnum))
+			argp->ffv2_present = true;
 		if (nfsd4_opnum_in_range(argp, op)) {
 			op->opdesc = OPDESC(op);
 			op->status = nfsd4_dec_ops[op->opnum](argp, &op->u);
@@ -2985,10 +3083,20 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 			max_reply += NFS4_OPAQUE_LIMIT;
 
 		if (op->status) {
+			nfsd4_ffv2_record_decode_error(argp, op->status);
+			decode_complete = false;
 			argp->opcnt = i+1;
 			break;
 		}
 	}
+	if (argp->ffv2_present && decode_complete) {
+		if (xdr_stream_remaining(argp->xdr))
+			return false;
+		argp->ffv2_digest_valid = true;
+	}
+	if (argp->ffv2_present && !argp->ffv2_digest_valid &&
+	    argp->ffv2_decode_class == NFSD4_FFV2_DECODE_NONE)
+		argp->ffv2_decode_class = NFSD4_FFV2_DECODE_NOTSUPP;
 	/* Sessions make the DRC unnecessary: */
 	if (argp->minorversion)
 		cachethis = false;
@@ -6763,6 +6871,11 @@ nfs4svc_decode_compoundargs(struct svc_rqst *rqstp, struct xdr_stream *xdr)
 	args->xdr = xdr;
 	args->ops = args->iops;
 	args->rqstp = rqstp;
+	args->ffv2_present = false;
+	args->ffv2_digest_valid = false;
+	args->ffv2_decode_class = NFSD4_FFV2_DECODE_NONE;
+	args->ffv2_decode_status = nfs_ok;
+	memset(args->ffv2_digest, 0, sizeof(args->ffv2_digest));
 
 	/*
 	 * NFSv4 operation decoders can invoke svc cache lookups

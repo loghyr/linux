@@ -286,6 +286,8 @@ static inline struct nfs4_delegation *delegstateid(struct nfs4_stid *s)
 #define NFSD_MAX_MEM_PER_SESSION  \
 		(NFSD_CACHE_SIZE_SLOTS_PER_SESSION * NFSD_SLOT_CACHE_SIZE)
 
+#define NFSD4_FFV2_DIGEST_SIZE	32
+
 struct nfsd4_slot {
 	u32	sl_seqid;
 	__be32	sl_status;
@@ -294,6 +296,8 @@ struct nfsd4_slot {
 	u32	sl_datalen;
 	u16	sl_opcnt;
 	u16	sl_generation;
+	bool	sl_ffv2_present;
+	u8	sl_ffv2_digest[NFSD4_FFV2_DIGEST_SIZE];
 #define NFSD4_SLOT_INUSE	(1 << 0)
 #define NFSD4_SLOT_CACHETHIS	(1 << 1)
 #define NFSD4_SLOT_INITIALIZED	(1 << 2)

@@ -944,6 +944,13 @@ struct svcxdr_tmpbuf {
 	char buf[];
 };
 
+enum nfsd4_ffv2_decode_class {
+	NFSD4_FFV2_DECODE_NONE,
+	NFSD4_FFV2_DECODE_BADXDR,
+	NFSD4_FFV2_DECODE_NOTSUPP,
+	NFSD4_FFV2_DECODE_ERROR,
+};
+
 struct nfsd4_compoundargs {
 	/* scratch variables for XDR decode */
 	struct xdr_stream		*xdr;
@@ -956,6 +963,11 @@ struct nfsd4_compoundargs {
 	u32				client_opcnt;
 	u32				opcnt;
 	bool				splice_ok;
+	bool				ffv2_present;
+	bool				ffv2_digest_valid;
+	enum nfsd4_ffv2_decode_class	ffv2_decode_class;
+	__be32				ffv2_decode_status;
+	u8				ffv2_digest[NFSD4_FFV2_DIGEST_SIZE];
 	struct nfsd4_op			*ops;
 	struct nfsd4_op			iops[8];
 };
@@ -989,6 +1001,12 @@ void warn_on_nonidempotent_op(struct nfsd4_op *op);
 
 bool nfsd4_mach_creds_match(struct nfs4_client *cl, struct svc_rqst *rqstp);
 bool nfs4svc_decode_compoundargs(struct svc_rqst *rqstp, struct xdr_stream *xdr);
+int nfsd4_ffv2_compound_digest(const struct xdr_buf *buf, unsigned int offset,
+			       size_t len,
+			       u8 digest[NFSD4_FFV2_DIGEST_SIZE]);
+__be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp);
+bool nfsd4_ffv2_replay_identity_match(const struct nfsd4_compoundargs *args,
+				      const struct nfsd4_slot *slot);
 bool nfs4svc_encode_compoundres(struct svc_rqst *rqstp, struct xdr_stream *xdr);
 __be32 nfsd4_check_resp_size(struct nfsd4_compoundres *, u32);
 void nfsd4_encode_operation(struct nfsd4_compoundres *, struct nfsd4_op *);

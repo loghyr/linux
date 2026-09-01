@@ -4433,11 +4433,26 @@ static bool nfsd4_request_too_big(struct svc_rqst *rqstp,
 	return xb->len > session->se_fchannel.maxreq_sz;
 }
 
+bool nfsd4_ffv2_replay_identity_match(const struct nfsd4_compoundargs *args,
+				      const struct nfsd4_slot *slot)
+{
+	if (slot->sl_ffv2_present != args->ffv2_present)
+		return false;
+	if (!args->ffv2_present)
+		return true;
+	if (!args->ffv2_digest_valid)
+		return false;
+	return !memcmp(slot->sl_ffv2_digest, args->ffv2_digest,
+		       NFSD4_FFV2_DIGEST_SIZE);
+}
+
 static bool replay_matches_cache(struct svc_rqst *rqstp,
 		 struct nfsd4_sequence *seq, struct nfsd4_slot *slot)
 {
 	struct nfsd4_compoundargs *argp = rqstp->rq_argp;
 
+	if (!nfsd4_ffv2_replay_identity_match(argp, slot))
+		return false;
 	if ((bool)(slot->sl_flags & NFSD4_SLOT_CACHETHIS) !=
 	    (bool)seq->cachethis)
 		return false;
@@ -4464,6 +4479,18 @@ static bool replay_matches_cache(struct svc_rqst *rqstp,
 	 * the reply), so we don't bother.
 	 */
 	return true;
+}
+
+static void nfsd4_slot_record_ffv2_identity(struct nfsd4_slot *slot,
+					    const struct nfsd4_compoundargs *args)
+{
+	slot->sl_ffv2_present = args->ffv2_present &&
+				args->ffv2_digest_valid;
+	if (slot->sl_ffv2_present)
+		memcpy(slot->sl_ffv2_digest, args->ffv2_digest,
+		       NFSD4_FFV2_DIGEST_SIZE);
+	else
+		memset(slot->sl_ffv2_digest, 0, NFSD4_FFV2_DIGEST_SIZE);
 }
 
 /*
@@ -4590,6 +4617,7 @@ nfsd4_sequence(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 
 	status = nfs_ok;
 	/* Success! accept new slot seqid */
+	nfsd4_slot_record_ffv2_identity(slot, rqstp->rq_argp);
 	slot->sl_seqid = seq->seqid;
 	slot->sl_flags &= ~NFSD4_SLOT_REUSED;
 	slot->sl_flags |= NFSD4_SLOT_INUSE;

@@ -3622,12 +3622,28 @@ static u32 nfsd4_removexattr_rsize(const struct svc_rqst *rqstp,
 		* sizeof(__be32);
 }
 
+__be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp)
+{
+	const struct nfsd4_compoundargs *args = rqstp->rq_argp;
+
+	if (likely(args->ffv2_digest_valid))
+		return nfs_ok;
+	if (args->ffv2_decode_class == NFSD4_FFV2_DECODE_BADXDR)
+		return nfserr_bad_xdr;
+	if (args->ffv2_decode_class == NFSD4_FFV2_DECODE_ERROR)
+		return args->ffv2_decode_status;
+	return nfserr_notsupp;
+}
 
 static __be32
 nfsd4_ffv2_notsupp(struct svc_rqst *rqstp,
 		    struct nfsd4_compound_state *cstate,
 		    union nfsd4_op_u *u)
 {
+	__be32 status = nfsd4_ffv2_compound_status(rqstp);
+
+	if (status)
+		return status;
 	return nfserr_notsupp;
 }
 
@@ -3637,6 +3653,9 @@ nfsd4_ffv2_probe(struct svc_rqst *rqstp,
 {
 	__be32 status;
 
+	status = nfsd4_ffv2_compound_status(rqstp);
+	if (status)
+		return status;
 	status = check_nfsd_access(cstate->current_fh.fh_export, rqstp, false);
 	if (status)
 		return status;
