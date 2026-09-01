@@ -457,8 +457,11 @@ int nfsd_ffv2_live_state_show(struct seq_file *m, void *v)
 						  nfsd_net_id);
 		struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 		struct nfsd_ffv2_reservation *reservation;
+		struct svc_export *exp;
 		unsigned int reservations = 0;
+		unsigned int contexts = 0;
 		unsigned int inventory;
+		unsigned int service = 0;
 		unsigned int updates;
 		u64 pending = 0, active = 0, retiring = 0;
 		bool registration;
@@ -478,6 +481,13 @@ int nfsd_ffv2_live_state_show(struct seq_file *m, void *v)
 		spin_unlock(&participant->update_lock);
 		mutex_lock(&participant->inventory_lock);
 		inventory = participant->inventory_count;
+		list_for_each_entry(exp, &participant->inventory,
+				    ex_ffv2_inventory) {
+			if (nfsd_ffv2_export_is_service(exp))
+				service++;
+			if (rcu_access_pointer(exp->ex_ffv2_context))
+				contexts++;
+		}
 		mutex_unlock(&participant->inventory_lock);
 		mutex_lock(&nfsd_ffv2_registry_lock);
 		list_for_each_entry(reservation, &participant->reservations,
@@ -486,9 +496,10 @@ int nfsd_ffv2_live_state_show(struct seq_file *m, void *v)
 		mutex_unlock(&nfsd_ffv2_registry_lock);
 
 		seq_printf(m,
-			   "netns=%u registration=%u updates=%u reservations=%u inventory=%u pending=%llu active=%llu retiring=%llu\n",
+			   "netns=%u registration=%u updates=%u reservations=%u inventory=%u service=%u contexts=%u pending=%llu active=%llu retiring=%llu\n",
 			   snapshots[i].net->ns.inum, registration, updates,
-			   reservations, inventory, pending, active, retiring);
+			   reservations, inventory, service, contexts, pending,
+			   active, retiring);
 	}
 	nfsd_ffv2_release_snapshots(snapshots, count);
 	return 0;
