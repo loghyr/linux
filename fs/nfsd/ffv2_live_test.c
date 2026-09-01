@@ -275,6 +275,20 @@ static const struct file_operations nfsd_ffv2_live_state_fops = {
 	.release = single_release,
 };
 
+static int nfsd_ffv2_provider_probe_open(struct inode *inode,
+					 struct file *file)
+{
+	return single_open(file, nfsd_ffv2_provider_probe_show, NULL);
+}
+
+static const struct file_operations nfsd_ffv2_provider_probe_fops = {
+	.owner = THIS_MODULE,
+	.open = nfsd_ffv2_provider_probe_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+
 void nfsd_ffv2_live_test_debugfs_init(struct dentry *parent)
 {
 	debugfs_create_file("ffv2-live-test", 0600, parent, NULL,
@@ -283,6 +297,8 @@ void nfsd_ffv2_live_test_debugfs_init(struct dentry *parent)
 			    &nfsd_ffv2_file_gate_diag_fops);
 	debugfs_create_file("ffv2-live-state", 0400, parent, NULL,
 			    &nfsd_ffv2_live_state_fops);
+	debugfs_create_file("ffv2-provider-probe", 0400, parent, NULL,
+			    &nfsd_ffv2_provider_probe_fops);
 }
 
 void nfsd_ffv2_live_test_exit(void)

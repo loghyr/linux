@@ -3631,6 +3631,34 @@ nfsd4_ffv2_notsupp(struct svc_rqst *rqstp,
 	return nfserr_notsupp;
 }
 
+static __be32
+nfsd4_ffv2_probe(struct svc_rqst *rqstp,
+		 struct nfsd4_compound_state *cstate, u32 opnum)
+{
+	__be32 status;
+
+	status = check_nfsd_access(cstate->current_fh.fh_export, rqstp, false);
+	if (status)
+		return status;
+	return nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh, opnum);
+}
+
+static __be32
+nfsd4_ffv2_chunk_read_probe(struct svc_rqst *rqstp,
+			    struct nfsd4_compound_state *cstate,
+			    union nfsd4_op_u *u)
+{
+	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_READ);
+}
+
+static __be32
+nfsd4_ffv2_chunk_header_read_probe(struct svc_rqst *rqstp,
+				   struct nfsd4_compound_state *cstate,
+				   union nfsd4_op_u *u)
+{
+	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_HEADER_READ);
+}
+
 static const struct nfsd4_operation nfsd4_ops[] = {
 	[OP_ACCESS] = {
 		.op_func = nfsd4_access,
@@ -4069,7 +4097,7 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_HEADER_READ] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_header_read_probe,
 		.op_name = "OP_CHUNK_HEADER_READ",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
@@ -4080,7 +4108,7 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_READ] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_read_probe,
 		.op_name = "OP_CHUNK_READ",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},

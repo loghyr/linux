@@ -82,6 +82,17 @@ struct nfsd_ffv2_binding {
 	struct nfsd_ffv2_admission admission;
 };
 
+struct nfsd_ffv2_provider_probe_counters {
+	atomic64_t	read;
+	atomic64_t	header_read;
+	atomic64_t	mapped;
+	atomic64_t	stale;
+	atomic64_t	fail_closed;
+	atomic64_t	last_generation;
+};
+
+static struct nfsd_ffv2_provider_probe_counters nfsd_ffv2_probe_counters;
+
 static DEFINE_MUTEX(nfsd_ffv2_registry_lock);
 static DEFINE_MUTEX(nfsd_ffv2_export_policy_lock);
 static LIST_HEAD(nfsd_ffv2_participants);
@@ -1253,6 +1264,58 @@ static bool nfsd_ffv2_binding_current(struct nfsd_net *nn,
 	return valid;
 }
 
+__be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				u32 opnum)
+{
+	struct nfsd_ffv2_binding *binding = fhp->fh_ffv2_binding;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_net *nn;
+
+	if (opnum == OP_CHUNK_READ)
+		atomic64_inc(&nfsd_ffv2_probe_counters.read);
+	else if (opnum == OP_CHUNK_HEADER_READ)
+		atomic64_inc(&nfsd_ffv2_probe_counters.header_read);
+	else
+		return nfserr_notsupp;
+
+	if (!binding || binding->net != SVC_NET(rqstp))
+		goto stale;
+	nn = net_generic(binding->net, nfsd_net_id);
+	if (!nfsd_ffv2_binding_current(nn, binding))
+		goto stale;
+
+	generation = binding->admission.generation;
+	if (!generation)
+		goto stale;
+	atomic64_set(&nfsd_ffv2_probe_counters.last_generation,
+		     generation->identity->generation);
+	atomic64_inc(&nfsd_ffv2_probe_counters.mapped);
+	/*
+	 * D0.5 has no trusted-stateid or MDS-session authority registry and
+	 * no content-aware slot replay record.  Keep the callback boundary
+	 * closed until those nfsd-core prerequisites exist.
+	 */
+	atomic64_inc(&nfsd_ffv2_probe_counters.fail_closed);
+	return nfserr_notsupp;
+
+stale:
+	atomic64_inc(&nfsd_ffv2_probe_counters.stale);
+	return nfserr_stale;
+}
+
+int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v)
+{
+	seq_printf(m,
+		   "read=%lld header_read=%lld mapped=%lld stale=%lld fail_closed=%lld last_generation=%lld\n",
+		   atomic64_read(&nfsd_ffv2_probe_counters.read),
+		   atomic64_read(&nfsd_ffv2_probe_counters.header_read),
+		   atomic64_read(&nfsd_ffv2_probe_counters.mapped),
+		   atomic64_read(&nfsd_ffv2_probe_counters.stale),
+		   atomic64_read(&nfsd_ffv2_probe_counters.fail_closed),
+		   atomic64_read(&nfsd_ffv2_probe_counters.last_generation));
+	return 0;
+}
+
 __be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp)
 {
 	struct nfsd_ffv2_binding *binding;
@@ -1363,6 +1426,8 @@ __be32 nfsd4_ffv2_export_policy_check(struct svc_export *exp, u32 opnum)
 	case OP_PUTPUBFH:
 	case OP_SAVEFH:
 	case OP_RESTOREFH:
+	case OP_CHUNK_HEADER_READ:
+	case OP_CHUNK_READ:
 		return nfs_ok;
 	default:
 		return nfserr_notsupp;

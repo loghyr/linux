@@ -178,6 +178,9 @@ int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
 __be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp);
 void nfsd_ffv2_binding_get(struct nfsd_ffv2_binding *binding);
 void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding);
+__be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				u32 opnum);
+int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v);
 
 struct nfsd_ffv2_admission {
 	struct list_head			node;

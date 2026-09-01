@@ -1299,6 +1299,8 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct svc_export *stale;
 	struct svc_export *retained = NULL;
 	struct svc_export exp;
+	struct svc_rqst *rqstp;
+	struct svc_xprt *xprt;
 	struct svc_fh *derived;
 	struct svc_fh *duplicate;
 	struct svc_fh *mapped;
@@ -1334,7 +1336,9 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	derived = kunit_kzalloc(test, sizeof(*derived), GFP_KERNEL);
 	duplicate = kunit_kzalloc(test, sizeof(*duplicate), GFP_KERNEL);
 	mapped = kunit_kzalloc(test, sizeof(*mapped), GFP_KERNEL);
-	if (!ordinary || !derived || !duplicate || !mapped) {
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	xprt = kunit_kzalloc(test, sizeof(*xprt), GFP_KERNEL);
+	if (!ordinary || !derived || !duplicate || !mapped || !rqstp || !xprt) {
 		KUNIT_FAIL(test, "failed to allocate transition handles");
 		return;
 	}
@@ -1345,6 +1349,8 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		return;
 	}
 	nn = net_generic(net, nfsd_net_id);
+	xprt->xpt_net = net;
+	rqstp->rq_xprt = xprt;
 	net2 = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
 	if (IS_ERR(net2)) {
 		KUNIT_FAIL(test, "failed to create second test netns: %ld",
@@ -1711,6 +1717,12 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			nfsd4_ffv2_export_policy_check(published, OP_RESTOREFH),
 			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(published, OP_CHUNK_HEADER_READ),
+			nfs_ok);
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_export_policy_check(published, OP_CHUNK_READ),
+			nfs_ok);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_get(published), -ESTALE);
 
 	/* Model a successfully mapped handle retaining both owners. */
@@ -1721,6 +1733,17 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	mapped->fh_ffv2_binding = binding;
 	binding = NULL;
 	retained = published;
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_provider_probe(rqstp, mapped, OP_CHUNK_READ),
+			nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_provider_probe(rqstp, mapped,
+						 OP_CHUNK_HEADER_READ),
+			nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_provider_probe(rqstp, ordinary,
+						 OP_CHUNK_READ),
+			nfserr_stale);
 
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	published = nfsd_export_cache_update(&exp);
