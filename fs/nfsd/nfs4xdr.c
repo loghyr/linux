@@ -2482,6 +2482,8 @@ nfsd4_decode_removexattr(struct nfsd4_compoundargs *argp,
 #define NFSD4_FFV2_MAX_ITEMS	4096U
 #define NFSD4_FFV2_MAX_PAYLOAD	(4U * 1024U * 1024U)
 #define NFSD4_FFV2_MAX_HEADER_READ 1024U
+#define NFSD4_FFV2_LOCK_ADOPT	BIT(0)
+#define NFSD4_FFV2_LOCK_TAKEOVER	BIT(1)
 
 static __be32
 nfsd4_decode_ffv2_range(struct nfsd4_compoundargs *argp,
@@ -2632,19 +2634,24 @@ static __be32
 nfsd4_decode_chunk_lock(struct nfsd4_compoundargs *argp,
 			union nfsd4_op_u *u)
 {
-	u32 adopt;
+	u32 adopt, flags;
 	__be32 status;
 
 	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
 	if (status)
 		return status;
-	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
+	if (xdr_stream_decode_u32(argp->xdr, &flags) < 0)
 		return nfserr_bad_xdr;
+	if (flags & ~(NFSD4_FFV2_LOCK_ADOPT | NFSD4_FFV2_LOCK_TAKEOVER) ||
+	    flags == (NFSD4_FFV2_LOCK_ADOPT | NFSD4_FFV2_LOCK_TAKEOVER))
+		return nfserr_inval;
 	status = nfsd4_decode_ffv2_owner(argp);
 	if (status)
 		return status;
 	if (xdr_stream_decode_u32(argp->xdr, &adopt) < 0 || adopt > 1)
 		return nfserr_bad_xdr;
+	if (!!(flags & NFSD4_FFV2_LOCK_ADOPT) != adopt)
+		return nfserr_inval;
 	if (adopt && !xdr_inline_decode(argp->xdr, 4 * XDR_UNIT))
 		return nfserr_bad_xdr;
 	return nfs_ok;
