@@ -2549,6 +2549,8 @@ static void nfsd_ffv2_authority_death_race_test(struct kunit *test)
 	spin_unlock(&nn->client_lock);
 	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_dead(authority));
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_authority_publish(authority, 11));
+	KUNIT_EXPECT_EQ(test, -ESHUTDOWN,
+			nfsd_ffv2_authority_token_get(authority));
 	KUNIT_EXPECT_EQ(test, 0ULL,
 			nfsd_ffv2_test_authority_gen(authority));
 	nfsd_ffv2_authority_put(authority);
@@ -2562,6 +2564,8 @@ static void nfsd_ffv2_authority_death_race_test(struct kunit *test)
 	spin_unlock(&nn->client_lock);
 	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_dead(authority));
 	KUNIT_EXPECT_TRUE(test, list_empty(&session->se_ffv2_authorities));
+	KUNIT_EXPECT_EQ(test, -ESHUTDOWN,
+			nfsd_ffv2_authority_token_get(authority));
 	nfsd_ffv2_authority_put(authority);
 
 	/* Drains the retirement work queued by the second linearization. */
@@ -2583,6 +2587,9 @@ static void nfsd_ffv2_authority_admission_test(struct kunit *test)
 
 	/* Tokens and work are admitted while the gates are open. */
 	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_admissions_idle(nn));
+	KUNIT_EXPECT_EQ(test, -ESHUTDOWN,
+			nfsd_ffv2_authority_token_get(authority));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_authority_publish(authority, 1));
 	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_authority_token_get(authority));
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_authority_admissions_idle(nn));
 	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_work_admit(nn));

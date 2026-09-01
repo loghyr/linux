@@ -530,7 +530,6 @@ nfsd_ffv2_reservation_unlink(struct nfsd_ffv2_reservation *reservation)
 	mutex_lock(&nfsd_ffv2_registry_lock);
 	if (!list_empty(&reservation->node)) {
 		list_del_rcu(&reservation->node);
-		INIT_LIST_HEAD(&reservation->node);
 		list_del_init(&reservation->owner_node);
 		reservation->owner = NULL;
 		linked = true;
@@ -538,6 +537,7 @@ nfsd_ffv2_reservation_unlink(struct nfsd_ffv2_reservation *reservation)
 	mutex_unlock(&nfsd_ffv2_registry_lock);
 	if (linked) {
 		synchronize_rcu();
+		INIT_LIST_HEAD(&reservation->node);
 		nfsd_ffv2_reservation_put(reservation);
 	}
 }
@@ -2252,8 +2252,11 @@ static void nfsd_ffv2_authority_retire_work(struct work_struct *work)
 	struct nfsd_ffv2_authority *authority = retire->authority;
 	struct nfsd_ffv2_anchor *anchor = &authority->nn->ffv2;
 
+	/* service_generation_retire owns the unlock-around-wait protocol. */
+	mutex_lock(&nfsd_mutex);
 	nfsd_ffv2_service_generation_retire(authority->nn,
 					    retire->generation_id);
+	mutex_unlock(&nfsd_mutex);
 	nfsd_ffv2_authority_put(authority);
 	kfree(retire);
 	/* Signals pre-exit last, once ->nn is no longer used here. */
@@ -2518,7 +2521,8 @@ out_put_session:
  * @authority: authority the caller wants to use
  *
  * A token holder may use the non-owning ->nn pointer until it releases the
- * admission.  Returns 0, or -ESHUTDOWN once the gate has closed.
+ * admission.  Only a published authority may be admitted.  Returns 0, or
+ * -ESHUTDOWN once the gate or authority has closed.
  */
 int nfsd_ffv2_authority_token_get(struct nfsd_ffv2_authority *authority)
 {
@@ -2527,9 +2531,15 @@ int nfsd_ffv2_authority_token_get(struct nfsd_ffv2_authority *authority)
 
 	spin_lock(&anchor->authority_tokens_lock);
 	if (anchor->authority_tokens_open) {
+		spin_lock(&authority->state_lock);
+		if (authority->state != NFSD_FFV2_AUTHORITY_PUBLISHED ||
+		    !authority->generation_id)
+			goto out_state;
 		anchor->authority_tokens++;
 		refcount_inc(&authority->ref);
 		error = 0;
+out_state:
+		spin_unlock(&authority->state_lock);
 	}
 	spin_unlock(&anchor->authority_tokens_lock);
 	return error;
