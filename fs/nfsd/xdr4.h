@@ -843,7 +843,7 @@ struct nfsd4_copy_notify {
 struct nfsd4_ffv2 {
 	stateid_t	stateid;
 	u64		offset;
-	u64		count;
+	u32		count;
 };
 
 struct nfsd4_chunk_read {

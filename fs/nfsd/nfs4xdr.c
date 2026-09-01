@@ -2497,7 +2497,7 @@ nfsd4_decode_ffv2_range(struct nfsd4_compoundargs *argp,
 		return status;
 	if (xdr_stream_decode_u64(argp->xdr, &ffv2->offset) < 0)
 		return nfserr_bad_xdr;
-	if (xdr_stream_decode_u64(argp->xdr, &ffv2->count) < 0)
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->count) < 0)
 		return nfserr_bad_xdr;
 	if (ffv2->count > NFSD4_FFV2_MAX_ITEMS)
 		return nfserr_inval;
@@ -2506,7 +2506,7 @@ nfsd4_decode_ffv2_range(struct nfsd4_compoundargs *argp,
 
 static __be32 nfsd4_decode_ffv2_owner(struct nfsd4_compoundargs *argp)
 {
-	return xdr_inline_decode(argp->xdr, 3 * XDR_UNIT) ?
+	return xdr_inline_decode(argp->xdr, 4 * XDR_UNIT) ?
 		nfs_ok : nfserr_bad_xdr;
 }
 
@@ -2518,7 +2518,7 @@ static __be32 nfsd4_decode_ffv2_owners(struct nfsd4_compoundargs *argp)
 		return nfserr_bad_xdr;
 	if (count > NFSD4_FFV2_MAX_ITEMS)
 		return nfserr_inval;
-	return xdr_inline_decode(argp->xdr, count * 3 * XDR_UNIT) ?
+	return xdr_inline_decode(argp->xdr, count * 4 * XDR_UNIT) ?
 		nfs_ok : nfserr_bad_xdr;
 }
 
