@@ -6898,6 +6898,65 @@ void nfsd4_release_compoundargs(struct svc_rqst *rqstp)
 	}
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/**
+ * nfsd4_test_decode_op - run one operation decoder over raw argument bytes
+ * @rqstp: request the decode is attributed to
+ * @opnum: operation whose decoder to run
+ * @buf: encoded argument bytes, without the operation number
+ * @len: length of @buf in bytes
+ * @u: receives the decoded arguments
+ * @consumed: receives the bytes the decoder consumed
+ *
+ * Drives the production decoder table over a caller-supplied stream so a
+ * test can check the wire shape rather than a helper's idea of it.  It
+ * decodes only; nothing is dispatched and no state is published.
+ *
+ * Returns the decoder's status.
+ */
+__be32 nfsd4_test_decode_op(struct svc_rqst *rqstp, u32 opnum, const void *buf,
+			    size_t len, union nfsd4_op_u *u, size_t *consumed)
+{
+	struct nfsd4_compoundargs *args;
+	struct xdr_stream stream;
+	struct xdr_buf xbuf = {};
+	struct kvec iov;
+	__be32 status;
+
+	if (opnum >= ARRAY_SIZE(nfsd4_dec_ops) || !nfsd4_dec_ops[opnum])
+		return nfserr_op_illegal;
+
+	/* Too large for the stack; the compound args embed an op array. */
+	args = kzalloc_obj(*args, GFP_KERNEL);
+	if (!args)
+		return nfserr_jukebox;
+
+	iov.iov_base = (void *)buf;
+	iov.iov_len = len;
+	xbuf.head[0] = iov;
+	xbuf.len = len;
+	xbuf.buflen = len;
+	xdr_init_decode(&stream, &xbuf, (__be32 *)buf, NULL);
+
+	args->xdr = &stream;
+	args->rqstp = rqstp;
+	args->ops = args->iops;
+	args->minorversion = 1;
+
+	status = nfsd4_dec_ops[opnum](args, u);
+	if (consumed)
+		*consumed = xdr_stream_pos(&stream);
+	while (args->to_free) {
+		struct svcxdr_tmpbuf *tb = args->to_free;
+
+		args->to_free = tb->next;
+		kfree(tb);
+	}
+	kfree(args);
+	return status;
+}
+#endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
+
 bool
 nfs4svc_decode_compoundargs(struct svc_rqst *rqstp, struct xdr_stream *xdr)
 {

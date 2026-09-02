@@ -1022,6 +1022,10 @@ int nfsd4_ffv2_compound_digest(const struct xdr_buf *buf, unsigned int offset,
 			       size_t len,
 			       u8 digest[NFSD4_FFV2_DIGEST_SIZE]);
 __be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd4_test_decode_op(struct svc_rqst *rqstp, u32 opnum, const void *buf,
+			    size_t len, union nfsd4_op_u *u, size_t *consumed);
+#endif
 bool nfsd4_ffv2_replay_identity_match(const struct nfsd4_compoundargs *args,
 				      const struct nfsd4_slot *slot);
 bool nfs4svc_encode_compoundres(struct svc_rqst *rqstp, struct xdr_stream *xdr);

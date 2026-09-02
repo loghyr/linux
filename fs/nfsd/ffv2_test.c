@@ -3525,6 +3525,205 @@ out_cleanup:
 			   error);
 }
 
+/*
+ * Argument-decoder evidence.
+ *
+ * These build genuine XDR byte streams and run them through the production
+ * decoder table, so the wire shape is checked against the aggregate draft
+ * rather than against a helper's idea of it.  Field order and widths follow
+ * draft-haynes-nfsv4-flexfiles-v2 sections chunk_owner4, chunk_cohort_id4,
+ * CHUNK_WRITE4args, CHUNK_UNLOCK4args, and BULK_REVOKE_STATEID4args.
+ */
+
+struct nfsd_ffv2_xdr_writer {
+	__be32	*p;
+	__be32	*base;
+	size_t	max;
+};
+
+static void nfsd_ffv2_xdr_u32(struct nfsd_ffv2_xdr_writer *w, u32 v)
+{
+	*w->p++ = cpu_to_be32(v);
+}
+
+static void nfsd_ffv2_xdr_u64(struct nfsd_ffv2_xdr_writer *w, u64 v)
+{
+	nfsd_ffv2_xdr_u32(w, upper_32_bits(v));
+	nfsd_ffv2_xdr_u32(w, lower_32_bits(v));
+}
+
+static void nfsd_ffv2_xdr_stateid(struct nfsd_ffv2_xdr_writer *w,
+				  const stateid_t *sid)
+{
+	nfsd_ffv2_xdr_u32(w, sid->si_generation);
+	nfsd_ffv2_xdr_u32(w, sid->si_opaque.so_clid.cl_boot);
+	nfsd_ffv2_xdr_u32(w, sid->si_opaque.so_clid.cl_id);
+	nfsd_ffv2_xdr_u32(w, sid->si_opaque.so_id);
+}
+
+static size_t nfsd_ffv2_xdr_len(const struct nfsd_ffv2_xdr_writer *w)
+{
+	return (w->p - w->base) * XDR_UNIT;
+}
+
+/* chunk_owner4: co_cohort_id (64 bits), co_client_id, co_id. */
+static void nfsd_ffv2_xdr_owner(struct nfsd_ffv2_xdr_writer *w, u64 cohort,
+				u32 client_id, u32 owner_id)
+{
+	nfsd_ffv2_xdr_u64(w, cohort);
+	nfsd_ffv2_xdr_u32(w, client_id);
+	nfsd_ffv2_xdr_u32(w, owner_id);
+}
+
+static void nfsd_ffv2_decoder_owner_test(struct kunit *test)
+{
+	struct nfsd_ffv2_xdr_writer w;
+	union nfsd4_op_u *u;
+	struct svc_rqst *rqstp;
+	size_t consumed;
+	stateid_t sid;
+	__be32 *buf;
+
+	buf = kunit_kzalloc(test, 256, GFP_KERNEL);
+	u = kunit_kzalloc(test, sizeof(*u), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, u);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+
+	/* CHUNK_UNLOCK4args: stateid, offset, count, owner. */
+	sid = nfsd_ffv2_test_stateid(0x11, 0x22, 0x33, 0x44);
+	w.base = buf;
+	w.p = buf;
+	nfsd_ffv2_xdr_stateid(&w, &sid);
+	nfsd_ffv2_xdr_u64(&w, 4096);			/* offset */
+	nfsd_ffv2_xdr_u32(&w, 1);			/* count */
+	nfsd_ffv2_xdr_owner(&w, 0x0123456789abcdefULL, 0xfeed, 0xbeef);
+
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd4_test_decode_op(rqstp, OP_CHUNK_UNLOCK, buf,
+					     nfsd_ffv2_xdr_len(&w), u,
+					     &consumed));
+	/* The whole owner is consumed and retained, all four words. */
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_xdr_len(&w), consumed);
+	KUNIT_EXPECT_EQ(test, 0x0123456789abcdefULL, u->ffv2.owner_cohort_id);
+	KUNIT_EXPECT_EQ(test, 0xfeedU, u->ffv2.owner_client_id);
+	KUNIT_EXPECT_EQ(test, 0xbeefU, u->ffv2.owner_id);
+	KUNIT_EXPECT_TRUE(test, u->ffv2.owner_present);
+	KUNIT_EXPECT_EQ(test, 0x11U, u->ffv2.stateid.si_generation);
+	KUNIT_EXPECT_EQ(test, 4096ULL, u->ffv2.offset);
+
+	/* Truncating the owner by one word must fail closed. */
+	memset(u, 0, sizeof(*u));
+	KUNIT_EXPECT_NE(test, nfs_ok,
+			nfsd4_test_decode_op(rqstp, OP_CHUNK_UNLOCK, buf,
+					     nfsd_ffv2_xdr_len(&w) - XDR_UNIT,
+					     u, &consumed));
+}
+
+static void nfsd_ffv2_decoder_write_test(struct kunit *test)
+{
+	struct nfsd_ffv2_xdr_writer w;
+	union nfsd4_op_u *u;
+	struct svc_rqst *rqstp;
+	size_t consumed;
+	stateid_t sid;
+	__be32 *buf;
+
+	buf = kunit_kzalloc(test, 512, GFP_KERNEL);
+	u = kunit_kzalloc(test, sizeof(*u), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, u);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+
+	/*
+	 * CHUNK_WRITE_REPAIR4args carries a bare cohort and client id, not a
+	 * chunk_owner4: stateid, offset, stable, cohort, client, co_ids<>,
+	 * payload id, chunk size, checksums<>, chunks<>.
+	 */
+	sid = nfsd_ffv2_test_stateid(7, 8, 9, 10);
+	w.base = buf;
+	w.p = buf;
+	nfsd_ffv2_xdr_stateid(&w, &sid);
+	nfsd_ffv2_xdr_u64(&w, 8192);			/* offset */
+	nfsd_ffv2_xdr_u32(&w, 2);			/* stable_how4 */
+	nfsd_ffv2_xdr_u64(&w, 0xcafef00dd00dULL);	/* cohort id */
+	nfsd_ffv2_xdr_u32(&w, 0x5150);			/* client id */
+	nfsd_ffv2_xdr_u32(&w, 2);			/* co_ids<> count */
+	nfsd_ffv2_xdr_u32(&w, 11);
+	nfsd_ffv2_xdr_u32(&w, 12);
+	nfsd_ffv2_xdr_u32(&w, 3);			/* payload id */
+	nfsd_ffv2_xdr_u32(&w, 4096);			/* chunk size */
+	nfsd_ffv2_xdr_u32(&w, 0);			/* checksums<> */
+	nfsd_ffv2_xdr_u32(&w, 0);			/* chunks<> */
+
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd4_test_decode_op(rqstp, OP_CHUNK_WRITE_REPAIR, buf,
+					     nfsd_ffv2_xdr_len(&w), u,
+					     &consumed));
+	/*
+	 * The writer identity must be the client id at its own position, not
+	 * a word of the cohort.  This is the field the authorization gate
+	 * compares against the trust entry.
+	 */
+	KUNIT_EXPECT_EQ(test, 0xcafef00dd00dULL, u->ffv2.owner_cohort_id);
+	KUNIT_EXPECT_EQ(test, 0x5150U, u->ffv2.owner_client_id);
+	KUNIT_EXPECT_TRUE(test, u->ffv2.owner_present);
+	KUNIT_EXPECT_EQ(test, 0U, u->ffv2.owner_id);
+
+	/*
+	 * An over-long co_ids array is refused rather than trusted.  The
+	 * count is the eleventh word: stateid, offset, stable, cohort,
+	 * client, then the array.
+	 */
+	memset(u, 0, sizeof(*u));
+	buf[10] = cpu_to_be32(U32_MAX);
+	KUNIT_EXPECT_NE(test, nfs_ok,
+			nfsd4_test_decode_op(rqstp, OP_CHUNK_WRITE_REPAIR, buf,
+					     nfsd_ffv2_xdr_len(&w), u,
+					     &consumed));
+}
+
+static void nfsd_ffv2_decoder_bulk_revoke_test(struct kunit *test)
+{
+	struct nfsd_ffv2_xdr_writer w;
+	union nfsd4_op_u *u;
+	struct svc_rqst *rqstp;
+	size_t consumed;
+	__be32 *buf;
+
+	buf = kunit_kzalloc(test, 64, GFP_KERNEL);
+	u = kunit_kzalloc(test, sizeof(*u), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, buf);
+	KUNIT_ASSERT_NOT_NULL(test, u);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+
+	/* BULK_REVOKE_STATEID4args is one clientid4 and names no file. */
+	w.base = buf;
+	w.p = buf;
+	nfsd_ffv2_xdr_u32(&w, 0xA1A2A3A4);
+	nfsd_ffv2_xdr_u32(&w, 0xB1B2B3B4);
+
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd4_test_decode_op(rqstp, OP_BULK_REVOKE_STATEID,
+					     buf, nfsd_ffv2_xdr_len(&w), u,
+					     &consumed));
+	KUNIT_EXPECT_EQ(test, 2 * XDR_UNIT, consumed);
+	/* The target is retained, and is distinct from any session client. */
+	KUNIT_EXPECT_TRUE(test, u->ffv2.target_present);
+	KUNIT_EXPECT_EQ(test, 0xA1A2A3A4U, u->ffv2.target_clientid.cl_boot);
+	KUNIT_EXPECT_EQ(test, 0xB1B2B3B4U, u->ffv2.target_clientid.cl_id);
+
+	/* A truncated clientid fails closed and retains nothing. */
+	memset(u, 0, sizeof(*u));
+	KUNIT_EXPECT_NE(test, nfs_ok,
+			nfsd4_test_decode_op(rqstp, OP_BULK_REVOKE_STATEID,
+					     buf, XDR_UNIT, u, &consumed));
+	KUNIT_EXPECT_FALSE(test, u->ffv2.target_present);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -3565,6 +3764,9 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_validate_order_test),
 	KUNIT_CASE(nfsd_ffv2_trust_actor_class_test),
 	KUNIT_CASE(nfsd_ffv2_no_fh_generation_race_test),
+	KUNIT_CASE(nfsd_ffv2_decoder_owner_test),
+	KUNIT_CASE(nfsd_ffv2_decoder_write_test),
+	KUNIT_CASE(nfsd_ffv2_decoder_bulk_revoke_test),
 	{}
 };
 
