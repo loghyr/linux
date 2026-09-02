@@ -1398,9 +1398,11 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		     generation->identity->generation);
 	atomic64_inc(&nfsd_ffv2_probe_counters.mapped);
 	/*
-	 * D0.5 has no trusted-stateid or MDS-session authority registry and
-	 * no content-aware slot replay record.  Keep the callback boundary
-	 * closed until those nfsd-core prerequisites exist.
+	 * The caller has already passed the ordered authority, trusted
+	 * stateid, and operation-profile checks.  What remains missing is
+	 * the provider itself: durable logical identity, the store and
+	 * write-ahead log behind mutating operations, and escrow ownership.
+	 * Keep the callback boundary closed until those exist.
 	 */
 	atomic64_inc(&nfsd_ffv2_probe_counters.fail_closed);
 	return nfserr_notsupp;
