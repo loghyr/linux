@@ -208,15 +208,6 @@ int nfsd_ffv2_authority_qualify(const struct nfs4_client *clp);
 bool nfsd_ffv2_authority_published(struct nfsd_ffv2_authority *authority,
 				   u64 *epoch);
 
-void nfsd_ffv2_session_init(struct nfsd4_session *session);
-void nfsd_ffv2_session_dead_locked(struct nfsd4_session *session);
-void nfsd_ffv2_session_free(struct nfsd4_session *session);
-int nfsd_ffv2_authority_token_get(struct nfsd_ffv2_authority *authority);
-void nfsd_ffv2_authority_token_put(struct nfsd_ffv2_authority *authority);
-int nfsd_ffv2_authority_qualify(const struct nfs4_client *clp);
-bool nfsd_ffv2_authority_published(struct nfsd_ffv2_authority *authority,
-				   u64 *epoch);
-
 int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info);
 int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
 			const struct nfsd_ffv2_fh_info *info);
