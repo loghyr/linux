@@ -3491,77 +3491,81 @@ static bool nfsd_ffv2_stateid_is_anonymous(const stateid_t *stateid)
  */
 static const struct nfsd_ffv2_op_profile nfsd_ffv2_op_profiles[] = {
 	[OP_CHUNK_READ] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
 		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
 		.profile_bit	= NFSD_FFV2_PROFILE_READ_DATA,
 	},
 	[OP_CHUNK_HEADER_READ] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
 		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
 		.profile_bit	= NFSD_FFV2_PROFILE_READ_METADATA,
 	},
 	[OP_CHUNK_WRITE] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
 		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_DATA,
 		.writer_identity = true,
 	},
 	[OP_CHUNK_COMMIT] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
 		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
 		.writer_identity = true,
 	},
 	[OP_CHUNK_FINALIZE] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
 		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
 		.writer_identity = true,
 	},
 	[OP_CHUNK_ROLLBACK] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
 		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
 		.writer_identity = true,
 	},
 	[OP_CHUNK_WRITE_REPAIR] = {
-		.caller		= NFSD_FFV2_CALLER_REPAIR_ACTOR,
+		.callers	= NFSD_FFV2_CALLERS(REPAIR_ACTOR),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
 		.profile_bit	= NFSD_FFV2_PROFILE_REPAIR_WRITE,
 		.writer_identity = true,
 	},
 	[OP_CHUNK_REPAIRED] = {
-		.caller		= NFSD_FFV2_CALLER_REPAIR_ACTOR,
+		.callers	= NFSD_FFV2_CALLERS(REPAIR_ACTOR),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
 		.profile_bit	= NFSD_FFV2_PROFILE_REPORT_REPAIRED,
 		.writer_identity = true,
 	},
 	[OP_CHUNK_LOCK] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT) |
+				  NFSD_FFV2_CALLERS(REPAIR_ACTOR),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
 		.profile_bit	= NFSD_FFV2_PROFILE_LOCK_CONTROL,
 	},
 	[OP_CHUNK_UNLOCK] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT) |
+				  NFSD_FFV2_CALLERS(REPAIR_ACTOR),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
 		.profile_bit	= NFSD_FFV2_PROFILE_LOCK_CONTROL,
 	},
 	[OP_CHUNK_ERROR] = {
-		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
 		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
 		.profile_bit	= NFSD_FFV2_PROFILE_REPORT_ERROR,
 	},
 	[OP_TRUST_STATEID] = {
-		.caller		= NFSD_FFV2_CALLER_MDS_CONTROL,
+		.callers	= NFSD_FFV2_CALLERS(MDS_CONTROL),
 		.iomode		= NFSD_FFV2_IOMODE_ANY,
 	},
 	[OP_REVOKE_STATEID] = {
-		.caller		= NFSD_FFV2_CALLER_MDS_CONTROL,
+		.callers	= NFSD_FFV2_CALLERS(MDS_CONTROL),
 		.iomode		= NFSD_FFV2_IOMODE_ANY,
 	},
 	[OP_BULK_REVOKE_STATEID] = {
-		.caller		= NFSD_FFV2_CALLER_MDS_CONTROL,
+		.callers	= NFSD_FFV2_CALLERS(MDS_CONTROL),
 		.iomode		= NFSD_FFV2_IOMODE_ANY,
+		/* Takes only a clientid4; it names no file. */
+		.no_filehandle	= true,
 	},
 };
 
@@ -3579,9 +3583,24 @@ const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum)
 	if (opnum >= ARRAY_SIZE(nfsd_ffv2_op_profiles))
 		return NULL;
 	profile = &nfsd_ffv2_op_profiles[opnum];
-	if (profile->caller == NFSD_FFV2_CALLER_NONE)
+	if (!profile->callers)
 		return NULL;
 	return profile;
+}
+
+/**
+ * nfsd_ffv2_op_no_filehandle - does this operation name no file?
+ * @opnum: NFSv4 operation number
+ *
+ * Returns true for a control operation whose arguments contain no
+ * filehandle, such as BULK_REVOKE_STATEID.
+ */
+bool nfsd_ffv2_op_no_filehandle(u32 opnum)
+{
+	const struct nfsd_ffv2_op_profile *profile;
+
+	profile = nfsd_ffv2_op_profile(opnum);
+	return profile && profile->no_filehandle;
 }
 
 /* Entry accessors used by the ordered validation gate. */
@@ -3629,7 +3648,7 @@ nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
 	 * actor by choosing a repair operation, and a repair actor cannot
 	 * use an ordinary writer's profile.
 	 */
-	if (entry->actor != profile->caller)
+	if (!(profile->callers & BIT(entry->actor)))
 		return nfserr_bad_stateid;
 
 	switch (profile->iomode) {
@@ -3659,6 +3678,23 @@ nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
 			return nfserr_bad_stateid;
 	}
 	return nfs_ok;
+}
+
+/*
+ * The generation a filehandle-less control operation applies to.  Only the
+ * pointer is read under the anchor lock; the execution admission taken
+ * later is what actually pins it.
+ */
+static struct nfsd_ffv2_generation *
+nfsd_ffv2_active_generation(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_generation *generation;
+
+	mutex_lock(&anchor->lock);
+	generation = anchor->active;
+	mutex_unlock(&anchor->lock);
+	return generation;
 }
 
 /**
@@ -3702,16 +3738,33 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	if (!profile)
 		return nfserr_notsupp;
 
-	/* Binding and generation identity precede any state lookup. */
-	binding = fhp->fh_ffv2_binding;
-	if (!binding || binding->net != SVC_NET(rqstp))
-		return nfserr_stale;
-	nn = net_generic(binding->net, nfsd_net_id);
-	if (!nfsd_ffv2_binding_current(nn, binding))
-		return nfserr_stale;
-	generation = binding->admission.generation;
-	if (!generation)
-		return nfserr_stale;
+	/*
+	 * Binding and generation identity precede any state lookup.  A
+	 * control operation that names no file, such as BULK_REVOKE_STATEID,
+	 * resolves the active generation directly instead: it still has to
+	 * pass the same authority checks, so it cannot be used to bypass
+	 * them.
+	 */
+	binding = fhp ? fhp->fh_ffv2_binding : NULL;
+	if (!binding) {
+		if (!profile->no_filehandle)
+			return nfserr_stale;
+		if (!rqstp->rq_xprt)
+			return nfserr_stale;
+		nn = net_generic(rqstp->rq_xprt->xpt_net, nfsd_net_id);
+		generation = nfsd_ffv2_active_generation(nn);
+		if (!generation)
+			return nfserr_stale;
+	} else {
+		if (binding->net != SVC_NET(rqstp))
+			return nfserr_stale;
+		nn = net_generic(binding->net, nfsd_net_id);
+		if (!nfsd_ffv2_binding_current(nn, binding))
+			return nfserr_stale;
+		generation = binding->admission.generation;
+		if (!generation)
+			return nfserr_stale;
+	}
 	context = generation->payload;
 	if (!context || !context->object)
 		return nfserr_stale;
@@ -3719,7 +3772,7 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	if (!authority)
 		return nfserr_perm;
 
-	if (profile->caller == NFSD_FFV2_CALLER_MDS_CONTROL) {
+	if (profile->callers & NFSD_FFV2_CALLERS(MDS_CONTROL)) {
 		/*
 		 * Control operations must arrive on the exact registered
 		 * session, still carrying the machine credential and GSS

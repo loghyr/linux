@@ -52,11 +52,20 @@ enum nfsd_ffv2_iomode_policy {
  * requirements.  The profile bit is named explicitly per operation and is
  * never inferred from iomode alone.
  */
+#define NFSD_FFV2_CALLERS(class)	BIT(NFSD_FFV2_CALLER_##class)
+
 struct nfsd_ffv2_op_profile {
-	enum nfsd_ffv2_caller_class	caller;
+	/*
+	 * Caller classes this operation admits.  Lock control is shared
+	 * between a data client and a repair actor, so this is a mask rather
+	 * than a single class.
+	 */
+	u32				callers;
 	enum nfsd_ffv2_iomode_policy	iomode;
 	u32				profile_bit;
 	bool				writer_identity;
+	/* Control operations that carry no current filehandle. */
+	bool				no_filehandle;
 };
 
 /* Defined in nfs4state.c and declared in xdr4.h, which ffv2.c does not use. */
@@ -69,6 +78,7 @@ struct nfsd_ffv2_actor_id {
 };
 
 const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum);
+bool nfsd_ffv2_op_no_filehandle(u32 opnum);
 __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				    struct nfsd4_session *session, u32 opnum,
 				    const stateid_t *stateid,

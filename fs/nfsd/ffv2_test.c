@@ -3247,7 +3247,8 @@ static void nfsd_ffv2_op_profile_test(struct kunit *test)
 	/* Reads are data-client operations and accept READ or RW. */
 	profile = nfsd_ffv2_op_profile(OP_CHUNK_READ);
 	KUNIT_ASSERT_NOT_NULL(test, profile);
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_DATA_CLIENT, profile->caller);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLERS(DATA_CLIENT),
+			profile->callers);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROFILE_READ_DATA,
 			profile->profile_bit);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_IOMODE_READ_OR_RW, profile->iomode);
@@ -3267,14 +3268,16 @@ static void nfsd_ffv2_op_profile_test(struct kunit *test)
 	/* Repair is a distinct caller class from an ordinary writer. */
 	profile = nfsd_ffv2_op_profile(OP_CHUNK_WRITE_REPAIR);
 	KUNIT_ASSERT_NOT_NULL(test, profile);
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_REPAIR_ACTOR, profile->caller);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLERS(REPAIR_ACTOR),
+			profile->callers);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROFILE_REPAIR_WRITE,
 			profile->profile_bit);
 
 	/* Control operations are MDS-only and do not consult iomode. */
 	profile = nfsd_ffv2_op_profile(OP_TRUST_STATEID);
 	KUNIT_ASSERT_NOT_NULL(test, profile);
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_MDS_CONTROL, profile->caller);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLERS(MDS_CONTROL),
+			profile->callers);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_IOMODE_ANY, profile->iomode);
 	KUNIT_EXPECT_EQ(test, 0U, profile->profile_bit);
 
@@ -3396,10 +3399,21 @@ static void nfsd_ffv2_trust_actor_class_test(struct kunit *test)
 	 */
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_DATA_CLIENT,
 			nfsd_ffv2_test_trust_actor(entry));
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_REPAIR_ACTOR,
-			nfsd_ffv2_op_profile(OP_CHUNK_WRITE_REPAIR)->caller);
-	KUNIT_EXPECT_NE(test, nfsd_ffv2_test_trust_actor(entry),
-			nfsd_ffv2_op_profile(OP_CHUNK_WRITE_REPAIR)->caller);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLERS(REPAIR_ACTOR),
+			nfsd_ffv2_op_profile(OP_CHUNK_WRITE_REPAIR)->callers);
+	KUNIT_EXPECT_EQ(test, 0U,
+			nfsd_ffv2_op_profile(OP_CHUNK_WRITE_REPAIR)->callers &
+			BIT(nfsd_ffv2_test_trust_actor(entry)));
+	/* Lock control admits both a data client and a repair actor. */
+	KUNIT_EXPECT_NE(test, 0U,
+			nfsd_ffv2_op_profile(OP_CHUNK_LOCK)->callers &
+			BIT(NFSD_FFV2_CALLER_DATA_CLIENT));
+	KUNIT_EXPECT_NE(test, 0U,
+			nfsd_ffv2_op_profile(OP_CHUNK_LOCK)->callers &
+			BIT(NFSD_FFV2_CALLER_REPAIR_ACTOR));
+	KUNIT_EXPECT_NE(test, 0U,
+			nfsd_ffv2_op_profile(OP_CHUNK_UNLOCK)->callers &
+			BIT(NFSD_FFV2_CALLER_REPAIR_ACTOR));
 	nfsd_ffv2_trust_entry_put(entry);
 
 	/* Renewal cannot quietly change the caller class either. */

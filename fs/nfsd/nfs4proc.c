@@ -3653,7 +3653,12 @@ nfsd4_ffv2_gate(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 
 	if (status)
 		return status;
-	if (!cstate->current_fh.fh_ffv2_binding)
+	/*
+	 * An operation with no FFv2 object and no filehandle-less profile
+	 * has nothing to authorize and keeps the plain terminal status.
+	 */
+	if (!cstate->current_fh.fh_ffv2_binding &&
+	    !nfsd_ffv2_op_no_filehandle(opnum))
 		return nfserr_notsupp;
 	status = nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh,
 					      cstate->session, opnum, stateid,

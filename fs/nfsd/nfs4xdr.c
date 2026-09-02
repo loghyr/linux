@@ -2535,20 +2535,35 @@ nfsd4_decode_ffv2_range(struct nfsd4_compoundargs *argp,
 }
 
 /*
- * chunk_owner4: a chunk_guard4 of cg_gen_id and cg_client_id, then
- * co_chunk_id.  Retain the identity rather than skipping it; the field
- * widths and their total are unchanged.
+ * chunk_cohort_id4 is a 64-bit writer-chosen identifier followed by the
+ * writer's 32-bit client id.  Both the write operations and chunk_owner4
+ * begin with this pair.
+ */
+static __be32 nfsd4_decode_ffv2_writer(struct nfsd4_compoundargs *argp,
+				       struct nfsd4_ffv2 *ffv2)
+{
+	if (xdr_stream_decode_u64(argp->xdr, &ffv2->owner_cohort_id) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_client_id) < 0)
+		return nfserr_bad_xdr;
+	ffv2->owner_present = true;
+	return nfs_ok;
+}
+
+/*
+ * chunk_owner4: co_cohort_id, co_client_id, co_id.  Four XDR words, which
+ * is exactly what this consumed before the identity was retained.
  */
 static __be32 nfsd4_decode_ffv2_owner(struct nfsd4_compoundargs *argp,
 				      struct nfsd4_ffv2 *ffv2)
 {
-	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_gen_id) < 0)
+	__be32 status;
+
+	status = nfsd4_decode_ffv2_writer(argp, ffv2);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_id) < 0)
 		return nfserr_bad_xdr;
-	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_client_id) < 0)
-		return nfserr_bad_xdr;
-	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_chunk_id) < 0)
-		return nfserr_bad_xdr;
-	ffv2->owner_present = true;
 	return nfs_ok;
 }
 
@@ -2737,8 +2752,6 @@ nfsd4_decode_ffv2_owner_op(struct nfsd4_compoundargs *argp,
 	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
 	if (status)
 		return status;
-	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
-		return nfserr_bad_xdr;
 	return nfsd4_decode_ffv2_owner(argp, &u->ffv2);
 }
 
@@ -2755,12 +2768,13 @@ nfsd4_decode_chunk_write_common(struct nfsd4_compoundargs *argp,
 		return status;
 	if (xdr_stream_decode_u64(argp->xdr, &u->ffv2.offset) < 0)
 		return nfserr_bad_xdr;
-	/* stable_how4, then the chunk_owner4 identity. */
+	/* stable_how4, then the writer's cohort and client id. */
 	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
 		return nfserr_bad_xdr;
-	status = nfsd4_decode_ffv2_owner(argp, &u->ffv2);
+	status = nfsd4_decode_ffv2_writer(argp, &u->ffv2);
 	if (status)
 		return status;
+	/* cwa_co_ids<> / cwra_co_ids<> */
 	status = nfsd4_decode_ffv2_u32s(argp);
 	if (status)
 		return status;
