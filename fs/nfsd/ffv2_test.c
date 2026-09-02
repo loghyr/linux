@@ -15,6 +15,7 @@
 #include <net/net_namespace.h>
 
 #include "ffv2.h"
+#include "ffv2_trust.h"
 #include "export.h"
 #include "filecache.h"
 #include "nfsd.h"
@@ -340,6 +341,20 @@ static struct nfsd_net *nfsd_ffv2_test_net(struct kunit *test)
 	if (!nn)
 		return NULL;
 	nfsd_ffv2_net_init(nn);
+	/*
+	 * A zeroed nfsd_net is not a registered participant, but the service
+	 * paths under test still take these locks.  Initialise them so
+	 * lockdep sees real keys instead of disabling itself on the first
+	 * acquisition, which would void lock validation for the whole run.
+	 */
+	spin_lock_init(&nn->ffv2_participant.update_lock);
+	init_waitqueue_head(&nn->ffv2_participant.update_wait);
+	mutex_init(&nn->ffv2_participant.inventory_lock);
+	init_waitqueue_head(&nn->ffv2_participant.inventory_wait);
+	INIT_LIST_HEAD(&nn->ffv2_participant.node);
+	INIT_LIST_HEAD(&nn->ffv2_participant.reservations);
+	INIT_LIST_HEAD(&nn->ffv2_participant.inventory);
+	spin_lock_init(&nn->client_lock);
 	return nn;
 }
 
@@ -2316,8 +2331,6 @@ static struct nfsd_net *nfsd_ffv2_authority_test_net(struct kunit *test)
 
 	if (!nn)
 		return NULL;
-	/* The authority paths nest ->client_lock outside the leaf lock. */
-	spin_lock_init(&nn->client_lock);
 	return nn;
 }
 
@@ -2627,6 +2640,482 @@ static void nfsd_ffv2_authority_provider_gate_test(struct kunit *test)
 	nfsd_ffv2_test_net_destroy(test, nn);
 }
 
+/*
+ * Trusted stateid registry tests.  These drive the production registry,
+ * lookup, renewal, revoke, and teardown paths.  Authorities are built with
+ * the test constructor and published so that installation can bind to a
+ * real issuer epoch.
+ */
+
+static const u8 nfsd_ffv2_test_uuid_a[16] = {
+	0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+	0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf,
+};
+
+static const u8 nfsd_ffv2_test_uuid_b[16] = {
+	0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7,
+	0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf,
+};
+
+static stateid_t nfsd_ffv2_test_stateid(u32 seqid, u32 boot, u32 id, u32 so)
+{
+	stateid_t stateid;
+
+	memset(&stateid, 0, sizeof(stateid));
+	stateid.si_generation = seqid;
+	stateid.si_opaque.so_clid.cl_boot = boot;
+	stateid.si_opaque.so_clid.cl_id = id;
+	stateid.si_opaque.so_id = so;
+	return stateid;
+}
+
+static void nfsd_ffv2_test_trust_request(struct nfsd_ffv2_trust_request *req,
+					 const stateid_t *stateid,
+					 const u8 *uuid, u32 iomode,
+					 const char *principal, int seconds)
+{
+	struct timespec64 now;
+
+	memset(req, 0, sizeof(*req));
+	req->stateid = *stateid;
+	req->object_uuid = uuid;
+	req->pnfs_clientid.cl_boot = stateid->si_opaque.so_clid.cl_boot;
+	req->pnfs_clientid.cl_id = stateid->si_opaque.so_clid.cl_id;
+	req->client_id = 7;
+	req->iomode = iomode;
+	req->profile_mask = NFSD_FFV2_PROFILE_READ_DATA |
+			    NFSD_FFV2_PROFILE_READ_METADATA;
+	ktime_get_real_ts64(&now);
+	req->expires.tv_sec = now.tv_sec + seconds;
+	req->expires.tv_nsec = 0;
+	req->principal = principal;
+}
+
+struct nfsd_ffv2_trust_fixture {
+	struct nfsd_net			*nn;
+	struct nfsd4_session		*session;
+	struct nfsd_ffv2_authority	*authority;
+	struct nfsd_ffv2_trust_registry	*registry;
+	u64				epoch;
+};
+
+static bool nfsd_ffv2_trust_fixture_init(struct kunit *test,
+					 struct nfsd_ffv2_trust_fixture *f,
+					 u64 generation_id)
+{
+	f->nn = nfsd_ffv2_authority_test_net(test);
+	if (!f->nn)
+		return false;
+	f->session = nfsd_ffv2_test_session(test);
+	if (!f->session)
+		return false;
+	f->authority = nfsd_ffv2_test_authority_create(f->nn, f->session);
+	if (!f->authority)
+		return false;
+	if (!nfsd_ffv2_authority_publish(f->authority, generation_id))
+		return false;
+	if (!nfsd_ffv2_authority_published(f->authority, &f->epoch))
+		return false;
+	f->registry = nfsd_ffv2_test_trust_registry_alloc();
+	return f->registry;
+}
+
+static void nfsd_ffv2_trust_fixture_exit(struct kunit *test,
+					 struct nfsd_ffv2_trust_fixture *f)
+{
+	if (f->registry)
+		nfsd_ffv2_test_trust_registry_free(f->registry);
+	if (f->authority) {
+		nfsd_ffv2_authority_detach(f->authority);
+		nfsd_ffv2_authority_put(f->authority);
+	}
+	if (f->nn)
+		nfsd_ffv2_test_net_destroy(test, f->nn);
+}
+
+static void nfsd_ffv2_trust_lookup_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_request req;
+	stateid_t sid, other;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 31));
+
+	sid = nfsd_ffv2_test_stateid(1, 0x11, 0x22, 0x33);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, NULL, 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						31, &req));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	/* Exact key hits. */
+	entry = nfsd_ffv2_trust_lookup(f.registry, &sid,
+				       nfsd_ffv2_test_uuid_a, f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_validate(entry, 31,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 NULL));
+	/* A profile bit the entry does not carry is refused. */
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_validate(entry, 31,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_WRITE_DATA,
+						 NULL));
+	/* Wrong generation, object, or issuer epoch all fail. */
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_validate(entry, 32,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 NULL));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_validate(entry, 31,
+						 nfsd_ffv2_test_uuid_b,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 NULL));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_validate(entry, 31,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch + 1,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 NULL));
+	nfsd_ffv2_trust_entry_put(entry);
+
+	/* A different seqid is a distinct key, not an update. */
+	other = nfsd_ffv2_test_stateid(2, 0x11, 0x22, 0x33);
+	KUNIT_EXPECT_NULL(test,
+			  nfsd_ffv2_trust_lookup(f.registry, &other,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch));
+	/* Wrong object and wrong issuer epoch miss. */
+	KUNIT_EXPECT_NULL(test,
+			  nfsd_ffv2_trust_lookup(f.registry, &sid,
+						 nfsd_ffv2_test_uuid_b,
+						 f.epoch));
+	KUNIT_EXPECT_NULL(test,
+			  nfsd_ffv2_trust_lookup(f.registry, &sid,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch + 1));
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
+static void nfsd_ffv2_trust_renewal_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_entry *old, *new;
+	struct nfsd_ffv2_trust_request req;
+	stateid_t sid;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 41));
+
+	sid = nfsd_ffv2_test_stateid(5, 0x1, 0x2, 0x3);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, "nfs@ds.example.net", 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						41, &req));
+	KUNIT_EXPECT_EQ(test, strlen("nfs@ds.example.net"),
+			nfsd_ffv2_test_trust_bytes(f.registry));
+
+	old = nfsd_ffv2_trust_lookup(f.registry, &sid, nfsd_ffv2_test_uuid_a,
+				     f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, old);
+
+	/* Exact renewal: same issuer, target, client id, and iomode. */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						41, &req));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	/* The reader holding the old entry still sees it as replaced. */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_trust_replaced(old));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_validate(old, 41,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 "nfs@ds.example.net"));
+	/* A new lookup reaches the replacement, which is live. */
+	new = nfsd_ffv2_trust_lookup(f.registry, &sid, nfsd_ffv2_test_uuid_a,
+				     f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, new);
+	KUNIT_EXPECT_PTR_NE(test, old, new);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_validate(new, 41,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 "nfs@ds.example.net"));
+	/* A principal mismatch is ACCESS, not BAD_STATEID. */
+	KUNIT_EXPECT_EQ(test, nfserr_acces,
+			nfsd_ffv2_trust_validate(new, 41,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 "other@ds.example.net"));
+	nfsd_ffv2_trust_entry_put(old);
+	nfsd_ffv2_trust_entry_put(new);
+
+	/* Changing the iomode is a mismatch, never a silent retarget. */
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_READ, "nfs@ds.example.net", 3600);
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						41, &req));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
+static void nfsd_ffv2_trust_revoke_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_request req;
+	clientid_t target;
+	stateid_t a, b, c;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 51));
+
+	a = nfsd_ffv2_test_stateid(1, 0xaa, 0xbb, 1);
+	b = nfsd_ffv2_test_stateid(1, 0xaa, 0xbb, 2);
+	c = nfsd_ffv2_test_stateid(1, 0xcc, 0xdd, 3);
+	nfsd_ffv2_test_trust_request(&req, &a, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, NULL, 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						51, &req));
+	nfsd_ffv2_test_trust_request(&req, &b, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, NULL, 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						51, &req));
+	nfsd_ffv2_test_trust_request(&req, &c, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, NULL, 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						51, &req));
+	KUNIT_EXPECT_EQ(test, 3U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	/* Revoking one exact entry leaves the others reachable. */
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_trust_revoke(f.registry, &a,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch));
+	KUNIT_EXPECT_EQ(test, 2U, nfsd_ffv2_test_trust_entries(f.registry));
+	KUNIT_EXPECT_NULL(test,
+			  nfsd_ffv2_trust_lookup(f.registry, &a,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch));
+	/* Revoking again, and revoking an unknown key, are both no-ops. */
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd_ffv2_trust_revoke(f.registry, &a,
+						  nfsd_ffv2_test_uuid_a,
+						  f.epoch));
+	/* A different issuer epoch must not match another issuer's entry. */
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd_ffv2_trust_revoke(f.registry, &b,
+						  nfsd_ffv2_test_uuid_a,
+						  f.epoch + 1));
+	KUNIT_EXPECT_EQ(test, 2U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	entry = nfsd_ffv2_trust_lookup(f.registry, &b, nfsd_ffv2_test_uuid_a,
+				       f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	nfsd_ffv2_trust_entry_put(entry);
+
+	/* Bulk revoke for another issuer removes nothing. */
+	KUNIT_EXPECT_EQ(test, 0U,
+			nfsd_ffv2_trust_bulk_revoke(f.registry, f.epoch + 1,
+						    NULL));
+	KUNIT_EXPECT_EQ(test, 2U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	/* A selected target removes only that client's entries. */
+	target.cl_boot = 0xaa;
+	target.cl_id = 0xbb;
+	KUNIT_EXPECT_EQ(test, 1U,
+			nfsd_ffv2_trust_bulk_revoke(f.registry, f.epoch,
+						    &target));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	/* A NULL target removes all of this issuer's remaining entries. */
+	KUNIT_EXPECT_EQ(test, 1U,
+			nfsd_ffv2_trust_bulk_revoke(f.registry, f.epoch, NULL));
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_test_trust_entries(f.registry));
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_test_trust_bytes(f.registry));
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
+static void nfsd_ffv2_trust_limits_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_request req;
+	char *principal;
+	stateid_t sid;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 61));
+
+	sid = nfsd_ffv2_test_stateid(1, 1, 1, 1);
+
+	/* An over-long principal is refused before any allocation. */
+	principal = kunit_kzalloc(test, NFSD_FFV2_TRUST_PRINCIPAL_MAX + 2,
+				  GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, principal);
+	memset(principal, 'p', NFSD_FFV2_TRUST_PRINCIPAL_MAX + 1);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, principal, 3600);
+	KUNIT_EXPECT_EQ(test, nfserr_inval,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						61, &req));
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	/* Exactly at the bound is accepted. */
+	principal[NFSD_FFV2_TRUST_PRINCIPAL_MAX] = '\0';
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						61, &req));
+	KUNIT_EXPECT_EQ(test, (size_t)NFSD_FFV2_TRUST_PRINCIPAL_MAX,
+			nfsd_ffv2_test_trust_bytes(f.registry));
+
+	/* An invalid iomode, nanoseconds, or profile bit is rejected. */
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_b,
+				     0, NULL, 3600);
+	KUNIT_EXPECT_EQ(test, nfserr_inval,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						61, &req));
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_b,
+				     IOMODE_RW, NULL, 3600);
+	req.expires.tv_nsec = NSEC_PER_SEC;
+	KUNIT_EXPECT_EQ(test, nfserr_inval,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						61, &req));
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_b,
+				     IOMODE_RW, NULL, 3600);
+	req.profile_mask = (u32)~NFSD_FFV2_PROFILE_ALL;
+	KUNIT_EXPECT_EQ(test, nfserr_inval,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						61, &req));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
+static void nfsd_ffv2_trust_expiry_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_request req;
+	stateid_t sid;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 71));
+
+	sid = nfsd_ffv2_test_stateid(9, 3, 4, 5);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, NULL, -3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						71, &req));
+
+	/*
+	 * An expired entry is still reachable, but expiry is enforced on
+	 * every validation rather than depending on a reaper.
+	 */
+	entry = nfsd_ffv2_trust_lookup(f.registry, &sid,
+				       nfsd_ffv2_test_uuid_a, f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_validate(entry, 71,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 NULL));
+	nfsd_ffv2_trust_entry_put(entry);
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
+static void nfsd_ffv2_trust_retire_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_entry *held;
+	struct nfsd_ffv2_trust_request req;
+	stateid_t sid;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 81));
+
+	sid = nfsd_ffv2_test_stateid(4, 8, 9, 10);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, "svc@ds.example.net", 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						81, &req));
+
+	/* A request already holding a reference survives retirement. */
+	held = nfsd_ffv2_trust_lookup(f.registry, &sid, nfsd_ffv2_test_uuid_a,
+				      f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+
+	nfsd_ffv2_trust_retire(f.registry);
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_test_trust_entries(f.registry));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_trust_revoked(held));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_validate(held, 81,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 "svc@ds.example.net"));
+	/* New lookups miss immediately. */
+	KUNIT_EXPECT_NULL(test,
+			  nfsd_ffv2_trust_lookup(f.registry, &sid,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch));
+	/* Installing into a retired registry fails closed. */
+	KUNIT_EXPECT_EQ(test, nfserr_stale,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						81, &req));
+	/* Repeated retirement is a no-op. */
+	nfsd_ffv2_trust_retire(f.registry);
+
+	nfsd_ffv2_trust_entry_put(held);
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_test_trust_bytes(f.registry));
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
+static void nfsd_ffv2_trust_dead_authority_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_request req;
+	stateid_t sid;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 91));
+
+	/* Session death makes the issuer unusable for new registrations. */
+	spin_lock(&f.nn->client_lock);
+	nfsd_ffv2_session_dead_locked(f.session);
+	spin_unlock(&f.nn->client_lock);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_dead(f.authority));
+
+	sid = nfsd_ffv2_test_stateid(1, 5, 5, 5);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, NULL, 3600);
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						91, &req));
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -2654,6 +3143,13 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_authority_death_race_test),
 	KUNIT_CASE(nfsd_ffv2_authority_admission_test),
 	KUNIT_CASE(nfsd_ffv2_authority_provider_gate_test),
+	KUNIT_CASE(nfsd_ffv2_trust_lookup_test),
+	KUNIT_CASE(nfsd_ffv2_trust_renewal_test),
+	KUNIT_CASE(nfsd_ffv2_trust_revoke_test),
+	KUNIT_CASE(nfsd_ffv2_trust_limits_test),
+	KUNIT_CASE(nfsd_ffv2_trust_expiry_test),
+	KUNIT_CASE(nfsd_ffv2_trust_retire_test),
+	KUNIT_CASE(nfsd_ffv2_trust_dead_authority_test),
 	{}
 };
 

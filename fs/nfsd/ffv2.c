@@ -3,7 +3,9 @@
 #include <linux/cred.h>
 #include <linux/lockdep.h>
 #include <linux/kthread.h>
+#include <linux/overflow.h>
 #include <linux/refcount.h>
+#include <linux/rhashtable.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
@@ -22,6 +24,7 @@
 
 #include "export.h"
 #include "ffv2.h"
+#include "ffv2_trust.h"
 #include "filecache.h"
 #include "nfsfh.h"
 #include "nfsd.h"
@@ -220,7 +223,76 @@ struct nfsd_ffv2_reservation {
 	bool			file_gated;
 };
 
+/*
+ * Trusted stateid registry.
+ *
+ * The key is the exact bytes the metadata server issued: the whole 16-byte
+ * stateid including its seqid, the logical object, and the epoch of the
+ * authority that installed it.  nfsd performs no seqid arithmetic on an
+ * MDS-issued value, so a new seqid is a distinct entry rather than an
+ * update of an existing one.
+ *
+ * Entries are immutable once published.  Renewal allocates a complete
+ * replacement and swaps it under the update mutex, which lets a reader that
+ * already validated the old entry finish while new lookups miss it.
+ */
+
+/* Contiguous and padding-free so it can be hashed as raw bytes. */
+struct nfsd_ffv2_trust_key {
+	stateid_t	stateid;
+	u8		object_uuid[16];
+	u64		authority_epoch;
+};
+
+static_assert(sizeof(struct nfsd_ffv2_trust_key) ==
+	      sizeof(stateid_t) + 16 + sizeof(u64),
+	      "trust key must not carry padding");
+
+enum nfsd_ffv2_trust_state {
+	NFSD_FFV2_TRUST_LIVE,
+	NFSD_FFV2_TRUST_REPLACED,
+	NFSD_FFV2_TRUST_REVOKED,
+};
+
+struct nfsd_ffv2_trust_entry {
+	struct rhash_head		node;
+	struct rcu_head			rcu;
+	/* Off-list staging for entries dropped outside the update mutex. */
+	struct list_head		dispose;
+	refcount_t			ref;
+	struct nfsd_ffv2_trust_key	key;
+	u64				generation_id;
+	clientid_t			pnfs_clientid;
+	u32				client_id;
+	u32				iomode;
+	u32				profile_mask;
+	struct timespec64		expires;
+	char				*principal;
+	size_t				principal_len;
+	atomic_t			state;
+	struct nfsd_ffv2_authority	*authority;
+	struct nfsd_ffv2_object		*object;
+	struct nfsd_ffv2_trust_registry *registry;
+};
+
+static const struct rhashtable_params nfsd_ffv2_trust_params = {
+	.key_len	= sizeof(struct nfsd_ffv2_trust_key),
+	.key_offset	= offsetof(struct nfsd_ffv2_trust_entry, key),
+	.head_offset	= offsetof(struct nfsd_ffv2_trust_entry, node),
+	.automatic_shrinking = true,
+};
+
+struct nfsd_ffv2_trust_registry {
+	struct rhashtable	table;
+	/* Serializes install, renewal, revoke, and retirement. */
+	struct mutex		update_lock;
+	unsigned int		entries;
+	size_t			principal_bytes;
+	bool			live;
+};
+
 struct nfsd_ffv2_service_context {
+	struct nfsd_ffv2_trust_registry trust;
 	struct nfsd_ffv2_reservation *reservation;
 	struct svc_export	*export;
 	struct nfsd_ffv2_object *object;
@@ -722,6 +794,10 @@ nfsd_ffv2_service_context_alloc(struct nfsd_ffv2_reservation *reservation,
 	context = kzalloc_obj(*context, GFP_KERNEL);
 	if (!context)
 		return NULL;
+	if (nfsd_ffv2_trust_registry_init(&context->trust)) {
+		kfree(context);
+		return NULL;
+	}
 	refcount_inc(&reservation->ref);
 	context->reservation = reservation;
 	context->cred = get_cred(cred);
@@ -1429,6 +1505,12 @@ void nfsd_ffv2_service_context_release(void *payload)
 		nfsd_export_put(exp);
 		wait_for_completion(&context->export_released);
 	}
+	/*
+	 * Retire trust before the object is freed: entries hold a non-owning
+	 * object pointer that stays valid only while the generation does.
+	 * This waits, so it must run with no anchor or registry lock held.
+	 */
+	nfsd_ffv2_trust_registry_destroy(&context->trust);
 	if (context->authority) {
 		nfsd_ffv2_authority_detach(context->authority);
 		nfsd_ffv2_authority_put(context->authority);
@@ -2402,6 +2484,27 @@ bool nfsd_ffv2_authority_publish(struct nfsd_ffv2_authority *authority,
 	return published;
 }
 
+/**
+ * nfsd_ffv2_authority_published - read a published authority's epoch
+ * @authority: authority to query
+ * @epoch: receives the issuer epoch when published
+ *
+ * Returns true only while the authority is PUBLISHED, so a caller cannot
+ * bind new state to a prepared or dead issuer.
+ */
+bool nfsd_ffv2_authority_published(struct nfsd_ffv2_authority *authority,
+				   u64 *epoch)
+{
+	bool published;
+
+	spin_lock(&authority->state_lock);
+	published = authority->state == NFSD_FFV2_AUTHORITY_PUBLISHED;
+	if (published)
+		*epoch = authority->epoch;
+	spin_unlock(&authority->state_lock);
+	return published;
+}
+
 /*
  * Allocate one epoch from the per-namespace counter.  The counter never
  * wraps and never reissues zero or a prior value: exhaustion fails closed so
@@ -2682,6 +2785,536 @@ void nfsd_ffv2_test_authority_admissions_close(struct nfsd_net *nn)
 bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn)
 {
 	return nfsd_ffv2_authority_admissions_idle(&nn->ffv2);
+}
+#endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
+
+/* Trusted stateid registry implementation. */
+
+static void nfsd_ffv2_trust_entry_free(struct rcu_head *rcu)
+{
+	struct nfsd_ffv2_trust_entry *entry =
+		container_of(rcu, struct nfsd_ffv2_trust_entry, rcu);
+
+	kfree_sensitive(entry->principal);
+	kfree(entry);
+}
+
+/*
+ * Release the caller's reference.  The principal and the authority
+ * reference are held until the last reader drops out, so a reader that
+ * validated the entry before revocation can always finish.
+ */
+void nfsd_ffv2_trust_entry_put(struct nfsd_ffv2_trust_entry *entry)
+{
+	struct nfsd_ffv2_trust_registry *registry;
+	struct nfsd_ffv2_authority *authority;
+	size_t bytes;
+
+	if (!entry || !refcount_dec_and_test(&entry->ref))
+		return;
+
+	registry = entry->registry;
+	authority = entry->authority;
+	bytes = entry->principal_len;
+
+	/*
+	 * Retained bytes are returned only at final free, so a replacement
+	 * cannot transiently exceed the budget while both entries exist.
+	 */
+	if (registry && bytes) {
+		mutex_lock(&registry->update_lock);
+		if (!WARN_ON_ONCE(registry->principal_bytes < bytes))
+			registry->principal_bytes -= bytes;
+		mutex_unlock(&registry->update_lock);
+	}
+	entry->authority = NULL;
+	call_rcu(&entry->rcu, nfsd_ffv2_trust_entry_free);
+	nfsd_ffv2_authority_put(authority);
+}
+
+/**
+ * nfsd_ffv2_trust_registry_init - prepare one generation's trust registry
+ * @registry: registry embedded in the generation payload
+ */
+int nfsd_ffv2_trust_registry_init(struct nfsd_ffv2_trust_registry *registry)
+{
+	int error;
+
+	mutex_init(&registry->update_lock);
+	registry->entries = 0;
+	registry->principal_bytes = 0;
+	error = rhashtable_init(&registry->table, &nfsd_ffv2_trust_params);
+	if (error) {
+		mutex_destroy(&registry->update_lock);
+		return error;
+	}
+	registry->live = true;
+	return 0;
+}
+
+/*
+ * Remove one entry from lookup.  On success the table's reference becomes
+ * the caller's, to be dropped once the update mutex is released: releasing
+ * it takes that same mutex to return the principal budget.
+ */
+static bool nfsd_ffv2_trust_unhash_locked(struct nfsd_ffv2_trust_registry *reg,
+					  struct nfsd_ffv2_trust_entry *entry,
+					  enum nfsd_ffv2_trust_state state)
+{
+	lockdep_assert_held(&reg->update_lock);
+
+	if (rhashtable_remove_fast(&reg->table, &entry->node,
+				   nfsd_ffv2_trust_params))
+		return false;
+	/* Publish the terminal state before the entry becomes unreachable. */
+	atomic_set_release(&entry->state, state);
+	if (!WARN_ON_ONCE(!reg->entries))
+		reg->entries--;
+	return true;
+}
+
+/**
+ * nfsd_ffv2_trust_retire - unhash and revoke every entry in a registry
+ * @registry: registry being torn down with its generation
+ *
+ * Removes lookup visibility for all entries, marks them revoked, and waits
+ * for the RCU lookup window with no registry, anchor, or service lock held.
+ * Outstanding entry references keep their memory alive until released.
+ */
+void nfsd_ffv2_trust_retire(struct nfsd_ffv2_trust_registry *registry)
+{
+	struct nfsd_ffv2_trust_entry *entry;
+	struct rhashtable_iter iter;
+	LIST_HEAD(doomed);
+
+	if (!registry->live)
+		return;
+
+	mutex_lock(&registry->update_lock);
+	registry->live = false;
+	rhashtable_walk_enter(&registry->table, &iter);
+	rhashtable_walk_start(&iter);
+	while ((entry = rhashtable_walk_next(&iter)) != NULL) {
+		if (IS_ERR(entry))
+			continue;
+		if (nfsd_ffv2_trust_unhash_locked(registry, entry,
+						  NFSD_FFV2_TRUST_REVOKED))
+			/* Carries the table reference, dropped below. */
+			list_add_tail(&entry->dispose, &doomed);
+	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
+	mutex_unlock(&registry->update_lock);
+
+	/* No registry, anchor, or service lock is held across this wait. */
+	synchronize_rcu();
+	while (!list_empty(&doomed)) {
+		entry = list_first_entry(&doomed, struct nfsd_ffv2_trust_entry,
+					 dispose);
+		list_del(&entry->dispose);
+		nfsd_ffv2_trust_entry_put(entry);
+	}
+}
+
+/**
+ * nfsd_ffv2_trust_registry_destroy - free a drained registry
+ * @registry: registry whose generation has retired
+ */
+void nfsd_ffv2_trust_registry_destroy(struct nfsd_ffv2_trust_registry *registry)
+{
+	if (!registry->live && !registry->entries && !registry->table.tbl) {
+		mutex_destroy(&registry->update_lock);
+		return;
+	}
+	nfsd_ffv2_trust_retire(registry);
+	WARN_ON_ONCE(registry->entries);
+	WARN_ON_ONCE(registry->principal_bytes);
+	rhashtable_destroy(&registry->table);
+	mutex_destroy(&registry->update_lock);
+}
+
+static void nfsd_ffv2_trust_key_init(struct nfsd_ffv2_trust_key *key,
+				     const stateid_t *stateid,
+				     const u8 object_uuid[16],
+				     u64 authority_epoch)
+{
+	/* Hashed as raw bytes, so every byte must be initialised. */
+	memset(key, 0, sizeof(*key));
+	key->stateid = *stateid;
+	memcpy(key->object_uuid, object_uuid, 16);
+	key->authority_epoch = authority_epoch;
+}
+
+/**
+ * nfsd_ffv2_trust_lookup - find a live entry and take a reference
+ * @registry: generation's registry
+ * @stateid: exact 16-byte stateid as issued, including seqid
+ * @object_uuid: logical object the entry is bound to
+ * @authority_epoch: epoch of the issuing authority
+ *
+ * Returns a referenced entry, or NULL.  The caller must revalidate with
+ * nfsd_ffv2_trust_validate() after leaving the RCU section, and must drop
+ * the reference with nfsd_ffv2_trust_entry_put().
+ */
+struct nfsd_ffv2_trust_entry *
+nfsd_ffv2_trust_lookup(struct nfsd_ffv2_trust_registry *registry,
+		       const stateid_t *stateid, const u8 object_uuid[16],
+		       u64 authority_epoch)
+{
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_key key;
+
+	nfsd_ffv2_trust_key_init(&key, stateid, object_uuid, authority_epoch);
+
+	rcu_read_lock();
+	entry = rhashtable_lookup(&registry->table, &key,
+				  nfsd_ffv2_trust_params);
+	/* A replaced or revoked entry must not start a new operation. */
+	if (entry && atomic_read_acquire(&entry->state) != NFSD_FFV2_TRUST_LIVE)
+		entry = NULL;
+	if (entry && !refcount_inc_not_zero(&entry->ref))
+		entry = NULL;
+	rcu_read_unlock();
+	return entry;
+}
+
+/**
+ * nfsd_ffv2_trust_validate - revalidate a referenced entry outside RCU
+ * @entry: referenced entry from nfsd_ffv2_trust_lookup()
+ * @generation_id: generation the request resolved to
+ * @object_uuid: object the request resolved to
+ * @authority_epoch: epoch the request resolved to
+ * @profile_bit: the single profile bit this operation requires
+ * @principal: authenticated request principal, or NULL for none
+ *
+ * Returns nfs_ok, or the exact wire status for the first failing check.
+ */
+__be32 nfsd_ffv2_trust_validate(const struct nfsd_ffv2_trust_entry *entry,
+				u64 generation_id, const u8 object_uuid[16],
+				u64 authority_epoch, u32 profile_bit,
+				const char *principal)
+{
+	struct timespec64 now;
+
+	if (atomic_read_acquire(&entry->state) != NFSD_FFV2_TRUST_LIVE)
+		return nfserr_bad_stateid;
+	if (entry->generation_id != generation_id)
+		return nfserr_bad_stateid;
+	if (entry->key.authority_epoch != authority_epoch)
+		return nfserr_bad_stateid;
+	if (memcmp(entry->key.object_uuid, object_uuid, 16))
+		return nfserr_bad_stateid;
+	/* Exactly one named bit; never inferred from iomode alone. */
+	if (!profile_bit || hweight32(profile_bit) != 1)
+		return nfserr_bad_stateid;
+	if (!(entry->profile_mask & profile_bit))
+		return nfserr_bad_stateid;
+
+	ktime_get_real_ts64(&now);
+	if (timespec64_compare(&entry->expires, &now) <= 0)
+		return nfserr_bad_stateid;
+
+	if (entry->principal) {
+		if (!principal || strcmp(entry->principal, principal))
+			return nfserr_acces;
+	}
+	return nfs_ok;
+}
+
+/* Charge one principal against the per-generation and per-issuer budgets. */
+static __be32 nfsd_ffv2_trust_charge_locked(struct nfsd_ffv2_trust_registry *r,
+					    size_t principal_len)
+{
+	size_t bytes;
+
+	lockdep_assert_held(&r->update_lock);
+
+	if (r->entries >= NFSD_FFV2_TRUST_ENTRIES_MAX)
+		return nfserr_delay;
+	if (check_add_overflow(r->principal_bytes, principal_len, &bytes))
+		return nfserr_delay;
+	if (bytes > NFSD_FFV2_TRUST_BYTES_MAX)
+		return nfserr_delay;
+	r->principal_bytes = bytes;
+	r->entries++;
+	return nfs_ok;
+}
+
+static struct nfsd_ffv2_trust_entry *
+nfsd_ffv2_trust_entry_alloc(struct nfsd_ffv2_trust_registry *registry,
+			    struct nfsd_ffv2_authority *authority,
+			    struct nfsd_ffv2_object *object,
+			    u64 generation_id,
+			    const struct nfsd_ffv2_trust_request *request,
+			    u64 authority_epoch, size_t principal_len)
+{
+	struct nfsd_ffv2_trust_entry *entry;
+
+	entry = kzalloc_obj(*entry, GFP_KERNEL);
+	if (!entry)
+		return NULL;
+	if (principal_len) {
+		entry->principal = kmemdup_nul(request->principal,
+					       principal_len, GFP_KERNEL);
+		if (!entry->principal) {
+			kfree(entry);
+			return NULL;
+		}
+		entry->principal_len = principal_len;
+	}
+	refcount_set(&entry->ref, 1);
+	INIT_LIST_HEAD(&entry->dispose);
+	nfsd_ffv2_trust_key_init(&entry->key, &request->stateid,
+				 request->object_uuid, authority_epoch);
+	entry->generation_id = generation_id;
+	entry->pnfs_clientid = request->pnfs_clientid;
+	entry->client_id = request->client_id;
+	entry->iomode = request->iomode;
+	entry->profile_mask = request->profile_mask;
+	entry->expires = request->expires;
+	entry->object = object;
+	entry->registry = registry;
+	atomic_set(&entry->state, NFSD_FFV2_TRUST_LIVE);
+	nfsd_ffv2_authority_get(authority);
+	entry->authority = authority;
+	return entry;
+}
+
+/* An exact key may be renewed only when the whole target identity matches. */
+static bool nfsd_ffv2_trust_renewable(const struct nfsd_ffv2_trust_entry *old,
+				      const struct nfsd_ffv2_trust_request *req)
+{
+	return old->pnfs_clientid.cl_boot == req->pnfs_clientid.cl_boot &&
+	       old->pnfs_clientid.cl_id == req->pnfs_clientid.cl_id &&
+	       old->client_id == req->client_id &&
+	       old->iomode == req->iomode;
+}
+
+/**
+ * nfsd_ffv2_trust_install - create or renew one trusted stateid
+ * @registry: generation's registry
+ * @authority: issuing MDS authority, must be published
+ * @object: generation-owned object the entry binds to
+ * @generation_id: owning generation
+ * @request: immutable description of the registration
+ *
+ * Allocates the complete replacement before taking the update mutex, so a
+ * failure never disturbs a live entry.  Returns nfs_ok, or the wire status.
+ */
+__be32 nfsd_ffv2_trust_install(struct nfsd_ffv2_trust_registry *registry,
+			       struct nfsd_ffv2_authority *authority,
+			       struct nfsd_ffv2_object *object,
+			       u64 generation_id,
+			       const struct nfsd_ffv2_trust_request *request)
+{
+	struct nfsd_ffv2_trust_entry *entry, *old, *replaced = NULL;
+	struct nfsd_ffv2_trust_key key;
+	size_t principal_len = 0;
+	u64 authority_epoch;
+	__be32 status;
+	int error;
+
+	if (request->iomode != IOMODE_READ && request->iomode != IOMODE_RW)
+		return nfserr_inval;
+	if (request->expires.tv_nsec < 0 ||
+	    request->expires.tv_nsec >= NSEC_PER_SEC)
+		return nfserr_inval;
+	if (request->profile_mask & ~NFSD_FFV2_PROFILE_ALL)
+		return nfserr_inval;
+	if (request->principal) {
+		principal_len = strnlen(request->principal,
+					NFSD_FFV2_TRUST_PRINCIPAL_MAX + 1);
+		if (principal_len > NFSD_FFV2_TRUST_PRINCIPAL_MAX)
+			return nfserr_inval;
+	}
+	if (!nfsd_ffv2_authority_published(authority, &authority_epoch))
+		return nfserr_bad_stateid;
+
+	entry = nfsd_ffv2_trust_entry_alloc(registry, authority, object,
+					    generation_id, request,
+					    authority_epoch, principal_len);
+	if (!entry)
+		return nfserr_delay;
+
+	nfsd_ffv2_trust_key_init(&key, &request->stateid, request->object_uuid,
+				 authority_epoch);
+
+	mutex_lock(&registry->update_lock);
+	if (!registry->live) {
+		status = nfserr_stale;
+		goto out_unlock;
+	}
+	old = rhashtable_lookup_fast(&registry->table, &key,
+				     nfsd_ffv2_trust_params);
+	if (old && !nfsd_ffv2_trust_renewable(old, request)) {
+		status = nfserr_bad_stateid;
+		goto out_unlock;
+	}
+	status = nfsd_ffv2_trust_charge_locked(registry, principal_len);
+	if (status != nfs_ok)
+		goto out_unlock;
+
+	if (old && nfsd_ffv2_trust_unhash_locked(registry, old,
+						 NFSD_FFV2_TRUST_REPLACED))
+		/*
+		 * Exact replacement: the old entry stops answering lookups
+		 * but its readers finish, and its bytes are returned at its
+		 * final free rather than here.
+		 */
+		replaced = old;
+	error = rhashtable_insert_fast(&registry->table, &entry->node,
+				       nfsd_ffv2_trust_params);
+	if (error) {
+		if (!WARN_ON_ONCE(!registry->entries))
+			registry->entries--;
+		if (!WARN_ON_ONCE(registry->principal_bytes < principal_len))
+			registry->principal_bytes -= principal_len;
+		status = nfserr_delay;
+		goto out_unlock;
+	}
+	mutex_unlock(&registry->update_lock);
+	nfsd_ffv2_trust_entry_put(replaced);
+	return nfs_ok;
+
+out_unlock:
+	mutex_unlock(&registry->update_lock);
+	nfsd_ffv2_trust_entry_put(replaced);
+	entry->principal_len = 0;
+	entry->registry = NULL;
+	nfsd_ffv2_trust_entry_put(entry);
+	return status;
+}
+
+/**
+ * nfsd_ffv2_trust_revoke - remove one exact entry from lookup
+ * @registry: generation's registry
+ * @stateid: exact stateid to revoke
+ * @object_uuid: object the entry is bound to
+ * @authority_epoch: epoch of the requesting issuer
+ *
+ * Returns true when an entry was removed.  A miss, including an entry owned
+ * by a different issuer, is not an error to the caller.
+ */
+bool nfsd_ffv2_trust_revoke(struct nfsd_ffv2_trust_registry *registry,
+			    const stateid_t *stateid, const u8 object_uuid[16],
+			    u64 authority_epoch)
+{
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_key key;
+	bool removed = false;
+
+	nfsd_ffv2_trust_key_init(&key, stateid, object_uuid, authority_epoch);
+
+	mutex_lock(&registry->update_lock);
+	entry = rhashtable_lookup_fast(&registry->table, &key,
+				       nfsd_ffv2_trust_params);
+	if (entry)
+		removed = nfsd_ffv2_trust_unhash_locked(registry, entry,
+							NFSD_FFV2_TRUST_REVOKED);
+	mutex_unlock(&registry->update_lock);
+
+	/* Drops the table reference now that the mutex is released. */
+	if (removed)
+		nfsd_ffv2_trust_entry_put(entry);
+	return removed;
+}
+
+/**
+ * nfsd_ffv2_trust_bulk_revoke - revoke one issuer's entries
+ * @registry: generation's registry
+ * @authority_epoch: only entries installed by this issuer are considered
+ * @target: pNFS client to select, or NULL for all of this issuer's entries
+ *
+ * Never touches an entry owned by another metadata server.  Returns the
+ * number of entries removed.
+ */
+unsigned int
+nfsd_ffv2_trust_bulk_revoke(struct nfsd_ffv2_trust_registry *registry,
+			    u64 authority_epoch,
+			    const clientid_t *target)
+{
+	struct nfsd_ffv2_trust_entry *entry;
+	struct rhashtable_iter iter;
+	unsigned int removed = 0;
+	LIST_HEAD(doomed);
+
+	mutex_lock(&registry->update_lock);
+	rhashtable_walk_enter(&registry->table, &iter);
+	rhashtable_walk_start(&iter);
+	while ((entry = rhashtable_walk_next(&iter)) != NULL) {
+		if (IS_ERR(entry))
+			continue;
+		if (entry->key.authority_epoch != authority_epoch)
+			continue;
+		if (target &&
+		    (entry->pnfs_clientid.cl_boot != target->cl_boot ||
+		     entry->pnfs_clientid.cl_id != target->cl_id))
+			continue;
+		if (!nfsd_ffv2_trust_unhash_locked(registry, entry,
+						   NFSD_FFV2_TRUST_REVOKED))
+			continue;
+		list_add_tail(&entry->dispose, &doomed);
+		removed++;
+	}
+	rhashtable_walk_stop(&iter);
+	rhashtable_walk_exit(&iter);
+	mutex_unlock(&registry->update_lock);
+
+	while (!list_empty(&doomed)) {
+		entry = list_first_entry(&doomed, struct nfsd_ffv2_trust_entry,
+					 dispose);
+		list_del(&entry->dispose);
+		nfsd_ffv2_trust_entry_put(entry);
+	}
+	return removed;
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct nfsd_ffv2_trust_registry *nfsd_ffv2_test_trust_registry_alloc(void)
+{
+	struct nfsd_ffv2_trust_registry *registry;
+
+	registry = kzalloc_obj(*registry, GFP_KERNEL);
+	if (!registry)
+		return NULL;
+	if (nfsd_ffv2_trust_registry_init(registry)) {
+		kfree(registry);
+		return NULL;
+	}
+	return registry;
+}
+
+void nfsd_ffv2_test_trust_registry_free(struct nfsd_ffv2_trust_registry *reg)
+{
+	nfsd_ffv2_trust_registry_destroy(reg);
+	kfree(reg);
+}
+
+unsigned int
+nfsd_ffv2_test_trust_entries(const struct nfsd_ffv2_trust_registry *registry)
+{
+	return registry->entries;
+}
+
+size_t
+nfsd_ffv2_test_trust_bytes(const struct nfsd_ffv2_trust_registry *registry)
+{
+	return registry->principal_bytes;
+}
+
+bool nfsd_ffv2_test_trust_replaced(const struct nfsd_ffv2_trust_entry *entry)
+{
+	return atomic_read(&entry->state) == NFSD_FFV2_TRUST_REPLACED;
+}
+
+bool nfsd_ffv2_test_trust_revoked(const struct nfsd_ffv2_trust_entry *entry)
+{
+	return atomic_read(&entry->state) == NFSD_FFV2_TRUST_REVOKED;
+}
+
+u32 nfsd_ffv2_test_trust_iomode(const struct nfsd_ffv2_trust_entry *entry)
+{
+	return entry->iomode;
 }
 #endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
 
