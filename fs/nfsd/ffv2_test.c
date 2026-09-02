@@ -3234,6 +3234,114 @@ static void nfsd_ffv2_trust_destroy_drain_test(struct kunit *test)
 	nfsd_ffv2_trust_fixture_exit(test, &f);
 }
 
+/*
+ * Operation profiles and the ordered validation gate.
+ */
+
+static void nfsd_ffv2_op_profile_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_op_profile *profile;
+
+	/* Reads are data-client operations and accept READ or RW. */
+	profile = nfsd_ffv2_op_profile(OP_CHUNK_READ);
+	KUNIT_ASSERT_NOT_NULL(test, profile);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_DATA_CLIENT, profile->caller);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROFILE_READ_DATA,
+			profile->profile_bit);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_IOMODE_READ_OR_RW, profile->iomode);
+	KUNIT_EXPECT_FALSE(test, profile->writer_identity);
+
+	profile = nfsd_ffv2_op_profile(OP_CHUNK_HEADER_READ);
+	KUNIT_ASSERT_NOT_NULL(test, profile);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROFILE_READ_METADATA,
+			profile->profile_bit);
+
+	/* Writes require RW and a writer identity. */
+	profile = nfsd_ffv2_op_profile(OP_CHUNK_WRITE);
+	KUNIT_ASSERT_NOT_NULL(test, profile);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_IOMODE_RW_ONLY, profile->iomode);
+	KUNIT_EXPECT_TRUE(test, profile->writer_identity);
+
+	/* Repair is a distinct caller class from an ordinary writer. */
+	profile = nfsd_ffv2_op_profile(OP_CHUNK_WRITE_REPAIR);
+	KUNIT_ASSERT_NOT_NULL(test, profile);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_REPAIR_ACTOR, profile->caller);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROFILE_REPAIR_WRITE,
+			profile->profile_bit);
+
+	/* Control operations are MDS-only and do not consult iomode. */
+	profile = nfsd_ffv2_op_profile(OP_TRUST_STATEID);
+	KUNIT_ASSERT_NOT_NULL(test, profile);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_MDS_CONTROL, profile->caller);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_IOMODE_ANY, profile->iomode);
+	KUNIT_EXPECT_EQ(test, 0U, profile->profile_bit);
+
+	/* Every lifecycle operation names the lifecycle profile. */
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+			nfsd_ffv2_op_profile(OP_CHUNK_COMMIT)->profile_bit);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+			nfsd_ffv2_op_profile(OP_CHUNK_FINALIZE)->profile_bit);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+			nfsd_ffv2_op_profile(OP_CHUNK_ROLLBACK)->profile_bit);
+
+	/*
+	 * The escrow family and everything outside the frozen range have no
+	 * profile, so they cannot be authorized by default.
+	 */
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_op_profile(92));
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_op_profile(93));
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_op_profile(94));
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_op_profile(95));
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_op_profile(OP_READ));
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_op_profile(0));
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_op_profile(U32_MAX));
+}
+
+static void nfsd_ffv2_validate_order_test(struct kunit *test)
+{
+	struct svc_rqst *rqstp;
+	struct svc_fh *unmapped;
+	stateid_t sid;
+	u64 before;
+
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	unmapped = kunit_kzalloc(test, sizeof(*unmapped), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+	KUNIT_ASSERT_NOT_NULL(test, unmapped);
+	sid = nfsd_ffv2_test_stateid(1, 2, 3, 4);
+
+	before = nfsd_ffv2_test_provider_entries();
+
+	/*
+	 * An operation with no profile is refused before anything else is
+	 * examined, including the escrow range and ordinary NFS operations.
+	 */
+	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
+			nfsd_ffv2_test_validate_operation(rqstp, unmapped,
+							  NULL, 92, &sid));
+	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
+			nfsd_ffv2_test_validate_operation(rqstp, unmapped,
+							  NULL, OP_READ, &sid));
+
+	/*
+	 * With a profile but no FFv2 binding, the handle is stale.  This
+	 * precedes any authority or stateid work, so an unmapped handle
+	 * never reports an authorization error.
+	 */
+	KUNIT_EXPECT_EQ(test, nfserr_stale,
+			nfsd_ffv2_test_validate_operation(rqstp, unmapped,
+							  NULL, OP_CHUNK_READ,
+							  &sid));
+	KUNIT_EXPECT_EQ(test, nfserr_stale,
+			nfsd_ffv2_test_validate_operation(rqstp, unmapped,
+							  NULL,
+							  OP_TRUST_STATEID,
+							  &sid));
+
+	/* No rejection crossed the provider boundary. */
+	KUNIT_EXPECT_EQ(test, before, nfsd_ffv2_test_provider_entries());
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -3270,6 +3378,8 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_trust_dead_authority_test),
 	KUNIT_CASE(nfsd_ffv2_trust_renewal_failure_test),
 	KUNIT_CASE(nfsd_ffv2_trust_destroy_drain_test),
+	KUNIT_CASE(nfsd_ffv2_op_profile_test),
+	KUNIT_CASE(nfsd_ffv2_validate_order_test),
 	{}
 };
 

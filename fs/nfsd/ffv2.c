@@ -3724,6 +3724,27 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	return nfs_ok;
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/*
+ * Provider entry accounting, so a test can prove that a fail-closed result
+ * was reached without the provider boundary ever being crossed.
+ */
+u64 nfsd_ffv2_test_provider_entries(void)
+{
+	return atomic64_read(&nfsd_ffv2_probe_counters.mapped) +
+	       atomic64_read(&nfsd_ffv2_probe_counters.fail_closed);
+}
+
+__be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
+					 struct svc_fh *fhp,
+					 struct nfsd4_session *session,
+					 u32 opnum, const stateid_t *stateid)
+{
+	return nfsd_ffv2_validate_operation(rqstp, fhp, session, opnum,
+					    stateid);
+}
+#endif
+
 void nfsd_ffv2_net_init(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;

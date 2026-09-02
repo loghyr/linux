@@ -66,6 +66,11 @@ const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum);
 __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				    struct nfsd4_session *session, u32 opnum,
 				    const stateid_t *stateid);
+u64 nfsd_ffv2_test_provider_entries(void);
+__be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
+					 struct svc_fh *fhp,
+					 struct nfsd4_session *session,
+					 u32 opnum, const stateid_t *stateid);
 
 /* One explicit bit per enabled operation; never inferred from iomode. */
 #define NFSD_FFV2_PROFILE_READ_DATA		BIT(0)
