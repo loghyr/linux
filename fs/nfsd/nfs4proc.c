@@ -51,6 +51,7 @@
 #include "acl.h"
 #include "pnfs.h"
 #include "ffv2.h"
+#include "ffv2_trust.h"
 #include "trace.h"
 
 static bool inter_copy_offload_enable;
@@ -3635,21 +3636,63 @@ __be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp)
 	return nfserr_notsupp;
 }
 
+/*
+ * Every FFv2 operation runs the ordered authorization gate before its
+ * fail-closed result, so a negative is reported from the exact check that
+ * failed rather than being flattened into NOTSUPP.  An operation whose
+ * current filehandle is not a mapped FFv2 object has nothing to authorize
+ * and keeps the plain terminal status.
+ */
 static __be32
-nfsd4_ffv2_notsupp(struct svc_rqst *rqstp,
-		    struct nfsd4_compound_state *cstate,
-		    union nfsd4_op_u *u)
+nfsd4_ffv2_gate(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
+		u32 opnum, const stateid_t *stateid)
 {
 	__be32 status = nfsd4_ffv2_compound_status(rqstp);
 
 	if (status)
 		return status;
+	if (!cstate->current_fh.fh_ffv2_binding)
+		return nfserr_notsupp;
+	status = nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh,
+					      cstate->session, opnum, stateid);
+	if (status)
+		return status;
+	/* Authorized, and still unimplemented: no provider exists. */
 	return nfserr_notsupp;
 }
 
+/*
+ * One handler per operation, so each names its own operation number and
+ * the argument member carrying its stateid.  Control operations present
+ * theirs in the shared FFv2 argument; the two read operations have their
+ * own argument structures.
+ */
+#define NFSD4_FFV2_OP(name, opnum, stateid_expr)			\
+static __be32								\
+nfsd4_ffv2_##name(struct svc_rqst *rqstp,				\
+		  struct nfsd4_compound_state *cstate,			\
+		  union nfsd4_op_u *u)					\
+{									\
+	return nfsd4_ffv2_gate(rqstp, cstate, (opnum), (stateid_expr));	\
+}
+
+NFSD4_FFV2_OP(chunk_commit, OP_CHUNK_COMMIT, &u->ffv2.stateid)
+NFSD4_FFV2_OP(chunk_error, OP_CHUNK_ERROR, &u->ffv2.stateid)
+NFSD4_FFV2_OP(chunk_finalize, OP_CHUNK_FINALIZE, &u->ffv2.stateid)
+NFSD4_FFV2_OP(chunk_lock, OP_CHUNK_LOCK, &u->ffv2.stateid)
+NFSD4_FFV2_OP(chunk_repaired, OP_CHUNK_REPAIRED, &u->ffv2.stateid)
+NFSD4_FFV2_OP(chunk_rollback, OP_CHUNK_ROLLBACK, &u->ffv2.stateid)
+NFSD4_FFV2_OP(chunk_unlock, OP_CHUNK_UNLOCK, &u->ffv2.stateid)
+NFSD4_FFV2_OP(chunk_write, OP_CHUNK_WRITE, &u->ffv2.stateid)
+NFSD4_FFV2_OP(chunk_write_repair, OP_CHUNK_WRITE_REPAIR, &u->ffv2.stateid)
+NFSD4_FFV2_OP(trust_stateid, OP_TRUST_STATEID, &u->ffv2.stateid)
+NFSD4_FFV2_OP(revoke_stateid, OP_REVOKE_STATEID, &u->ffv2.stateid)
+NFSD4_FFV2_OP(bulk_revoke_stateid, OP_BULK_REVOKE_STATEID, &u->ffv2.stateid)
+
 static __be32
 nfsd4_ffv2_probe(struct svc_rqst *rqstp,
-		 struct nfsd4_compound_state *cstate, u32 opnum)
+		 struct nfsd4_compound_state *cstate, u32 opnum,
+		 const stateid_t *stateid)
 {
 	__be32 status;
 
@@ -3657,6 +3700,10 @@ nfsd4_ffv2_probe(struct svc_rqst *rqstp,
 	if (status)
 		return status;
 	status = check_nfsd_access(cstate->current_fh.fh_export, rqstp, false);
+	if (status)
+		return status;
+	status = nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh,
+					      cstate->session, opnum, stateid);
 	if (status)
 		return status;
 	return nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh, opnum);
@@ -3667,7 +3714,8 @@ nfsd4_ffv2_chunk_read_probe(struct svc_rqst *rqstp,
 			    struct nfsd4_compound_state *cstate,
 			    union nfsd4_op_u *u)
 {
-	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_READ);
+	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_READ,
+				&u->chunk_read.cra_stateid);
 }
 
 static __be32
@@ -3675,7 +3723,8 @@ nfsd4_ffv2_chunk_header_read_probe(struct svc_rqst *rqstp,
 				   struct nfsd4_compound_state *cstate,
 				   union nfsd4_op_u *u)
 {
-	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_HEADER_READ);
+	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_HEADER_READ,
+				&u->chunk_header_read.chra_stateid);
 }
 
 static const struct nfsd4_operation nfsd4_ops[] = {
@@ -4098,19 +4147,19 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_rsize_bop = nfsd4_removexattr_rsize,
 	},
 	[OP_CHUNK_COMMIT] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_commit,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_COMMIT",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_ERROR] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_error,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_ERROR",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_FINALIZE] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_finalize,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_FINALIZE",
 		.op_rsize_bop = nfsd4_only_status_rsize,
@@ -4121,7 +4170,7 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_LOCK] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_lock,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_LOCK",
 		.op_rsize_bop = nfsd4_only_status_rsize,
@@ -4132,49 +4181,49 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_REPAIRED] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_repaired,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_REPAIRED",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_ROLLBACK] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_rollback,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_ROLLBACK",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_UNLOCK] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_unlock,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_UNLOCK",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_WRITE] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_write,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_WRITE",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_WRITE_REPAIR] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_chunk_write_repair,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_WRITE_REPAIR",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_TRUST_STATEID] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_trust_stateid,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_TRUST_STATEID",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_REVOKE_STATEID] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_revoke_stateid,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_REVOKE_STATEID",
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_BULK_REVOKE_STATEID] = {
-		.op_func = nfsd4_ffv2_notsupp,
+		.op_func = nfsd4_ffv2_bulk_revoke_stateid,
 		.op_flags = ALLOWED_WITHOUT_FH | OP_MODIFIES_SOMETHING,
 		.op_name = "OP_BULK_REVOKE_STATEID",
 		.op_rsize_bop = nfsd4_only_status_rsize,

@@ -3406,6 +3406,46 @@ u32 nfsd_ffv2_test_trust_iomode(const struct nfsd_ffv2_trust_entry *entry)
 }
 #endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
 
+/**
+ * nfsd_ffv2_authority_matches_session - is this the exact registered session?
+ * @authority: published authority to compare against
+ * @session: session the request arrived on
+ *
+ * Compares the whole session locator and the owning clientid, so a client
+ * that copied a machine credential onto a different session cannot present
+ * itself as the metadata server.
+ */
+static bool
+nfsd_ffv2_authority_matches_session(struct nfsd_ffv2_authority *authority,
+				    struct nfsd4_session *session)
+{
+	struct nfs4_client *clp;
+	bool match;
+
+	if (!session)
+		return false;
+	clp = session->se_client;
+	if (!clp)
+		return false;
+
+	spin_lock(&authority->state_lock);
+	match = authority->state == NFSD_FFV2_AUTHORITY_PUBLISHED &&
+		!memcmp(authority->sessionid.data, session->se_sessionid.data,
+			NFS4_MAX_SESSIONID_LEN) &&
+		authority->clientid.cl_boot == clp->cl_clientid.cl_boot &&
+		authority->clientid.cl_id == clp->cl_clientid.cl_id;
+	spin_unlock(&authority->state_lock);
+	return match;
+}
+
+/* Is this the anonymous capability-probe tuple rather than a real stateid? */
+static bool nfsd_ffv2_stateid_is_anonymous(const stateid_t *stateid)
+{
+	static const stateid_t anonymous = {};
+
+	return !memcmp(stateid, &anonymous, sizeof(*stateid));
+}
+
 /*
  * FFv2 operation profiles.
  *
@@ -3507,6 +3547,179 @@ const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum)
 	if (profile->caller == NFSD_FFV2_CALLER_NONE)
 		return NULL;
 	return profile;
+}
+
+/* Entry accessors used by the ordered validation gate. */
+static u32
+nfsd_ffv2_trust_entry_iomode(const struct nfsd_ffv2_trust_entry *entry)
+{
+	return entry->iomode;
+}
+
+/*
+ * Does this entry name the requesting client as its writer?  With no
+ * session the answer is no: a writer must be identifiable.
+ */
+static bool
+nfsd_ffv2_trust_entry_has_writer(const struct nfsd_ffv2_trust_entry *entry,
+				 struct nfsd4_session *session)
+{
+	struct nfs4_client *clp;
+
+	if (!session)
+		return false;
+	clp = session->se_client;
+	if (!clp)
+		return false;
+	return entry->pnfs_clientid.cl_boot == clp->cl_clientid.cl_boot &&
+	       entry->pnfs_clientid.cl_id == clp->cl_clientid.cl_id;
+}
+
+/*
+ * Iomode and writer policy, checked after the entry's own validation so a
+ * caller cannot substitute a read entry for a write operation, or act as a
+ * writer or repair actor it is not.
+ */
+static __be32
+nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
+			     const struct nfsd_ffv2_op_profile *profile,
+			     struct nfsd4_session *session)
+{
+	u32 iomode = nfsd_ffv2_trust_entry_iomode(entry);
+
+	switch (profile->iomode) {
+	case NFSD_FFV2_IOMODE_RW_ONLY:
+		if (iomode != IOMODE_RW)
+			return nfserr_bad_stateid;
+		break;
+	case NFSD_FFV2_IOMODE_READ_OR_RW:
+		if (iomode != IOMODE_READ && iomode != IOMODE_RW)
+			return nfserr_bad_stateid;
+		break;
+	case NFSD_FFV2_IOMODE_ANY:
+		break;
+	}
+
+	/*
+	 * A writer or repair actor must be the client the entry was issued
+	 * to.  A data request need not use the MDS session, so identity is
+	 * taken from the entry rather than from the connection.
+	 */
+	if (profile->writer_identity &&
+	    !nfsd_ffv2_trust_entry_has_writer(entry, session))
+		return nfserr_bad_stateid;
+	return nfs_ok;
+}
+
+/**
+ * nfsd_ffv2_validate_operation - ordered FFv2 authorization gate
+ * @rqstp: the request being authorized
+ * @fhp: current filehandle, which must already be a mapped FFv2 binding
+ * @session: session the request arrived on, or NULL
+ * @opnum: FFv2 operation number
+ * @stateid: stateid the operation presented, or NULL when it has none
+ *
+ * Runs every authorization check in the design's precedence before any
+ * provider admission could be taken.  The caller has already resolved
+ * decode and SEQUENCE status; this function covers binding, authority,
+ * trusted stateid, operation profile, principal and writer policy, and
+ * generation liveness.
+ *
+ * Returns the exact wire status for the first failing check, or nfs_ok
+ * when the request is fully authorized.  A fully authorized request still
+ * terminates in NFS4ERR_NOTSUPP at its caller: no provider exists.
+ */
+__be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				    struct nfsd4_session *session, u32 opnum,
+				    const stateid_t *stateid)
+{
+	const struct nfsd_ffv2_op_profile *profile;
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_binding *binding;
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_authority *authority;
+	struct nfsd_net *nn;
+	u64 epoch;
+	__be32 status;
+
+	/* An operation with no profile cannot be authorized at all. */
+	profile = nfsd_ffv2_op_profile(opnum);
+	if (!profile)
+		return nfserr_notsupp;
+
+	/* Binding and generation identity precede any state lookup. */
+	binding = fhp->fh_ffv2_binding;
+	if (!binding || binding->net != SVC_NET(rqstp))
+		return nfserr_stale;
+	nn = net_generic(binding->net, nfsd_net_id);
+	if (!nfsd_ffv2_binding_current(nn, binding))
+		return nfserr_stale;
+	generation = binding->admission.generation;
+	if (!generation)
+		return nfserr_stale;
+	context = generation->payload;
+	if (!context || !context->object)
+		return nfserr_stale;
+	authority = context->authority;
+	if (!authority)
+		return nfserr_perm;
+
+	if (profile->caller == NFSD_FFV2_CALLER_MDS_CONTROL) {
+		/*
+		 * Control operations must arrive on the exact registered
+		 * session, still carrying the machine credential and GSS
+		 * profile the authority was derived from.
+		 */
+		if (!nfsd_ffv2_authority_matches_session(authority, session))
+			return nfserr_perm;
+		if (nfsd_ffv2_authority_qualify(session->se_client))
+			return nfserr_perm;
+		if (!nfsd4_mach_creds_match(session->se_client, rqstp))
+			return nfserr_perm;
+
+		/*
+		 * The service-root capability probe is recognised only after
+		 * authority validation, and only for the exact anonymous
+		 * tuple.  It never creates or consults a trust entry.
+		 */
+		if (opnum == OP_TRUST_STATEID && stateid &&
+		    nfsd_ffv2_stateid_is_anonymous(stateid))
+			return nfserr_inval;
+		return nfs_ok;
+	}
+
+	/*
+	 * Data and repair operations need not use the MDS session, but their
+	 * trust entry must be rooted in the published authority epoch.
+	 */
+	if (!stateid)
+		return nfserr_bad_stateid;
+	if (nfsd_ffv2_stateid_is_anonymous(stateid))
+		return nfserr_bad_stateid;
+	if (!nfsd_ffv2_authority_published(authority, &epoch))
+		return nfserr_bad_stateid;
+
+	entry = nfsd_ffv2_trust_lookup(&context->trust, stateid,
+				       context->object->object_uuid, epoch);
+	if (!entry)
+		return nfserr_bad_stateid;
+
+	status = nfsd_ffv2_trust_validate(entry, generation->identity->generation,
+					  context->object->object_uuid, epoch,
+					  profile->profile_bit,
+					  rqstp->rq_cred.cr_principal);
+	if (status == nfs_ok)
+		status = nfsd_ffv2_trust_check_policy(entry, profile,
+						      session);
+	nfsd_ffv2_trust_entry_put(entry);
+	if (status != nfs_ok)
+		return status;
+
+	/* Generation must still be current at the execution boundary. */
+	if (!nfsd_ffv2_binding_current(nn, binding))
+		return nfserr_stale;
+	return nfs_ok;
 }
 
 void nfsd_ffv2_net_init(struct nfsd_net *nn)
