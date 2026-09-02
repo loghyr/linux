@@ -266,6 +266,7 @@ struct nfsd_ffv2_trust_entry {
 	u32				client_id;
 	u32				iomode;
 	u32				profile_mask;
+	enum nfsd_ffv2_caller_class	actor;
 	struct timespec64		expires;
 	char				*principal;
 	size_t				principal_len;
@@ -322,6 +323,11 @@ struct nfsd_ffv2_participant_snapshot {
 
 static void
 nfsd_ffv2_participant_put(struct nfsd_ffv2_participant *participant);
+static int
+nfsd_ffv2_admit_generation(struct nfsd_net *nn,
+			   struct nfsd_ffv2_admission *admission,
+			   struct nfsd_ffv2_generation *expected,
+			   struct nfsd_ffv2_authority *authority);
 static int
 nfsd_ffv2_snapshot_participants(struct nfsd_ffv2_participant_snapshot **result,
 				unsigned int *count);
@@ -2496,6 +2502,21 @@ bool nfsd_ffv2_authority_publish(struct nfsd_ffv2_authority *authority,
 	return published;
 }
 
+/*
+ * Caller holds the anchor lock; the authority leaf nests inside it, which
+ * is the documented order for publication and admission.
+ */
+static bool
+nfsd_ffv2_authority_published_locked(struct nfsd_ffv2_authority *authority)
+{
+	bool published;
+
+	spin_lock(&authority->state_lock);
+	published = authority->state == NFSD_FFV2_AUTHORITY_PUBLISHED;
+	spin_unlock(&authority->state_lock);
+	return published;
+}
+
 /**
  * nfsd_ffv2_authority_published - read a published authority's epoch
  * @authority: authority to query
@@ -3134,6 +3155,7 @@ nfsd_ffv2_trust_entry_alloc(struct nfsd_ffv2_trust_registry *registry,
 	entry->generation_id = generation_id;
 	entry->pnfs_clientid = request->pnfs_clientid;
 	entry->client_id = request->client_id;
+	entry->actor = request->actor;
 	entry->iomode = request->iomode;
 	entry->profile_mask = request->profile_mask;
 	entry->expires = request->expires;
@@ -3152,7 +3174,8 @@ static bool nfsd_ffv2_trust_renewable(const struct nfsd_ffv2_trust_entry *old,
 	return old->pnfs_clientid.cl_boot == req->pnfs_clientid.cl_boot &&
 	       old->pnfs_clientid.cl_id == req->pnfs_clientid.cl_id &&
 	       old->client_id == req->client_id &&
-	       old->iomode == req->iomode;
+	       old->iomode == req->iomode &&
+	       old->actor == req->actor;
 }
 
 /**
@@ -3185,6 +3208,10 @@ __be32 nfsd_ffv2_trust_install(struct nfsd_ffv2_trust_registry *registry,
 	    request->expires.tv_nsec >= NSEC_PER_SEC)
 		return nfserr_inval;
 	if (request->profile_mask & ~NFSD_FFV2_PROFILE_ALL)
+		return nfserr_inval;
+	/* Only a data client or a repair actor can hold a trust entry. */
+	if (request->actor != NFSD_FFV2_CALLER_DATA_CLIENT &&
+	    request->actor != NFSD_FFV2_CALLER_REPAIR_ACTOR)
 		return nfserr_inval;
 	if (request->principal) {
 		principal_len = strnlen(request->principal,
@@ -3406,6 +3433,12 @@ u32 nfsd_ffv2_test_trust_iomode(const struct nfsd_ffv2_trust_entry *entry)
 {
 	return entry->iomode;
 }
+
+enum nfsd_ffv2_caller_class
+nfsd_ffv2_test_trust_actor(const struct nfsd_ffv2_trust_entry *entry)
+{
+	return entry->actor;
+}
 #endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
 
 /**
@@ -3585,9 +3618,19 @@ nfsd_ffv2_trust_entry_has_writer(const struct nfsd_ffv2_trust_entry *entry,
 static __be32
 nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
 			     const struct nfsd_ffv2_op_profile *profile,
-			     struct nfsd4_session *session)
+			     struct nfsd4_session *session,
+			     const struct nfsd_ffv2_actor_id *actor)
 {
 	u32 iomode = nfsd_ffv2_trust_entry_iomode(entry);
+
+	/*
+	 * The caller class comes from the entry the metadata server
+	 * installed, so an ordinary writer cannot present itself as a repair
+	 * actor by choosing a repair operation, and a repair actor cannot
+	 * use an ordinary writer's profile.
+	 */
+	if (entry->actor != profile->caller)
+		return nfserr_bad_stateid;
 
 	switch (profile->iomode) {
 	case NFSD_FFV2_IOMODE_RW_ONLY:
@@ -3603,13 +3646,18 @@ nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
 	}
 
 	/*
-	 * A writer or repair actor must be the client the entry was issued
-	 * to.  A data request need not use the MDS session, so identity is
-	 * taken from the entry rather than from the connection.
+	 * A writer or repair actor must name itself on the wire, and that
+	 * name must be the one the entry was issued to.  A data request need
+	 * not use the MDS session, so the connection cannot supply this.
 	 */
-	if (profile->writer_identity &&
-	    !nfsd_ffv2_trust_entry_has_writer(entry, session))
-		return nfserr_bad_stateid;
+	if (profile->writer_identity) {
+		if (!actor || !actor->present)
+			return nfserr_bad_stateid;
+		if (actor->client_id != entry->client_id)
+			return nfserr_bad_stateid;
+		if (!nfsd_ffv2_trust_entry_has_writer(entry, session))
+			return nfserr_bad_stateid;
+	}
 	return nfs_ok;
 }
 
@@ -3620,6 +3668,8 @@ nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
  * @session: session the request arrived on, or NULL
  * @opnum: FFv2 operation number
  * @stateid: stateid the operation presented, or NULL when it has none
+ * @actor: writer or repair-actor identity the request named, or NULL
+ * @admission: receives the execution admission the caller must release
  *
  * Runs every authorization check in the design's precedence before any
  * provider admission could be taken.  The caller has already resolved
@@ -3633,7 +3683,9 @@ nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
  */
 __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				    struct nfsd4_session *session, u32 opnum,
-				    const stateid_t *stateid)
+				    const stateid_t *stateid,
+				    const struct nfsd_ffv2_actor_id *actor,
+				    struct nfsd_ffv2_admission *admission)
 {
 	const struct nfsd_ffv2_op_profile *profile;
 	struct nfsd_ffv2_service_context *context;
@@ -3712,14 +3764,19 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 					  profile->profile_bit,
 					  rqstp->rq_cred.cr_principal);
 	if (status == nfs_ok)
-		status = nfsd_ffv2_trust_check_policy(entry, profile,
-						      session);
+		status = nfsd_ffv2_trust_check_policy(entry, profile, session,
+						      actor);
 	nfsd_ffv2_trust_entry_put(entry);
 	if (status != nfs_ok)
 		return status;
 
-	/* Generation must still be current at the execution boundary. */
-	if (!nfsd_ffv2_binding_current(nn, binding))
+	/*
+	 * Execution admission is the fence: it revalidates the generation
+	 * identity and the authority state under the anchor lock, and its
+	 * reference is what retirement and namespace exit drain before
+	 * tearing anything down.  The caller releases it on every path.
+	 */
+	if (nfsd_ffv2_admit_generation(nn, admission, generation, authority))
 		return nfserr_stale;
 	return nfs_ok;
 }
@@ -3738,10 +3795,12 @@ u64 nfsd_ffv2_test_provider_entries(void)
 __be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
 					 struct svc_fh *fhp,
 					 struct nfsd4_session *session,
-					 u32 opnum, const stateid_t *stateid)
+					 u32 opnum, const stateid_t *stateid,
+					 const struct nfsd_ffv2_actor_id *actor,
+					 struct nfsd_ffv2_admission *admission)
 {
 	return nfsd_ffv2_validate_operation(rqstp, fhp, session, opnum,
-					    stateid);
+					    stateid, actor, admission);
 }
 #endif
 
@@ -3943,7 +4002,9 @@ int nfsd_ffv2_register(struct nfsd_net *nn)
 
 static int
 nfsd_ffv2_admit_generation(struct nfsd_net *nn,
-			   struct nfsd_ffv2_admission *admission)
+			   struct nfsd_ffv2_admission *admission,
+			   struct nfsd_ffv2_generation *expected,
+			   struct nfsd_ffv2_authority *authority)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_generation *generation;
@@ -3966,6 +4027,20 @@ nfsd_ffv2_admit_generation(struct nfsd_net *nn,
 	if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
 	    anchor->service_state != NFSD_FFV2_SERVICE_UP || !generation) {
 		error = -ESHUTDOWN;
+	} else if (expected && generation != expected) {
+		/*
+		 * The generation was replaced between validation and here,
+		 * so the work this request authorized no longer applies.
+		 */
+		error = -ESTALE;
+	} else if (authority &&
+		   !nfsd_ffv2_authority_published_locked(authority)) {
+		/*
+		 * Authority teardown is the linearization point: once it is
+		 * no longer published, nothing new may be admitted against
+		 * it even while its generation is briefly still active.
+		 */
+		error = -ESTALE;
 	} else {
 		refcount_inc(&generation->ref);
 		atomic_inc(&generation->admitted);
@@ -3990,7 +4065,7 @@ int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 	if (nfsd_current_rqst() != rqstp || !rqstp->rq_xprt)
 		return -EOPNOTSUPP;
 	nn = net_generic(rqstp->rq_xprt->xpt_net, nfsd_net_id);
-	return nfsd_ffv2_admit_generation(nn, admission);
+	return nfsd_ffv2_admit_generation(nn, admission, NULL, NULL);
 }
 
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
@@ -4230,7 +4305,7 @@ int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
 int nfsd_ffv2_test_admit(struct nfsd_net *nn,
 			 struct nfsd_ffv2_admission *admission)
 {
-	return nfsd_ffv2_admit_generation(nn, admission);
+	return nfsd_ffv2_admit_generation(nn, admission, NULL, NULL);
 }
 
 void nfsd_ffv2_test_complete(struct nfsd_ffv2_admission *admission)

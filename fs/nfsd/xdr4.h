@@ -844,6 +844,16 @@ struct nfsd4_ffv2 {
 	stateid_t	stateid;
 	u64		offset;
 	u32		count;
+	/*
+	 * chunk_owner4 identity, retained so the authorization gate can
+	 * compare the writer or repair actor the request names against the
+	 * one the metadata server issued the trust entry to.  Fixed width
+	 * and copied out of the stream; no pointer into the XDR buffer.
+	 */
+	u32		owner_gen_id;
+	u32		owner_client_id;
+	u32		owner_chunk_id;
+	bool		owner_present;
 };
 
 struct nfsd4_chunk_read {

@@ -62,15 +62,25 @@ struct nfsd_ffv2_op_profile {
 /* Defined in nfs4state.c and declared in xdr4.h, which ffv2.c does not use. */
 bool nfsd4_mach_creds_match(struct nfs4_client *cl, struct svc_rqst *rqstp);
 
+/* Writer or repair-actor identity a request named on the wire. */
+struct nfsd_ffv2_actor_id {
+	u32	client_id;
+	bool	present;
+};
+
 const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum);
 __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				    struct nfsd4_session *session, u32 opnum,
-				    const stateid_t *stateid);
+				    const stateid_t *stateid,
+				    const struct nfsd_ffv2_actor_id *actor,
+				    struct nfsd_ffv2_admission *admission);
 u64 nfsd_ffv2_test_provider_entries(void);
 __be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
 					 struct svc_fh *fhp,
 					 struct nfsd4_session *session,
-					 u32 opnum, const stateid_t *stateid);
+					 u32 opnum, const stateid_t *stateid,
+					 const struct nfsd_ffv2_actor_id *actor,
+					 struct nfsd_ffv2_admission *admission);
 
 /* One explicit bit per enabled operation; never inferred from iomode. */
 #define NFSD_FFV2_PROFILE_READ_DATA		BIT(0)
@@ -88,6 +98,13 @@ __be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
  * into the entry, so a caller cannot retain an alias into registry state.
  */
 struct nfsd_ffv2_trust_request {
+	/*
+	 * Caller class the metadata server issued this entry for.  It is
+	 * kernel-owned state, not something the data client asserts on the
+	 * wire, and it is what separates a repair actor from an ordinary
+	 * writer at request time.
+	 */
+	enum nfsd_ffv2_caller_class actor;
 	stateid_t	stateid;
 	const u8	*object_uuid;
 	clientid_t	pnfs_clientid;
@@ -132,5 +149,7 @@ nfsd_ffv2_test_trust_bytes(const struct nfsd_ffv2_trust_registry *registry);
 bool nfsd_ffv2_test_trust_replaced(const struct nfsd_ffv2_trust_entry *entry);
 bool nfsd_ffv2_test_trust_revoked(const struct nfsd_ffv2_trust_entry *entry);
 u32 nfsd_ffv2_test_trust_iomode(const struct nfsd_ffv2_trust_entry *entry);
+enum nfsd_ffv2_caller_class
+nfsd_ffv2_test_trust_actor(const struct nfsd_ffv2_trust_entry *entry);
 
 #endif /* _NFSD_FFV2_TRUST_H */

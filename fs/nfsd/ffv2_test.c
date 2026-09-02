@@ -2677,6 +2677,8 @@ static void nfsd_ffv2_test_trust_request(struct nfsd_ffv2_trust_request *req,
 	struct timespec64 now;
 
 	memset(req, 0, sizeof(*req));
+	/* Ordinary data client unless a test overrides it. */
+	req->actor = NFSD_FFV2_CALLER_DATA_CLIENT;
 	req->stateid = *stateid;
 	req->object_uuid = uuid;
 	req->pnfs_clientid.cl_boot = stateid->si_opaque.so_clid.cl_boot;
@@ -3318,10 +3320,12 @@ static void nfsd_ffv2_validate_order_test(struct kunit *test)
 	 */
 	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
 			nfsd_ffv2_test_validate_operation(rqstp, unmapped,
-							  NULL, 92, &sid));
+							  NULL, 92, &sid,
+							  NULL, NULL));
 	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
 			nfsd_ffv2_test_validate_operation(rqstp, unmapped,
-							  NULL, OP_READ, &sid));
+							  NULL, OP_READ, &sid,
+							  NULL, NULL));
 
 	/*
 	 * With a profile but no FFv2 binding, the handle is stale.  This
@@ -3331,15 +3335,87 @@ static void nfsd_ffv2_validate_order_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nfserr_stale,
 			nfsd_ffv2_test_validate_operation(rqstp, unmapped,
 							  NULL, OP_CHUNK_READ,
-							  &sid));
+							  &sid,
+							  NULL, NULL));
 	KUNIT_EXPECT_EQ(test, nfserr_stale,
 			nfsd_ffv2_test_validate_operation(rqstp, unmapped,
 							  NULL,
 							  OP_TRUST_STATEID,
-							  &sid));
+							  &sid,
+							  NULL, NULL));
 
 	/* No rejection crossed the provider boundary. */
 	KUNIT_EXPECT_EQ(test, before, nfsd_ffv2_test_provider_entries());
+}
+
+/*
+ * Caller class and writer identity are properties of the entry the metadata
+ * server installed, not of the operation the client chose to send.
+ */
+static void nfsd_ffv2_trust_actor_class_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_request req;
+	stateid_t sid;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 121));
+
+	sid = nfsd_ffv2_test_stateid(1, 9, 9, 9);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, NULL, 3600);
+
+	/* An entry with no caller class cannot be installed at all. */
+	req.actor = NFSD_FFV2_CALLER_NONE;
+	KUNIT_EXPECT_EQ(test, nfserr_inval,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						121, &req));
+	/* Nor can a data client be issued MDS control authority this way. */
+	req.actor = NFSD_FFV2_CALLER_MDS_CONTROL;
+	KUNIT_EXPECT_EQ(test, nfserr_inval,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						121, &req));
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	/* Install an ordinary data client that also carries repair bits. */
+	req.actor = NFSD_FFV2_CALLER_DATA_CLIENT;
+	req.profile_mask = NFSD_FFV2_PROFILE_WRITE_DATA |
+			   NFSD_FFV2_PROFILE_REPAIR_WRITE;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						121, &req));
+
+	entry = nfsd_ffv2_trust_lookup(f.registry, &sid,
+				       nfsd_ffv2_test_uuid_a, f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+
+	/*
+	 * Holding the repair profile bit does not make this client a repair
+	 * actor: the caller class is checked separately, so a repair
+	 * operation is refused even though the bit is present.
+	 */
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_DATA_CLIENT,
+			nfsd_ffv2_test_trust_actor(entry));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_REPAIR_ACTOR,
+			nfsd_ffv2_op_profile(OP_CHUNK_WRITE_REPAIR)->caller);
+	KUNIT_EXPECT_NE(test, nfsd_ffv2_test_trust_actor(entry),
+			nfsd_ffv2_op_profile(OP_CHUNK_WRITE_REPAIR)->caller);
+	nfsd_ffv2_trust_entry_put(entry);
+
+	/* Renewal cannot quietly change the caller class either. */
+	req.actor = NFSD_FFV2_CALLER_REPAIR_ACTOR;
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						121, &req));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+	entry = nfsd_ffv2_trust_lookup(f.registry, &sid,
+				       nfsd_ffv2_test_uuid_a, f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_CALLER_DATA_CLIENT,
+			nfsd_ffv2_test_trust_actor(entry));
+	nfsd_ffv2_trust_entry_put(entry);
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
 }
 
 static struct kunit_case nfsd_ffv2_test_cases[] = {
@@ -3380,6 +3456,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_trust_destroy_drain_test),
 	KUNIT_CASE(nfsd_ffv2_op_profile_test),
 	KUNIT_CASE(nfsd_ffv2_validate_order_test),
+	KUNIT_CASE(nfsd_ffv2_trust_actor_class_test),
 	{}
 };
 

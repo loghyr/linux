@@ -3645,8 +3645,10 @@ __be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp)
  */
 static __be32
 nfsd4_ffv2_gate(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
-		u32 opnum, const stateid_t *stateid)
+		u32 opnum, const stateid_t *stateid,
+		const struct nfsd_ffv2_actor_id *actor)
 {
+	struct nfsd_ffv2_admission admission = {};
 	__be32 status = nfsd4_ffv2_compound_status(rqstp);
 
 	if (status)
@@ -3654,10 +3656,15 @@ nfsd4_ffv2_gate(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	if (!cstate->current_fh.fh_ffv2_binding)
 		return nfserr_notsupp;
 	status = nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh,
-					      cstate->session, opnum, stateid);
+					      cstate->session, opnum, stateid,
+					      actor, &admission);
 	if (status)
 		return status;
-	/* Authorized, and still unimplemented: no provider exists. */
+	/*
+	 * Authorized.  The execution admission is owned from here, so it is
+	 * released before returning even though no provider runs yet.
+	 */
+	nfsd_ffv2_complete(&admission);
 	return nfserr_notsupp;
 }
 
@@ -3673,7 +3680,13 @@ nfsd4_ffv2_##name(struct svc_rqst *rqstp,				\
 		  struct nfsd4_compound_state *cstate,			\
 		  union nfsd4_op_u *u)					\
 {									\
-	return nfsd4_ffv2_gate(rqstp, cstate, (opnum), (stateid_expr));	\
+	struct nfsd_ffv2_actor_id actor = {				\
+		.client_id = u->ffv2.owner_client_id,			\
+		.present = u->ffv2.owner_present,			\
+	};								\
+									\
+	return nfsd4_ffv2_gate(rqstp, cstate, (opnum), (stateid_expr),	\
+			       &actor);					\
 }
 
 NFSD4_FFV2_OP(chunk_commit, OP_CHUNK_COMMIT, &u->ffv2.stateid)
@@ -3694,6 +3707,7 @@ nfsd4_ffv2_probe(struct svc_rqst *rqstp,
 		 struct nfsd4_compound_state *cstate, u32 opnum,
 		 const stateid_t *stateid)
 {
+	struct nfsd_ffv2_admission admission = {};
 	__be32 status;
 
 	status = nfsd4_ffv2_compound_status(rqstp);
@@ -3703,10 +3717,17 @@ nfsd4_ffv2_probe(struct svc_rqst *rqstp,
 	if (status)
 		return status;
 	status = nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh,
-					      cstate->session, opnum, stateid);
+					      cstate->session, opnum, stateid,
+					      NULL, &admission);
 	if (status)
 		return status;
-	return nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh, opnum);
+	/*
+	 * The admission is held across the provider boundary and released
+	 * once, so retirement waits for this request rather than racing it.
+	 */
+	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh, opnum);
+	nfsd_ffv2_complete(&admission);
+	return status;
 }
 
 static __be32

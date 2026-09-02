@@ -2534,10 +2534,22 @@ nfsd4_decode_ffv2_range(struct nfsd4_compoundargs *argp,
 	return nfs_ok;
 }
 
-static __be32 nfsd4_decode_ffv2_owner(struct nfsd4_compoundargs *argp)
+/*
+ * chunk_owner4: a chunk_guard4 of cg_gen_id and cg_client_id, then
+ * co_chunk_id.  Retain the identity rather than skipping it; the field
+ * widths and their total are unchanged.
+ */
+static __be32 nfsd4_decode_ffv2_owner(struct nfsd4_compoundargs *argp,
+				      struct nfsd4_ffv2 *ffv2)
 {
-	return xdr_inline_decode(argp->xdr, 4 * XDR_UNIT) ?
-		nfs_ok : nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_gen_id) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_client_id) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_chunk_id) < 0)
+		return nfserr_bad_xdr;
+	ffv2->owner_present = true;
+	return nfs_ok;
 }
 
 static __be32 nfsd4_decode_ffv2_owners(struct nfsd4_compoundargs *argp)
@@ -2646,7 +2658,7 @@ nfsd4_decode_chunk_error(struct nfsd4_compoundargs *argp,
 		return status;
 	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
 		return nfserr_bad_xdr;
-	return nfsd4_decode_ffv2_owner(argp);
+	return nfsd4_decode_ffv2_owner(argp, &u->ffv2);
 }
 
 static __be32
@@ -2704,7 +2716,7 @@ nfsd4_decode_chunk_lock(struct nfsd4_compoundargs *argp,
 	if (flags & ~(NFSD4_FFV2_LOCK_ADOPT | NFSD4_FFV2_LOCK_TAKEOVER) ||
 	    flags == (NFSD4_FFV2_LOCK_ADOPT | NFSD4_FFV2_LOCK_TAKEOVER))
 		return nfserr_inval;
-	status = nfsd4_decode_ffv2_owner(argp);
+	status = nfsd4_decode_ffv2_owner(argp, &u->ffv2);
 	if (status)
 		return status;
 	if (xdr_stream_decode_u32(argp->xdr, &adopt) < 0 || adopt > 1)
@@ -2725,7 +2737,9 @@ nfsd4_decode_ffv2_owner_op(struct nfsd4_compoundargs *argp,
 	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
 	if (status)
 		return status;
-	return nfsd4_decode_ffv2_owner(argp);
+	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
+		return nfserr_bad_xdr;
+	return nfsd4_decode_ffv2_owner(argp, &u->ffv2);
 }
 
 static __be32
@@ -2741,9 +2755,12 @@ nfsd4_decode_chunk_write_common(struct nfsd4_compoundargs *argp,
 		return status;
 	if (xdr_stream_decode_u64(argp->xdr, &u->ffv2.offset) < 0)
 		return nfserr_bad_xdr;
-	/* stable_how4, cohort, and client ID */
-	if (!xdr_inline_decode(argp->xdr, 4 * XDR_UNIT))
+	/* stable_how4, then the chunk_owner4 identity. */
+	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
 		return nfserr_bad_xdr;
+	status = nfsd4_decode_ffv2_owner(argp, &u->ffv2);
+	if (status)
+		return status;
 	status = nfsd4_decode_ffv2_u32s(argp);
 	if (status)
 		return status;
