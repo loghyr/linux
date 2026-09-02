@@ -71,10 +71,16 @@ struct nfsd_ffv2_op_profile {
 /* Defined in nfs4state.c and declared in xdr4.h, which ffv2.c does not use. */
 bool nfsd4_mach_creds_match(struct nfs4_client *cl, struct svc_rqst *rqstp);
 
-/* Writer or repair-actor identity a request named on the wire. */
+/*
+ * Identities a request named on the wire: the writer or repair actor for a
+ * data operation, and the target client a bulk revocation selects.  Both
+ * are copied out of the argument stream, not aliased into it.
+ */
 struct nfsd_ffv2_actor_id {
-	u32	client_id;
-	bool	present;
+	u32		client_id;
+	bool		present;
+	clientid_t	target;
+	bool		target_present;
 };
 
 const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum);
@@ -159,6 +165,11 @@ nfsd_ffv2_test_trust_bytes(const struct nfsd_ffv2_trust_registry *registry);
 bool nfsd_ffv2_test_trust_replaced(const struct nfsd_ffv2_trust_entry *entry);
 bool nfsd_ffv2_test_trust_revoked(const struct nfsd_ffv2_trust_entry *entry);
 u32 nfsd_ffv2_test_trust_iomode(const struct nfsd_ffv2_trust_entry *entry);
+struct nfsd_ffv2_generation *
+nfsd_ffv2_test_active_generation_get(struct nfsd_net *nn);
+void nfsd_ffv2_test_generation_put(struct nfsd_ffv2_generation *generation);
+unsigned int
+nfsd_ffv2_test_generation_refcount(struct nfsd_ffv2_generation *generation);
 enum nfsd_ffv2_caller_class
 nfsd_ffv2_test_trust_actor(const struct nfsd_ffv2_trust_entry *entry);
 

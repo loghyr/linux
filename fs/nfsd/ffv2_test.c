@@ -3432,6 +3432,99 @@ static void nfsd_ffv2_trust_actor_class_test(struct kunit *test)
 	nfsd_ffv2_trust_fixture_exit(test, &f);
 }
 
+/*
+ * A filehandle-less control operation resolves the active generation by
+ * reference.  Retirement must not be able to free it while that reference
+ * is held, which is what the gate depends on before it dereferences the
+ * generation payload.
+ */
+static void nfsd_ffv2_no_fh_generation_race_test(struct kunit *test)
+{
+	struct nfsd_ffv2_worker_ctx worker = {};
+	struct nfsd_ffv2_generation *held;
+	bool worker_installed = false;
+	bool service_up = false;
+	unsigned int before, after;
+	struct nfsd_net *nn;
+	struct net *net;
+	atomic_t releases;
+	u64 generation_id = 0;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create test netns: %ld",
+			   PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	atomic_set(&releases, 0);
+	error = nfsd_ffv2_worker_ctx_install(&worker, net);
+	if (error)
+		goto out_cleanup;
+	worker_installed = true;
+	error = nfsd_ffv2_start_test_service(net, &worker);
+	if (error)
+		goto out_cleanup;
+	service_up = true;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_test_publish(nn, &releases, nfsd_ffv2_count_release,
+				       &generation_id);
+	mutex_unlock(&nfsd_mutex);
+	if (error)
+		goto out_cleanup;
+
+	/* The gate's acquisition must actually take a reference. */
+	held = nfsd_ffv2_test_active_generation_get(nn);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	before = nfsd_ffv2_test_generation_refcount(held);
+	KUNIT_EXPECT_GT(test, before, 1U);
+
+	/* A second acquisition is independent of the first. */
+	{
+		struct nfsd_ffv2_generation *again;
+
+		again = nfsd_ffv2_test_active_generation_get(nn);
+		KUNIT_ASSERT_PTR_EQ(test, held, again);
+		after = nfsd_ffv2_test_generation_refcount(again);
+		KUNIT_EXPECT_EQ(test, before + 1, after);
+		nfsd_ffv2_test_generation_put(again);
+		KUNIT_EXPECT_EQ(test, before,
+				nfsd_ffv2_test_generation_refcount(held));
+	}
+
+	/*
+	 * Retire while the reference is held.  The payload is released, but
+	 * the generation itself must survive for the holder.
+	 */
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_test_unregister(nn, generation_id);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, 1, atomic_read(&releases));
+	KUNIT_EXPECT_GT(test, nfsd_ffv2_test_generation_refcount(held), 0U);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_generation_retired(held));
+
+	/* A later acquisition finds no active generation. */
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_test_active_generation_get(nn));
+
+	nfsd_ffv2_test_generation_put(held);
+	error = 0;
+
+out_cleanup:
+	complete_all(&worker.run);
+	complete_all(&worker.allow_complete);
+	if (service_up)
+		nfsd_shutdown_threads(net);
+	if (worker_installed)
+		nfsd_ffv2_worker_ctx_remove(&worker);
+	put_net(net);
+	net_ns_barrier();
+	if (error)
+		KUNIT_FAIL(test, "no-filehandle generation race failed: %d",
+			   error);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -3471,6 +3564,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_op_profile_test),
 	KUNIT_CASE(nfsd_ffv2_validate_order_test),
 	KUNIT_CASE(nfsd_ffv2_trust_actor_class_test),
+	KUNIT_CASE(nfsd_ffv2_no_fh_generation_race_test),
 	{}
 };
 

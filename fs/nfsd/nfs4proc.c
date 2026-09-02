@@ -3688,6 +3688,8 @@ nfsd4_ffv2_##name(struct svc_rqst *rqstp,				\
 	struct nfsd_ffv2_actor_id actor = {				\
 		.client_id = u->ffv2.owner_client_id,			\
 		.present = u->ffv2.owner_present,			\
+		.target = u->ffv2.target_clientid,			\
+		.target_present = u->ffv2.target_present,		\
 	};								\
 									\
 	return nfsd4_ffv2_gate(rqstp, cstate, (opnum), (stateid_expr),	\

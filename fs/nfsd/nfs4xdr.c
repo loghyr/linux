@@ -2846,8 +2846,15 @@ nfsd4_decode_bulk_revoke_stateid(struct nfsd4_compoundargs *argp,
 				 union nfsd4_op_u *u)
 {
 	memset(&u->ffv2, 0, sizeof(u->ffv2));
-	return xdr_inline_decode(argp->xdr, 2 * XDR_UNIT) ?
-		nfs_ok : nfserr_bad_xdr;
+	/* BULK_REVOKE_STATEID4args is a single clientid4 and names no file. */
+	if (xdr_stream_decode_u32(argp->xdr,
+				  &u->ffv2.target_clientid.cl_boot) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr,
+				  &u->ffv2.target_clientid.cl_id) < 0)
+		return nfserr_bad_xdr;
+	u->ffv2.target_present = true;
+	return nfs_ok;
 }
 
 static __be32

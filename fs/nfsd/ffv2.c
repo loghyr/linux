@@ -3681,18 +3681,33 @@ nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
 }
 
 /*
- * The generation a filehandle-less control operation applies to.  Only the
- * pointer is read under the anchor lock; the execution admission taken
- * later is what actually pins it.
+ * Drop a generation reference taken for a filehandle-less operation.  A
+ * request that used a mapped binding owns no such reference.
+ */
+static void nfsd_ffv2_generation_put_owned(struct nfsd_ffv2_generation *owned)
+{
+	if (owned)
+		nfsd_ffv2_generation_put(owned);
+}
+
+/*
+ * Take a reference to the generation a filehandle-less control operation
+ * applies to.  The reference is acquired under the anchor lock, because
+ * retirement takes that lock to move the generation off ->active and then
+ * releases it: an unreferenced pointer read here could be freed before it
+ * was dereferenced.  The caller owns the reference and must drop it on
+ * every path.
  */
 static struct nfsd_ffv2_generation *
-nfsd_ffv2_active_generation(struct nfsd_net *nn)
+nfsd_ffv2_active_generation_get(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_generation *generation;
 
 	mutex_lock(&anchor->lock);
 	generation = anchor->active;
+	if (generation)
+		refcount_inc(&generation->ref);
 	mutex_unlock(&anchor->lock);
 	return generation;
 }
@@ -3726,9 +3741,10 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	const struct nfsd_ffv2_op_profile *profile;
 	struct nfsd_ffv2_service_context *context;
 	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_generation *owned = NULL;
+	struct nfsd_ffv2_authority *authority;
 	struct nfsd_ffv2_binding *binding;
 	struct nfsd_ffv2_trust_entry *entry;
-	struct nfsd_ffv2_authority *authority;
 	struct nfsd_net *nn;
 	u64 epoch;
 	__be32 status;
@@ -3741,20 +3757,20 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	/*
 	 * Binding and generation identity precede any state lookup.  A
 	 * control operation that names no file, such as BULK_REVOKE_STATEID,
-	 * resolves the active generation directly instead: it still has to
-	 * pass the same authority checks, so it cannot be used to bypass
-	 * them.
+	 * resolves the active generation directly instead, taking a
+	 * reference so retirement cannot free it underneath this request.
+	 * It still passes the same authority checks, so this is not a way
+	 * around them.
 	 */
 	binding = fhp ? fhp->fh_ffv2_binding : NULL;
 	if (!binding) {
-		if (!profile->no_filehandle)
-			return nfserr_stale;
-		if (!rqstp->rq_xprt)
+		if (!profile->no_filehandle || !rqstp->rq_xprt)
 			return nfserr_stale;
 		nn = net_generic(rqstp->rq_xprt->xpt_net, nfsd_net_id);
-		generation = nfsd_ffv2_active_generation(nn);
-		if (!generation)
+		owned = nfsd_ffv2_active_generation_get(nn);
+		if (!owned)
 			return nfserr_stale;
+		generation = owned;
 	} else {
 		if (binding->net != SVC_NET(rqstp))
 			return nfserr_stale;
@@ -3765,12 +3781,17 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		if (!generation)
 			return nfserr_stale;
 	}
+
 	context = generation->payload;
-	if (!context || !context->object)
-		return nfserr_stale;
+	if (!context || !context->object) {
+		status = nfserr_stale;
+		goto out;
+	}
 	authority = context->authority;
-	if (!authority)
-		return nfserr_perm;
+	if (!authority) {
+		status = nfserr_perm;
+		goto out;
+	}
 
 	if (profile->callers & NFSD_FFV2_CALLERS(MDS_CONTROL)) {
 		/*
@@ -3778,12 +3799,13 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		 * session, still carrying the machine credential and GSS
 		 * profile the authority was derived from.
 		 */
+		status = nfserr_perm;
 		if (!nfsd_ffv2_authority_matches_session(authority, session))
-			return nfserr_perm;
+			goto out;
 		if (nfsd_ffv2_authority_qualify(session->se_client))
-			return nfserr_perm;
+			goto out;
 		if (!nfsd4_mach_creds_match(session->se_client, rqstp))
-			return nfserr_perm;
+			goto out;
 
 		/*
 		 * The service-root capability probe is recognised only after
@@ -3791,28 +3813,40 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		 * tuple.  It never creates or consults a trust entry.
 		 */
 		if (opnum == OP_TRUST_STATEID && stateid &&
-		    nfsd_ffv2_stateid_is_anonymous(stateid))
-			return nfserr_inval;
-		return nfs_ok;
+		    nfsd_ffv2_stateid_is_anonymous(stateid)) {
+			status = nfserr_inval;
+			goto out;
+		}
+		/*
+		 * A control operation selecting a target client must name
+		 * one; the selection is carried to the operation itself.
+		 */
+		if (opnum == OP_BULK_REVOKE_STATEID &&
+		    (!actor || !actor->target_present)) {
+			status = nfserr_inval;
+			goto out;
+		}
+		status = nfs_ok;
+		goto admit;
 	}
 
 	/*
 	 * Data and repair operations need not use the MDS session, but their
 	 * trust entry must be rooted in the published authority epoch.
 	 */
-	if (!stateid)
-		return nfserr_bad_stateid;
-	if (nfsd_ffv2_stateid_is_anonymous(stateid))
-		return nfserr_bad_stateid;
+	status = nfserr_bad_stateid;
+	if (!stateid || nfsd_ffv2_stateid_is_anonymous(stateid))
+		goto out;
 	if (!nfsd_ffv2_authority_published(authority, &epoch))
-		return nfserr_bad_stateid;
+		goto out;
 
 	entry = nfsd_ffv2_trust_lookup(&context->trust, stateid,
 				       context->object->object_uuid, epoch);
 	if (!entry)
-		return nfserr_bad_stateid;
+		goto out;
 
-	status = nfsd_ffv2_trust_validate(entry, generation->identity->generation,
+	status = nfsd_ffv2_trust_validate(entry,
+					  generation->identity->generation,
 					  context->object->object_uuid, epoch,
 					  profile->profile_bit,
 					  rqstp->rq_cred.cr_principal);
@@ -3821,8 +3855,9 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 						      actor);
 	nfsd_ffv2_trust_entry_put(entry);
 	if (status != nfs_ok)
-		return status;
+		goto out;
 
+admit:
 	/*
 	 * Execution admission is the fence: it revalidates the generation
 	 * identity and the authority state under the anchor lock, and its
@@ -3830,11 +3865,34 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	 * tearing anything down.  The caller releases it on every path.
 	 */
 	if (nfsd_ffv2_admit_generation(nn, admission, generation, authority))
-		return nfserr_stale;
-	return nfs_ok;
+		status = nfserr_stale;
+out:
+	nfsd_ffv2_generation_put_owned(owned);
+	return status;
 }
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/*
+ * Take and drop a filehandle-less generation reference the way the gate
+ * does, so a test can prove retirement waits for it.
+ */
+struct nfsd_ffv2_generation *
+nfsd_ffv2_test_active_generation_get(struct nfsd_net *nn)
+{
+	return nfsd_ffv2_active_generation_get(nn);
+}
+
+void nfsd_ffv2_test_generation_put(struct nfsd_ffv2_generation *generation)
+{
+	nfsd_ffv2_generation_put_owned(generation);
+}
+
+unsigned int
+nfsd_ffv2_test_generation_refcount(struct nfsd_ffv2_generation *generation)
+{
+	return refcount_read(&generation->ref);
+}
+
 /*
  * Provider entry accounting, so a test can prove that a fail-closed result
  * was reached without the provider boundary ever being crossed.

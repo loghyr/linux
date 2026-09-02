@@ -858,6 +858,9 @@ struct nfsd4_ffv2 {
 	u32		owner_client_id;
 	u32		owner_id;
 	bool		owner_present;
+	/* BULK_REVOKE_STATEID4args: the clientid whose state is revoked. */
+	clientid_t	target_clientid;
+	bool		target_present;
 };
 
 struct nfsd4_chunk_read {
