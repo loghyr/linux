@@ -287,6 +287,16 @@ struct nfsd_ffv2_trust_registry {
 	/* Serializes install, renewal, revoke, and retirement. */
 	struct mutex		update_lock;
 	unsigned int		entries;
+	/*
+	 * Closeable admission count: one per live entry, plus one per
+	 * in-flight install.  An RCU grace period does not cover a
+	 * reference taken before it began, so destruction waits on this
+	 * rather than on RCU alone.  It is atomic so the drain predicate
+	 * takes no lock: wait_event() evaluates its condition with the
+	 * task already set !TASK_RUNNING, where blocking is illegal.
+	 */
+	atomic_t		admissions;
+	wait_queue_head_t	drain_wait;
 	size_t			principal_bytes;
 	bool			live;
 };
@@ -2790,6 +2800,31 @@ bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn)
 
 /* Trusted stateid registry implementation. */
 
+/*
+ * Take one registry admission.  Fails once retirement has closed the
+ * registry, which is what prevents a new install from racing destruction.
+ */
+static bool
+nfsd_ffv2_trust_admission_get(struct nfsd_ffv2_trust_registry *registry)
+{
+	bool admitted = false;
+
+	mutex_lock(&registry->update_lock);
+	if (registry->live) {
+		atomic_inc(&registry->admissions);
+		admitted = true;
+	}
+	mutex_unlock(&registry->update_lock);
+	return admitted;
+}
+
+static void
+nfsd_ffv2_trust_admission_put(struct nfsd_ffv2_trust_registry *registry)
+{
+	if (atomic_dec_and_test(&registry->admissions))
+		wake_up_all(&registry->drain_wait);
+}
+
 static void nfsd_ffv2_trust_entry_free(struct rcu_head *rcu)
 {
 	struct nfsd_ffv2_trust_entry *entry =
@@ -2820,12 +2855,22 @@ void nfsd_ffv2_trust_entry_put(struct nfsd_ffv2_trust_entry *entry)
 	/*
 	 * Retained bytes are returned only at final free, so a replacement
 	 * cannot transiently exceed the budget while both entries exist.
+	 * The same critical section retires this entry from the drain count
+	 * and wakes a waiting destroy, which is why destruction cannot
+	 * complete while any reference remains.
 	 */
-	if (registry && bytes) {
-		mutex_lock(&registry->update_lock);
-		if (!WARN_ON_ONCE(registry->principal_bytes < bytes))
-			registry->principal_bytes -= bytes;
-		mutex_unlock(&registry->update_lock);
+	if (registry) {
+		if (bytes) {
+			mutex_lock(&registry->update_lock);
+			if (!WARN_ON_ONCE(registry->principal_bytes < bytes))
+				registry->principal_bytes -= bytes;
+			mutex_unlock(&registry->update_lock);
+		}
+		/*
+		 * Released after the mutex, so a destroy woken by this drop
+		 * cannot destroy the mutex while it is still held here.
+		 */
+		nfsd_ffv2_trust_admission_put(registry);
 	}
 	entry->authority = NULL;
 	call_rcu(&entry->rcu, nfsd_ffv2_trust_entry_free);
@@ -2841,7 +2886,9 @@ int nfsd_ffv2_trust_registry_init(struct nfsd_ffv2_trust_registry *registry)
 	int error;
 
 	mutex_init(&registry->update_lock);
+	init_waitqueue_head(&registry->drain_wait);
 	registry->entries = 0;
+	atomic_set(&registry->admissions, 0);
 	registry->principal_bytes = 0;
 	error = rhashtable_init(&registry->table, &nfsd_ffv2_trust_params);
 	if (error) {
@@ -2917,16 +2964,22 @@ void nfsd_ffv2_trust_retire(struct nfsd_ffv2_trust_registry *registry)
 }
 
 /**
- * nfsd_ffv2_trust_registry_destroy - free a drained registry
+ * nfsd_ffv2_trust_registry_destroy - drain and free a registry
  * @registry: registry whose generation has retired
+ *
+ * Waits for every outstanding entry reference, not only for an RCU grace
+ * period: a request may hold a reference it acquired before retirement
+ * began, and releasing it takes this registry's mutex.  Destroying the
+ * mutex before that release would be a use-after-free.
+ *
+ * Caller holds no registry, anchor, or service lock.
  */
 void nfsd_ffv2_trust_registry_destroy(struct nfsd_ffv2_trust_registry *registry)
 {
-	if (!registry->live && !registry->entries && !registry->table.tbl) {
-		mutex_destroy(&registry->update_lock);
-		return;
-	}
 	nfsd_ffv2_trust_retire(registry);
+	/* Lockless predicate: wait_event() forbids blocking in its test. */
+	wait_event(registry->drain_wait,
+		   !atomic_read(&registry->admissions));
 	WARN_ON_ONCE(registry->entries);
 	WARN_ON_ONCE(registry->principal_bytes);
 	rhashtable_destroy(&registry->table);
@@ -3021,22 +3074,26 @@ __be32 nfsd_ffv2_trust_validate(const struct nfsd_ffv2_trust_entry *entry,
 	return nfs_ok;
 }
 
-/* Charge one principal against the per-generation and per-issuer budgets. */
+/*
+ * Charge one principal against the per-generation and per-issuer budgets.
+ * A replacement does not change the entry count, only the retained bytes.
+ */
 static __be32 nfsd_ffv2_trust_charge_locked(struct nfsd_ffv2_trust_registry *r,
-					    size_t principal_len)
+					    size_t principal_len, bool new_entry)
 {
 	size_t bytes;
 
 	lockdep_assert_held(&r->update_lock);
 
-	if (r->entries >= NFSD_FFV2_TRUST_ENTRIES_MAX)
+	if (new_entry && r->entries >= NFSD_FFV2_TRUST_ENTRIES_MAX)
 		return nfserr_delay;
 	if (check_add_overflow(r->principal_bytes, principal_len, &bytes))
 		return nfserr_delay;
 	if (bytes > NFSD_FFV2_TRUST_BYTES_MAX)
 		return nfserr_delay;
 	r->principal_bytes = bytes;
-	r->entries++;
+	if (new_entry)
+		r->entries++;
 	return nfs_ok;
 }
 
@@ -3064,6 +3121,12 @@ nfsd_ffv2_trust_entry_alloc(struct nfsd_ffv2_trust_registry *registry,
 	}
 	refcount_set(&entry->ref, 1);
 	INIT_LIST_HEAD(&entry->dispose);
+	/*
+	 * The entry owns an admission from allocation until its final
+	 * release, so a request holding a reference blocks destruction.
+	 * The caller's install admission guarantees the registry is open.
+	 */
+	atomic_inc(&registry->admissions);
 	nfsd_ffv2_trust_key_init(&entry->key, &request->stateid,
 				 request->object_uuid, authority_epoch);
 	entry->generation_id = generation_id;
@@ -3130,11 +3193,17 @@ __be32 nfsd_ffv2_trust_install(struct nfsd_ffv2_trust_registry *registry,
 	if (!nfsd_ffv2_authority_published(authority, &authority_epoch))
 		return nfserr_bad_stateid;
 
+	/* Holds the registry open for the whole operation. */
+	if (!nfsd_ffv2_trust_admission_get(registry))
+		return nfserr_stale;
+
 	entry = nfsd_ffv2_trust_entry_alloc(registry, authority, object,
 					    generation_id, request,
 					    authority_epoch, principal_len);
-	if (!entry)
+	if (!entry) {
+		nfsd_ffv2_trust_admission_put(registry);
 		return nfserr_delay;
+	}
 
 	nfsd_ffv2_trust_key_init(&key, &request->stateid, request->object_uuid,
 				 authority_epoch);
@@ -3150,22 +3219,39 @@ __be32 nfsd_ffv2_trust_install(struct nfsd_ffv2_trust_registry *registry,
 		status = nfserr_bad_stateid;
 		goto out_unlock;
 	}
-	status = nfsd_ffv2_trust_charge_locked(registry, principal_len);
+	status = nfsd_ffv2_trust_charge_locked(registry, principal_len, !old);
 	if (status != nfs_ok)
 		goto out_unlock;
 
-	if (old && nfsd_ffv2_trust_unhash_locked(registry, old,
-						 NFSD_FFV2_TRUST_REPLACED))
+	if (old) {
 		/*
-		 * Exact replacement: the old entry stops answering lookups
-		 * but its readers finish, and its bytes are returned at its
-		 * final free rather than here.
+		 * Replace atomically.  This cannot allocate, so renewal has
+		 * no failure path that could leave the caller's live stateid
+		 * unhashed while the operation reports a retryable error.
 		 */
-		replaced = old;
-	error = rhashtable_insert_fast(&registry->table, &entry->node,
-				       nfsd_ffv2_trust_params);
+		if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_TRUST_REPLACE))
+			error = -ENOMEM;
+		else
+			error = rhashtable_replace_fast(&registry->table,
+							&old->node,
+							&entry->node,
+							nfsd_ffv2_trust_params);
+		if (!error) {
+			/* The old entry stops answering new lookups; its
+			 * existing readers finish, and its bytes return at
+			 * its own final free.
+			 */
+			atomic_set_release(&old->state,
+					   NFSD_FFV2_TRUST_REPLACED);
+			replaced = old;
+		}
+	} else {
+		error = rhashtable_insert_fast(&registry->table, &entry->node,
+					       nfsd_ffv2_trust_params);
+	}
 	if (error) {
-		if (!WARN_ON_ONCE(!registry->entries))
+		/* The old entry, if any, is still hashed and still LIVE. */
+		if (!old && !WARN_ON_ONCE(!registry->entries))
 			registry->entries--;
 		if (!WARN_ON_ONCE(registry->principal_bytes < principal_len))
 			registry->principal_bytes -= principal_len;
@@ -3174,14 +3260,16 @@ __be32 nfsd_ffv2_trust_install(struct nfsd_ffv2_trust_registry *registry,
 	}
 	mutex_unlock(&registry->update_lock);
 	nfsd_ffv2_trust_entry_put(replaced);
+	nfsd_ffv2_trust_admission_put(registry);
 	return nfs_ok;
 
 out_unlock:
 	mutex_unlock(&registry->update_lock);
 	nfsd_ffv2_trust_entry_put(replaced);
+	/* Releases the entry's own admission through the normal path. */
 	entry->principal_len = 0;
-	entry->registry = NULL;
 	nfsd_ffv2_trust_entry_put(entry);
+	nfsd_ffv2_trust_admission_put(registry);
 	return status;
 }
 

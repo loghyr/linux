@@ -3116,6 +3116,124 @@ static void nfsd_ffv2_trust_dead_authority_test(struct kunit *test)
 	nfsd_ffv2_trust_fixture_exit(test, &f);
 }
 
+/*
+ * Renewal must not disturb a live entry when installation fails.  The
+ * replacement itself cannot allocate, so the failure is injected to prove
+ * the unwind rather than to model a reachable allocation error.
+ */
+static void nfsd_ffv2_trust_renewal_failure_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_request req;
+	stateid_t sid;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 101));
+
+	sid = nfsd_ffv2_test_stateid(3, 2, 1, 4);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, "keep@ds.example.net", 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						101, &req));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	/* Renewal fails at installation. */
+	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_TRUST_REPLACE);
+	KUNIT_EXPECT_EQ(test, nfserr_delay,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						101, &req));
+
+	/* The caller's existing stateid must still be live and usable. */
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+	entry = nfsd_ffv2_trust_lookup(f.registry, &sid,
+				       nfsd_ffv2_test_uuid_a, f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_trust_replaced(entry));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_validate(entry, 101,
+						 nfsd_ffv2_test_uuid_a,
+						 f.epoch,
+						 NFSD_FFV2_PROFILE_READ_DATA,
+						 "keep@ds.example.net"));
+	nfsd_ffv2_trust_entry_put(entry);
+
+	/* The failed attempt returned its own budget and nothing else. */
+	KUNIT_EXPECT_EQ(test, strlen("keep@ds.example.net"),
+			nfsd_ffv2_test_trust_bytes(f.registry));
+
+	/* A subsequent renewal still succeeds. */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						101, &req));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_test_trust_entries(f.registry));
+
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
+/* Destruction must not complete while a request still holds a reference. */
+struct nfsd_ffv2_trust_drain_ctx {
+	struct nfsd_ffv2_trust_registry	*registry;
+	struct completion		destroy_entered;
+	struct completion		destroy_done;
+};
+
+static int nfsd_ffv2_trust_drain_thread(void *data)
+{
+	struct nfsd_ffv2_trust_drain_ctx *ctx = data;
+
+	complete(&ctx->destroy_entered);
+	nfsd_ffv2_test_trust_registry_free(ctx->registry);
+	complete(&ctx->destroy_done);
+	return 0;
+}
+
+static void nfsd_ffv2_trust_destroy_drain_test(struct kunit *test)
+{
+	struct nfsd_ffv2_trust_drain_ctx ctx;
+	struct nfsd_ffv2_trust_fixture f = {};
+	struct nfsd_ffv2_trust_entry *held;
+	struct nfsd_ffv2_trust_request req;
+	struct task_struct *task;
+	unsigned long left;
+	stateid_t sid;
+
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 111));
+
+	sid = nfsd_ffv2_test_stateid(6, 7, 8, 9);
+	nfsd_ffv2_test_trust_request(&req, &sid, nfsd_ffv2_test_uuid_a,
+				     IOMODE_RW, "drain@ds.example.net", 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						111, &req));
+
+	/* A request obtains a reference and has not finished. */
+	held = nfsd_ffv2_trust_lookup(f.registry, &sid, nfsd_ffv2_test_uuid_a,
+				      f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+
+	ctx.registry = f.registry;
+	init_completion(&ctx.destroy_entered);
+	init_completion(&ctx.destroy_done);
+	task = kthread_run(nfsd_ffv2_trust_drain_thread, &ctx,
+			   "nfsd_ffv2_drain");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+	wait_for_completion(&ctx.destroy_entered);
+
+	/* Destruction must block while the reference is outstanding. */
+	left = wait_for_completion_timeout(&ctx.destroy_done, HZ / 2);
+	KUNIT_EXPECT_EQ(test, 0UL, left);
+
+	/* Releasing the last reference releases destruction. */
+	nfsd_ffv2_trust_entry_put(held);
+	left = wait_for_completion_timeout(&ctx.destroy_done, 10 * HZ);
+	KUNIT_EXPECT_NE(test, 0UL, left);
+
+	/* Freed by the thread; do not free it again during teardown. */
+	f.registry = NULL;
+	nfsd_ffv2_trust_fixture_exit(test, &f);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -3150,6 +3268,8 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_trust_expiry_test),
 	KUNIT_CASE(nfsd_ffv2_trust_retire_test),
 	KUNIT_CASE(nfsd_ffv2_trust_dead_authority_test),
+	KUNIT_CASE(nfsd_ffv2_trust_renewal_failure_test),
+	KUNIT_CASE(nfsd_ffv2_trust_destroy_drain_test),
 	{}
 };
 
