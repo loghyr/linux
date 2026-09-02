@@ -28,6 +28,39 @@ struct nfsd_ffv2_trust_registry;
 #define NFSD_FFV2_TRUST_ENTRIES_MAX	4096
 #define NFSD_FFV2_TRUST_BYTES_MAX	(4U * 1024U * 1024U)
 
+/*
+ * Caller classes.  An operation names exactly one, so a data client can
+ * never satisfy an MDS-control operation by presenting a valid trust entry,
+ * and a repair actor is distinguished from an ordinary writer.
+ */
+enum nfsd_ffv2_caller_class {
+	NFSD_FFV2_CALLER_NONE,
+	NFSD_FFV2_CALLER_MDS_CONTROL,
+	NFSD_FFV2_CALLER_DATA_CLIENT,
+	NFSD_FFV2_CALLER_REPAIR_ACTOR,
+};
+
+/* Which iomodes an operation accepts on its trust entry. */
+enum nfsd_ffv2_iomode_policy {
+	NFSD_FFV2_IOMODE_ANY,		/* control operations: not consulted */
+	NFSD_FFV2_IOMODE_READ_OR_RW,
+	NFSD_FFV2_IOMODE_RW_ONLY,
+};
+
+/*
+ * Immutable description of one FFv2 operation's authorization
+ * requirements.  The profile bit is named explicitly per operation and is
+ * never inferred from iomode alone.
+ */
+struct nfsd_ffv2_op_profile {
+	enum nfsd_ffv2_caller_class	caller;
+	enum nfsd_ffv2_iomode_policy	iomode;
+	u32				profile_bit;
+	bool				writer_identity;
+};
+
+const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum);
+
 /* One explicit bit per enabled operation; never inferred from iomode. */
 #define NFSD_FFV2_PROFILE_READ_DATA		BIT(0)
 #define NFSD_FFV2_PROFILE_READ_METADATA		BIT(1)

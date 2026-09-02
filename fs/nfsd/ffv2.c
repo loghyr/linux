@@ -3406,6 +3406,109 @@ u32 nfsd_ffv2_test_trust_iomode(const struct nfsd_ffv2_trust_entry *entry)
 }
 #endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
 
+/*
+ * FFv2 operation profiles.
+ *
+ * Each operation names one caller class, one profile bit, and its iomode
+ * requirement.  An operation absent from this table has no profile and
+ * cannot be authorized, which is what keeps values outside the frozen
+ * 78..91 range, including the escrow family, unreachable.
+ */
+static const struct nfsd_ffv2_op_profile nfsd_ffv2_op_profiles[] = {
+	[OP_CHUNK_READ] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
+		.profile_bit	= NFSD_FFV2_PROFILE_READ_DATA,
+	},
+	[OP_CHUNK_HEADER_READ] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
+		.profile_bit	= NFSD_FFV2_PROFILE_READ_METADATA,
+	},
+	[OP_CHUNK_WRITE] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_DATA,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_COMMIT] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_FINALIZE] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_ROLLBACK] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_WRITE_REPAIR] = {
+		.caller		= NFSD_FFV2_CALLER_REPAIR_ACTOR,
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_REPAIR_WRITE,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_REPAIRED] = {
+		.caller		= NFSD_FFV2_CALLER_REPAIR_ACTOR,
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_REPORT_REPAIRED,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_LOCK] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_LOCK_CONTROL,
+	},
+	[OP_CHUNK_UNLOCK] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_LOCK_CONTROL,
+	},
+	[OP_CHUNK_ERROR] = {
+		.caller		= NFSD_FFV2_CALLER_DATA_CLIENT,
+		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
+		.profile_bit	= NFSD_FFV2_PROFILE_REPORT_ERROR,
+	},
+	[OP_TRUST_STATEID] = {
+		.caller		= NFSD_FFV2_CALLER_MDS_CONTROL,
+		.iomode		= NFSD_FFV2_IOMODE_ANY,
+	},
+	[OP_REVOKE_STATEID] = {
+		.caller		= NFSD_FFV2_CALLER_MDS_CONTROL,
+		.iomode		= NFSD_FFV2_IOMODE_ANY,
+	},
+	[OP_BULK_REVOKE_STATEID] = {
+		.caller		= NFSD_FFV2_CALLER_MDS_CONTROL,
+		.iomode		= NFSD_FFV2_IOMODE_ANY,
+	},
+};
+
+/**
+ * nfsd_ffv2_op_profile - describe one operation's authorization requirements
+ * @opnum: NFSv4 operation number
+ *
+ * Returns the operation's profile, or NULL when the operation has none and
+ * therefore cannot be authorized.
+ */
+const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum)
+{
+	const struct nfsd_ffv2_op_profile *profile;
+
+	if (opnum >= ARRAY_SIZE(nfsd_ffv2_op_profiles))
+		return NULL;
+	profile = &nfsd_ffv2_op_profiles[opnum];
+	if (profile->caller == NFSD_FFV2_CALLER_NONE)
+		return NULL;
+	return profile;
+}
+
 void nfsd_ffv2_net_init(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
