@@ -3506,6 +3506,11 @@ static const struct nfsd_ffv2_op_profile nfsd_ffv2_op_profiles[] = {
 		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_DATA,
 		.writer_identity = true,
 	},
+	/*
+	 * The lifecycle operations name a chunk_owner4 array that the
+	 * decoder counts but does not retain; enabling their dispatch
+	 * requires retaining those identities first.
+	 */
 	[OP_CHUNK_COMMIT] = {
 		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
 		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,

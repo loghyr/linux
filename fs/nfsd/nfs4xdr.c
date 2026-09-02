@@ -2567,6 +2567,14 @@ static __be32 nfsd4_decode_ffv2_owner(struct nfsd4_compoundargs *argp,
 	return nfs_ok;
 }
 
+/*
+ * A counted array of chunk_owner4.  The elements are bounded and consumed
+ * but not retained, so the lifecycle operations know how many owners a
+ * request named without knowing which.  That is sufficient only while
+ * lifecycle dispatch is disabled: whichever patch enables CHUNK_COMMIT,
+ * CHUNK_FINALIZE, or CHUNK_ROLLBACK must retain the identities first, or it
+ * will act on owners it never read.
+ */
 static __be32 nfsd4_decode_ffv2_owners(struct nfsd4_compoundargs *argp)
 {
 	u32 count;
