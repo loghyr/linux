@@ -1300,6 +1300,10 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	struct nfsd_ffv2_object_unregister_ctx retire_ctx = {};
 	struct nfsd_ffv2_transition_publish_ctx publish_ctx = {};
 	struct nfsd_ffv2_object_request request;
+	const struct nfsd_ffv2_chunk_request chunks = { .offset = 0,
+							.count = 1 };
+	struct nfsd_ffv2_chunk_result chunk_result;
+	struct nfsd_ffv2_admission probe_admission = {};
 	struct nfsd_ffv2_export_update registration = {};
 	struct nfsd_ffv2_export_update second = {};
 	struct nfsd_ffv2_object *object = NULL;
@@ -1750,16 +1754,26 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	mapped->fh_ffv2_binding = binding;
 	binding = NULL;
 	retained = published;
+	/*
+	 * The boundary requires an admission even where no provider can be
+	 * reached, so hand it a zeroed one; completing that is a no-op.
+	 */
 	KUNIT_EXPECT_EQ(test,
-			nfsd_ffv2_provider_probe(rqstp, mapped, OP_CHUNK_READ),
+			nfsd_ffv2_provider_probe(rqstp, mapped, OP_CHUNK_READ,
+						 &chunks, &chunk_result,
+						 &probe_admission),
 			nfserr_notsupp);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_provider_probe(rqstp, mapped,
-						 OP_CHUNK_HEADER_READ),
+						 OP_CHUNK_HEADER_READ,
+						 &chunks, &chunk_result,
+						 &probe_admission),
 			nfserr_notsupp);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_provider_probe(rqstp, ordinary,
-						 OP_CHUNK_READ),
+						 OP_CHUNK_READ,
+						 &chunks, &chunk_result,
+						 &probe_admission),
 			nfserr_stale);
 
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);

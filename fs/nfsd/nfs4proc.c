@@ -3712,9 +3712,11 @@ NFSD4_FFV2_OP(bulk_revoke_stateid, OP_BULK_REVOKE_STATEID, &u->ffv2.stateid)
 static __be32
 nfsd4_ffv2_probe(struct svc_rqst *rqstp,
 		 struct nfsd4_compound_state *cstate, u32 opnum,
-		 const stateid_t *stateid)
+		 const stateid_t *stateid,
+		 const struct nfsd_ffv2_chunk_request *request)
 {
 	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_chunk_result result = {};
 	__be32 status;
 
 	status = nfsd4_ffv2_compound_status(rqstp);
@@ -3731,8 +3733,13 @@ nfsd4_ffv2_probe(struct svc_rqst *rqstp,
 	/*
 	 * The admission is held across the provider boundary and released
 	 * once, so retirement waits for this request rather than racing it.
+	 *
+	 * The result is discarded here because no encoder exists yet: with
+	 * no provider installed this path always reports NFS4ERR_NOTSUPP,
+	 * and the encoder lands with the operation that needs it.
 	 */
-	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh, opnum);
+	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh, opnum,
+					  request, &result, &admission);
 	nfsd_ffv2_complete(&admission);
 	return status;
 }
@@ -3742,8 +3749,13 @@ nfsd4_ffv2_chunk_read_probe(struct svc_rqst *rqstp,
 			    struct nfsd4_compound_state *cstate,
 			    union nfsd4_op_u *u)
 {
+	const struct nfsd_ffv2_chunk_request request = {
+		.offset	= u->chunk_read.cra_offset,
+		.count	= u->chunk_read.cra_count,
+	};
+
 	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_READ,
-				&u->chunk_read.cra_stateid);
+				&u->chunk_read.cra_stateid, &request);
 }
 
 static __be32
@@ -3751,8 +3763,13 @@ nfsd4_ffv2_chunk_header_read_probe(struct svc_rqst *rqstp,
 				   struct nfsd4_compound_state *cstate,
 				   union nfsd4_op_u *u)
 {
+	const struct nfsd_ffv2_chunk_request request = {
+		.offset	= u->chunk_header_read.chra_offset,
+		.count	= u->chunk_header_read.chra_count,
+	};
+
 	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_HEADER_READ,
-				&u->chunk_header_read.chra_stateid);
+				&u->chunk_header_read.chra_stateid, &request);
 }
 
 static const struct nfsd4_operation nfsd4_ops[] = {

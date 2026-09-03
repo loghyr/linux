@@ -95,10 +95,37 @@ struct nfsd_ffv2_provider_probe_counters {
 	atomic64_t	mapped;
 	atomic64_t	stale;
 	atomic64_t	fail_closed;
+	/* Callbacks actually entered, so a test can tell one from none. */
+	atomic64_t	callbacks;
+	/* Results the boundary refused to hand back. */
+	atomic64_t	malformed;
 	atomic64_t	last_generation;
 };
 
 static struct nfsd_ffv2_provider_probe_counters nfsd_ffv2_probe_counters;
+
+/* Providers retired by the namespace-exit fence rather than by removal. */
+static atomic64_t nfsd_ffv2_provider_fenced = ATOMIC64_INIT(0);
+
+/*
+ * A published read-only provider: the callbacks and the opaque state they
+ * run against, held in one object so a request can never pair one with the
+ * other's replacement.  The reference count protects this container, which
+ * is what lets removal know when the last callback has left; the installer
+ * owns the operations vector and the state it published and must keep them
+ * alive until removal returns.
+ *
+ * One of these is published per namespace, in nn->ffv2.provider.  There is
+ * no way to install one outside a KUnit build, so in an ordinary build
+ * every namespace has none and every mapped request still terminates in
+ * NFS4ERR_NOTSUPP.
+ */
+struct nfsd_ffv2_provider {
+	const struct nfsd_ffv2_provider_ops	*ops;
+	void					*data;
+	refcount_t				ref;
+	struct completion			gone;
+};
 
 static DEFINE_MUTEX(nfsd_ffv2_registry_lock);
 static DEFINE_MUTEX(nfsd_ffv2_export_policy_lock);
@@ -1377,12 +1404,160 @@ static bool nfsd_ffv2_binding_current(struct nfsd_net *nn,
 	return valid;
 }
 
+/*
+ * A provider may answer with fewer chunks than were asked for, but never
+ * with more, and every array an encoder would walk has to be there when it
+ * says it produced something.  Checked here, on the way out of the
+ * boundary, so a later encoder can trust the count and the pointers rather
+ * than re-deriving whether a provider is well behaved.
+ */
+static bool nfsd_ffv2_result_valid(u32 opnum,
+				   const struct nfsd_ffv2_chunk_request *request,
+				   const struct nfsd_ffv2_chunk_result *result)
+{
+	if (result->count > request->count)
+		return false;
+	if (!result->count)
+		return true;
+	if (opnum == OP_CHUNK_READ)
+		return result->read.chunks;
+	return result->header.status && result->header.locked &&
+	       result->header.owners && result->header.guards &&
+	       result->header.predecessors;
+}
+
+/* Drop a callback's reference, releasing a removal waiting on the last. */
+static void nfsd_ffv2_provider_put(struct nfsd_ffv2_provider *provider)
+{
+	if (refcount_dec_and_test(&provider->ref))
+		complete(&provider->gone);
+}
+
+/*
+ * Unpublish @nn's provider, wait out an RCU grace period so no further
+ * callback can find it, drop the publication reference, and wait for the
+ * last callback or admission reference before freeing the container.
+ *
+ * Return: true when a provider was published and has now been retired.
+ */
+static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_provider *provider;
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	provider = rcu_dereference_protected(nn->ffv2.provider,
+					     lockdep_is_held(&nfsd_ffv2_registry_lock));
+	rcu_assign_pointer(nn->ffv2.provider, NULL);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	if (!provider)
+		return false;
+
+	/* No further callback can find it; drain the ones that did. */
+	synchronize_rcu();
+	nfsd_ffv2_provider_put(provider);
+	wait_for_completion(&provider->gone);
+	kfree(provider);
+	return true;
+}
+
+/*
+ * Run the read-only provider installed for @nn, if one exists.  The
+ * published provider is looked up under RCU and a reference on it is taken
+ * there and held across the callback, so removal cannot free the container
+ * a request is still inside, and cannot return while the installer's
+ * operations vector and state are still in use.
+ *
+ * Returns nfserr_notsupp with no callback made when that namespace has no
+ * provider installed, which is every namespace in an ordinary build.
+ */
+static __be32
+nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
+			    const struct nfsd_ffv2_object *object,
+			    const struct nfsd_ffv2_chunk_request *request,
+			    struct nfsd_ffv2_chunk_result *result,
+			    struct nfsd_ffv2_admission *admission)
+{
+	struct nfsd_ffv2_provider *provider;
+	__be32 status;
+
+	rcu_read_lock();
+	provider = rcu_dereference(nn->ffv2.provider);
+	if (!provider || !refcount_inc_not_zero(&provider->ref)) {
+		rcu_read_unlock();
+		return nfserr_notsupp;
+	}
+	rcu_read_unlock();
+
+	memset(result, 0, sizeof(*result));
+	atomic64_inc(&nfsd_ffv2_probe_counters.callbacks);
+	if (opnum == OP_CHUNK_READ)
+		status = provider->ops->chunk_read(provider->data, object,
+						   request, result);
+	else
+		status = provider->ops->chunk_header_read(provider->data,
+							  object, request,
+							  result);
+
+	/*
+	 * A result borrows provider storage, so the reference outlives the
+	 * callback: it moves to the execution admission and is dropped when
+	 * that completes, which is after every consumer of the result.
+	 * Nothing borrows storage from a failed call, and a second call on
+	 * one admission borrows from the provider the first already holds.
+	 */
+	if (status != nfs_ok || admission->provider)
+		nfsd_ffv2_provider_put(provider);
+	else
+		admission->provider = provider;
+	return status;
+}
+
+/**
+ * nfsd_ffv2_provider_probe - cross the FFv2 provider boundary
+ * @rqstp: the request being served
+ * @fhp: current filehandle, which must be a mapped FFv2 binding
+ * @opnum: CHUNK_READ or CHUNK_HEADER_READ
+ * @request: the chunk range the operation asked for
+ * @result: receives the provider's result on success
+ * @admission: the caller's execution admission, which takes a reference on
+ *	the provider so the result's borrowed storage outlives the callback.
+ *	Required: there is no result-safe way to cross the boundary without
+ *	one
+ *
+ * The caller has already passed the ordered authority, trusted stateid,
+ * and operation-profile checks, and holds an execution admission.  This
+ * revalidates the binding against the currently active generation and then
+ * consults the provider.
+ *
+ * What remains missing for a full provider is durable logical identity,
+ * the store and write-ahead log behind mutating operations, and escrow
+ * ownership; no mutating entry point exists here.
+ *
+ * Return: the provider's status, NFS4ERR_STALE when the binding no longer
+ * names the active generation, NFS4ERR_NOTSUPP when no provider is
+ * installed, or NFS4ERR_SERVERFAULT for a malformed provider result or a
+ * caller with no execution admission.
+ */
 __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
-				u32 opnum)
+				u32 opnum,
+				const struct nfsd_ffv2_chunk_request *request,
+				struct nfsd_ffv2_chunk_result *result,
+				struct nfsd_ffv2_admission *admission)
 {
 	struct nfsd_ffv2_binding *binding = fhp->fh_ffv2_binding;
 	struct nfsd_ffv2_generation *generation;
 	struct nfsd_net *nn;
+	__be32 status;
+
+	/*
+	 * The admission is what a successful result's borrowed storage is
+	 * bounded by, so there is no correct way to cross this boundary
+	 * without one.  Refuse rather than hand back pointers nothing holds
+	 * a reference for; a caller reaching here without an admission is a
+	 * kernel bug, not a client one.
+	 */
+	if (WARN_ON_ONCE(!admission))
+		return nfserr_serverfault;
 
 	if (opnum == OP_CHUNK_READ)
 		atomic64_inc(&nfsd_ffv2_probe_counters.read);
@@ -1403,15 +1578,24 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	atomic64_set(&nfsd_ffv2_probe_counters.last_generation,
 		     generation->identity->generation);
 	atomic64_inc(&nfsd_ffv2_probe_counters.mapped);
-	/*
-	 * The caller has already passed the ordered authority, trusted
-	 * stateid, and operation-profile checks.  What remains missing is
-	 * the provider itself: durable logical identity, the store and
-	 * write-ahead log behind mutating operations, and escrow ownership.
-	 * Keep the callback boundary closed until those exist.
-	 */
-	atomic64_inc(&nfsd_ffv2_probe_counters.fail_closed);
-	return nfserr_notsupp;
+
+	status = nfsd_ffv2_provider_dispatch(nn, opnum, binding->object,
+					     request, result, admission);
+	if (status == nfserr_notsupp) {
+		atomic64_inc(&nfsd_ffv2_probe_counters.fail_closed);
+		return status;
+	}
+	if (status == nfs_ok && !nfsd_ffv2_result_valid(opnum, request, result)) {
+		memset(result, 0, sizeof(*result));
+		/* Nothing borrows storage from a refused result. */
+		if (admission && admission->provider) {
+			nfsd_ffv2_provider_put(admission->provider);
+			admission->provider = NULL;
+		}
+		atomic64_inc(&nfsd_ffv2_probe_counters.malformed);
+		return nfserr_serverfault;
+	}
+	return status;
 
 stale:
 	atomic64_inc(&nfsd_ffv2_probe_counters.stale);
@@ -1421,12 +1605,14 @@ stale:
 int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v)
 {
 	seq_printf(m,
-		   "read=%lld header_read=%lld mapped=%lld stale=%lld fail_closed=%lld last_generation=%lld\n",
+		   "read=%lld header_read=%lld mapped=%lld stale=%lld fail_closed=%lld callbacks=%lld malformed=%lld last_generation=%lld\n",
 		   atomic64_read(&nfsd_ffv2_probe_counters.read),
 		   atomic64_read(&nfsd_ffv2_probe_counters.header_read),
 		   atomic64_read(&nfsd_ffv2_probe_counters.mapped),
 		   atomic64_read(&nfsd_ffv2_probe_counters.stale),
 		   atomic64_read(&nfsd_ffv2_probe_counters.fail_closed),
+		   atomic64_read(&nfsd_ffv2_probe_counters.callbacks),
+		   atomic64_read(&nfsd_ffv2_probe_counters.malformed),
 		   atomic64_read(&nfsd_ffv2_probe_counters.last_generation));
 	return 0;
 }
@@ -3908,6 +4094,90 @@ u64 nfsd_ffv2_test_provider_entries(void)
 	       atomic64_read(&nfsd_ffv2_probe_counters.fail_closed);
 }
 
+/* Callbacks entered, so a test can distinguish one call from none. */
+u64 nfsd_ffv2_test_provider_callbacks(void)
+{
+	return atomic64_read(&nfsd_ffv2_probe_counters.callbacks);
+}
+
+/**
+ * nfsd_ffv2_test_provider_install - install a namespace's read-only provider
+ * @nn: the namespace the provider serves
+ * @ops: read-only callbacks, which must both be supplied
+ * @data: opaque provider state passed back to each callback
+ *
+ * Only one provider may be installed per namespace.  The callbacks and the
+ * state are published together, so a callback always runs against the
+ * state its own operations vector was installed with.
+ *
+ * Return: 0, -EINVAL for a missing namespace or an incomplete operations
+ * vector, -ENOMEM, -ESHUTDOWN once @nn has begun exiting, or -EBUSY when
+ * @nn already has one installed.
+ */
+int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
+				    const struct nfsd_ffv2_provider_ops *ops,
+				    void *data)
+{
+	struct nfsd_ffv2_provider *provider;
+	struct nfsd_ffv2_anchor *anchor;
+
+	if (!nn || !ops || !ops->chunk_read || !ops->chunk_header_read)
+		return -EINVAL;
+	anchor = &nn->ffv2;
+	provider = kzalloc_obj(*provider, GFP_KERNEL);
+	if (!provider)
+		return -ENOMEM;
+	provider->ops = ops;
+	provider->data = data;
+	refcount_set(&provider->ref, 1);
+	init_completion(&provider->gone);
+
+	/*
+	 * Publication is part of the namespace's lifecycle, not merely of
+	 * the registry: taking the anchor lock and requiring NET_LIVE is
+	 * what makes installation and namespace exit one transaction.  A
+	 * provider published before exit closes that state is drained by the
+	 * exit fence; one attempted after it never publishes at all.
+	 */
+	mutex_lock(&anchor->lock);
+	if (anchor->net_state != NFSD_FFV2_NET_LIVE) {
+		mutex_unlock(&anchor->lock);
+		kfree(provider);
+		return -ESHUTDOWN;
+	}
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (rcu_dereference_protected(nn->ffv2.provider,
+				      lockdep_is_held(&nfsd_ffv2_registry_lock))) {
+		mutex_unlock(&nfsd_ffv2_registry_lock);
+		mutex_unlock(&anchor->lock);
+		kfree(provider);
+		return -EBUSY;
+	}
+	rcu_assign_pointer(nn->ffv2.provider, provider);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	mutex_unlock(&anchor->lock);
+	return 0;
+}
+
+/**
+ * nfsd_ffv2_test_provider_remove - remove @nn's read-only provider
+ * @nn: the namespace whose boundary is being closed
+ *
+ * Closes the boundary first, then waits for the last callback reference to
+ * be dropped, so no request can be running in provider code once this
+ * returns and the caller may free its operations vector and state.
+ */
+void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn)
+{
+	nfsd_ffv2_provider_shutdown(nn);
+}
+
+/* Providers the namespace-exit fence had to retire, for a test to see. */
+u64 nfsd_ffv2_test_provider_fenced(void)
+{
+	return atomic64_read(&nfsd_ffv2_provider_fenced);
+}
+
 __be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
 					 struct svc_fh *fhp,
 					 struct nfsd4_session *session,
@@ -3929,6 +4199,7 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 	mutex_init(&anchor->lock);
 	anchor->net_state = NFSD_FFV2_NET_LIVE;
 	anchor->service_state = NFSD_FFV2_SERVICE_DOWN;
+	RCU_INIT_POINTER(anchor->provider, NULL);
 	anchor->next_generation = 1;
 	anchor->pending = NULL;
 	anchor->active = NULL;
@@ -3964,6 +4235,18 @@ void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
 	generation = nfsd_ffv2_retire_begin_locked(anchor);
 	mutex_unlock(&anchor->lock);
 
+	/*
+	 * Close the provider boundary now that installation is refused: an
+	 * installer takes the same lock and requires NET_LIVE, so one that
+	 * published before the store above is drained here and one that
+	 * arrives after it never publishes.  A namespace must not depend on
+	 * its installer removing a provider -- no callback and no
+	 * result-holding admission may outlive it -- and the WARN in
+	 * nfsd_ffv2_net_destroy() means this fence was missed.
+	 */
+	if (nfsd_ffv2_provider_shutdown(nn))
+		atomic64_inc(&nfsd_ffv2_provider_fenced);
+
 	nfsd_ffv2_retire_finish(anchor, generation, true);
 	/*
 	 * Drain every admitted token and worker before the session tables and
@@ -3985,6 +4268,13 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	WARN_ON_ONCE(anchor->retiring);
 	WARN_ON_ONCE(anchor->pending);
 	WARN_ON_ONCE(anchor->registration_pending);
+	/*
+	 * A provider is namespace-scoped and only a KUnit build can install
+	 * one; a namespace reaching teardown while one is still published
+	 * means a test left it behind, which would outlive the anchor the
+	 * callbacks are fenced by.
+	 */
+	WARN_ON_ONCE(rcu_access_pointer(anchor->provider));
 	mutex_unlock(&anchor->lock);
 	WARN_ON_ONCE(!nfsd_ffv2_authority_admissions_idle(anchor));
 	nfsd_ffv2_anchor_put(anchor);
@@ -4202,6 +4492,14 @@ void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 	admission->task = NULL;
 	if (atomic_dec_and_test(&generation->admitted))
 		wake_up_all(&generation->admitted_wait);
+	/*
+	 * Last: the result this request may still have been reading borrows
+	 * provider storage, and provider removal is waiting on this.
+	 */
+	if (admission->provider) {
+		nfsd_ffv2_provider_put(admission->provider);
+		admission->provider = NULL;
+	}
 	nfsd_ffv2_generation_put(generation);
 	nfsd_ffv2_anchor_put(anchor);
 }

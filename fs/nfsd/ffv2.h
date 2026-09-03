@@ -97,9 +97,19 @@ enum nfsd_ffv2_service_state {
 	NFSD_FFV2_SERVICE_DRAIN_FAILED,
 };
 
+/* Opaque outside ffv2.c: the published provider and its reference. */
+struct nfsd_ffv2_provider;
+
 struct nfsd_ffv2_anchor {
 	/* Keeps the embedded anchor alive across admitted callbacks. */
 	refcount_t			ref;
+	/*
+	 * The read-only provider installed for this namespace, if any.
+	 * FFv2 generation, binding, and authority state is per-namespace, so
+	 * provider selection is too: a request is served only by the
+	 * provider installed for the namespace its binding belongs to.
+	 */
+	struct nfsd_ffv2_provider __rcu	*provider;
 	struct completion		released;
 	/* Serializes service state, generation publication, and admission. */
 	struct mutex			lock;
@@ -214,16 +224,159 @@ int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
 __be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp);
 void nfsd_ffv2_binding_get(struct nfsd_ffv2_binding *binding);
 void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding);
-__be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
-				u32 opnum);
-int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v);
+/*
+ * Read-only chunk request and result shapes.
+ *
+ * These mirror CHUNK_READ4args/CHUNK_READ4resok and
+ * CHUNK_HEADER_READ4args/CHUNK_HEADER_READ4resok in the aggregate Flex
+ * Files v2 draft, so that the encoder a later slice adds is a direct field
+ * mapping rather than a translation.  The stateid is not repeated here:
+ * the ordered gate has already validated it before a provider is reached.
+ */
+#define NFSD_FFV2_CHUNK_HEADER_READ_MAX	1024
+#define NFSD_FFV2_CHECKSUM_VALUE_MAX	64
+
+/* chunk_owner4: the committed generation a chunk belongs to. */
+struct nfsd_ffv2_chunk_owner {
+	u64	co_cohort_id;
+	u32	co_client_id;
+	u32	co_id;
+};
+
+/* chunk_guard4: the per-chunk compare-and-swap state. */
+struct nfsd_ffv2_chunk_guard {
+	u32	cg_gen_id;
+	u32	cg_client_id;
+};
+
+/* checksum4: a tagged checksum over the chunk header and payload. */
+struct nfsd_ffv2_checksum {
+	u32	cs_algorithm;
+	u32	cs_len;
+	u8	cs_value[NFSD_FFV2_CHECKSUM_VALUE_MAX];
+};
+
+/* retained_generation_disposition4 */
+enum nfsd_ffv2_retained_disposition {
+	NFSD_FFV2_RETAINED_ABSENT,
+	NFSD_FFV2_RETAINED_PRESENT,
+	NFSD_FFV2_RETAINED_ERRORED,
+};
+
+/* optional_retained4: a predecessor generation, when one is retained. */
+struct nfsd_ffv2_retained {
+	enum nfsd_ffv2_retained_disposition disposition;
+	struct nfsd_ffv2_chunk_owner	rp_owner;
+};
+
+/* read_chunk4 */
+struct nfsd_ffv2_read_chunk {
+	struct nfsd_ffv2_checksum	cr_checksum;
+	u32				cr_effective_len;
+	struct nfsd_ffv2_chunk_owner	cr_owner;
+	struct nfsd_ffv2_chunk_guard	cr_guard;
+	u32				cr_payload_id;
+	u32				cr_locked;
+	__be32				cr_status;
+	const u8			*cr_chunk;
+};
+
+/*
+ * A chunk range.  @offset is a chunk index, not a byte offset, and @count
+ * is a chunk count: CHUNK_READ works in the layout's chunk coordinate
+ * system rather than the byte coordinate system READ uses.
+ */
+struct nfsd_ffv2_chunk_request {
+	u64	offset;
+	u32	count;
+};
+
+/*
+ * One read result.  A provider may return fewer chunks than were asked
+ * for, so @count is what it actually produced; it is never more, and the
+ * arrays an encoder walks are present whenever @count is non-zero, both
+ * checked at the boundary before this is handed back.  Every pointer here
+ * is borrowed from provider-owned storage and stays valid only while the
+ * caller's execution admission is held: the admission carries a reference
+ * on the provider that produced the result, so provider removal cannot
+ * complete, and the storage cannot be freed, until the admission does.
+ * That admission is also what retirement and namespace exit drain.  A
+ * caller that must outlive its admission -- a wire encoder, once one
+ * exists -- has to copy what it needs or hold the admission through
+ * encoding.
+ *
+ * Lifetime is necessary but not sufficient: the storage a successful
+ * result points at must also be immutable and not reused for another
+ * operation until this operation's admission completes.  Callbacks can
+ * run concurrently on one provider, so a shared scratch array that the
+ * next call overwrites would corrupt a result whose reference is still
+ * perfectly valid.  A provider that cannot promise that has to return
+ * per-operation storage.
+ */
+struct nfsd_ffv2_chunk_result {
+	bool	eof;
+	u32	count;
+	union {
+		/* CHUNK_READ4resok */
+		struct {
+			const struct nfsd_ffv2_read_chunk *chunks;
+		} read;
+		/* CHUNK_HEADER_READ4resok: five co-indexed arrays. */
+		struct {
+			const __be32			   *status;
+			const u32			   *locked;
+			const struct nfsd_ffv2_chunk_owner *owners;
+			const struct nfsd_ffv2_chunk_guard *guards;
+			const struct nfsd_ffv2_retained	   *predecessors;
+		} header;
+	};
+};
+
+/*
+ * The read-only half of the provider boundary.  A callback runs only after
+ * the ordered gate has authorized the request and taken an execution
+ * admission, and only for an operation whose profile names it.  No
+ * mutating entry point exists yet, and no provider is installed in an
+ * ordinary build.
+ *
+ * Callbacks are synchronous and may sleep.  @object, @request and @result
+ * are the caller's, valid only for the duration of the call: a provider
+ * must not retain any of them, and must answer before it returns.  The
+ * storage a result points at is the provider's own and must stay valid
+ * until the caller releases the execution admission it holds.  An
+ * asynchronous provider needs a different interface, not this one.
+ */
+struct nfsd_ffv2_provider_ops {
+	__be32 (*chunk_read)(void *provider,
+			     const struct nfsd_ffv2_object *object,
+			     const struct nfsd_ffv2_chunk_request *request,
+			     struct nfsd_ffv2_chunk_result *result);
+	__be32 (*chunk_header_read)(void *provider,
+				    const struct nfsd_ffv2_object *object,
+				    const struct nfsd_ffv2_chunk_request *request,
+				    struct nfsd_ffv2_chunk_result *result);
+};
 
 struct nfsd_ffv2_admission {
 	struct list_head			node;
 	struct nfsd_ffv2_anchor		*anchor;
 	struct nfsd_ffv2_generation	*generation;
 	struct task_struct		*task;
+	/*
+	 * The provider a callback ran against, held from the callback until
+	 * this admission completes.  A result borrows provider storage, so
+	 * the storage has to outlive every consumer of the result, and this
+	 * admission is what those consumers are bounded by.
+	 */
+	struct nfsd_ffv2_provider	*provider;
 };
+
+__be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				u32 opnum,
+				const struct nfsd_ffv2_chunk_request *request,
+				struct nfsd_ffv2_chunk_result *result,
+				struct nfsd_ffv2_admission *admission);
+int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v);
 
 int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 		    struct nfsd_ffv2_admission *admission);
@@ -361,5 +514,21 @@ bool nfsd_ffv2_test_authority_work_admit(struct nfsd_net *nn);
 void nfsd_ffv2_test_authority_work_done(struct nfsd_net *nn);
 void nfsd_ffv2_test_authority_admissions_close(struct nfsd_net *nn);
 bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn);
+
+/*
+ * Install or remove @nn's read-only provider.  Both are defined inside the
+ * CONFIG_NFSD_FFV2_KUNIT_TEST guard in ffv2.c, so neither symbol exists in
+ * ffv2.o in an ordinary build, and there is no netlink, debugfs, or
+ * syscall path to them in any build.  Removal closes @nn's boundary and
+ * then waits for the callbacks already inside it; the installer owns the
+ * operations vector and the state throughout and may free them once
+ * removal returns.
+ */
+int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
+				    const struct nfsd_ffv2_provider_ops *ops,
+				    void *data);
+void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn);
+u64 nfsd_ffv2_test_provider_fenced(void);
+u64 nfsd_ffv2_test_provider_callbacks(void);
 
 #endif /* _NFSD_FFV2_H */
