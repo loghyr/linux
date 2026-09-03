@@ -4085,6 +4085,87 @@ nfsd_ffv2_test_generation_refcount(struct nfsd_ffv2_generation *generation)
 }
 
 /*
+ * Install a trust entry into the active generation's registry, the way the
+ * TRUST_STATEID handler will once it exists.  @authority selects the
+ * issuer: NULL uses the generation's own, and any other published
+ * authority roots the entry in a different issuer epoch, which is how a
+ * test builds a stale-issuer negative that the gate must not find.
+ */
+__be32
+nfsd_ffv2_test_trust_install_active(struct nfsd_net *nn,
+				    struct nfsd_ffv2_authority *authority,
+				    const struct nfsd_ffv2_trust_request *req)
+{
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	__be32 status;
+
+	generation = nfsd_ffv2_active_generation_get(nn);
+	if (!generation)
+		return nfserr_stale;
+	context = generation->payload;
+	if (!context || !context->object || !context->authority) {
+		nfsd_ffv2_generation_put_owned(generation);
+		return nfserr_stale;
+	}
+	status = nfsd_ffv2_trust_install(&context->trust,
+					 authority ? authority :
+						     context->authority,
+					 context->object,
+					 generation->identity->generation, req);
+	nfsd_ffv2_generation_put_owned(generation);
+	return status;
+}
+
+/* Revoke one entry from the active generation's registry. */
+bool nfsd_ffv2_test_trust_revoke_active(struct nfsd_net *nn,
+					const stateid_t *stateid)
+{
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	bool revoked = false;
+	u64 epoch;
+
+	generation = nfsd_ffv2_active_generation_get(nn);
+	if (!generation)
+		return false;
+	context = generation->payload;
+	if (context && context->object && context->authority &&
+	    nfsd_ffv2_authority_published(context->authority, &epoch))
+		revoked = nfsd_ffv2_trust_revoke(&context->trust, stateid,
+						 context->object->object_uuid,
+						 epoch);
+	nfsd_ffv2_generation_put_owned(generation);
+	return revoked;
+}
+
+/* The object a mapped binding resolved to, so a fixture can match it. */
+const struct nfsd_ffv2_object *
+nfsd_ffv2_test_binding_object(const struct nfsd_ffv2_binding *binding)
+{
+	return binding ? binding->object : NULL;
+}
+
+/* The object UUID the active generation was published with. */
+bool nfsd_ffv2_test_active_object_uuid(struct nfsd_net *nn, u8 uuid[16])
+{
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	bool found = false;
+
+	generation = nfsd_ffv2_active_generation_get(nn);
+	if (!generation)
+		return false;
+	context = generation->payload;
+	if (context && context->object) {
+		memcpy(uuid, context->object->object_uuid, 16);
+		found = true;
+	}
+	nfsd_ffv2_generation_put_owned(generation);
+	return found;
+}
+
+/*
  * Provider entry accounting, so a test can prove that a fail-closed result
  * was reached without the provider boundary ever being crossed.
  */

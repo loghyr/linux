@@ -172,5 +172,12 @@ unsigned int
 nfsd_ffv2_test_generation_refcount(struct nfsd_ffv2_generation *generation);
 enum nfsd_ffv2_caller_class
 nfsd_ffv2_test_trust_actor(const struct nfsd_ffv2_trust_entry *entry);
+__be32
+nfsd_ffv2_test_trust_install_active(struct nfsd_net *nn,
+				    struct nfsd_ffv2_authority *authority,
+				    const struct nfsd_ffv2_trust_request *req);
+bool nfsd_ffv2_test_trust_revoke_active(struct nfsd_net *nn,
+					const stateid_t *stateid);
+bool nfsd_ffv2_test_active_object_uuid(struct nfsd_net *nn, u8 uuid[16]);
 
 #endif /* _NFSD_FFV2_TRUST_H */

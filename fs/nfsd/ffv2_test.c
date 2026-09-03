@@ -2,6 +2,7 @@
 #include <kunit/test.h>
 #include <linux/completion.h>
 #include <linux/cred.h>
+#include <linux/delay.h>
 #include <linux/fs_struct.h>
 #include <linux/iopoll.h>
 #include <linux/kthread.h>
@@ -9,6 +10,7 @@
 #include <linux/namei.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 #include <linux/sunrpc/gss_api.h>
 #include <linux/sunrpc/svcsock.h>
 #include <linux/sunrpc/svc_xprt.h>
@@ -3914,6 +3916,2189 @@ static void nfsd_ffv2_decoder_lifecycle_test(struct kunit *test)
 	}
 }
 
+/*
+ * Read-only provider fixture.
+ *
+ * Option C of the provider-enablement design gate: a test-only provider
+ * that serves CHUNK_READ and CHUNK_HEADER_READ from a synthetic backing
+ * object, so the authorized data path and its lifetime gates can be
+ * exercised without a metadata server, a KDC, or a real store.  Nothing
+ * here is reachable from an ordinary client: the provider exists only in a
+ * KUnit build and is installed only by these tests.
+ */
+
+#define NFSD_FFV2_RO_CHUNK_SIZE		64
+#define NFSD_FFV2_RO_CHUNKS		4
+
+struct nfsd_ffv2_ro_provider {
+	/* The object this provider will serve; anything else is stale. */
+	const struct nfsd_ffv2_object	*object;
+	u8				data[NFSD_FFV2_RO_CHUNKS]
+					    [NFSD_FFV2_RO_CHUNK_SIZE];
+	struct nfsd_ffv2_read_chunk	chunks[NFSD_FFV2_RO_CHUNKS];
+	__be32				status[NFSD_FFV2_RO_CHUNKS];
+	u32				locked[NFSD_FFV2_RO_CHUNKS];
+	struct nfsd_ffv2_chunk_owner	owners[NFSD_FFV2_RO_CHUNKS];
+	struct nfsd_ffv2_chunk_guard	guards[NFSD_FFV2_RO_CHUNKS];
+	struct nfsd_ffv2_retained	predecessors[NFSD_FFV2_RO_CHUNKS];
+	atomic_t			reads;
+	atomic_t			header_reads;
+	/* Optional stall, so a test can overlap a read with retirement. */
+	struct completion		*enter;
+	struct completion		*release;
+};
+
+/* Clamp a requested chunk range to what the fixture holds. */
+static u32 nfsd_ffv2_ro_range(const struct nfsd_ffv2_chunk_request *request,
+			      bool *eof)
+{
+	u32 avail;
+
+	if (request->offset >= NFSD_FFV2_RO_CHUNKS) {
+		*eof = true;
+		return 0;
+	}
+	avail = NFSD_FFV2_RO_CHUNKS - (u32)request->offset;
+	if (request->count >= avail) {
+		*eof = true;
+		return avail;
+	}
+	*eof = false;
+	return request->count;
+}
+
+/*
+ * Let a test hold a callback inside the provider boundary.  The stall is
+ * keyed on the release completion alone: a test that wants to model a
+ * callback which never announces itself leaves enter NULL and still gets a
+ * held callback.
+ */
+static void nfsd_ffv2_ro_stall(struct nfsd_ffv2_ro_provider *provider)
+{
+	if (!provider->release)
+		return;
+	if (provider->enter)
+		complete(provider->enter);
+	wait_for_completion(provider->release);
+}
+
+static __be32 nfsd_ffv2_ro_chunk_read(void *opaque,
+				      const struct nfsd_ffv2_object *object,
+				      const struct nfsd_ffv2_chunk_request *req,
+				      struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_ro_provider *provider = opaque;
+
+	atomic_inc(&provider->reads);
+	if (object != provider->object)
+		return nfserr_stale;
+	nfsd_ffv2_ro_stall(provider);
+	result->count = nfsd_ffv2_ro_range(req, &result->eof);
+	if (result->count)
+		result->read.chunks = &provider->chunks[req->offset];
+	return nfs_ok;
+}
+
+static __be32
+nfsd_ffv2_ro_chunk_header_read(void *opaque,
+			       const struct nfsd_ffv2_object *object,
+			       const struct nfsd_ffv2_chunk_request *req,
+			       struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_ro_provider *provider = opaque;
+	u32 first;
+
+	atomic_inc(&provider->header_reads);
+	if (object != provider->object)
+		return nfserr_stale;
+	nfsd_ffv2_ro_stall(provider);
+	result->count = nfsd_ffv2_ro_range(req, &result->eof);
+	if (!result->count)
+		return nfs_ok;
+	first = (u32)req->offset;
+	result->header.status = &provider->status[first];
+	result->header.locked = &provider->locked[first];
+	result->header.owners = &provider->owners[first];
+	result->header.guards = &provider->guards[first];
+	result->header.predecessors = &provider->predecessors[first];
+	return nfs_ok;
+}
+
+static const struct nfsd_ffv2_provider_ops nfsd_ffv2_ro_provider_ops = {
+	.chunk_read		= nfsd_ffv2_ro_chunk_read,
+	.chunk_header_read	= nfsd_ffv2_ro_chunk_header_read,
+};
+
+/* Fill the fixture's chunks with values a test can check exactly. */
+static void nfsd_ffv2_ro_provider_init(struct nfsd_ffv2_ro_provider *provider)
+{
+	unsigned int i;
+
+	memset(provider, 0, sizeof(*provider));
+	for (i = 0; i < NFSD_FFV2_RO_CHUNKS; i++) {
+		memset(provider->data[i], 0x40 + i, NFSD_FFV2_RO_CHUNK_SIZE);
+		provider->owners[i].co_cohort_id = 0x1122334400000000ULL + i;
+		provider->owners[i].co_client_id = 7;
+		provider->owners[i].co_id = 0x900 + i;
+		provider->guards[i].cg_gen_id = 3 + i;
+		provider->guards[i].cg_client_id = 7;
+		provider->locked[i] = i & 1;
+		provider->status[i] = nfs_ok;
+		provider->predecessors[i].disposition =
+			NFSD_FFV2_RETAINED_ABSENT;
+		provider->chunks[i].cr_checksum.cs_algorithm = 1;
+		provider->chunks[i].cr_checksum.cs_len = 4;
+		memset(provider->chunks[i].cr_checksum.cs_value, 0x5a, 4);
+		provider->chunks[i].cr_effective_len = NFSD_FFV2_RO_CHUNK_SIZE;
+		provider->chunks[i].cr_owner = provider->owners[i];
+		provider->chunks[i].cr_guard = provider->guards[i];
+		provider->chunks[i].cr_payload_id = 0x100 + i;
+		provider->chunks[i].cr_locked = provider->locked[i];
+		provider->chunks[i].cr_status = nfs_ok;
+		provider->chunks[i].cr_chunk = provider->data[i];
+	}
+}
+
+/*
+ * The environment one authorized read needs: a published generation with a
+ * real object and mapped filehandle, the authority that generation was
+ * published under, and a live trust entry rooted in that authority's
+ * epoch.  Everything is built through the production paths except the
+ * session lookup and credential copy, which no KUnit test can supply.
+ */
+struct nfsd_ffv2_ro_fixture {
+	struct net			*net;
+	struct nfsd_net			*nn;
+	struct nfsd4_session		*session;
+	struct auth_domain		*domain;
+	struct svc_rqst			*rqstp;
+	struct svc_xprt			*xprt;
+	struct svc_fh			*mapped;
+	struct svc_export		*published;
+	struct nfsd_ffv2_binding	*binding;
+	struct nfsd_ffv2_object		*object;
+	struct nfsd_ffv2_export_update	registration;
+	struct nfsd_ffv2_ro_provider	*provider;
+	struct path			root;
+	struct path			object_path;
+	struct dentry			*object_dentry;
+	struct knfsd_fh			outer_fh;
+	stateid_t			stateid;
+	u64				generation_id;
+	u8				uuid[16];
+	u8				token[32];
+	bool				service_up;
+	bool				filecache_up;
+	bool				registration_open;
+	bool				provider_installed;
+	bool				root_held;
+	/* Set when the publication wait expired; see the init comment. */
+	bool				publish_timed_out;
+};
+
+/* How long fixture construction waits for publication to complete. */
+#define NFSD_FFV2_RO_PUBLISH_WAIT	(10 * HZ)
+
+/*
+ * The fixture's publication worker.  @delay_ms exists so a test can make
+ * the worker demonstrably still running when construction's wait expires,
+ * which is the only way to exercise that timeout deterministically.
+ */
+struct nfsd_ffv2_ro_publish_ctx {
+	struct nfsd_ffv2_transition_publish_ctx	publish;
+	unsigned int				delay_ms;
+};
+
+static int nfsd_ffv2_ro_publish_thread(void *data)
+{
+	struct nfsd_ffv2_ro_publish_ctx *ctx = data;
+
+	if (ctx->delay_ms)
+		msleep(ctx->delay_ms);
+	return nfsd_ffv2_transition_publish_thread(&ctx->publish);
+}
+
+/*
+ * Run one publication on its own thread and wait it out.  Publication has
+ * to run off this thread because it waits for export crossing to drain,
+ * and it cannot be cancelled once started: on a timeout the wait is
+ * reported and then completed anyway, because returning would leave the
+ * worker running against the caller's storage.
+ *
+ * Return: the publication's own result, or -EIO if the worker never
+ * started.  @timed_out, when given, records whether the wait expired.
+ */
+static int nfsd_ffv2_ro_publish_run(struct kunit *test,
+				    struct nfsd_ffv2_ro_publish_ctx *pubctx,
+				    unsigned long publish_wait,
+				    bool timeout_expected, bool *timed_out)
+{
+	struct task_struct *publish_task;
+
+	publish_task = kthread_run(nfsd_ffv2_ro_publish_thread, pubctx,
+				   "nfsd-ffv2-ro-publish");
+	if (IS_ERR(publish_task)) {
+		KUNIT_FAIL(test, "failed to start fixture publisher: %ld",
+			   PTR_ERR(publish_task));
+		return -EIO;
+	}
+	if (!wait_for_completion_timeout(&pubctx->publish.done, publish_wait)) {
+		if (timed_out)
+			*timed_out = true;
+		if (!timeout_expected)
+			KUNIT_FAIL(test,
+				   "publication did not complete in %lu jiffies",
+				   publish_wait);
+		wait_for_completion(&pubctx->publish.done);
+	}
+	kthread_stop(publish_task);
+	return pubctx->publish.result;
+}
+
+/*
+ * Added to the construction wait to get the worker's delay, so a test that
+ * wants the wait to expire gets that on any HZ rather than on the
+ * assumption that a jiffy is short.
+ */
+#define NFSD_FFV2_RO_PUBLISH_DELAY_MS	50
+
+static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
+				      struct nfsd_ffv2_ro_fixture *f)
+{
+	struct nfsd_ffv2_generation *generation;
+
+	if (f->provider_installed) {
+		nfsd_ffv2_test_provider_remove(f->nn);
+		f->provider_installed = false;
+	}
+	if (f->mapped) {
+		fh_put(f->mapped);
+		f->mapped = NULL;
+	}
+	if (f->binding) {
+		nfsd_ffv2_binding_put(f->binding);
+		f->binding = NULL;
+	}
+	if (f->published) {
+		exp_put(f->published);
+		f->published = NULL;
+	}
+	nfsd_ffv2_object_free(f->object);
+	f->object = NULL;
+	if (f->registration_open) {
+		nfsd_ffv2_registration_end(f->nn, &f->registration);
+		f->registration_open = false;
+	}
+	if (f->service_up) {
+		mutex_lock(&nfsd_mutex);
+		generation = nfsd_ffv2_service_stop_begin(f->nn);
+		mutex_unlock(&nfsd_mutex);
+		nfsd_ffv2_service_stop_finish(f->nn, generation);
+		mutex_lock(&nfsd_mutex);
+		nfsd_ffv2_service_down(f->nn);
+		mutex_unlock(&nfsd_mutex);
+		f->service_up = false;
+	}
+	if (f->net)
+		nfsd_export_flush(f->net);
+	if (f->filecache_up) {
+		mutex_lock(&nfsd_mutex);
+		nfsd_file_cache_shutdown();
+		mutex_unlock(&nfsd_mutex);
+		f->filecache_up = false;
+	}
+	if (f->object_dentry) {
+		dput(f->object_dentry);
+		f->object_dentry = NULL;
+	}
+	if (f->root_held) {
+		path_put(&f->root);
+		f->root_held = false;
+	}
+	if (f->domain) {
+		auth_domain_put(f->domain);
+		f->domain = NULL;
+	}
+	if (f->net) {
+		put_net(f->net);
+		f->net = NULL;
+		net_ns_barrier();
+	}
+}
+
+/*
+ * Build the fixture, waiting @publish_wait for the publication worker.
+ *
+ * A caller that passes a deliberately short wait is exercising the timeout
+ * path itself and sets @timeout_expected, which records the timeout in
+ * f->publish_timed_out instead of failing the test.  Either way the worker
+ * is joined before this returns: it runs against storage owned by this
+ * frame, so no exit may leave it alive.
+ *
+ * Returns false with the failure already reported, so a caller can go
+ * straight to teardown.
+ */
+static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
+					   struct nfsd_ffv2_ro_fixture *f,
+					   unsigned long publish_wait,
+					   bool timeout_expected)
+{
+	struct nfsd_ffv2_ro_publish_ctx pubctx = {};
+	struct nfsd_ffv2_transition_publish_ctx *publish = &pubctx.publish;
+	struct nfsd_ffv2_trust_request trust;
+	struct nfsd_ffv2_fh_info decoded;
+	struct svc_export *selected;
+	struct svc_export *seeded;
+	struct inode *object_inode;
+	struct svc_export exp;
+	const u8 inner[] = { 1, 0, 1, 1, 0xa5, 0xb5, 0xc5, 0xd5 };
+	int error;
+
+	memset(f, 0, sizeof(*f));
+	memset(f->uuid, 0x2c, sizeof(f->uuid));
+	memset(f->token, 0x1c, sizeof(f->token));
+
+	f->rqstp = kunit_kzalloc(test, sizeof(*f->rqstp), GFP_KERNEL);
+	f->xprt = kunit_kzalloc(test, sizeof(*f->xprt), GFP_KERNEL);
+	f->mapped = kunit_kzalloc(test, sizeof(*f->mapped), GFP_KERNEL);
+	f->provider = kunit_kzalloc(test, sizeof(*f->provider), GFP_KERNEL);
+	f->session = nfsd_ffv2_test_session(test);
+	if (!f->rqstp || !f->xprt || !f->mapped || !f->provider || !f->session) {
+		KUNIT_FAIL(test, "failed to allocate read-only fixture");
+		return false;
+	}
+	nfsd_ffv2_ro_provider_init(f->provider);
+
+	f->net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(f->net)) {
+		KUNIT_FAIL(test, "failed to create fixture netns: %ld",
+			   PTR_ERR(f->net));
+		f->net = NULL;
+		return false;
+	}
+	f->nn = net_generic(f->net, nfsd_net_id);
+	f->xprt->xpt_net = f->net;
+	f->rqstp->rq_xprt = f->xprt;
+	/*
+	 * nfs4_state_create_net() initialises this lock when the v4 state
+	 * machine starts, which the fixture does not do: only the FFv2
+	 * service comes up here.  Initialise it so lockdep sees a real key
+	 * on the authority path instead of disabling itself for the run.
+	 */
+	spin_lock_init(&f->nn->client_lock);
+
+	f->domain = unix_domain_find("ffv2-ro-kunit");
+	if (!f->domain) {
+		KUNIT_FAIL(test, "failed to create fixture auth domain");
+		return false;
+	}
+	get_fs_root(current->fs, &f->root);
+	f->root_held = true;
+
+	/*
+	 * A regular file under the export root for the object to name.  It
+	 * exists only in the dentry cache, which is all the registry needs:
+	 * no operation in this fixture reaches the backing filesystem.
+	 */
+	f->object_dentry = d_alloc_name(f->root.dentry, "ffv2-ro-object");
+	if (!f->object_dentry) {
+		KUNIT_FAIL(test, "failed to allocate fixture object dentry");
+		return false;
+	}
+	object_inode = new_inode(f->root.mnt->mnt_sb);
+	if (!object_inode) {
+		KUNIT_FAIL(test, "failed to allocate fixture object inode");
+		return false;
+	}
+	object_inode->i_mode = S_IFREG | 0600;
+	object_inode->i_ino = get_next_ino();
+	set_nlink(object_inode, 1);
+	d_add(f->object_dentry, object_inode);
+	f->object_path.mnt = f->root.mnt;
+	f->object_path.dentry = f->object_dentry;
+
+	/* Seed the ordinary export the object will be published from. */
+	nfsd_ffv2_init_test_export(&exp, f->nn, f->domain, &f->root);
+	exp.ex_uuid = kmemdup(f->uuid, sizeof(f->uuid), GFP_KERNEL);
+	if (!exp.ex_uuid) {
+		KUNIT_FAIL(test, "failed to allocate fixture export UUID");
+		return false;
+	}
+	seeded = nfsd_export_cache_update(&exp);
+	if (IS_ERR(seeded)) {
+		KUNIT_FAIL(test, "fixture export publication failed: %ld",
+			   PTR_ERR(seeded));
+		kfree(exp.ex_uuid);
+		return false;
+	}
+	exp_put(seeded);
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_up(f->nn);
+	f->service_up = !error;
+	if (!error)
+		error = nfsd_file_ffv2_test_cache_start();
+	f->filecache_up = !error && f->service_up;
+	if (!error)
+		error = nfsd_ffv2_registration_begin(f->nn, &f->registration);
+	f->registration_open = !error;
+	mutex_unlock(&nfsd_mutex);
+	if (error) {
+		KUNIT_FAIL(test, "fixture service start failed: %d", error);
+		return false;
+	}
+
+	/*
+	 * The authority the generation is published under.  Only the session
+	 * lookup and credential copy are bypassed; the epoch allocation,
+	 * session linkage, and publication are the production paths.
+	 */
+	f->registration.authority =
+		nfsd_ffv2_test_authority_create(f->nn, f->session);
+	if (!f->registration.authority) {
+		KUNIT_FAIL(test, "fixture authority creation failed");
+		return false;
+	}
+
+	f->object = nfsd_ffv2_object_alloc();
+	if (!f->object) {
+		KUNIT_FAIL(test, "failed to allocate fixture object");
+		return false;
+	}
+	error = nfsd_ffv2_test_object_init(f->object, f->domain, &f->root,
+					   &f->object_path, inner,
+					   sizeof(inner), f->uuid, f->uuid);
+	if (error) {
+		KUNIT_FAIL(test, "fixture object init failed: %d", error);
+		return false;
+	}
+
+	selected = nfsd_ffv2_export_lookup(f->nn->svc_export_cache, f->domain,
+					   &f->root);
+	if (IS_ERR(selected)) {
+		KUNIT_FAIL(test, "fixture export lookup failed: %ld",
+			   PTR_ERR(selected));
+		return false;
+	}
+	error = nfsd_ffv2_export_transition_exact(selected);
+	if (error) {
+		KUNIT_FAIL(test, "fixture export transition failed: %d", error);
+		exp_put(selected);
+		return false;
+	}
+	error = nfsd_ffv2_export_template_clone(&exp, selected);
+	if (error) {
+		KUNIT_FAIL(test, "fixture template clone failed: %d", error);
+		nfsd_ffv2_export_transition_abort_exact(selected);
+		exp_put(selected);
+		return false;
+	}
+
+	/*
+	 * Publication runs on its own thread because it waits for export
+	 * crossing to drain, which a caller holding no references still has
+	 * to let happen.
+	 */
+	publish->owner = f->nn;
+	publish->registration = &f->registration;
+	publish->object = f->object;
+	publish->outer_fh = &f->outer_fh;
+	publish->template = &exp;
+	publish->expected = selected;
+	publish->root = &f->root;
+	publish->store_uuid = f->uuid;
+	publish->binding_token = f->token;
+	publish->cred = get_current_cred();
+	publish->control_root = 1;
+	publish->result = -EINPROGRESS;
+	init_completion(&publish->done);
+	if (timeout_expected)
+		pubctx.delay_ms = jiffies_to_msecs(publish_wait) +
+				  NFSD_FFV2_RO_PUBLISH_DELAY_MS;
+	error = nfsd_ffv2_ro_publish_run(test, &pubctx, publish_wait,
+					 timeout_expected,
+					 &f->publish_timed_out);
+	if (error == -EIO) {
+		put_cred(publish->cred);
+		nfsd_ffv2_export_template_free(&exp);
+		nfsd_ffv2_export_transition_abort_exact(selected);
+		exp_put(selected);
+		return false;
+	}
+	put_cred(publish->cred);
+	nfsd_ffv2_export_template_free(&exp);
+	exp_put(selected);
+	if (error) {
+		KUNIT_FAIL(test, "fixture publication failed: %d", error);
+		return false;
+	}
+	/* Publication owns the object from here. */
+	f->object = NULL;
+	f->generation_id = publish->generation_id;
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_registration_end(f->nn, &f->registration);
+	mutex_unlock(&nfsd_mutex);
+	f->registration_open = false;
+
+	if (nfsd_ffv2_fh_parse(&f->outer_fh, &decoded)) {
+		KUNIT_FAIL(test, "fixture filehandle did not parse");
+		return false;
+	}
+	f->binding = nfsd_ffv2_test_binding_create(f->nn, &decoded);
+	if (IS_ERR(f->binding)) {
+		KUNIT_FAIL(test, "fixture binding admission failed: %ld",
+			   PTR_ERR(f->binding));
+		f->binding = NULL;
+		return false;
+	}
+
+	nfsd_ffv2_init_test_export(&exp, f->nn, f->domain, &f->root);
+	f->published = nfsd_ffv2_test_export_lookup(&exp);
+	if (!f->published) {
+		KUNIT_FAIL(test, "fixture service export not found");
+		return false;
+	}
+
+	/* A mapped current filehandle, exactly as PUTFH would leave one. */
+	fh_init(f->mapped, NFS4_FHSIZE);
+	f->mapped->fh_handle = f->outer_fh;
+	f->mapped->fh_export = nfsd_export_get(f->published);
+	f->mapped->fh_dentry = dget(f->object_dentry);
+	f->mapped->fh_ffv2_binding = f->binding;
+	f->binding = NULL;
+
+	/* A live read entry rooted in the published authority's epoch. */
+	f->stateid = nfsd_ffv2_test_stateid(1, 0x5e, 0x5f, 0x60);
+	nfsd_ffv2_test_trust_request(&trust, &f->stateid, f->uuid, IOMODE_READ,
+				     NULL, 3600);
+	if (nfsd_ffv2_test_trust_install_active(f->nn, NULL, &trust) != nfs_ok) {
+		KUNIT_FAIL(test, "fixture trust installation failed");
+		return false;
+	}
+
+	f->provider->object = nfsd_ffv2_test_binding_object(f->mapped->fh_ffv2_binding);
+	if (nfsd_ffv2_test_provider_install(f->nn, &nfsd_ffv2_ro_provider_ops,
+					    f->provider)) {
+		KUNIT_FAIL(test, "fixture provider installation failed");
+		return false;
+	}
+	f->provider_installed = true;
+	return true;
+}
+
+static bool nfsd_ffv2_ro_fixture_init(struct kunit *test,
+				      struct nfsd_ffv2_ro_fixture *f)
+{
+	return nfsd_ffv2_ro_fixture_init_wait(test, f,
+					      NFSD_FFV2_RO_PUBLISH_WAIT, false);
+}
+
+/*
+ * Run one authorized operation the way nfsd4_ffv2_probe() does: the
+ * ordered gate, then the provider boundary, then release of the execution
+ * admission.  The status and the result are the caller's to check.
+ */
+static __be32 nfsd_ffv2_ro_operation(struct nfsd_ffv2_ro_fixture *f,
+				     u32 opnum, const stateid_t *stateid,
+				     const struct nfsd_ffv2_chunk_request *req,
+				     struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_admission admission = {};
+	__be32 status;
+
+	status = nfsd_ffv2_test_validate_operation(f->rqstp, f->mapped,
+						   f->session, opnum, stateid,
+						   NULL, &admission);
+	if (status)
+		return status;
+	status = nfsd_ffv2_provider_probe(f->rqstp, f->mapped, opnum, req,
+					  result, &admission);
+	nfsd_ffv2_complete(&admission);
+	return status;
+}
+
+/*
+ * One authorized CHUNK_READ and one authorized CHUNK_HEADER_READ, checked
+ * field by field against what the fixture holds, with exactly one provider
+ * callback each.
+ */
+static void nfsd_ffv2_provider_read_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 1, .count = 2 };
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks;
+	unsigned int i;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 1, atomic_read(&f.provider->reads));
+	KUNIT_EXPECT_EQ(test, 2U, result.count);
+	/* Chunk 3 is still behind this range, so this is not the end. */
+	KUNIT_EXPECT_FALSE(test, result.eof);
+	if (!result.read.chunks) {
+		KUNIT_FAIL(test, "read returned no chunk array");
+		goto out;
+	}
+	for (i = 0; i < result.count; i++) {
+		const struct nfsd_ffv2_read_chunk *chunk =
+			&result.read.chunks[i];
+		unsigned int index = i + 1;
+
+		KUNIT_EXPECT_EQ(test, NFSD_FFV2_RO_CHUNK_SIZE,
+				chunk->cr_effective_len);
+		KUNIT_EXPECT_EQ(test, 0x100 + index, chunk->cr_payload_id);
+		KUNIT_EXPECT_EQ(test, 0x1122334400000000ULL + index,
+				chunk->cr_owner.co_cohort_id);
+		KUNIT_EXPECT_EQ(test, 7U, chunk->cr_owner.co_client_id);
+		KUNIT_EXPECT_EQ(test, 0x900 + index, chunk->cr_owner.co_id);
+		KUNIT_EXPECT_EQ(test, 3 + index, chunk->cr_guard.cg_gen_id);
+		KUNIT_EXPECT_EQ(test, index & 1, chunk->cr_locked);
+		KUNIT_EXPECT_EQ(test, nfs_ok, chunk->cr_status);
+		if (!chunk->cr_chunk) {
+			KUNIT_FAIL(test, "chunk %u carries no payload", index);
+			goto out;
+		}
+		KUNIT_EXPECT_EQ(test, 0x40 + index, chunk->cr_chunk[0]);
+		KUNIT_EXPECT_EQ(test, 0x40 + index,
+				chunk->cr_chunk[NFSD_FFV2_RO_CHUNK_SIZE - 1]);
+	}
+
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_HEADER_READ,
+					       &f.stateid, &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 1, atomic_read(&f.provider->header_reads));
+	KUNIT_EXPECT_EQ(test, 2U, result.count);
+	KUNIT_EXPECT_FALSE(test, result.eof);
+	if (!result.header.owners || !result.header.guards ||
+	    !result.header.status || !result.header.locked ||
+	    !result.header.predecessors) {
+		KUNIT_FAIL(test, "header read returned an incomplete result");
+		goto out;
+	}
+	for (i = 0; i < result.count; i++) {
+		unsigned int index = i + 1;
+
+		KUNIT_EXPECT_EQ(test, nfs_ok, result.header.status[i]);
+		KUNIT_EXPECT_EQ(test, index & 1, result.header.locked[i]);
+		KUNIT_EXPECT_EQ(test, 0x1122334400000000ULL + index,
+				result.header.owners[i].co_cohort_id);
+		KUNIT_EXPECT_EQ(test, 3 + index,
+				result.header.guards[i].cg_gen_id);
+		KUNIT_EXPECT_EQ(test, NFSD_FFV2_RETAINED_ABSENT,
+				result.header.predecessors[i].disposition);
+	}
+
+	/* A range that reaches the last chunk reports EOF with its data. */
+	{
+		const struct nfsd_ffv2_chunk_request last = { .offset = 2,
+							      .count = 2 };
+
+		KUNIT_EXPECT_EQ(test, nfs_ok,
+				nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ,
+						       &f.stateid, &last,
+						       &result));
+		KUNIT_EXPECT_EQ(test, 2U, result.count);
+		KUNIT_EXPECT_TRUE(test, result.eof);
+		if (!result.read.chunks) {
+			KUNIT_FAIL(test, "read returned no chunk array");
+			goto out;
+		}
+		KUNIT_EXPECT_EQ(test, 0x102U,
+				result.read.chunks[0].cr_payload_id);
+		KUNIT_EXPECT_EQ(test, 0x103U,
+				result.read.chunks[1].cr_payload_id);
+	}
+
+	/* A range past the end succeeds, returns nothing, and reports EOF. */
+	{
+		const struct nfsd_ffv2_chunk_request past = {
+			.offset = NFSD_FFV2_RO_CHUNKS, .count = 1
+		};
+
+		KUNIT_EXPECT_EQ(test, nfs_ok,
+				nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ,
+						       &f.stateid, &past,
+						       &result));
+		KUNIT_EXPECT_EQ(test, 0U, result.count);
+		KUNIT_EXPECT_TRUE(test, result.eof);
+	}
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * Every rejection the ordered gate is responsible for, each proved to fail
+ * before the provider boundary rather than inside it.  The provider
+ * callback count must not move across any of them.
+ */
+static void nfsd_ffv2_provider_negative_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_authority *other = NULL;
+	struct nfsd_ffv2_trust_request trust;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	struct svc_fh *unmapped;
+	struct svc_fh *saved;
+	stateid_t sid;
+	u64 callbacks;
+	u8 wrong_uuid[16];
+
+	unmapped = kunit_kzalloc(test, sizeof(*unmapped), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, unmapped);
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+
+	/* An unmapped current filehandle is stale before anything else. */
+	saved = f.mapped;
+	f.mapped = unmapped;
+	KUNIT_EXPECT_EQ(test, nfserr_stale,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	f.mapped = saved;
+
+	/* A stateid that was never installed. */
+	sid = nfsd_ffv2_test_stateid(1, 0x11, 0x12, 0x13);
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &sid, &req,
+					       &result));
+
+	/* The anonymous stateid is never a data credential. */
+	sid = nfsd_ffv2_test_stateid(0, 0, 0, 0);
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &sid, &req,
+					       &result));
+
+	/*
+	 * An entry rooted in a different issuer epoch.  The bytes are
+	 * installed and live, but the gate looks up under the published
+	 * authority's epoch, so this entry is not reachable at all.
+	 */
+	other = nfsd_ffv2_test_authority_create(f.nn, f.session);
+	if (!other || !nfsd_ffv2_authority_publish(other, f.generation_id)) {
+		KUNIT_FAIL(test, "failed to publish a second authority");
+		goto out;
+	}
+	sid = nfsd_ffv2_test_stateid(1, 0x21, 0x22, 0x23);
+	nfsd_ffv2_test_trust_request(&trust, &sid, f.uuid, IOMODE_READ, NULL,
+				     3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_trust_install_active(f.nn, other,
+							    &trust));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &sid, &req,
+					       &result));
+
+	/* An entry bound to a different logical object. */
+	memset(wrong_uuid, 0x77, sizeof(wrong_uuid));
+	sid = nfsd_ffv2_test_stateid(1, 0x31, 0x32, 0x33);
+	nfsd_ffv2_test_trust_request(&trust, &sid, wrong_uuid, IOMODE_READ,
+				     NULL, 3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_trust_install_active(f.nn, NULL,
+							    &trust));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &sid, &req,
+					       &result));
+
+	/* Live and current, but without the profile bit CHUNK_READ names. */
+	sid = nfsd_ffv2_test_stateid(1, 0x41, 0x42, 0x43);
+	nfsd_ffv2_test_trust_request(&trust, &sid, f.uuid, IOMODE_RW, NULL,
+				     3600);
+	trust.profile_mask = NFSD_FFV2_PROFILE_WRITE_DATA;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_trust_install_active(f.nn, NULL,
+							    &trust));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &sid, &req,
+					       &result));
+
+	/*
+	 * The write profile bit held at read-only iomode.  The profile check
+	 * passes and the iomode check is what refuses it, so a read entry
+	 * cannot be spent on a write operation.
+	 */
+	sid = nfsd_ffv2_test_stateid(1, 0x51, 0x52, 0x53);
+	nfsd_ffv2_test_trust_request(&trust, &sid, f.uuid, IOMODE_READ, NULL,
+				     3600);
+	trust.profile_mask = NFSD_FFV2_PROFILE_WRITE_DATA;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_trust_install_active(f.nn, NULL,
+							    &trust));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_WRITE, &sid, &req,
+					       &result));
+
+	/* Expired. */
+	sid = nfsd_ffv2_test_stateid(1, 0x61, 0x62, 0x63);
+	nfsd_ffv2_test_trust_request(&trust, &sid, f.uuid, IOMODE_READ, NULL,
+				     -3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_trust_install_active(f.nn, NULL,
+							    &trust));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &sid, &req,
+					       &result));
+
+	/* Revoked after installation. */
+	sid = nfsd_ffv2_test_stateid(1, 0x71, 0x72, 0x73);
+	nfsd_ffv2_test_trust_request(&trust, &sid, f.uuid, IOMODE_READ, NULL,
+				     3600);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_trust_install_active(f.nn, NULL,
+							    &trust));
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_test_trust_revoke_active(f.nn, &sid));
+	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &sid, &req,
+					       &result));
+
+	/* Not one of these reached the provider. */
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&f.provider->reads));
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&f.provider->header_reads));
+
+	/* The unmodified entry still works, so nothing above disabled it. */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+out:
+	if (other) {
+		nfsd_ffv2_authority_detach(other);
+		nfsd_ffv2_authority_put(other);
+	}
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/* Build one SEQUENCE + PUTFH + CHUNK_READ compound at a given offset. */
+static size_t nfsd_ffv2_ro_compound(__be32 *request, u32 offset)
+{
+	__be32 *p = request;
+	int i;
+
+	*p++ = cpu_to_be32(0);		/* tag */
+	*p++ = cpu_to_be32(2);		/* minorversion */
+	*p++ = cpu_to_be32(3);		/* opcount */
+	*p++ = cpu_to_be32(OP_SEQUENCE);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(0);	/* sessionid */
+	*p++ = cpu_to_be32(1);		/* sequenceid */
+	*p++ = cpu_to_be32(0);		/* slotid */
+	*p++ = cpu_to_be32(0);		/* highest slotid */
+	*p++ = cpu_to_be32(1);		/* cachethis */
+	*p++ = cpu_to_be32(OP_PUTFH);
+	*p++ = cpu_to_be32(4);
+	*p++ = cpu_to_be32(0x01020304);
+	*p++ = cpu_to_be32(OP_CHUNK_READ);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(i);	/* stateid */
+	*p++ = cpu_to_be32(0);		/* offset, high word */
+	*p++ = cpu_to_be32(offset);	/* offset, low word */
+	*p++ = cpu_to_be32(1);		/* count */
+	return (char *)p - (char *)request;
+}
+
+/* Decode one such compound and hand back its FFv2 replay digest. */
+static bool nfsd_ffv2_ro_digest(struct kunit *test, u32 offset,
+				struct nfsd4_compoundargs *args)
+{
+	struct nfsd_thread_local_info *ntli;
+	struct svc_rqst *rqstp;
+	struct auth_ops auth = {
+		.flavour = RPC_AUTH_NULL,
+	};
+	struct xdr_stream xdr;
+	struct xdr_buf buf;
+	__be32 request[32];
+	size_t request_len;
+	bool decoded;
+
+	ntli = kunit_kzalloc(test, sizeof(*ntli), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	if (!ntli || !rqstp)
+		return false;
+	request_len = nfsd_ffv2_ro_compound(request, offset);
+	xdr_buf_init(&buf, request, request_len);
+	buf.len = request_len;
+	xdr_init_decode(&xdr, &buf, request, NULL);
+	rqstp->rq_argp = args;
+	rqstp->rq_private = ntli;
+	rqstp->rq_authop = &auth;
+	decoded = nfs4svc_decode_compoundargs(rqstp, &xdr);
+	if (decoded)
+		nfsd4_release_compoundargs(rqstp);
+	return decoded;
+}
+
+/*
+ * Serve one request the way a session slot does: an exact replay returns
+ * the retained result and never reaches the operation, anything else is
+ * dispatched.  This models the decision nfsd4_sequence() makes from the
+ * FFv2 request digest; the slot cache itself needs a live session and a
+ * cached reply buffer, which KUnit cannot build.
+ */
+static __be32 nfsd_ffv2_ro_serve(struct nfsd_ffv2_ro_fixture *f,
+				 const struct nfsd4_compoundargs *args,
+				 const struct nfsd4_slot *slot,
+				 const struct nfsd_ffv2_chunk_request *req,
+				 const struct nfsd_ffv2_chunk_result *retained,
+				 struct nfsd_ffv2_chunk_result *result,
+				 bool *replayed)
+{
+	if (slot->sl_ffv2_present &&
+	    nfsd4_ffv2_replay_identity_match(args, slot)) {
+		*replayed = true;
+		*result = *retained;
+		return nfs_ok;
+	}
+	*replayed = false;
+	return nfsd_ffv2_ro_operation(f, OP_CHUNK_READ, &f->stateid, req,
+				      result);
+}
+
+/*
+ * An identical read is answered from the retained result without entering
+ * the provider again; a read whose request identity differs is not, and
+ * produces its own result.
+ */
+static void nfsd_ffv2_provider_replay_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request first = { .offset = 0,
+						       .count = 1 };
+	const struct nfsd_ffv2_chunk_request second = { .offset = 2,
+							.count = 1 };
+	struct nfsd_ffv2_chunk_result retained;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd4_compoundargs *args;
+	struct nfsd_ffv2_ro_fixture f;
+	struct nfsd4_slot *slot;
+	bool replayed;
+	u64 callbacks;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	slot = kunit_kzalloc(test, sizeof(*slot), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	/* First request: decoded, dispatched, and its identity retained. */
+	if (!nfsd_ffv2_ro_digest(test, 0, args) || !args->ffv2_present ||
+	    !args->ffv2_digest_valid) {
+		KUNIT_FAIL(test, "failed to digest the first request");
+		goto out;
+	}
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_serve(&f, args, slot, &first, NULL,
+					   &retained, &replayed));
+	KUNIT_EXPECT_FALSE(test, replayed);
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	if (!retained.read.chunks) {
+		KUNIT_FAIL(test, "the first read returned no chunk array");
+		goto out;
+	}
+	KUNIT_EXPECT_EQ(test, 0x100U, retained.read.chunks[0].cr_payload_id);
+	slot->sl_ffv2_present = true;
+	memcpy(slot->sl_ffv2_digest, args->ffv2_digest,
+	       sizeof(slot->sl_ffv2_digest));
+
+	/* The same bytes again: retained result, no second callback. */
+	memset(args, 0, sizeof(*args));
+	if (!nfsd_ffv2_ro_digest(test, 0, args)) {
+		KUNIT_FAIL(test, "failed to digest the replayed request");
+		goto out;
+	}
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_serve(&f, args, slot, &first, &retained,
+					   &result, &replayed));
+	KUNIT_EXPECT_TRUE(test, replayed);
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 1, atomic_read(&f.provider->reads));
+	if (!result.read.chunks) {
+		KUNIT_FAIL(test, "the replayed read returned no chunk array");
+		goto out;
+	}
+	KUNIT_EXPECT_EQ(test, 0x100U, result.read.chunks[0].cr_payload_id);
+
+	/* A different chunk range is a different request, not a replay. */
+	memset(args, 0, sizeof(*args));
+	if (!nfsd_ffv2_ro_digest(test, 2, args)) {
+		KUNIT_FAIL(test, "failed to digest the second request");
+		goto out;
+	}
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd4_ffv2_replay_identity_match(args, slot));
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_serve(&f, args, slot, &second, &retained,
+					   &result, &replayed));
+	KUNIT_EXPECT_FALSE(test, replayed);
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 2, atomic_read(&f.provider->reads));
+	if (!result.read.chunks) {
+		KUNIT_FAIL(test, "the second read returned no chunk array");
+		goto out;
+	}
+	KUNIT_EXPECT_EQ(test, 0x102U, result.read.chunks[0].cr_payload_id);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+struct nfsd_ffv2_ro_read_ctx {
+	struct nfsd_ffv2_ro_fixture	*f;
+	struct nfsd_ffv2_chunk_request	request;
+	struct nfsd_ffv2_chunk_result	result;
+	__be32				status;
+	struct completion		done;
+};
+
+static int nfsd_ffv2_ro_read_thread(void *data)
+{
+	struct nfsd_ffv2_ro_read_ctx *ctx = data;
+
+	ctx->status = nfsd_ffv2_ro_operation(ctx->f, OP_CHUNK_READ,
+					     &ctx->f->stateid, &ctx->request,
+					     &ctx->result);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+/*
+ * Retirement overlapping an admitted read.  The read is held inside the
+ * provider, retirement is started, and it must wait: the execution
+ * admission the gate took is what it drains.  Exactly one callback runs,
+ * both complete, and nothing is left holding the generation.
+ */
+static void nfsd_ffv2_provider_retire_overlap_test(struct kunit *test)
+{
+	struct nfsd_ffv2_object_unregister_ctx retire = {};
+	struct nfsd_ffv2_ro_read_ctx read = {};
+	struct completion enter, release;
+	struct task_struct *read_task = NULL;
+	struct task_struct *retire_task = NULL;
+	struct nfsd_ffv2_ro_fixture f;
+	u8 drained[16];
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	init_completion(&enter);
+	init_completion(&release);
+	f.provider->enter = &enter;
+	f.provider->release = &release;
+
+	read.f = &f;
+	read.request.offset = 0;
+	read.request.count = 1;
+	read.status = nfserr_serverfault;
+	init_completion(&read.done);
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	read_task = kthread_run(nfsd_ffv2_ro_read_thread, &read,
+				"nfsd-ffv2-ro-read");
+	if (IS_ERR(read_task)) {
+		KUNIT_FAIL(test, "failed to start read thread: %ld",
+			   PTR_ERR(read_task));
+		read_task = NULL;
+		goto out_unstall;
+	}
+
+	/*
+	 * The read is now inside the provider, holding its admission.  A
+	 * missed signal must not return from the test function: the read
+	 * thread would be left waiting on a completion this frame owns.
+	 * Take the recovery path instead.
+	 */
+	if (!wait_for_completion_timeout(&enter, 5 * HZ)) {
+		KUNIT_FAIL(test, "read thread never entered the provider");
+		goto out_unstall;
+	}
+
+	retire.nn = f.nn;
+	retire.generation = f.generation_id;
+	memcpy(retire.object_uuid, f.uuid, sizeof(f.uuid));
+	retire.result = -EINPROGRESS;
+	init_completion(&retire.done);
+	retire_task = kthread_run(nfsd_ffv2_object_unregister_thread, &retire,
+				  "nfsd-ffv2-ro-retire");
+	if (IS_ERR(retire_task)) {
+		KUNIT_FAIL(test, "failed to start retirement thread: %ld",
+			   PTR_ERR(retire_task));
+		retire_task = NULL;
+		goto out_unstall;
+	}
+
+	/* Retirement cannot finish while the read holds its admission. */
+	KUNIT_EXPECT_EQ(test,
+			wait_for_completion_timeout(&retire.done, HZ / 2), 0UL);
+
+out_unstall:
+	/*
+	 * complete_all() rather than complete(): the release must also free
+	 * a callback that reaches the stall after this point, so no path out
+	 * of this test can leave a thread inside the provider.
+	 */
+	complete_all(&release);
+	if (read_task) {
+		KUNIT_EXPECT_NE(test,
+				wait_for_completion_timeout(&read.done, 5 * HZ),
+				0UL);
+		kthread_stop(read_task);
+		KUNIT_EXPECT_EQ(test, nfs_ok, read.status);
+	}
+	f.provider->enter = NULL;
+	f.provider->release = NULL;
+
+	/*
+	 * The read is done, but the fixture still holds the mapped
+	 * filehandle's binding admission and a reference to the published
+	 * service export.  Retirement waits for both, so release them here
+	 * and only then require it to finish.
+	 */
+	if (f.mapped) {
+		fh_put(f.mapped);
+		f.mapped = NULL;
+	}
+	if (f.published) {
+		exp_put(f.published);
+		f.published = NULL;
+	}
+	if (retire_task) {
+		KUNIT_EXPECT_NE(test,
+				wait_for_completion_timeout(&retire.done,
+							    5 * HZ),
+				0UL);
+		kthread_stop(retire_task);
+		KUNIT_EXPECT_EQ(test, 0, retire.result);
+		/* Nothing is left holding the retired generation. */
+		KUNIT_EXPECT_FALSE(test,
+				   nfsd_ffv2_test_active_object_uuid(f.nn,
+								     drained));
+	}
+	if (read_task) {
+		KUNIT_EXPECT_EQ(test, callbacks + 1,
+				nfsd_ffv2_test_provider_callbacks());
+		KUNIT_EXPECT_EQ(test, 1, atomic_read(&f.provider->reads));
+	}
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * Ordinary NFS operations are unaffected by an installed provider, and the
+ * provider is never consulted for them.  The service export still refuses
+ * ordinary operations, and an unmapped handle still has nothing to
+ * authorize.
+ */
+static void nfsd_ffv2_provider_ordinary_ops_test(struct kunit *test)
+{
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_ro_fixture f;
+	struct svc_fh *unmapped;
+	stateid_t sid;
+	u64 callbacks;
+
+	unmapped = kunit_kzalloc(test, sizeof(*unmapped), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, unmapped);
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	sid = nfsd_ffv2_test_stateid(1, 2, 3, 4);
+
+	/* Handle-positioning operations remain available on the export. */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd4_ffv2_export_policy_check(f.published, OP_PUTFH));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd4_ffv2_export_policy_check(f.published,
+						       OP_PUTROOTFH));
+	/* Ordinary data operations are still refused there. */
+	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
+			nfsd4_ffv2_export_policy_check(f.published, OP_READ));
+	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
+			nfsd4_ffv2_export_policy_check(f.published, OP_WRITE));
+	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
+			nfsd4_ffv2_export_policy_check(f.published, OP_GETATTR));
+
+	/* An ordinary operation has no FFv2 profile at all. */
+	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
+			nfsd_ffv2_test_validate_operation(f.rqstp, unmapped,
+							  f.session, OP_READ,
+							  &sid, NULL,
+							  &admission));
+	/* An FFv2 operation on an unmapped handle stops at the binding. */
+	KUNIT_EXPECT_EQ(test, nfserr_stale,
+			nfsd_ffv2_test_validate_operation(f.rqstp, unmapped,
+							  f.session,
+							  OP_CHUNK_READ, &sid,
+							  NULL, &admission));
+
+	/* None of that consulted the provider. */
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&f.provider->reads));
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&f.provider->header_reads));
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * Provider installation is rejected when incomplete or already held, and
+ * removing the provider closes the boundary again.  Building and tearing
+ * the whole fixture down twice must leave the namespace anchor exactly
+ * where it started.
+ */
+static void nfsd_ffv2_provider_install_cycle_test(struct kunit *test)
+{
+	static const struct nfsd_ffv2_provider_ops partial = {
+		.chunk_read = nfsd_ffv2_ro_chunk_read,
+	};
+	const struct nfsd_ffv2_provider_ops *ops = &nfsd_ffv2_ro_provider_ops;
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	unsigned int anchor_before;
+	u64 callbacks;
+	int pass;
+
+	/* No namespace, no provider. */
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_test_provider_install(NULL, ops, NULL));
+
+	for (pass = 0; pass < 2; pass++) {
+		if (!nfsd_ffv2_ro_fixture_init(test, &f)) {
+			nfsd_ffv2_ro_fixture_exit(test, &f);
+			return;
+		}
+		anchor_before = nfsd_ffv2_test_anchor_refcount(f.nn);
+
+		/* An incomplete operations vector is never installed. */
+		KUNIT_EXPECT_EQ(test, -EINVAL,
+				nfsd_ffv2_test_provider_install(f.nn, NULL,
+								NULL));
+		KUNIT_EXPECT_EQ(test, -EINVAL,
+				nfsd_ffv2_test_provider_install(f.nn, &partial,
+								NULL));
+
+		/* Only one provider at a time, per namespace. */
+		KUNIT_EXPECT_EQ(test, -EBUSY,
+				nfsd_ffv2_test_provider_install(f.nn, ops,
+								f.provider));
+
+		callbacks = nfsd_ffv2_test_provider_callbacks();
+		KUNIT_EXPECT_EQ(test, nfs_ok,
+				nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ,
+						       &f.stateid, &req,
+						       &result));
+		KUNIT_EXPECT_EQ(test, callbacks + 1,
+				nfsd_ffv2_test_provider_callbacks());
+
+		/* Removed: the boundary is closed again, with no callback. */
+		nfsd_ffv2_test_provider_remove(f.nn);
+		f.provider_installed = false;
+		callbacks = nfsd_ffv2_test_provider_callbacks();
+		KUNIT_EXPECT_EQ(test, nfserr_notsupp,
+				nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ,
+						       &f.stateid, &req,
+						       &result));
+		KUNIT_EXPECT_EQ(test, callbacks,
+				nfsd_ffv2_test_provider_callbacks());
+
+		/* And installable again. */
+		KUNIT_EXPECT_EQ(test, 0,
+				nfsd_ffv2_test_provider_install(f.nn, ops,
+								f.provider));
+		f.provider_installed = true;
+		KUNIT_EXPECT_EQ(test, nfs_ok,
+				nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ,
+						       &f.stateid, &req,
+						       &result));
+
+		/* The admission taken for each read was released. */
+		KUNIT_EXPECT_EQ(test, anchor_before,
+				nfsd_ffv2_test_anchor_refcount(f.nn));
+		nfsd_ffv2_ro_fixture_exit(test, &f);
+	}
+}
+
+/*
+ * The harness's own recovery path.  A callback that never announces itself
+ * must not strand the thread running it: the cleanup path releases the
+ * provider unconditionally and joins the thread, so a lost entry signal
+ * costs a failed expectation rather than a hung suite and a thread left
+ * waiting on completions this stack frame owns.
+ */
+static void nfsd_ffv2_provider_stall_recovery_test(struct kunit *test)
+{
+	struct nfsd_ffv2_ro_read_ctx read = {};
+	struct completion enter, release;
+	struct task_struct *read_task = NULL;
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	init_completion(&enter);
+	init_completion(&release);
+	/* Injected fault: the callback stalls but never signals entry. */
+	f.provider->enter = NULL;
+	f.provider->release = &release;
+
+	read.f = &f;
+	read.request.offset = 0;
+	read.request.count = 1;
+	read.status = nfserr_serverfault;
+	init_completion(&read.done);
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	read_task = kthread_run(nfsd_ffv2_ro_read_thread, &read,
+				"nfsd-ffv2-ro-read");
+	if (IS_ERR(read_task)) {
+		KUNIT_FAIL(test, "failed to start read thread: %ld",
+			   PTR_ERR(read_task));
+		read_task = NULL;
+		goto out_unstall;
+	}
+
+	/* The signal never arrives, exactly as a lost wakeup would look. */
+	KUNIT_EXPECT_EQ(test, wait_for_completion_timeout(&enter, HZ / 2), 0UL);
+
+out_unstall:
+	complete_all(&release);
+	if (read_task) {
+		/* Recovered: the held callback returns and the thread joins. */
+		KUNIT_EXPECT_NE(test,
+				wait_for_completion_timeout(&read.done, 5 * HZ),
+				0UL);
+		kthread_stop(read_task);
+		KUNIT_EXPECT_EQ(test, nfs_ok, read.status);
+		KUNIT_EXPECT_EQ(test, callbacks + 1,
+				nfsd_ffv2_test_provider_callbacks());
+	}
+	f.provider->enter = NULL;
+	f.provider->release = NULL;
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+struct nfsd_ffv2_ro_remove_ctx {
+	struct nfsd_net		*nn;
+	struct completion	done;
+};
+
+static int nfsd_ffv2_ro_remove_thread(void *data)
+{
+	struct nfsd_ffv2_ro_remove_ctx *ctx = data;
+
+	nfsd_ffv2_test_provider_remove(ctx->nn);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+/*
+ * A provider that owns its operations vector.  A real provider allocates
+ * the vector together with its state and frees both once it has been
+ * removed, so removal must not return while a callback is still inside
+ * them.  The read is held in the callback, removal is started, and it must
+ * block until the callback is released; only then are the vector and the
+ * state freed.
+ */
+static void nfsd_ffv2_provider_dynamic_free_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_ro_provider *dynamic = NULL;
+	struct nfsd_ffv2_provider_ops *ops = NULL;
+	struct nfsd_ffv2_ro_remove_ctx remove;
+	struct nfsd_ffv2_ro_read_ctx read = {};
+	struct task_struct *remove_task = NULL;
+	struct task_struct *read_task = NULL;
+	struct nfsd_ffv2_chunk_result result;
+	struct completion enter, release;
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	ops = kmalloc_obj(*ops, GFP_KERNEL);
+	dynamic = kmalloc_obj(*dynamic, GFP_KERNEL);
+	if (!ops || !dynamic) {
+		KUNIT_FAIL(test, "failed to allocate a dynamic provider");
+		goto out_free;
+	}
+	*ops = nfsd_ffv2_ro_provider_ops;
+	nfsd_ffv2_ro_provider_init(dynamic);
+	dynamic->object = f.provider->object;
+
+	/* Swap the fixture's static provider for the caller-owned one. */
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic)) {
+		KUNIT_FAIL(test, "failed to install the dynamic provider");
+		goto out_free;
+	}
+	f.provider_installed = true;
+
+	init_completion(&enter);
+	init_completion(&release);
+	dynamic->enter = &enter;
+	dynamic->release = &release;
+
+	read.f = &f;
+	read.request.offset = 0;
+	read.request.count = 1;
+	read.status = nfserr_serverfault;
+	init_completion(&read.done);
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	read_task = kthread_run(nfsd_ffv2_ro_read_thread, &read,
+				"nfsd-ffv2-ro-read");
+	if (IS_ERR(read_task)) {
+		KUNIT_FAIL(test, "failed to start read thread: %ld",
+			   PTR_ERR(read_task));
+		read_task = NULL;
+		goto out_unstall;
+	}
+	if (!wait_for_completion_timeout(&enter, 5 * HZ)) {
+		KUNIT_FAIL(test, "read thread never entered the provider");
+		goto out_unstall;
+	}
+
+	remove.nn = f.nn;
+	init_completion(&remove.done);
+	remove_task = kthread_run(nfsd_ffv2_ro_remove_thread, &remove,
+				  "nfsd-ffv2-ro-remove");
+	if (IS_ERR(remove_task)) {
+		KUNIT_FAIL(test, "failed to start removal thread: %ld",
+			   PTR_ERR(remove_task));
+		remove_task = NULL;
+		goto out_unstall;
+	}
+
+	/* Removal cannot return while the callback is inside the vector. */
+	KUNIT_EXPECT_EQ(test,
+			wait_for_completion_timeout(&remove.done, HZ / 2), 0UL);
+
+out_unstall:
+	complete_all(&release);
+	if (read_task) {
+		KUNIT_EXPECT_NE(test,
+				wait_for_completion_timeout(&read.done, 5 * HZ),
+				0UL);
+		kthread_stop(read_task);
+		KUNIT_EXPECT_EQ(test, nfs_ok, read.status);
+		KUNIT_EXPECT_EQ(test, callbacks + 1,
+				nfsd_ffv2_test_provider_callbacks());
+		KUNIT_EXPECT_EQ(test, 1, atomic_read(&dynamic->reads));
+	}
+	if (remove_task) {
+		/* Released, so removal may finish and the vector is idle. */
+		KUNIT_EXPECT_NE(test,
+				wait_for_completion_timeout(&remove.done,
+							    5 * HZ),
+				0UL);
+		kthread_stop(remove_task);
+		f.provider_installed = false;
+	}
+	if (dynamic) {
+		dynamic->enter = NULL;
+		dynamic->release = NULL;
+	}
+out_free:
+	/*
+	 * Close the boundary before the vector and the state go away: after
+	 * this the provider cannot be entered, so freeing them is safe.
+	 */
+	if (f.provider_installed) {
+		nfsd_ffv2_test_provider_remove(f.nn);
+		f.provider_installed = false;
+	}
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfserr_notsupp,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+	kfree(dynamic);
+	kfree(ops);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * Fixture construction's own timeout path.  Publication is a production
+ * transition that cannot be cancelled, so construction must never return
+ * while the worker can still reach the storage it was handed.  Force the
+ * wait to expire against a worker that is provably still running, and
+ * require the fixture to come out whole: the worker joined, the generation
+ * it published recorded, and an authorized read still served.
+ */
+static void nfsd_ffv2_provider_publish_timeout_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+
+	/*
+	 * One jiffy against a worker that sleeps for longer than that wait
+	 * whatever HZ is, so the timeout branch is always the one taken.
+	 */
+	if (!nfsd_ffv2_ro_fixture_init_wait(test, &f, 1, true))
+		goto out;
+
+	KUNIT_EXPECT_TRUE(test, f.publish_timed_out);
+	/* Waited out rather than abandoned, so publication still landed. */
+	KUNIT_EXPECT_NE(test, 0ULL, f.generation_id);
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/* A provider that claims more chunks than it was asked for. */
+static __be32 nfsd_ffv2_ro_overcount_read(void *opaque,
+					  const struct nfsd_ffv2_object *object,
+					  const struct nfsd_ffv2_chunk_request *req,
+					  struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_ro_provider *provider = opaque;
+
+	atomic_inc(&provider->reads);
+	result->count = req->count + 1;
+	result->read.chunks = provider->chunks;
+	return nfs_ok;
+}
+
+/* A provider that reports chunks but hands back no array. */
+static __be32 nfsd_ffv2_ro_empty_read(void *opaque,
+				      const struct nfsd_ffv2_object *object,
+				      const struct nfsd_ffv2_chunk_request *req,
+				      struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_ro_provider *provider = opaque;
+
+	atomic_inc(&provider->reads);
+	result->count = 1;
+	result->read.chunks = NULL;
+	return nfs_ok;
+}
+
+/* A header read missing one of its five co-indexed arrays. */
+static __be32
+nfsd_ffv2_ro_partial_header_read(void *opaque,
+				 const struct nfsd_ffv2_object *object,
+				 const struct nfsd_ffv2_chunk_request *req,
+				 struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_ro_provider *provider = opaque;
+
+	atomic_inc(&provider->header_reads);
+	result->count = 1;
+	result->header.status = provider->status;
+	result->header.locked = provider->locked;
+	result->header.owners = provider->owners;
+	result->header.guards = provider->guards;
+	result->header.predecessors = NULL;
+	return nfs_ok;
+}
+
+/*
+ * The boundary's postcondition on provider output.  A result that claims
+ * more chunks than were requested, or claims chunks without the arrays an
+ * encoder would walk, is refused with NFS4ERR_SERVERFAULT and zeroed, so a
+ * later encoder never sees a cardinality it cannot trust.  The callback
+ * still ran in each case: this is the boundary rejecting the answer, not
+ * the gate refusing the request.
+ */
+static void nfsd_ffv2_provider_malformed_result_test(struct kunit *test)
+{
+	static const struct nfsd_ffv2_provider_ops overcount = {
+		.chunk_read		= nfsd_ffv2_ro_overcount_read,
+		.chunk_header_read	= nfsd_ffv2_ro_chunk_header_read,
+	};
+	static const struct nfsd_ffv2_provider_ops empty = {
+		.chunk_read		= nfsd_ffv2_ro_empty_read,
+		.chunk_header_read	= nfsd_ffv2_ro_chunk_header_read,
+	};
+	static const struct nfsd_ffv2_provider_ops partial = {
+		.chunk_read		= nfsd_ffv2_ro_chunk_read,
+		.chunk_header_read	= nfsd_ffv2_ro_partial_header_read,
+	};
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	/* More chunks than asked for. */
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, &overcount, f.provider)) {
+		KUNIT_FAIL(test, "failed to install the overcount provider");
+		goto out;
+	}
+	f.provider_installed = true;
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	/* Refused results are zeroed, not passed through. */
+	KUNIT_EXPECT_EQ(test, 0U, result.count);
+	KUNIT_EXPECT_NULL(test, result.read.chunks);
+
+	/* Chunks claimed with no array behind them. */
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, &empty, f.provider)) {
+		KUNIT_FAIL(test, "failed to install the empty provider");
+		goto out;
+	}
+	f.provider_installed = true;
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0U, result.count);
+
+	/* A header read missing one of its five arrays. */
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, &partial, f.provider)) {
+		KUNIT_FAIL(test, "failed to install the partial provider");
+		goto out;
+	}
+	f.provider_installed = true;
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_HEADER_READ,
+					       &f.stateid, &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0U, result.count);
+	KUNIT_EXPECT_NULL(test, result.header.predecessors);
+
+	/* A well-formed result is still served. */
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, &nfsd_ffv2_ro_provider_ops,
+					    f.provider)) {
+		KUNIT_FAIL(test, "failed to reinstall the fixture provider");
+		goto out;
+	}
+	f.provider_installed = true;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, 1U, result.count);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * The stale-binding negative, run rather than reasoned about.
+ *
+ * A namespace holds at most one generation at a time: the generation gate
+ * refuses a new one while any is pending, active, or retiring, so a
+ * binding can never be caught against a *newer* active generation.  The
+ * window where a held binding stops being current is retirement, which
+ * clears the active generation and hides the object before it drains the
+ * admissions that binding holds.  Read through the binding inside that
+ * window: the gate must refuse it as stale, ahead of the boundary, with
+ * the provider never entered.
+ */
+static void nfsd_ffv2_provider_retired_generation_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_object_unregister_ctx retire = {};
+	struct task_struct *retire_task = NULL;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	u8 drained[16];
+	u64 callbacks;
+	int waited;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	/* Current, so the read is served. */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+
+	retire.nn = f.nn;
+	retire.generation = f.generation_id;
+	memcpy(retire.object_uuid, f.uuid, sizeof(f.uuid));
+	retire.result = -EINPROGRESS;
+	init_completion(&retire.done);
+	retire_task = kthread_run(nfsd_ffv2_object_unregister_thread, &retire,
+				  "nfsd-ffv2-ro-retire");
+	if (IS_ERR(retire_task)) {
+		KUNIT_FAIL(test, "failed to start retirement thread: %ld",
+			   PTR_ERR(retire_task));
+		retire_task = NULL;
+		goto out;
+	}
+
+	/*
+	 * Retirement parks draining the admissions the fixture holds, which
+	 * is after it has cleared the active generation.  Wait for that,
+	 * rather than for a duration, so the read below lands in the window.
+	 */
+	for (waited = 0; waited < 250; waited++) {
+		if (!nfsd_ffv2_test_active_object_uuid(f.nn, drained))
+			break;
+		msleep(20);
+	}
+	if (nfsd_ffv2_test_active_object_uuid(f.nn, drained)) {
+		KUNIT_FAIL(test,
+			   "retirement never cleared the active generation");
+		goto out_drain;
+	}
+
+	/* Same handle, same stateid: the generation moved underneath it. */
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfserr_stale,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, nfserr_stale,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_HEADER_READ,
+					       &f.stateid, &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+
+out_drain:
+	/* Release what retirement is draining, then require it to finish. */
+	if (f.mapped) {
+		fh_put(f.mapped);
+		f.mapped = NULL;
+	}
+	if (f.published) {
+		exp_put(f.published);
+		f.published = NULL;
+	}
+	KUNIT_EXPECT_NE(test,
+			wait_for_completion_timeout(&retire.done, 5 * HZ), 0UL);
+	kthread_stop(retire_task);
+	KUNIT_EXPECT_EQ(test, 0, retire.result);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * Run one authorized operation but keep the execution admission, so the
+ * caller stands where a wire encoder would: holding a result whose arrays
+ * are still borrowed from the provider.  The caller must complete the
+ * admission.
+ */
+static __be32 nfsd_ffv2_ro_operation_hold(struct nfsd_ffv2_ro_fixture *f,
+					  u32 opnum,
+					  const struct nfsd_ffv2_chunk_request *req,
+					  struct nfsd_ffv2_chunk_result *result,
+					  struct nfsd_ffv2_admission *admission)
+{
+	__be32 status;
+
+	status = nfsd_ffv2_test_validate_operation(f->rqstp, f->mapped,
+						   f->session, opnum,
+						   &f->stateid, NULL,
+						   admission);
+	if (status)
+		return status;
+	return nfsd_ffv2_provider_probe(f->rqstp, f->mapped, opnum, req,
+					result, admission);
+}
+
+/*
+ * The result-storage contract, held rather than documented.  A result's
+ * arrays are borrowed from the provider, and the caller may still be
+ * reading them after the callback has returned -- which is exactly where a
+ * wire encoder will run.  Removal must therefore block until the execution
+ * admission completes, not merely until the callback returns.  The
+ * provider here owns its operations vector and state, so if removal
+ * returned early the encoder's arrays would be freed underneath it.
+ */
+static void nfsd_ffv2_provider_result_lifetime_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 2 };
+	struct nfsd_ffv2_ro_provider *dynamic = NULL;
+	struct nfsd_ffv2_provider_ops *ops = NULL;
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_ro_remove_ctx remove;
+	struct task_struct *remove_task = NULL;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	bool held = false;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	ops = kmalloc_obj(*ops, GFP_KERNEL);
+	dynamic = kmalloc_obj(*dynamic, GFP_KERNEL);
+	if (!ops || !dynamic) {
+		KUNIT_FAIL(test, "failed to allocate a dynamic provider");
+		goto out_free;
+	}
+	*ops = nfsd_ffv2_ro_provider_ops;
+	nfsd_ffv2_ro_provider_init(dynamic);
+	dynamic->object = f.provider->object;
+
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic)) {
+		KUNIT_FAIL(test, "failed to install the dynamic provider");
+		goto out_free;
+	}
+	f.provider_installed = true;
+
+	/* The callback has returned; the admission is still held. */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation_hold(&f, OP_CHUNK_READ, &req,
+						    &result, &admission));
+	held = true;
+	KUNIT_EXPECT_EQ(test, 2U, result.count);
+	if (!result.read.chunks) {
+		KUNIT_FAIL(test, "read returned no chunk array");
+		goto out_complete;
+	}
+
+	remove.nn = f.nn;
+	init_completion(&remove.done);
+	remove_task = kthread_run(nfsd_ffv2_ro_remove_thread, &remove,
+				  "nfsd-ffv2-ro-remove");
+	if (IS_ERR(remove_task)) {
+		KUNIT_FAIL(test, "failed to start removal thread: %ld",
+			   PTR_ERR(remove_task));
+		remove_task = NULL;
+		goto out_complete;
+	}
+
+	/* Removal waits for the admission, not just for the callback. */
+	KUNIT_EXPECT_EQ(test,
+			wait_for_completion_timeout(&remove.done, HZ / 2), 0UL);
+	/* And the borrowed arrays are still the provider's, still readable. */
+	KUNIT_EXPECT_EQ(test, 0x100U, result.read.chunks[0].cr_payload_id);
+	KUNIT_EXPECT_EQ(test, 0x101U, result.read.chunks[1].cr_payload_id);
+
+out_complete:
+	if (held) {
+		nfsd_ffv2_complete(&admission);
+		held = false;
+	}
+	if (remove_task) {
+		/* Completed, so removal may finish and the storage is free. */
+		KUNIT_EXPECT_NE(test,
+				wait_for_completion_timeout(&remove.done,
+							    5 * HZ),
+				0UL);
+		kthread_stop(remove_task);
+		f.provider_installed = false;
+	}
+out_free:
+	if (f.provider_installed) {
+		nfsd_ffv2_test_provider_remove(f.nn);
+		f.provider_installed = false;
+	}
+	kfree(dynamic);
+	kfree(ops);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * Namespace exit closes the provider boundary itself.  A namespace must
+ * not depend on whoever installed a provider to remove it, so the fence in
+ * nfsd_ffv2_net_pre_exit() unpublishes, drains, and frees the container.
+ * Install a caller-owned provider, deliberately hand the fixture no
+ * responsibility for it, and require the fence to have retired it by the
+ * time the namespace is gone -- after which freeing the vector is safe.
+ */
+static void nfsd_ffv2_provider_netns_fence_test(struct kunit *test)
+{
+	struct nfsd_ffv2_ro_provider *dynamic = NULL;
+	struct nfsd_ffv2_provider_ops *ops = NULL;
+	struct nfsd_ffv2_ro_fixture f;
+	bool abandoned = false;
+	u64 fenced = 0;
+	int waited;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	ops = kmalloc_obj(*ops, GFP_KERNEL);
+	dynamic = kmalloc_obj(*dynamic, GFP_KERNEL);
+	if (!ops || !dynamic) {
+		KUNIT_FAIL(test, "failed to allocate a dynamic provider");
+		goto out;
+	}
+	*ops = nfsd_ffv2_ro_provider_ops;
+	nfsd_ffv2_ro_provider_init(dynamic);
+	dynamic->object = f.provider->object;
+
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	fenced = nfsd_ffv2_test_provider_fenced();
+	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic)) {
+		KUNIT_FAIL(test, "failed to install the dynamic provider");
+		goto out;
+	}
+	/*
+	 * Left installed on purpose: provider_installed stays false, so
+	 * teardown will not remove it and only the fence can.
+	 */
+	abandoned = true;
+
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+	/*
+	 * put_net() queues the namespace's cleanup rather than running it,
+	 * and net_ns_barrier() only serialises against a pernet operation
+	 * already under way, so wait for the fence's own counter rather than
+	 * assuming teardown has happened.  This is also what makes the free
+	 * below safe: the fence has drained the container by then.
+	 */
+	for (waited = 0; abandoned && waited < 250; waited++) {
+		if (nfsd_ffv2_test_provider_fenced() > fenced)
+			break;
+		msleep(20);
+	}
+	if (abandoned)
+		KUNIT_EXPECT_EQ(test, fenced + 1,
+				nfsd_ffv2_test_provider_fenced());
+	kfree(dynamic);
+	kfree(ops);
+}
+
+/*
+ * One operation that holds its admission open on its own thread, so two
+ * can overlap with both results live at once.
+ */
+struct nfsd_ffv2_ro_hold_ctx {
+	struct nfsd_ffv2_ro_fixture	*f;
+	struct nfsd_ffv2_chunk_request	request;
+	struct nfsd_ffv2_chunk_result	result;
+	struct nfsd_ffv2_admission	admission;
+	__be32				status;
+	u32				expect_payload;
+	bool				stable;
+	struct completion		ready;
+	struct completion		release;
+	struct completion		done;
+};
+
+static int nfsd_ffv2_ro_hold_thread(void *data)
+{
+	struct nfsd_ffv2_ro_hold_ctx *ctx = data;
+
+	ctx->status = nfsd_ffv2_ro_operation_hold(ctx->f, OP_CHUNK_READ,
+						  &ctx->request, &ctx->result,
+						  &ctx->admission);
+	complete(&ctx->ready);
+	/* Both results are live from here until the test releases us. */
+	wait_for_completion(&ctx->release);
+	ctx->stable = ctx->status == nfs_ok && ctx->result.read.chunks &&
+		      ctx->result.read.chunks[0].cr_payload_id ==
+			      ctx->expect_payload;
+	nfsd_ffv2_complete(&ctx->admission);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+/*
+ * Two successful results live at once.  Holding a reference keeps the
+ * provider's storage allocated, but says nothing about whether the
+ * provider reused it: a shared scratch array overwritten by the next
+ * callback would corrupt a result whose reference is still perfectly
+ * valid.  Run two reads for different chunk ranges, keep both admissions
+ * open until both callbacks have returned, and require each result to
+ * still describe its own range.
+ *
+ * This demonstrates the property for a provider that honours it -- the
+ * fixture's arrays are filled once and never written again.  It is not a
+ * check the boundary performs; the contract in ffv2.h is what a provider
+ * has to meet, and nfsd cannot verify it without copying.
+ */
+static void nfsd_ffv2_provider_concurrent_results_test(struct kunit *test)
+{
+	struct nfsd_ffv2_ro_hold_ctx first = {};
+	struct nfsd_ffv2_ro_hold_ctx second = {};
+	struct task_struct *first_task = NULL;
+	struct task_struct *second_task = NULL;
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	first.f = &f;
+	first.request.offset = 0;
+	first.request.count = 1;
+	first.expect_payload = 0x100;
+	first.status = nfserr_serverfault;
+	init_completion(&first.ready);
+	init_completion(&first.release);
+	init_completion(&first.done);
+
+	second.f = &f;
+	second.request.offset = 2;
+	second.request.count = 1;
+	second.expect_payload = 0x102;
+	second.status = nfserr_serverfault;
+	init_completion(&second.ready);
+	init_completion(&second.release);
+	init_completion(&second.done);
+
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	first_task = kthread_run(nfsd_ffv2_ro_hold_thread, &first,
+				 "nfsd-ffv2-ro-hold1");
+	if (IS_ERR(first_task)) {
+		KUNIT_FAIL(test, "failed to start first reader: %ld",
+			   PTR_ERR(first_task));
+		first_task = NULL;
+		goto out_release;
+	}
+	second_task = kthread_run(nfsd_ffv2_ro_hold_thread, &second,
+				  "nfsd-ffv2-ro-hold2");
+	if (IS_ERR(second_task)) {
+		KUNIT_FAIL(test, "failed to start second reader: %ld",
+			   PTR_ERR(second_task));
+		second_task = NULL;
+		goto out_release;
+	}
+
+	/* Both callbacks have returned; neither admission has completed. */
+	KUNIT_EXPECT_NE(test,
+			wait_for_completion_timeout(&first.ready, 5 * HZ), 0UL);
+	KUNIT_EXPECT_NE(test,
+			wait_for_completion_timeout(&second.ready, 5 * HZ),
+			0UL);
+
+out_release:
+	complete_all(&first.release);
+	complete_all(&second.release);
+	if (first_task) {
+		KUNIT_EXPECT_NE(test,
+				wait_for_completion_timeout(&first.done,
+							    5 * HZ), 0UL);
+		kthread_stop(first_task);
+		KUNIT_EXPECT_EQ(test, nfs_ok, first.status);
+		/* Its arrays still describe chunk 0, not the other range. */
+		KUNIT_EXPECT_TRUE(test, first.stable);
+	}
+	if (second_task) {
+		KUNIT_EXPECT_NE(test,
+				wait_for_completion_timeout(&second.done,
+							    5 * HZ), 0UL);
+		kthread_stop(second_task);
+		KUNIT_EXPECT_EQ(test, nfs_ok, second.status);
+		KUNIT_EXPECT_TRUE(test, second.stable);
+	}
+	if (first_task && second_task)
+		KUNIT_EXPECT_EQ(test, callbacks + 2,
+				nfsd_ffv2_test_provider_callbacks());
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * Installation and namespace exit are one transaction.  Publication takes
+ * the anchor lock and requires NET_LIVE; namespace exit closes that state
+ * and only then drains, so there is no window where a provider is
+ * published into a namespace that will not fence it.  Drive the real exit
+ * path and require both halves: what was published beforehand is drained
+ * by the fence, and what is attempted afterwards is refused outright.
+ */
+static void nfsd_ffv2_provider_install_race_test(struct kunit *test)
+{
+	struct nfsd_ffv2_ro_provider *dynamic = NULL;
+	struct nfsd_ffv2_provider_ops *ops = NULL;
+	struct nfsd_ffv2_ro_fixture f;
+	u64 fenced;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	ops = kmalloc_obj(*ops, GFP_KERNEL);
+	dynamic = kmalloc_obj(*dynamic, GFP_KERNEL);
+	if (!ops || !dynamic) {
+		KUNIT_FAIL(test, "failed to allocate a dynamic provider");
+		goto out;
+	}
+	*ops = nfsd_ffv2_ro_provider_ops;
+	nfsd_ffv2_ro_provider_init(dynamic);
+	dynamic->object = f.provider->object;
+
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic)) {
+		KUNIT_FAIL(test, "failed to install the dynamic provider");
+		goto out;
+	}
+
+	/*
+	 * Exit drains the admissions a mapped handle holds, so release what
+	 * this fixture is holding first; the test is about the provider, not
+	 * about making retirement wait.
+	 */
+	if (f.mapped) {
+		fh_put(f.mapped);
+		f.mapped = NULL;
+	}
+	if (f.published) {
+		exp_put(f.published);
+		f.published = NULL;
+	}
+
+	fenced = nfsd_ffv2_test_provider_fenced();
+	nfsd_ffv2_net_pre_exit(f.nn);
+	/*
+	 * The namespace has exited; teardown must not stop the service
+	 * again, and there is nothing left for it to unregister.
+	 */
+	f.service_up = false;
+	f.registration_open = false;
+
+	/* Published before the close: the fence drained and freed it. */
+	KUNIT_EXPECT_EQ(test, fenced + 1, nfsd_ffv2_test_provider_fenced());
+	/* Attempted after it: refused, so nothing is left unfenced. */
+	KUNIT_EXPECT_EQ(test, -ESHUTDOWN,
+			nfsd_ffv2_test_provider_install(f.nn, ops, dynamic));
+	KUNIT_EXPECT_EQ(test, fenced + 1, nfsd_ffv2_test_provider_fenced());
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+	/* Drained by the fence and never republished, so this is safe. */
+	kfree(dynamic);
+	kfree(ops);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -3959,6 +6144,21 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_decoder_bulk_revoke_test),
 	KUNIT_CASE(nfsd_ffv2_decoder_chunk_write_test),
 	KUNIT_CASE(nfsd_ffv2_decoder_lifecycle_test),
+	KUNIT_CASE(nfsd_ffv2_provider_read_test),
+	KUNIT_CASE(nfsd_ffv2_provider_negative_test),
+	KUNIT_CASE(nfsd_ffv2_provider_replay_test),
+	KUNIT_CASE(nfsd_ffv2_provider_retire_overlap_test),
+	KUNIT_CASE(nfsd_ffv2_provider_ordinary_ops_test),
+	KUNIT_CASE(nfsd_ffv2_provider_install_cycle_test),
+	KUNIT_CASE(nfsd_ffv2_provider_stall_recovery_test),
+	KUNIT_CASE(nfsd_ffv2_provider_dynamic_free_test),
+	KUNIT_CASE(nfsd_ffv2_provider_publish_timeout_test),
+	KUNIT_CASE(nfsd_ffv2_provider_malformed_result_test),
+	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
+	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
+	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
+	KUNIT_CASE(nfsd_ffv2_provider_concurrent_results_test),
+	KUNIT_CASE(nfsd_ffv2_provider_install_race_test),
 	{}
 };
 

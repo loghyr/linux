@@ -530,5 +530,7 @@ int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn);
 u64 nfsd_ffv2_test_provider_fenced(void);
 u64 nfsd_ffv2_test_provider_callbacks(void);
+const struct nfsd_ffv2_object *
+nfsd_ffv2_test_binding_object(const struct nfsd_ffv2_binding *binding);
 
 #endif /* _NFSD_FFV2_H */
