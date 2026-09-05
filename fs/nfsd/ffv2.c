@@ -1404,12 +1404,131 @@ static bool nfsd_ffv2_binding_current(struct nfsd_net *nn,
 	return valid;
 }
 
+/* Statuses a CHUNK_READ result may report per chunk. */
+static bool nfsd_ffv2_read_status_valid(__be32 status)
+{
+	/*
+	 * NFS4ERR_NOENT is excluded rather than absent from the protocol: an
+	 * EMPTY chunk must be returned as a synthetic payload zero-filled to
+	 * the layout's chunk size, and no chunk size reaches this boundary,
+	 * so neither the length nor the fill can be checked here.
+	 */
+	return status == nfs_ok ||
+	       status == nfserr_payload_not_atomic ||
+	       status == nfserr_payload_lost;
+}
+
+/* Statuses a CHUNK_HEADER_READ result may report per chunk. */
+static bool nfsd_ffv2_header_status_valid(__be32 status)
+{
+	/*
+	 * NFS4ERR_CHUNK_LOCKED is not among them: lock state is reported
+	 * separately in the locked array so that a locked chunk still
+	 * surfaces its lifecycle state and owner.
+	 */
+	return status == nfs_ok ||
+	       status == nfserr_payload_not_atomic ||
+	       status == nfserr_noent ||
+	       status == nfserr_payload_lost;
+}
+
+/* A checksum this server can encode and the client can verify. */
+static bool nfsd_ffv2_checksum_valid(const struct nfsd_ffv2_checksum *checksum)
+{
+	return checksum->cs_algorithm == NFSD_FFV2_CHECKSUM_ALG_CRC32 &&
+	       checksum->cs_len == NFSD_FFV2_CHECKSUM_CRC32_LEN;
+}
+
 /*
- * A provider may answer with fewer chunks than were asked for, but never
- * with more, and every array an encoder would walk has to be there when it
- * says it produced something.  Checked here, on the way out of the
- * boundary, so a later encoder can trust the count and the pointers rather
- * than re-deriving whether a provider is well behaved.
+ * Per-chunk checks for a read result.  The payload bound is aggregate, so
+ * the running total is carried across elements: bounding each chunk alone
+ * would admit a full count of chunks each just under the limit.
+ */
+static bool nfsd_ffv2_read_chunks_valid(u32 count,
+					const struct nfsd_ffv2_read_chunk *chunks)
+{
+	u64 total = 0;
+	u32 i;
+
+	for (i = 0; i < count; i++) {
+		const struct nfsd_ffv2_read_chunk *chunk = &chunks[i];
+
+		if (!nfsd_ffv2_read_status_valid(chunk->cr_status))
+			return false;
+		if (!nfsd_ffv2_checksum_valid(&chunk->cr_checksum))
+			return false;
+		/* Only a committed chunk carries bytes. */
+		if (chunk->cr_status != nfs_ok) {
+			if (chunk->cr_effective_len)
+				return false;
+			continue;
+		}
+		if (chunk->cr_effective_len > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+			return false;
+		/*
+		 * A length without a pointer would be copied through NULL.
+		 * A pointer without a length is harmless and permitted.
+		 */
+		if (chunk->cr_effective_len && !chunk->cr_chunk)
+			return false;
+		total += chunk->cr_effective_len;
+	}
+	/*
+	 * Each element is bounded and the count is bounded, so the sum
+	 * cannot overflow the accumulator; only the total needs testing.
+	 */
+	return total <= NFSD_FFV2_MAX_PAYLOAD_BYTES;
+}
+
+/* Per-chunk checks for a header result. */
+static bool nfsd_ffv2_header_entries_valid(u32 count,
+					   const struct nfsd_ffv2_chunk_result *result)
+{
+	u32 i;
+
+	for (i = 0; i < count; i++) {
+		const struct nfsd_ffv2_chunk_guard *guard;
+		const struct nfsd_ffv2_retained *pred;
+
+		if (!nfsd_ffv2_header_status_valid(result->header.status[i]))
+			return false;
+
+		/* The discriminant selects a union arm on the wire. */
+		pred = &result->header.predecessors[i];
+		switch (pred->disposition) {
+		case NFSD_FFV2_RETAINED_ABSENT:
+		case NFSD_FFV2_RETAINED_PRESENT:
+		case NFSD_FFV2_RETAINED_ERRORED:
+			break;
+		default:
+			return false;
+		}
+
+		if (result->header.status[i] != nfserr_noent)
+			continue;
+		/*
+		 * An EMPTY chunk reports the all-zeros guard and holds no
+		 * retained predecessor.  Its owner is unspecified, so it is
+		 * deliberately not checked; a terminally lost chunk is a
+		 * different case and constrains neither.
+		 */
+		guard = &result->header.guards[i];
+		if (guard->cg_gen_id ||
+		    guard->cg_client_id != NFSD_FFV2_GUARD_CLIENT_ID_NONE)
+			return false;
+		if (pred->disposition != NFSD_FFV2_RETAINED_ABSENT)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * A provider may answer with fewer chunks than were asked for, but only at
+ * the end of what it holds, and never with more.  Every array an encoder
+ * would walk has to be there when it says it produced something, and every
+ * length, status and metadata invariant an encoder would rely on is checked
+ * here, on the way out of the boundary, so the encoder can trust the result
+ * rather than re-deriving whether a provider is well behaved.
  */
 static bool nfsd_ffv2_result_valid(u32 opnum,
 				   const struct nfsd_ffv2_chunk_request *request,
@@ -1417,13 +1536,25 @@ static bool nfsd_ffv2_result_valid(u32 opnum,
 {
 	if (result->count > request->count)
 		return false;
+	/*
+	 * Shortness is only ever end-of-range here: a shortfall for response
+	 * capacity is applied by bounding the request before it is made, so
+	 * a short answer that does not report EOF has no defined meaning and
+	 * would leave a client resuming at the offset it started from.
+	 */
+	if (result->count < request->count && !result->eof)
+		return false;
 	if (!result->count)
 		return true;
 	if (opnum == OP_CHUNK_READ)
-		return result->read.chunks;
-	return result->header.status && result->header.locked &&
-	       result->header.owners && result->header.guards &&
-	       result->header.predecessors;
+		return result->read.chunks &&
+		       nfsd_ffv2_read_chunks_valid(result->count,
+						   result->read.chunks);
+	if (!result->header.status || !result->header.locked ||
+	    !result->header.owners || !result->header.guards ||
+	    !result->header.predecessors)
+		return false;
+	return nfsd_ffv2_header_entries_valid(result->count, result);
 }
 
 /* Drop a callback's reference, releasing a removal waiting on the last. */

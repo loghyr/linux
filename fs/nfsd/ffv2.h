@@ -236,6 +236,30 @@ void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding);
 #define NFSD_FFV2_CHUNK_HEADER_READ_MAX	1024
 #define NFSD_FFV2_CHECKSUM_VALUE_MAX	64
 
+/*
+ * checksum_algorithm4 values.  Only CRC32 is wired: the client's verifier
+ * accepts nothing else, so a result naming another algorithm could not be
+ * consumed even if it were encoded.
+ */
+#define NFSD_FFV2_CHECKSUM_ALG_NONE	0
+#define NFSD_FFV2_CHECKSUM_ALG_CRC32	1
+
+/* Length CRC32 always produces, in bytes. */
+#define NFSD_FFV2_CHECKSUM_CRC32_LEN	4
+
+/*
+ * Aggregate bound on the concatenated payload bytes a CHUNK_READ reply may
+ * carry.  Bounds the total rather than any single chunk: a per-element check
+ * alone would admit a full count of chunks each just under the limit.
+ */
+#define NFSD_FFV2_MAX_PAYLOAD_BYTES	4194304U
+
+/*
+ * Reserved chunk_guard4 client identity.  An EMPTY chunk reports the
+ * all-zeros guard pair, which uses this value rather than a real client.
+ */
+#define NFSD_FFV2_GUARD_CLIENT_ID_NONE	0U
+
 /* chunk_owner4: the committed generation a chunk belongs to. */
 struct nfsd_ffv2_chunk_owner {
 	u64	co_cohort_id;
@@ -293,7 +317,11 @@ struct nfsd_ffv2_chunk_request {
 
 /*
  * One read result.  A provider may return fewer chunks than were asked
- * for, so @count is what it actually produced; it is never more, and the
+ * for, but only when it has run out of chunks in the requested range, and
+ * a short result MUST then set @eof: shortness has no other defined cause
+ * at this boundary, and a short result without @eof leaves a client
+ * resuming at the offset it started from.  @count is what it actually
+ * produced; it is never more, and the
  * arrays an encoder walks are present whenever @count is non-zero, both
  * checked at the boundary before this is handed back.  Every pointer here
  * is borrowed from provider-owned storage and stays valid only while the

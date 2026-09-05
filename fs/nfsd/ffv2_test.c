@@ -5532,6 +5532,111 @@ nfsd_ffv2_ro_partial_header_read(void *opaque,
  * still ran in each case: this is the boundary rejecting the answer, not
  * the gate refusing the request.
  */
+/*
+ * Every per-chunk rule the boundary enforces, exercised one at a time from
+ * a well-formed result: a rule that is only checked in combination is not
+ * checked at all.  The fixture's own arrays are edited between calls, so
+ * each case differs from a served result by exactly one field.
+ */
+static void nfsd_ffv2_provider_result_contract_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+#define RO_READ()	nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid, \
+					       &req, &result)
+#define RO_HEADER()	nfsd_ffv2_ro_operation(&f, OP_CHUNK_HEADER_READ, \
+					       &f.stateid, &req, &result)
+
+	/* The unedited result is served, so every rejection below is the edit. */
+	KUNIT_EXPECT_EQ(test, nfs_ok, RO_READ());
+	KUNIT_EXPECT_EQ(test, nfs_ok, RO_HEADER());
+
+	/* A committed chunk needs the bytes it claims. */
+	f.provider->chunks[0].cr_chunk = NULL;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_chunk = f.provider->data[0];
+
+	/* A length no chunk could hold. */
+	f.provider->chunks[0].cr_effective_len = NFSD_FFV2_MAX_PAYLOAD_BYTES + 1;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_effective_len = NFSD_FFV2_RO_CHUNK_SIZE;
+
+	/* A checksum this server cannot encode. */
+	f.provider->chunks[0].cr_checksum.cs_len = 8;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_checksum.cs_len = 4;
+	f.provider->chunks[0].cr_checksum.cs_algorithm = NFSD_FFV2_CHECKSUM_ALG_NONE;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_checksum.cs_algorithm = NFSD_FFV2_CHECKSUM_ALG_CRC32;
+
+	/* Terminally lost carries no bytes, and is refused if it claims any. */
+	f.provider->chunks[0].cr_status = nfserr_payload_lost;
+	f.provider->chunks[0].cr_effective_len = 0;
+	KUNIT_EXPECT_EQ(test, nfs_ok, RO_READ());
+	f.provider->chunks[0].cr_effective_len = NFSD_FFV2_RO_CHUNK_SIZE;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+
+	/* An operation-level status is not a per-chunk status. */
+	f.provider->chunks[0].cr_status = nfserr_acces;
+	f.provider->chunks[0].cr_effective_len = 0;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_status = nfserr_delay;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+
+	/* EMPTY needs a synthetic payload this slice cannot verify. */
+	f.provider->chunks[0].cr_status = nfserr_noent;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_status = nfs_ok;
+	f.provider->chunks[0].cr_effective_len = NFSD_FFV2_RO_CHUNK_SIZE;
+
+	/* Lock state is reported beside the status, never inside it. */
+	f.provider->status[0] = nfserr_chunk_locked;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_HEADER());
+
+	/* An in-progress generation is a legal header status. */
+	f.provider->status[0] = nfserr_payload_not_atomic;
+	KUNIT_EXPECT_EQ(test, nfs_ok, RO_HEADER());
+
+	/* EMPTY reports the all-zeros guard and holds no predecessor. */
+	f.provider->status[0] = nfserr_noent;
+	f.provider->guards[0].cg_gen_id = 0;
+	f.provider->guards[0].cg_client_id = NFSD_FFV2_GUARD_CLIENT_ID_NONE;
+	KUNIT_EXPECT_EQ(test, nfs_ok, RO_HEADER());
+	f.provider->guards[0].cg_gen_id = 1;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_HEADER());
+	f.provider->guards[0].cg_gen_id = 0;
+	f.provider->guards[0].cg_client_id = 1;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_HEADER());
+	f.provider->guards[0].cg_client_id = NFSD_FFV2_GUARD_CLIENT_ID_NONE;
+	f.provider->predecessors[0].disposition = NFSD_FFV2_RETAINED_PRESENT;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_HEADER());
+
+	/*
+	 * A terminally lost chunk constrains neither: its metadata still
+	 * names the last retained generation where one is held, so the
+	 * EMPTY rules must not be applied to it.
+	 */
+	f.provider->status[0] = nfserr_payload_lost;
+	f.provider->guards[0].cg_gen_id = 7;
+	f.provider->guards[0].cg_client_id = 9;
+	KUNIT_EXPECT_EQ(test, nfs_ok, RO_HEADER());
+
+	/* A discriminant that selects no union arm. */
+	f.provider->predecessors[0].disposition =
+		(enum nfsd_ffv2_retained_disposition)3;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_HEADER());
+
+#undef RO_READ
+#undef RO_HEADER
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
 static void nfsd_ffv2_provider_malformed_result_test(struct kunit *test)
 {
 	static const struct nfsd_ffv2_provider_ops overcount = {
@@ -6154,6 +6259,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_dynamic_free_test),
 	KUNIT_CASE(nfsd_ffv2_provider_publish_timeout_test),
 	KUNIT_CASE(nfsd_ffv2_provider_malformed_result_test),
+	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
