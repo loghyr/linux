@@ -5562,6 +5562,160 @@ nfsd_ffv2_ro_partial_header_read(void *opaque,
  * checked at all.  The fixture's own arrays are edited between calls, so
  * each case differs from a served result by exactly one field.
  */
+/* Encode one reply into a private buffer and hand back its length. */
+static int nfsd_ffv2_ro_encode(struct kunit *test, union nfsd4_op_u *u,
+			       bool header, __be32 **out)
+{
+	struct xdr_stream xdr;
+	struct xdr_buf buf;
+	__be32 *page;
+	__be32 status;
+
+	page = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+	/* An empty head the stream will fill, not a buffer already holding. */
+	memset(&buf, 0, sizeof(buf));
+	buf.head[0].iov_base = page;
+	buf.head[0].iov_len = 0;
+	buf.buflen = PAGE_SIZE;
+	xdr_init_encode(&xdr, &buf, page, NULL);
+	status = header ? nfsd_ffv2_test_encode_chunk_header_read(&xdr, u) :
+			  nfsd_ffv2_test_encode_chunk_read(&xdr, u);
+	if (status != nfs_ok)
+		return -EIO;
+	*out = page;
+	return buf.len;
+}
+
+/*
+ * The encoded shape of a read reply.  A reply can be structurally right and
+ * still wrong on the wire, so this checks the bytes: that each payload is
+ * padded on its own rather than the concatenation being padded once, that
+ * the padding is zeroed, and that an entirely empty result encodes without
+ * a payload block to point into.
+ */
+static void nfsd_ffv2_encode_read_test(struct kunit *test)
+{
+	static const u32 lens[] = { 1, 2, 3, 4 };
+	struct nfsd4_chunk_read_ent ents[ARRAY_SIZE(lens)] = {};
+	u8 payload[ARRAY_SIZE(lens) * 4];
+	union nfsd4_op_u u = {};
+	u32 expect, off = 0;
+	__be32 *p;
+	int len;
+	u32 i;
+
+	for (i = 0; i < ARRAY_SIZE(lens); i++) {
+		memset(payload + off, 0xc0 + i, lens[i]);
+		ents[i].cre_checksum.cs_algorithm = NFSD_FFV2_CHECKSUM_ALG_CRC32;
+		ents[i].cre_checksum.cs_len = NFSD_FFV2_CHECKSUM_CRC32_LEN;
+		ents[i].cre_effective_len = lens[i];
+		ents[i].cre_payload_off = off;
+		ents[i].cre_status = nfs_ok;
+		off += lens[i];
+	}
+	u.chunk_read.cra_eof = true;
+	u.chunk_read.cra_nchunks = ARRAY_SIZE(lens);
+	u.chunk_read.cra_chunks = ents;
+	u.chunk_read.cra_payload = payload;
+	u.chunk_read.cra_payload_len = off;
+
+	len = nfsd_ffv2_ro_encode(test, &u, false, &p);
+	KUNIT_ASSERT_GT(test, len, 0);
+
+	/*
+	 * eof, the outer count, then each entry: fourteen words of metadata
+	 * and a payload padded to a four-byte boundary by itself.  Ten bytes
+	 * of payload become sixteen, not twelve.
+	 */
+	expect = 2 * XDR_UNIT;
+	for (i = 0; i < ARRAY_SIZE(lens); i++)
+		expect += NFSD4_FFV2_TEST_READ_ENT_WORDS * XDR_UNIT +
+			  xdr_align_size(lens[i]);
+	KUNIT_EXPECT_EQ(test, expect, (u32)len);
+
+	KUNIT_EXPECT_EQ(test, 1U, be32_to_cpu(p[0]));	/* crr_eof */
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(lens), be32_to_cpu(p[1]));
+
+	/* Walk the entries and check each payload's length, bytes and pad. */
+	p += 2;
+	for (i = 0; i < ARRAY_SIZE(lens); i++) {
+		const u8 *bytes;
+		u32 pad;
+
+		/* checksum algorithm, checksum length, checksum value word */
+		KUNIT_EXPECT_EQ(test, NFSD_FFV2_CHECKSUM_ALG_CRC32,
+				be32_to_cpu(p[0]));
+		KUNIT_EXPECT_EQ(test, NFSD_FFV2_CHECKSUM_CRC32_LEN,
+				be32_to_cpu(p[1]));
+		p += NFSD4_FFV2_TEST_READ_ENT_WORDS - 1;
+		KUNIT_EXPECT_EQ(test, lens[i], be32_to_cpu(p[0]));
+		bytes = (const u8 *)&p[1];
+		KUNIT_EXPECT_EQ(test, 0xc0 + i, bytes[0]);
+		for (pad = lens[i]; pad < xdr_align_size(lens[i]); pad++)
+			KUNIT_EXPECT_EQ(test, 0, bytes[pad]);
+		p += 1 + xdr_align_size(lens[i]) / XDR_UNIT;
+	}
+
+	/* A result of nothing but empty chunks allocates no payload block. */
+	memset(ents, 0, sizeof(ents));
+	ents[0].cre_status = nfserr_payload_lost;
+	ents[0].cre_checksum.cs_algorithm = NFSD_FFV2_CHECKSUM_ALG_CRC32;
+	ents[0].cre_checksum.cs_len = NFSD_FFV2_CHECKSUM_CRC32_LEN;
+	u.chunk_read.cra_nchunks = 1;
+	u.chunk_read.cra_payload = NULL;
+	u.chunk_read.cra_payload_len = 0;
+	len = nfsd_ffv2_ro_encode(test, &u, false, &p);
+	KUNIT_ASSERT_GT(test, len, 0);
+	KUNIT_EXPECT_EQ(test,
+			2 * XDR_UNIT + NFSD4_FFV2_TEST_READ_ENT_WORDS * XDR_UNIT,
+			(u32)len);
+	KUNIT_EXPECT_EQ(test, 0U,
+			be32_to_cpu(p[2 + NFSD4_FFV2_TEST_READ_ENT_WORDS - 1]));
+}
+
+/*
+ * The encoded shape of a header reply: five arrays, each carrying its own
+ * count, and an absent predecessor encoding its discriminant alone.
+ */
+static void nfsd_ffv2_encode_header_test(struct kunit *test)
+{
+	struct nfsd4_chunk_header_ent ents[2] = {};
+	union nfsd4_op_u u = {};
+	__be32 *p;
+	int len;
+
+	ents[0].che_status = nfs_ok;
+	ents[0].che_predecessor.disposition = NFSD_FFV2_RETAINED_ABSENT;
+	ents[1].che_status = nfserr_payload_lost;
+	ents[1].che_predecessor.disposition = NFSD_FFV2_RETAINED_PRESENT;
+	ents[1].che_predecessor.rp_owner.co_client_id = 5;
+	u.chunk_header_read.chrr_eof = false;
+	u.chunk_header_read.chrr_nents = ARRAY_SIZE(ents);
+	u.chunk_header_read.chrr_ents = ents;
+
+	len = nfsd_ffv2_ro_encode(test, &u, true, &p);
+	KUNIT_ASSERT_GT(test, len, 0);
+
+	/*
+	 * eof, then status, locked, owners, guards and predecessors, each
+	 * with a count of its own.  The absent arm is one word; the present
+	 * arm carries an owner triple as well.
+	 */
+	KUNIT_EXPECT_EQ(test, (1 + 5) * XDR_UNIT + (2 + 2 + 8 + 4) * XDR_UNIT +
+			(1 + 5) * XDR_UNIT, (u32)len);
+	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(p[0]));		/* chrr_eof */
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(ents), be32_to_cpu(p[1]));
+
+	/* The predecessor array is last: absent alone, then present. */
+	p += len / XDR_UNIT - 7;
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(ents), be32_to_cpu(p[0]));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_RETAINED_ABSENT, be32_to_cpu(p[1]));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_RETAINED_PRESENT, be32_to_cpu(p[2]));
+	KUNIT_EXPECT_EQ(test, 5U, be32_to_cpu(p[5]));
+}
+
 static void nfsd_ffv2_provider_result_contract_test(struct kunit *test)
 {
 	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
@@ -6284,6 +6438,8 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_publish_timeout_test),
 	KUNIT_CASE(nfsd_ffv2_provider_malformed_result_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
+	KUNIT_CASE(nfsd_ffv2_encode_read_test),
+	KUNIT_CASE(nfsd_ffv2_encode_header_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),

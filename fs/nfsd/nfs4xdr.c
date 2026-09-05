@@ -6578,6 +6578,29 @@ nfsd4_encode_chunk_header_read(struct nfsd4_compoundres *resp, __be32 nfserr,
 	return nfs_ok;
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/*
+ * Encode a read reply straight into @xdr, without the compound the ordinary
+ * path supplies.  Only the response object and the stream are needed, so a
+ * test can hold the encoded bytes and check them.
+ */
+__be32 nfsd_ffv2_test_encode_chunk_read(struct xdr_stream *xdr,
+					union nfsd4_op_u *u)
+{
+	struct nfsd4_compoundres resp = { .xdr = xdr };
+
+	return nfsd4_encode_chunk_read(&resp, nfs_ok, u);
+}
+
+__be32 nfsd_ffv2_test_encode_chunk_header_read(struct xdr_stream *xdr,
+					       union nfsd4_op_u *u)
+{
+	struct nfsd4_compoundres resp = { .xdr = xdr };
+
+	return nfsd4_encode_chunk_header_read(&resp, nfs_ok, u);
+}
+#endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
+
 static __be32
 nfsd4_encode_noop(struct nfsd4_compoundres *resp, __be32 nfserr,
 		  union nfsd4_op_u *p)

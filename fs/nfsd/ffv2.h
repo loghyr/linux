@@ -561,4 +561,22 @@ u64 nfsd_ffv2_test_provider_callbacks(void);
 const struct nfsd_ffv2_object *
 nfsd_ffv2_test_binding_object(const struct nfsd_ffv2_binding *binding);
 
+/*
+ * Encode one read reply into @xdr from an operation's own response object.
+ * Both are defined inside the CONFIG_NFSD_FFV2_KUNIT_TEST guard in
+ * nfs4xdr.c, so neither symbol exists in an ordinary build.  They exist
+ * because the wire shape cannot otherwise be examined: KUnit cannot build
+ * a compound with a response buffer, and a reply that is structurally
+ * right can still be wrong on the wire.
+ */
+/* Words one read_chunk4 costs apart from its payload; see nfs4proc.c. */
+#define NFSD4_FFV2_TEST_READ_ENT_WORDS	14
+
+struct xdr_stream;
+union nfsd4_op_u;
+__be32 nfsd_ffv2_test_encode_chunk_read(struct xdr_stream *xdr,
+					union nfsd4_op_u *u);
+__be32 nfsd_ffv2_test_encode_chunk_header_read(struct xdr_stream *xdr,
+					       union nfsd4_op_u *u);
+
 #endif /* _NFSD_FFV2_H */
