@@ -1598,7 +1598,13 @@ static void nfsd_ffv2_provider_put(struct nfsd_ffv2_provider *provider)
  *
  * Return: true when a provider was published and has now been retired.
  */
-static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
+/*
+ * Take @nn's provider out of the registry.  A callback that has not yet
+ * found it never will; the ones already inside keep it alive until they
+ * finish, so the caller must drain what it unpublished.
+ */
+static struct nfsd_ffv2_provider *
+nfsd_ffv2_provider_unpublish(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_provider *provider;
 
@@ -1607,14 +1613,25 @@ static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
 					     lockdep_is_held(&nfsd_ffv2_registry_lock));
 	rcu_assign_pointer(nn->ffv2.provider, NULL);
 	mutex_unlock(&nfsd_ffv2_registry_lock);
-	if (!provider)
-		return false;
+	return provider;
+}
 
-	/* No further callback can find it; drain the ones that did. */
+/* Wait for the callbacks and admissions still holding @provider, then free. */
+static void nfsd_ffv2_provider_drain(struct nfsd_ffv2_provider *provider)
+{
 	synchronize_rcu();
 	nfsd_ffv2_provider_put(provider);
 	wait_for_completion(&provider->gone);
 	kfree(provider);
+}
+
+static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_provider *provider = nfsd_ffv2_provider_unpublish(nn);
+
+	if (!provider)
+		return false;
+	nfsd_ffv2_provider_drain(provider);
 	return true;
 }
 
@@ -1632,8 +1649,9 @@ static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
  * The largest CHUNK_READ reply @count chunks of @chunk_size can produce.
  * The aggregate limit bounds the concatenated payload, so it caps that
  * product alone; each payload is a separately counted opaque, so its
- * padding is a term of its own and is not absorbed by the cap.  With no
- * chunks there is no payload and no padding, so the metadata stands alone.
+ * padding is a term of its own and is not absorbed by the cap.  A request
+ * for no chunks needs no special case: both terms are zero and the
+ * metadata stands alone.
  *
  * Returns U32_MAX if the arithmetic would overflow, which no response
  * buffer can hold and so rejects the request.
@@ -1650,8 +1668,6 @@ static u32 nfsd_ffv2_read_bound(u32 count, u32 chunk_size)
 		return U32_MAX;
 	if (check_mul_overflow(total, (u64)XDR_UNIT, &total))
 		return U32_MAX;
-	if (!count)
-		return total > U32_MAX ? U32_MAX : (u32)total;
 
 	/*
 	 * An overflow here is not a reply the aggregate limit would have
@@ -1785,6 +1801,7 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	struct nfsd_ffv2_binding *binding = fhp->fh_ffv2_binding;
 	struct nfsd_ffv2_generation *generation;
 	struct nfsd_net *nn;
+	bool had_provider;
 	__be32 status;
 
 	/*
@@ -1796,6 +1813,7 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	 */
 	if (WARN_ON_ONCE(!admission))
 		return nfserr_serverfault;
+	had_provider = admission->provider;
 
 	if (opnum == OP_CHUNK_READ)
 		atomic64_inc(&nfsd_ffv2_probe_counters.read);
@@ -1830,8 +1848,13 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				    admission->provider->chunk_size : 0,
 				    request, result)) {
 		memset(result, 0, sizeof(*result));
-		/* Nothing borrows storage from a refused result. */
-		if (admission && admission->provider) {
+		/*
+		 * Nothing borrows storage from a refused result, so a
+		 * reference this call took is dropped.  One the admission
+		 * already owned stays: an earlier result still borrows from
+		 * it, and this call's failure says nothing about that one.
+		 */
+		if (!had_provider && admission->provider) {
 			nfsd_ffv2_provider_put(admission->provider);
 			admission->provider = NULL;
 		}
@@ -4499,6 +4522,23 @@ int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
  * be dropped, so no request can be running in provider code once this
  * returns and the caller may free its operations vector and state.
  */
+/*
+ * Unpublish without waiting.  A test that holds an admission cannot call
+ * the removal that drains it, because the drain would wait for the very
+ * admission the test still holds; this lets the registry slot be freed
+ * first and the drain be done once the admission has completed.
+ */
+void *nfsd_ffv2_test_provider_unpublish(struct nfsd_net *nn)
+{
+	return nfsd_ffv2_provider_unpublish(nn);
+}
+
+void nfsd_ffv2_test_provider_drain(void *handle)
+{
+	if (handle)
+		nfsd_ffv2_provider_drain(handle);
+}
+
 void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn)
 {
 	nfsd_ffv2_provider_shutdown(nn);

@@ -6438,49 +6438,78 @@ static int nfsd_ffv2_ro_hold_thread(void *data)
  * has to meet, and nfsd cannot verify it without copying.
  */
 /*
- * An admission keeps the provider it first used, so a later call on the
- * same admission is answered by it rather than by whatever is installed at
- * the time.  Both results then borrow storage the admission holds a
- * reference to, and both stay readable until it completes.
- *
- * Replacing the provider under a live admission is not reachable and so is
- * not attempted here: removal waits for the admissions already inside the
- * boundary, and installation refuses while one is published, so a
- * replacement cannot appear between two calls of one admission.  The rule
- * is kept in the code regardless, because it is what makes the second
- * call's borrowed storage safe rather than incidentally safe.
+ * An admission keeps the provider it first used.  Removal takes a provider
+ * out of the registry before it waits for the callbacks still inside, so
+ * the slot can be filled again while an older admission is live: a second
+ * call on that admission must still reach the provider it pinned, whose
+ * storage the first result borrows, rather than whatever is published now.
  */
 static void nfsd_ffv2_provider_pinned_reference_test(struct kunit *test)
 {
 	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
 	struct nfsd_ffv2_chunk_result first = {}, second = {};
 	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_ro_provider *replacement;
 	struct nfsd_ffv2_ro_fixture f;
-	u64 callbacks;
+	void *unpublished = NULL;
+	bool held = false;
 
 	if (!nfsd_ffv2_ro_fixture_init(test, &f))
 		goto out;
 
-	callbacks = nfsd_ffv2_test_provider_callbacks();
-	KUNIT_EXPECT_EQ(test, nfs_ok,
-			nfsd_ffv2_ro_operation_hold(&f, OP_CHUNK_READ, &req,
-						    &first, &admission));
+	replacement = kunit_kzalloc(test, sizeof(*replacement), GFP_KERNEL);
+	if (!replacement) {
+		KUNIT_FAIL(test, "failed to allocate the second provider");
+		goto out;
+	}
+	nfsd_ffv2_ro_provider_init(replacement);
+	replacement->object = f.object;
+	/* Distinct payload bytes, so a result names which provider served it. */
+	memset(replacement->data[0], 0xd0, NFSD_FFV2_RO_CHUNK_SIZE);
 
-	/* A second call on the same admission reaches the same provider. */
+	/* The first call pins the published provider on this admission. */
+	if (nfsd_ffv2_ro_operation_hold(&f, OP_CHUNK_READ, &req, &first,
+					&admission) != nfs_ok) {
+		KUNIT_FAIL(test, "the first call did not reach the provider");
+		goto out;
+	}
+	held = true;
+	KUNIT_EXPECT_EQ(test, 0x40, first.read.chunks[0].cr_chunk[0]);
+
+	/*
+	 * Free the registry slot without waiting: the drain would wait for
+	 * this very admission.  The provider stays alive because the
+	 * admission holds it.
+	 */
+	unpublished = nfsd_ffv2_test_provider_unpublish(f.nn);
+	f.provider_installed = false;
+	KUNIT_ASSERT_NOT_NULL(test, unpublished);
+
+	if (nfsd_ffv2_test_provider_install(f.nn, &nfsd_ffv2_ro_provider_ops,
+					    replacement,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
+		KUNIT_FAIL(test, "failed to publish the second provider");
+		goto out;
+	}
+	f.provider_installed = true;
+
+	/* The second call on this admission still reaches the first provider. */
 	KUNIT_EXPECT_EQ(test, nfs_ok,
 			nfsd_ffv2_provider_probe(f.rqstp, f.mapped,
 						 OP_CHUNK_READ, &req, &second,
 						 U32_MAX, &admission));
-	KUNIT_EXPECT_EQ(test, callbacks + 2,
-			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&replacement->reads));
 	KUNIT_EXPECT_PTR_EQ(test, first.read.chunks, second.read.chunks);
-
-	/* Both stay readable while the admission is held. */
-	KUNIT_EXPECT_EQ(test, 0x40, first.read.chunks[0].cr_chunk[0]);
 	KUNIT_EXPECT_EQ(test, 0x40, second.read.chunks[0].cr_chunk[0]);
-	nfsd_ffv2_complete(&admission);
+
+	/* Both results stay readable until the admission completes. */
+	KUNIT_EXPECT_EQ(test, 0x40, first.read.chunks[0].cr_chunk[0]);
 
 out:
+	if (held)
+		nfsd_ffv2_complete(&admission);
+	/* Only now can the provider the admission held be drained. */
+	nfsd_ffv2_test_provider_drain(unpublished);
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 

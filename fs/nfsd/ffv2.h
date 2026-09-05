@@ -576,6 +576,13 @@ int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 				    const struct nfsd_ffv2_provider_ops *ops,
 				    void *data, u32 chunk_size);
 void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn);
+/*
+ * Removal in two steps, for a test that must keep an admission alive while
+ * the registry slot is reused.  The handle must be drained once the
+ * admission has completed, or the provider is leaked.
+ */
+void *nfsd_ffv2_test_provider_unpublish(struct nfsd_net *nn);
+void nfsd_ffv2_test_provider_drain(void *handle);
 u64 nfsd_ffv2_test_provider_fenced(void);
 u64 nfsd_ffv2_test_provider_callbacks(void);
 const struct nfsd_ffv2_object *
