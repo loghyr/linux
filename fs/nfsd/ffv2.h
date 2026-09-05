@@ -567,10 +567,14 @@ bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn);
  * Install or remove @nn's read-only provider.  Both are defined inside the
  * CONFIG_NFSD_FFV2_KUNIT_TEST guard in ffv2.c, so neither symbol exists in
  * ffv2.o in an ordinary build, and there is no netlink, debugfs, or
- * syscall path to them in any build.  Removal closes @nn's boundary and
- * then waits for the callbacks already inside it; the installer owns the
- * operations vector and the state throughout and may free them once
- * removal returns.
+ * syscall path to them in any build.  Removal takes the provider out of the
+ * registry and then waits for the callbacks and admissions already holding
+ * it; the installer owns the operations vector and the state throughout and
+ * may free them once removal returns.
+ *
+ * A caller that must keep an admission alive across the removal cannot use
+ * this one, because the wait is for that admission.  Unpublish and drain
+ * separately instead.
  */
 int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 				    const struct nfsd_ffv2_provider_ops *ops,

@@ -4452,6 +4452,7 @@ u64 nfsd_ffv2_test_provider_callbacks(void)
  * @nn: the namespace the provider serves
  * @ops: read-only callbacks, which must both be supplied
  * @data: opaque provider state passed back to each callback
+ * @chunk_size: bytes in one chunk of every object this provider serves
  *
  * Only one provider may be installed per namespace.  The callbacks and the
  * state are published together, so a callback always runs against the
@@ -4514,20 +4515,6 @@ int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 	return 0;
 }
 
-/**
- * nfsd_ffv2_test_provider_remove - remove @nn's read-only provider
- * @nn: the namespace whose boundary is being closed
- *
- * Closes the boundary first, then waits for the last callback reference to
- * be dropped, so no request can be running in provider code once this
- * returns and the caller may free its operations vector and state.
- */
-/*
- * Unpublish without waiting.  A test that holds an admission cannot call
- * the removal that drains it, because the drain would wait for the very
- * admission the test still holds; this lets the registry slot be freed
- * first and the drain be done once the admission has completed.
- */
 /*
  * Give the object a filehandle is mapped to the chunk size a layout would
  * have carried, so a test can present a provider with an object it does not
@@ -4541,17 +4528,34 @@ void nfsd_ffv2_test_fh_set_chunk_size(struct svc_fh *fhp, u32 chunk_size)
 		binding->object->chunk_size = chunk_size;
 }
 
+/*
+ * Unpublish without waiting.  A caller holding an admission cannot use the
+ * removal that drains, because the drain waits for that admission; this
+ * frees the registry slot first and leaves the drain until afterwards.  The
+ * provider stays alive meanwhile because its holders still reference it.
+ */
 void *nfsd_ffv2_test_provider_unpublish(struct nfsd_net *nn)
 {
 	return nfsd_ffv2_provider_unpublish(nn);
 }
 
+/* Complete a removal begun by unpublishing, once its holders have gone. */
 void nfsd_ffv2_test_provider_drain(void *handle)
 {
 	if (handle)
 		nfsd_ffv2_provider_drain(handle);
 }
 
+/**
+ * nfsd_ffv2_test_provider_remove - remove @nn's read-only provider
+ * @nn: the namespace whose boundary is being closed
+ *
+ * Takes the provider out of the registry, then waits for the callbacks and
+ * admissions still holding it, so no request can be running in provider
+ * code once this returns and the caller may free its operations vector and
+ * state.  A caller that must keep an admission alive across the removal
+ * cannot use this, because the wait is for that admission.
+ */
 void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn)
 {
 	nfsd_ffv2_provider_shutdown(nn);

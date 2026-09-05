@@ -6481,7 +6481,15 @@ static void nfsd_ffv2_provider_pinned_reference_test(struct kunit *test)
 	 */
 	unpublished = nfsd_ffv2_test_provider_unpublish(f.nn);
 	f.provider_installed = false;
-	KUNIT_ASSERT_NOT_NULL(test, unpublished);
+	if (!unpublished) {
+		/*
+		 * Reported rather than asserted: an assertion would leave
+		 * this test case at once, and the admission it is holding
+		 * would never be completed.
+		 */
+		KUNIT_FAIL(test, "no provider was published to unpublish");
+		goto out;
+	}
 
 	if (nfsd_ffv2_test_provider_install(f.nn, &nfsd_ffv2_ro_provider_ops,
 					    replacement,
