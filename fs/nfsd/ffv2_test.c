@@ -1763,19 +1763,19 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_provider_probe(rqstp, mapped, OP_CHUNK_READ,
 						 &chunks, &chunk_result,
-						 &probe_admission),
+						 U32_MAX, &probe_admission),
 			nfserr_notsupp);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_provider_probe(rqstp, mapped,
 						 OP_CHUNK_HEADER_READ,
 						 &chunks, &chunk_result,
-						 &probe_admission),
+						 U32_MAX, &probe_admission),
 			nfserr_notsupp);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_provider_probe(rqstp, ordinary,
 						 OP_CHUNK_READ,
 						 &chunks, &chunk_result,
-						 &probe_admission),
+						 U32_MAX, &probe_admission),
 			nfserr_stale);
 
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
@@ -4501,7 +4501,8 @@ static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
 
 	f->provider->object = nfsd_ffv2_test_binding_object(f->mapped->fh_ffv2_binding);
 	if (nfsd_ffv2_test_provider_install(f->nn, &nfsd_ffv2_ro_provider_ops,
-					    f->provider)) {
+					    f->provider,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "fixture provider installation failed");
 		return false;
 	}
@@ -4535,7 +4536,7 @@ static __be32 nfsd_ffv2_ro_operation(struct nfsd_ffv2_ro_fixture *f,
 	if (status)
 		return status;
 	status = nfsd_ffv2_provider_probe(f->rqstp, f->mapped, opnum, req,
-					  result, &admission);
+					  result, U32_MAX, &admission);
 	nfsd_ffv2_complete(&admission);
 	return status;
 }
@@ -5208,7 +5209,8 @@ static void nfsd_ffv2_provider_install_cycle_test(struct kunit *test)
 
 	/* No namespace, no provider. */
 	KUNIT_EXPECT_EQ(test, -EINVAL,
-			nfsd_ffv2_test_provider_install(NULL, ops, NULL));
+			nfsd_ffv2_test_provider_install(NULL, ops, NULL,
+							NFSD_FFV2_RO_CHUNK_SIZE));
 
 	for (pass = 0; pass < 2; pass++) {
 		if (!nfsd_ffv2_ro_fixture_init(test, &f)) {
@@ -5220,15 +5222,18 @@ static void nfsd_ffv2_provider_install_cycle_test(struct kunit *test)
 		/* An incomplete operations vector is never installed. */
 		KUNIT_EXPECT_EQ(test, -EINVAL,
 				nfsd_ffv2_test_provider_install(f.nn, NULL,
-								NULL));
+								NULL,
+								NFSD_FFV2_RO_CHUNK_SIZE));
 		KUNIT_EXPECT_EQ(test, -EINVAL,
 				nfsd_ffv2_test_provider_install(f.nn, &partial,
-								NULL));
+								NULL,
+								NFSD_FFV2_RO_CHUNK_SIZE));
 
 		/* Only one provider at a time, per namespace. */
 		KUNIT_EXPECT_EQ(test, -EBUSY,
 				nfsd_ffv2_test_provider_install(f.nn, ops,
-								f.provider));
+								f.provider,
+								NFSD_FFV2_RO_CHUNK_SIZE));
 
 		callbacks = nfsd_ffv2_test_provider_callbacks();
 		KUNIT_EXPECT_EQ(test, nfs_ok,
@@ -5252,7 +5257,8 @@ static void nfsd_ffv2_provider_install_cycle_test(struct kunit *test)
 		/* And installable again. */
 		KUNIT_EXPECT_EQ(test, 0,
 				nfsd_ffv2_test_provider_install(f.nn, ops,
-								f.provider));
+								f.provider,
+								NFSD_FFV2_RO_CHUNK_SIZE));
 		f.provider_installed = true;
 		KUNIT_EXPECT_EQ(test, nfs_ok,
 				nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ,
@@ -5379,7 +5385,8 @@ static void nfsd_ffv2_provider_dynamic_free_test(struct kunit *test)
 	/* Swap the fixture's static provider for the caller-owned one. */
 	nfsd_ffv2_test_provider_remove(f.nn);
 	f.provider_installed = false;
-	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic)) {
+	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "failed to install the dynamic provider");
 		goto out_free;
 	}
@@ -5772,6 +5779,12 @@ static __be32 nfsd_ffv2_ro_compound_op(struct kunit *test,
 	if (cachethis)
 		slot->sl_flags |= NFSD4_SLOT_CACHETHIS;
 
+	/*
+	 * The buffer must never claim more room than it has: a handler that
+	 * believed otherwise would be invited to write past the end of it.
+	 */
+	if (budget > PAGE_SIZE)
+		return nfserr_jukebox;
 	f->rqstp->rq_argp = args;
 	f->rqstp->rq_resp = resp;
 	f->rqstp->rq_res.head[0].iov_base = page;
@@ -5868,25 +5881,33 @@ static void nfsd_ffv2_compound_read_capacity_test(struct kunit *test)
 	if (!nfsd_ffv2_ro_fixture_init(test, &f))
 		goto out;
 
+	/*
+	 * One chunk of the size this provider declared costs its metadata,
+	 * its bytes and its padding; a buffer smaller than that cannot hold
+	 * the reply and the request is refused before the provider is asked.
+	 */
 	u.chunk_read.cra_stateid = f.stateid;
 	u.chunk_read.cra_count = 1;
 	callbacks = nfsd_ffv2_test_provider_callbacks();
 	KUNIT_EXPECT_EQ(test, nfserr_toosmall,
 			nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_READ,
-						 1024 * 1024, false, &u));
+						 2 * XDR_UNIT, false, &u));
 	/* Refused before dispatch: the provider was never asked. */
 	KUNIT_EXPECT_EQ(test, callbacks,
 			nfsd_ffv2_test_provider_callbacks());
 	KUNIT_EXPECT_EQ(test, 0U, u.chunk_read.cra_nchunks);
 	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_payload);
 
-	/* A budget above the admitted limit is served. */
+	/*
+	 * A budget that can hold it is served, and an ordinary session is
+	 * now large enough: the bound is the chunk size the provider
+	 * declared, not the whole payload the protocol allows.
+	 */
 	memset(&u, 0, sizeof(u));
 	u.chunk_read.cra_stateid = f.stateid;
 	u.chunk_read.cra_count = 1;
 	KUNIT_EXPECT_EQ(test, nfs_ok,
 			nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_READ,
-						 NFSD_FFV2_MAX_PAYLOAD_BYTES +
 						 PAGE_SIZE, false, &u));
 	KUNIT_EXPECT_EQ(test, 1U, u.chunk_read.cra_nchunks);
 	nfsd_ffv2_test_release_op(OP_CHUNK_READ, &u);
@@ -6021,7 +6042,8 @@ static void nfsd_ffv2_provider_malformed_result_test(struct kunit *test)
 	/* More chunks than asked for. */
 	nfsd_ffv2_test_provider_remove(f.nn);
 	f.provider_installed = false;
-	if (nfsd_ffv2_test_provider_install(f.nn, &overcount, f.provider)) {
+	if (nfsd_ffv2_test_provider_install(f.nn, &overcount, f.provider,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "failed to install the overcount provider");
 		goto out;
 	}
@@ -6039,7 +6061,8 @@ static void nfsd_ffv2_provider_malformed_result_test(struct kunit *test)
 	/* Chunks claimed with no array behind them. */
 	nfsd_ffv2_test_provider_remove(f.nn);
 	f.provider_installed = false;
-	if (nfsd_ffv2_test_provider_install(f.nn, &empty, f.provider)) {
+	if (nfsd_ffv2_test_provider_install(f.nn, &empty, f.provider,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "failed to install the empty provider");
 		goto out;
 	}
@@ -6055,7 +6078,8 @@ static void nfsd_ffv2_provider_malformed_result_test(struct kunit *test)
 	/* A header read missing one of its five arrays. */
 	nfsd_ffv2_test_provider_remove(f.nn);
 	f.provider_installed = false;
-	if (nfsd_ffv2_test_provider_install(f.nn, &partial, f.provider)) {
+	if (nfsd_ffv2_test_provider_install(f.nn, &partial, f.provider,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "failed to install the partial provider");
 		goto out;
 	}
@@ -6073,7 +6097,8 @@ static void nfsd_ffv2_provider_malformed_result_test(struct kunit *test)
 	nfsd_ffv2_test_provider_remove(f.nn);
 	f.provider_installed = false;
 	if (nfsd_ffv2_test_provider_install(f.nn, &nfsd_ffv2_ro_provider_ops,
-					    f.provider)) {
+					    f.provider,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "failed to reinstall the fixture provider");
 		goto out;
 	}
@@ -6197,7 +6222,7 @@ static __be32 nfsd_ffv2_ro_operation_hold(struct nfsd_ffv2_ro_fixture *f,
 	if (status)
 		return status;
 	return nfsd_ffv2_provider_probe(f->rqstp, f->mapped, opnum, req,
-					result, admission);
+					result, U32_MAX, admission);
 }
 
 /*
@@ -6236,7 +6261,8 @@ static void nfsd_ffv2_provider_result_lifetime_test(struct kunit *test)
 
 	nfsd_ffv2_test_provider_remove(f.nn);
 	f.provider_installed = false;
-	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic)) {
+	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "failed to install the dynamic provider");
 		goto out_free;
 	}
@@ -6329,7 +6355,8 @@ static void nfsd_ffv2_provider_netns_fence_test(struct kunit *test)
 	nfsd_ffv2_test_provider_remove(f.nn);
 	f.provider_installed = false;
 	fenced = nfsd_ffv2_test_provider_fenced();
-	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic)) {
+	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "failed to install the dynamic provider");
 		goto out;
 	}
@@ -6522,7 +6549,8 @@ static void nfsd_ffv2_provider_install_race_test(struct kunit *test)
 
 	nfsd_ffv2_test_provider_remove(f.nn);
 	f.provider_installed = false;
-	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic)) {
+	if (nfsd_ffv2_test_provider_install(f.nn, ops, dynamic,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
 		KUNIT_FAIL(test, "failed to install the dynamic provider");
 		goto out;
 	}
@@ -6554,7 +6582,8 @@ static void nfsd_ffv2_provider_install_race_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fenced + 1, nfsd_ffv2_test_provider_fenced());
 	/* Attempted after it: refused, so nothing is left unfenced. */
 	KUNIT_EXPECT_EQ(test, -ESHUTDOWN,
-			nfsd_ffv2_test_provider_install(f.nn, ops, dynamic));
+			nfsd_ffv2_test_provider_install(f.nn, ops, dynamic,
+							NFSD_FFV2_RO_CHUNK_SIZE));
 	KUNIT_EXPECT_EQ(test, fenced + 1, nfsd_ffv2_test_provider_fenced());
 out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);

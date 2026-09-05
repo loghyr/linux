@@ -51,6 +51,14 @@ struct nfsd_ffv2_object_request {
 	const u8	*store_uuid;
 	const u8	*binding_token;
 	u64		control_root;
+	/*
+	 * Bytes in one chunk of this object, or zero when the registrar does
+	 * not know.  The value belongs to the layout: it is a per-mirror
+	 * parameter, so it is recorded per object rather than once for a
+	 * server, and every chunk of a shard carries it except the last,
+	 * which may be shorter.
+	 */
+	u32		chunk_size;
 };
 
 struct nfsd_ffv2_participant {
@@ -260,6 +268,17 @@ void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding);
  */
 #define NFSD_FFV2_GUARD_CLIENT_ID_NONE	0U
 
+/*
+ * XDR words a CHUNK_READ reply costs apart from its payloads: the operation
+ * number and status, the eof flag and the outer array's length; and, per
+ * chunk, a tagged checksum, the effective length, the owner triple, the
+ * guard pair, the payload identifier, the lock flags, the status, and the
+ * payload's own length.  The boundary sizes a reply with these before the
+ * provider runs, and the encoder emits them.
+ */
+#define NFSD4_FFV2_READ_FIXED_WORDS	(2 + 1 + 1)
+#define NFSD4_FFV2_READ_ENT_WORDS	14
+
 /* chunk_owner4: the committed generation a chunk belongs to. */
 struct nfsd_ffv2_chunk_owner {
 	u64	co_cohort_id;
@@ -403,6 +422,7 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				u32 opnum,
 				const struct nfsd_ffv2_chunk_request *request,
 				struct nfsd_ffv2_chunk_result *result,
+				u32 available,
 				struct nfsd_ffv2_admission *admission);
 int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v);
 
@@ -554,7 +574,7 @@ bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn);
  */
 int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 				    const struct nfsd_ffv2_provider_ops *ops,
-				    void *data);
+				    void *data, u32 chunk_size);
 void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn);
 u64 nfsd_ffv2_test_provider_fenced(void);
 u64 nfsd_ffv2_test_provider_callbacks(void);

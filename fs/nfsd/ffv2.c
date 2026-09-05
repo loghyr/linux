@@ -71,6 +71,8 @@ struct nfsd_ffv2_generation {
 };
 
 struct nfsd_ffv2_object {
+	/* Bytes in one chunk of this object; zero when it is not known. */
+	u32			chunk_size;
 	struct path		export_path;
 	struct path		object_path;
 	struct knfsd_fh		inner_fh;
@@ -123,6 +125,14 @@ static atomic64_t nfsd_ffv2_provider_fenced = ATOMIC64_INIT(0);
 struct nfsd_ffv2_provider {
 	const struct nfsd_ffv2_provider_ops	*ops;
 	void					*data;
+	/*
+	 * The one chunk size this provider serves.  Declaring it asserts
+	 * that every object it answers for has exactly this size, which the
+	 * boundary checks rather than trusts.  It is a homogeneous test
+	 * provider's value: a server whose objects differ needs the size
+	 * per object, which is where it belongs.
+	 */
+	u32					chunk_size;
 	refcount_t				ref;
 	struct completion			gone;
 };
@@ -1217,6 +1227,16 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 		error = -EINVAL;
 		goto out_free;
 	}
+	/*
+	 * A chunk cannot be larger than the whole payload one operation may
+	 * carry, so a larger claim is refused here rather than bounding a
+	 * reply with it later.
+	 */
+	if (request->chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES) {
+		error = -EINVAL;
+		goto out_free;
+	}
+	object->chunk_size = request->chunk_size;
 
 	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_AUTH_DOMAIN)) {
 		error = -ENOMEM;
@@ -1601,11 +1621,48 @@ static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
  * Returns nfserr_notsupp with no callback made when that namespace has no
  * provider installed, which is every namespace in an ordinary build.
  */
+/*
+ * The largest CHUNK_READ reply @count chunks of @chunk_size can produce.
+ * The aggregate limit bounds the concatenated payload, so it caps that
+ * product alone; each payload is a separately counted opaque, so its
+ * padding is a term of its own and is not absorbed by the cap.  With no
+ * chunks there is no payload and no padding, so the metadata stands alone.
+ *
+ * Returns U32_MAX if the arithmetic would overflow, which no response
+ * buffer can hold and so rejects the request.
+ */
+static u32 nfsd_ffv2_read_bound(u32 count, u32 chunk_size)
+{
+	u64 payload, padding, total;
+
+	if (check_mul_overflow((u64)count, (u64)NFSD4_FFV2_READ_ENT_WORDS,
+			       &total))
+		return U32_MAX;
+	if (check_add_overflow(total, (u64)NFSD4_FFV2_READ_FIXED_WORDS,
+			       &total))
+		return U32_MAX;
+	if (check_mul_overflow(total, (u64)XDR_UNIT, &total))
+		return U32_MAX;
+	if (!count)
+		return total > U32_MAX ? U32_MAX : (u32)total;
+
+	if (check_mul_overflow((u64)count, (u64)chunk_size, &payload))
+		payload = NFSD_FFV2_MAX_PAYLOAD_BYTES;
+	payload = min_t(u64, payload, NFSD_FFV2_MAX_PAYLOAD_BYTES);
+	padding = (u64)count * (XDR_UNIT - 1);
+
+	if (check_add_overflow(total, payload, &total) ||
+	    check_add_overflow(total, padding, &total))
+		return U32_MAX;
+	return total > U32_MAX ? U32_MAX : (u32)total;
+}
+
 static __be32
 nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
 			    const struct nfsd_ffv2_object *object,
 			    const struct nfsd_ffv2_chunk_request *request,
 			    struct nfsd_ffv2_chunk_result *result,
+			    u32 available,
 			    struct nfsd_ffv2_admission *admission)
 {
 	struct nfsd_ffv2_provider *provider;
@@ -1618,6 +1675,25 @@ nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
 		return nfserr_notsupp;
 	}
 	rcu_read_unlock();
+
+	/*
+	 * Selection, the size the bound is computed from, and the callback
+	 * are one decision on one reference: a provider installed after this
+	 * point does not answer this request, and the size that admitted it
+	 * is the size the answering provider declared.  A provider that
+	 * declares one size for objects of another is refused rather than
+	 * asked, because the bound would describe a different object.
+	 */
+	if (object->chunk_size && object->chunk_size != provider->chunk_size) {
+		nfsd_ffv2_provider_put(provider);
+		return nfserr_serverfault;
+	}
+	if (opnum == OP_CHUNK_READ &&
+	    nfsd_ffv2_read_bound(request->count, provider->chunk_size) >
+	    available) {
+		nfsd_ffv2_provider_put(provider);
+		return nfserr_toosmall;
+	}
 
 	memset(result, 0, sizeof(*result));
 	atomic64_inc(&nfsd_ffv2_probe_counters.callbacks);
@@ -1650,6 +1726,7 @@ nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
  * @opnum: CHUNK_READ or CHUNK_HEADER_READ
  * @request: the chunk range the operation asked for
  * @result: receives the provider's result on success
+ * @available: bytes the reply may occupy, from the caller's response buffer
  * @admission: the caller's execution admission, which takes a reference on
  *	the provider so the result's borrowed storage outlives the callback.
  *	Required: there is no result-safe way to cross the boundary without
@@ -1673,6 +1750,7 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				u32 opnum,
 				const struct nfsd_ffv2_chunk_request *request,
 				struct nfsd_ffv2_chunk_result *result,
+				u32 available,
 				struct nfsd_ffv2_admission *admission)
 {
 	struct nfsd_ffv2_binding *binding = fhp->fh_ffv2_binding;
@@ -1711,7 +1789,8 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	atomic64_inc(&nfsd_ffv2_probe_counters.mapped);
 
 	status = nfsd_ffv2_provider_dispatch(nn, opnum, binding->object,
-					     request, result, admission);
+					     request, result, available,
+					     admission);
 	if (status == nfserr_notsupp) {
 		atomic64_inc(&nfsd_ffv2_probe_counters.fail_closed);
 		return status;
@@ -4328,12 +4407,19 @@ u64 nfsd_ffv2_test_provider_callbacks(void)
  */
 int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 				    const struct nfsd_ffv2_provider_ops *ops,
-				    void *data)
+				    void *data, u32 chunk_size)
 {
 	struct nfsd_ffv2_provider *provider;
 	struct nfsd_ffv2_anchor *anchor;
 
 	if (!nn || !ops || !ops->chunk_read || !ops->chunk_header_read)
+		return -EINVAL;
+	/*
+	 * A provider must say how large its chunks are, because nothing else
+	 * at this boundary does, and a reply cannot be bounded without it.
+	 * Zero is not "unknown" here: it would admit no payload at all.
+	 */
+	if (!chunk_size || chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES)
 		return -EINVAL;
 	anchor = &nn->ffv2;
 	provider = kzalloc_obj(*provider, GFP_KERNEL);
@@ -4341,6 +4427,7 @@ int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 		return -ENOMEM;
 	provider->ops = ops;
 	provider->data = data;
+	provider->chunk_size = chunk_size;
 	refcount_set(&provider->ref, 1);
 	init_completion(&provider->gone);
 

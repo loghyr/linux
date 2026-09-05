@@ -3710,18 +3710,10 @@ NFSD4_FFV2_OP(revoke_stateid, OP_REVOKE_STATEID, &u->ffv2.stateid)
 NFSD4_FFV2_OP(bulk_revoke_stateid, OP_BULK_REVOKE_STATEID, &u->ffv2.stateid)
 
 /*
- * XDR words a reply costs, apart from the per-chunk arrays: the operation
+ * XDR words a header reply costs apart from its arrays: the operation
  * number and status, the eof flag, and one length for each wire array.
  */
-#define NFSD4_FFV2_READ_FIXED_WORDS	(2 + 1 + 1)
 #define NFSD4_FFV2_HEADER_FIXED_WORDS	(2 + 1 + 5)
-
-/*
- * Words one read_chunk4 costs apart from its payload: a tagged checksum,
- * the effective length, the owner triple, the guard pair, the payload
- * identifier, the lock flags, the status, and the payload's own length.
- */
-#define NFSD4_FFV2_READ_ENT_WORDS	14
 
 /*
  * Words one header entry costs across the five arrays.  A predecessor that
@@ -3961,14 +3953,17 @@ nfsd4_ffv2_chunk_read_op(struct svc_rqst *rqstp,
 	if (status)
 		return status;
 
+	/*
+	 * The size a reply is bounded by belongs to the provider, so the
+	 * boundary makes the decision with the provider it will then ask.
+	 * A refusal here means the reply could not have fit.
+	 */
 	available = nfsd4_ffv2_available(rqstp);
-	if (nfsd4_ffv2_read_max_bytes(cr->cra_count) > available) {
-		nfsd_ffv2_complete(&admission);
-		return nfsd4_ffv2_capacity_status(rqstp, nfserr_toosmall);
-	}
 	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh,
 					  OP_CHUNK_READ, &request, &result,
-					  &admission);
+					  available, &admission);
+	if (status == nfserr_toosmall)
+		status = nfsd4_ffv2_capacity_status(rqstp, nfserr_toosmall);
 	if (status == nfs_ok)
 		status = nfsd4_ffv2_copy_read(cr, &result);
 	nfsd_ffv2_complete(&admission);
@@ -4036,7 +4031,7 @@ nfsd4_ffv2_chunk_header_read_op(struct svc_rqst *rqstp,
 	request.count = count;
 	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh,
 					  OP_CHUNK_HEADER_READ, &request,
-					  &result, &admission);
+					  &result, available, &admission);
 	if (status == nfs_ok)
 		status = nfsd4_ffv2_copy_header(hr, &result);
 	nfsd_ffv2_complete(&admission);
