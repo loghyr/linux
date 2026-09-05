@@ -4528,6 +4528,19 @@ int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
  * admission the test still holds; this lets the registry slot be freed
  * first and the drain be done once the admission has completed.
  */
+/*
+ * Give the object a filehandle is mapped to the chunk size a layout would
+ * have carried, so a test can present a provider with an object it does not
+ * serve.  This is the object the boundary itself checks.
+ */
+void nfsd_ffv2_test_fh_set_chunk_size(struct svc_fh *fhp, u32 chunk_size)
+{
+	struct nfsd_ffv2_binding *binding = fhp->fh_ffv2_binding;
+
+	if (binding && binding->object)
+		binding->object->chunk_size = chunk_size;
+}
+
 void *nfsd_ffv2_test_provider_unpublish(struct nfsd_net *nn)
 {
 	return nfsd_ffv2_provider_unpublish(nn);

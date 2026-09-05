@@ -6452,7 +6452,6 @@ static void nfsd_ffv2_provider_pinned_reference_test(struct kunit *test)
 	struct nfsd_ffv2_ro_provider *replacement;
 	struct nfsd_ffv2_ro_fixture f;
 	void *unpublished = NULL;
-	bool held = false;
 
 	if (!nfsd_ffv2_ro_fixture_init(test, &f))
 		goto out;
@@ -6473,7 +6472,6 @@ static void nfsd_ffv2_provider_pinned_reference_test(struct kunit *test)
 		KUNIT_FAIL(test, "the first call did not reach the provider");
 		goto out;
 	}
-	held = true;
 	KUNIT_EXPECT_EQ(test, 0x40, first.read.chunks[0].cr_chunk[0]);
 
 	/*
@@ -6506,10 +6504,62 @@ static void nfsd_ffv2_provider_pinned_reference_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0x40, first.read.chunks[0].cr_chunk[0]);
 
 out:
-	if (held)
-		nfsd_ffv2_complete(&admission);
-	/* Only now can the provider the admission held be drained. */
+	/*
+	 * One exit for every path: completing an admission that was never
+	 * granted is a no-op, and draining a provider that was never
+	 * unpublished is one too, so neither an early assertion nor a setup
+	 * failure can strand a provider or an admission here.
+	 */
+	nfsd_ffv2_complete(&admission);
 	nfsd_ffv2_test_provider_drain(unpublished);
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * A provider states one chunk size and serves objects of that size only.
+ * An object carrying a different one is refused at the boundary: the reply
+ * would have been admitted against a size that does not describe it, so the
+ * callback is never entered and nothing is left holding a reference.
+ */
+static void nfsd_ffv2_provider_size_mismatch_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_chunk_result result = {};
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	/* The size a layout would have carried, and not the one served. */
+	nfsd_ffv2_test_fh_set_chunk_size(f.mapped,
+					 NFSD_FFV2_RO_CHUNK_SIZE * 2);
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_ro_operation_hold(&f, OP_CHUNK_READ, &req,
+						    &result, &admission));
+	/* Refused before the provider was asked. */
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0U, result.count);
+	KUNIT_EXPECT_NULL(test, result.read.chunks);
+	nfsd_ffv2_complete(&admission);
+
+	/* The same object at the size the provider serves is answered. */
+	memset(&admission, 0, sizeof(admission));
+	memset(&result, 0, sizeof(result));
+	nfsd_ffv2_test_fh_set_chunk_size(f.mapped, NFSD_FFV2_RO_CHUNK_SIZE);
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation_hold(&f, OP_CHUNK_READ, &req,
+						    &result, &admission));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 1U, result.count);
+
+out:
+	nfsd_ffv2_complete(&admission);
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
@@ -6733,6 +6783,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
 	KUNIT_CASE(nfsd_ffv2_provider_concurrent_results_test),
 	KUNIT_CASE(nfsd_ffv2_provider_pinned_reference_test),
+	KUNIT_CASE(nfsd_ffv2_provider_size_mismatch_test),
 	KUNIT_CASE(nfsd_ffv2_provider_install_race_test),
 	{}
 };

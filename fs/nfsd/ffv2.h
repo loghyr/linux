@@ -581,6 +581,7 @@ void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn);
  * the registry slot is reused.  The handle must be drained once the
  * admission has completed, or the provider is leaked.
  */
+void nfsd_ffv2_test_fh_set_chunk_size(struct svc_fh *fhp, u32 chunk_size);
 void *nfsd_ffv2_test_provider_unpublish(struct nfsd_net *nn);
 void nfsd_ffv2_test_provider_drain(void *handle);
 u64 nfsd_ffv2_test_provider_fenced(void);
