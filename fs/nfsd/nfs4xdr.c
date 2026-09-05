@@ -6472,8 +6472,13 @@ static __be32 nfsd4_encode_read_chunk4(struct xdr_stream *xdr,
 		return nfserr;
 	if (xdr_stream_encode_be32(xdr, ent->cre_status) != XDR_UNIT)
 		return nfserr_resource;
-	/* cr_chunk */
-	return nfsd4_encode_opaque(xdr, cr->cra_payload + ent->cre_payload_off,
+	/*
+	 * cr_chunk.  A result of entirely empty chunks allocates no payload
+	 * block at all, so the base is only offset when there is one.
+	 */
+	return nfsd4_encode_opaque(xdr,
+				   cr->cra_payload ?
+				   cr->cra_payload + ent->cre_payload_off : "",
 				   ent->cre_effective_len);
 }
 

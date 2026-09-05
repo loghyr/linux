@@ -3739,6 +3739,22 @@ static u32 nfsd4_ffv2_bytes(u64 words)
 }
 
 /*
+ * The largest reply a CHUNK_READ of @count chunks could produce.  The
+ * payload lengths are not known until the provider answers, so the whole
+ * aggregate limit is admitted, and each payload is a counted opaque of its
+ * own, so each can carry up to three bytes of padding.
+ */
+static u32 nfsd4_ffv2_read_max_bytes(u32 count)
+{
+	u64 total = nfsd4_ffv2_bytes(NFSD4_FFV2_READ_FIXED_WORDS +
+				     (u64)count * NFSD4_FFV2_READ_ENT_WORDS);
+
+	total += NFSD_FFV2_MAX_PAYLOAD_BYTES;
+	total += (u64)count * (XDR_UNIT - 1);
+	return total > U32_MAX ? U32_MAX : (u32)total;
+}
+
+/*
  * Bytes this operation may still emit.  Taken from the response buffer
  * rather than re-derived from the session: SEQUENCE has already restricted
  * the buffer to the negotiated response size less the authentication
@@ -3925,9 +3941,9 @@ nfsd4_ffv2_chunk_read_op(struct svc_rqst *rqstp,
 	};
 	struct nfsd_ffv2_admission admission = {};
 	struct nfsd_ffv2_chunk_result result = {};
-	u32 available;
+	u32 available, i;
 	__be32 status;
-	u64 words;
+	u64 total;
 
 	/*
 	 * A read is all or nothing: it has no short form, so a reply that
@@ -3943,9 +3959,7 @@ nfsd4_ffv2_chunk_read_op(struct svc_rqst *rqstp,
 		return status;
 
 	available = nfsd4_ffv2_available(rqstp);
-	words = NFSD4_FFV2_READ_FIXED_WORDS +
-		(u64)cr->cra_count * NFSD4_FFV2_READ_ENT_WORDS;
-	if (nfsd4_ffv2_bytes(words) > available) {
+	if (nfsd4_ffv2_read_max_bytes(cr->cra_count) > available) {
 		nfsd_ffv2_complete(&admission);
 		return nfsd4_ffv2_capacity_status(rqstp, nfserr_toosmall);
 	}
@@ -3960,10 +3974,17 @@ nfsd4_ffv2_chunk_read_op(struct svc_rqst *rqstp,
 		return status;
 	}
 
-	words = NFSD4_FFV2_READ_FIXED_WORDS +
-		(u64)cr->cra_nchunks * NFSD4_FFV2_READ_ENT_WORDS;
-	if ((u64)nfsd4_ffv2_bytes(words) +
-	    xdr_align_size(cr->cra_payload_len) > available) {
+	/*
+	 * Each payload is a counted opaque padded to a four-byte boundary on
+	 * its own, so the cost is the sum of the aligned lengths rather than
+	 * the aligned sum: a chunk of one byte costs four, whatever its
+	 * neighbours are.
+	 */
+	total = nfsd4_ffv2_bytes(NFSD4_FFV2_READ_FIXED_WORDS +
+				 (u64)cr->cra_nchunks * NFSD4_FFV2_READ_ENT_WORDS);
+	for (i = 0; i < cr->cra_nchunks; i++)
+		total += xdr_align_size(cr->cra_chunks[i].cre_effective_len);
+	if (total > available) {
 		nfsd4_chunk_read_release(u);
 		return nfsd4_ffv2_capacity_status(rqstp, nfserr_toosmall);
 	}
@@ -4061,10 +4082,8 @@ nfsd4_ffv2_chunk_header_read_op(struct svc_rqst *rqstp,
 static u32 nfsd4_chunk_read_rsize(const struct svc_rqst *rqstp,
 				  const struct nfsd4_op *op)
 {
-	u64 words = op_encode_hdr_size + 1 + 1 +
-		    (u64)op->u.chunk_read.cra_count * NFSD4_FFV2_READ_ENT_WORDS;
-
-	return min_t(u32, nfsd4_ffv2_bytes(words), nfsd4_max_payload(rqstp));
+	return min_t(u32, nfsd4_ffv2_read_max_bytes(op->u.chunk_read.cra_count),
+		     nfsd4_max_payload(rqstp));
 }
 
 static u32 nfsd4_chunk_header_read_rsize(const struct svc_rqst *rqstp,
