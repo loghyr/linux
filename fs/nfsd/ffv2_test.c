@@ -6437,6 +6437,53 @@ static int nfsd_ffv2_ro_hold_thread(void *data)
  * check the boundary performs; the contract in ffv2.h is what a provider
  * has to meet, and nfsd cannot verify it without copying.
  */
+/*
+ * An admission keeps the provider it first used, so a later call on the
+ * same admission is answered by it rather than by whatever is installed at
+ * the time.  Both results then borrow storage the admission holds a
+ * reference to, and both stay readable until it completes.
+ *
+ * Replacing the provider under a live admission is not reachable and so is
+ * not attempted here: removal waits for the admissions already inside the
+ * boundary, and installation refuses while one is published, so a
+ * replacement cannot appear between two calls of one admission.  The rule
+ * is kept in the code regardless, because it is what makes the second
+ * call's borrowed storage safe rather than incidentally safe.
+ */
+static void nfsd_ffv2_provider_pinned_reference_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 1 };
+	struct nfsd_ffv2_chunk_result first = {}, second = {};
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation_hold(&f, OP_CHUNK_READ, &req,
+						    &first, &admission));
+
+	/* A second call on the same admission reaches the same provider. */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_provider_probe(f.rqstp, f.mapped,
+						 OP_CHUNK_READ, &req, &second,
+						 U32_MAX, &admission));
+	KUNIT_EXPECT_EQ(test, callbacks + 2,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_PTR_EQ(test, first.read.chunks, second.read.chunks);
+
+	/* Both stay readable while the admission is held. */
+	KUNIT_EXPECT_EQ(test, 0x40, first.read.chunks[0].cr_chunk[0]);
+	KUNIT_EXPECT_EQ(test, 0x40, second.read.chunks[0].cr_chunk[0]);
+	nfsd_ffv2_complete(&admission);
+
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
 static void nfsd_ffv2_provider_concurrent_results_test(struct kunit *test)
 {
 	struct nfsd_ffv2_ro_hold_ctx first = {};
@@ -6656,6 +6703,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
 	KUNIT_CASE(nfsd_ffv2_provider_concurrent_results_test),
+	KUNIT_CASE(nfsd_ffv2_provider_pinned_reference_test),
 	KUNIT_CASE(nfsd_ffv2_provider_install_race_test),
 	{}
 };

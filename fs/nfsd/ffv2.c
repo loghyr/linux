@@ -1464,7 +1464,7 @@ static bool nfsd_ffv2_checksum_valid(const struct nfsd_ffv2_checksum *checksum)
  * the running total is carried across elements: bounding each chunk alone
  * would admit a full count of chunks each just under the limit.
  */
-static bool nfsd_ffv2_read_chunks_valid(u32 count,
+static bool nfsd_ffv2_read_chunks_valid(u32 count, u32 chunk_size,
 					const struct nfsd_ffv2_read_chunk *chunks)
 {
 	u64 total = 0;
@@ -1483,7 +1483,14 @@ static bool nfsd_ffv2_read_chunks_valid(u32 count,
 				return false;
 			continue;
 		}
-		if (chunk->cr_effective_len > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+		/*
+		 * No chunk is larger than the size its provider serves, and
+		 * none is larger than one operation's whole payload.  The
+		 * first is what the reply was admitted against, so a longer
+		 * one would not fit the room reserved for it.
+		 */
+		if (chunk->cr_effective_len > chunk_size ||
+		    chunk->cr_effective_len > NFSD_FFV2_MAX_PAYLOAD_BYTES)
 			return false;
 		/*
 		 * A length without a pointer would be copied through NULL.
@@ -1550,7 +1557,7 @@ static bool nfsd_ffv2_header_entries_valid(u32 count,
  * here, on the way out of the boundary, so the encoder can trust the result
  * rather than re-deriving whether a provider is well behaved.
  */
-static bool nfsd_ffv2_result_valid(u32 opnum,
+static bool nfsd_ffv2_result_valid(u32 opnum, u32 chunk_size,
 				   const struct nfsd_ffv2_chunk_request *request,
 				   const struct nfsd_ffv2_chunk_result *result)
 {
@@ -1568,7 +1575,7 @@ static bool nfsd_ffv2_result_valid(u32 opnum,
 		return true;
 	if (opnum == OP_CHUNK_READ)
 		return result->read.chunks &&
-		       nfsd_ffv2_read_chunks_valid(result->count,
+		       nfsd_ffv2_read_chunks_valid(result->count, chunk_size,
 						   result->read.chunks);
 	if (!result->header.status || !result->header.locked ||
 	    !result->header.owners || !result->header.guards ||
@@ -1646,10 +1653,16 @@ static u32 nfsd_ffv2_read_bound(u32 count, u32 chunk_size)
 	if (!count)
 		return total > U32_MAX ? U32_MAX : (u32)total;
 
+	/*
+	 * An overflow here is not a reply the aggregate limit would have
+	 * bounded, it is arithmetic that says nothing: reject rather than
+	 * substitute a number that happens to be smaller.
+	 */
 	if (check_mul_overflow((u64)count, (u64)chunk_size, &payload))
-		payload = NFSD_FFV2_MAX_PAYLOAD_BYTES;
+		return U32_MAX;
 	payload = min_t(u64, payload, NFSD_FFV2_MAX_PAYLOAD_BYTES);
-	padding = (u64)count * (XDR_UNIT - 1);
+	if (check_mul_overflow((u64)count, (u64)(XDR_UNIT - 1), &padding))
+		return U32_MAX;
 
 	if (check_add_overflow(total, payload, &total) ||
 	    check_add_overflow(total, padding, &total))
@@ -1666,15 +1679,27 @@ nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
 			    struct nfsd_ffv2_admission *admission)
 {
 	struct nfsd_ffv2_provider *provider;
+	bool pinned = admission->provider;
 	__be32 status;
 
-	rcu_read_lock();
-	provider = rcu_dereference(nn->ffv2.provider);
-	if (!provider || !refcount_inc_not_zero(&provider->ref)) {
+	/*
+	 * An admission owns one provider for its whole life.  A later call
+	 * on the same admission uses it rather than looking again: choosing
+	 * again could answer from a replacement whose storage this admission
+	 * does not hold, and the result would borrow from something nothing
+	 * keeps alive.
+	 */
+	if (pinned) {
+		provider = admission->provider;
+	} else {
+		rcu_read_lock();
+		provider = rcu_dereference(nn->ffv2.provider);
+		if (!provider || !refcount_inc_not_zero(&provider->ref)) {
+			rcu_read_unlock();
+			return nfserr_notsupp;
+		}
 		rcu_read_unlock();
-		return nfserr_notsupp;
 	}
-	rcu_read_unlock();
 
 	/*
 	 * Selection, the size the bound is computed from, and the callback
@@ -1685,13 +1710,15 @@ nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
 	 * asked, because the bound would describe a different object.
 	 */
 	if (object->chunk_size && object->chunk_size != provider->chunk_size) {
-		nfsd_ffv2_provider_put(provider);
+		if (!pinned)
+			nfsd_ffv2_provider_put(provider);
 		return nfserr_serverfault;
 	}
 	if (opnum == OP_CHUNK_READ &&
 	    nfsd_ffv2_read_bound(request->count, provider->chunk_size) >
 	    available) {
-		nfsd_ffv2_provider_put(provider);
+		if (!pinned)
+			nfsd_ffv2_provider_put(provider);
 		return nfserr_toosmall;
 	}
 
@@ -1709,13 +1736,15 @@ nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
 	 * A result borrows provider storage, so the reference outlives the
 	 * callback: it moves to the execution admission and is dropped when
 	 * that completes, which is after every consumer of the result.
-	 * Nothing borrows storage from a failed call, and a second call on
-	 * one admission borrows from the provider the first already holds.
+	 * Nothing borrows storage from a failed call.  A reference already
+	 * owned by the admission stays owned by it and is not dropped here.
 	 */
-	if (status != nfs_ok || admission->provider)
-		nfsd_ffv2_provider_put(provider);
-	else
-		admission->provider = provider;
+	if (!pinned) {
+		if (status != nfs_ok)
+			nfsd_ffv2_provider_put(provider);
+		else
+			admission->provider = provider;
+	}
 	return status;
 }
 
@@ -1795,7 +1824,11 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		atomic64_inc(&nfsd_ffv2_probe_counters.fail_closed);
 		return status;
 	}
-	if (status == nfs_ok && !nfsd_ffv2_result_valid(opnum, request, result)) {
+	if (status == nfs_ok &&
+	    !nfsd_ffv2_result_valid(opnum,
+				    admission->provider ?
+				    admission->provider->chunk_size : 0,
+				    request, result)) {
 		memset(result, 0, sizeof(*result));
 		/* Nothing borrows storage from a refused result. */
 		if (admission && admission->provider) {
