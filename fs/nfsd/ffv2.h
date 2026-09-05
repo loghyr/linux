@@ -579,4 +579,15 @@ __be32 nfsd_ffv2_test_encode_chunk_read(struct xdr_stream *xdr,
 __be32 nfsd_ffv2_test_encode_chunk_header_read(struct xdr_stream *xdr,
 					       union nfsd4_op_u *u);
 
+/*
+ * Run and release one operation through its own table entry, so a test can
+ * drive the production handler with a response buffer of its choosing.
+ * Defined inside the same guard in nfs4proc.c.
+ */
+struct nfsd4_compound_state;
+__be32 nfsd_ffv2_test_run_op(struct svc_rqst *rqstp,
+			     struct nfsd4_compound_state *cstate, u32 opnum,
+			     union nfsd4_op_u *u);
+void nfsd_ffv2_test_release_op(u32 opnum, union nfsd4_op_u *u);
+
 #endif /* _NFSD_FFV2_H */

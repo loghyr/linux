@@ -5574,6 +5574,11 @@ static int nfsd_ffv2_ro_encode(struct kunit *test, union nfsd4_op_u *u,
 	page = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
 	if (!page)
 		return -ENOMEM;
+	/*
+	 * Poison the buffer first.  Zeroed memory would let an encoder that
+	 * never wrote a pad byte pass a test that the padding is zero.
+	 */
+	memset(page, 0xa5, PAGE_SIZE);
 	/* An empty head the stream will fill, not a buffer already holding. */
 	memset(&buf, 0, sizeof(buf));
 	buf.head[0].iov_base = page;
@@ -5683,7 +5688,7 @@ static void nfsd_ffv2_encode_header_test(struct kunit *test)
 {
 	struct nfsd4_chunk_header_ent ents[2] = {};
 	union nfsd4_op_u u = {};
-	__be32 *p;
+	__be32 *base, *p;
 	int len;
 
 	ents[0].che_status = nfs_ok;
@@ -5697,23 +5702,199 @@ static void nfsd_ffv2_encode_header_test(struct kunit *test)
 
 	len = nfsd_ffv2_ro_encode(test, &u, true, &p);
 	KUNIT_ASSERT_GT(test, len, 0);
+	base = p;
 
 	/*
-	 * eof, then status, locked, owners, guards and predecessors, each
-	 * with a count of its own.  The absent arm is one word; the present
-	 * arm carries an owner triple as well.
+	 * Walk the reply array by array rather than checking a total, so the
+	 * shape is asserted where it is emitted: eof, then five arrays each
+	 * introduced by its own count, and a predecessor arm that carries an
+	 * owner only when one is retained.
 	 */
-	KUNIT_EXPECT_EQ(test, (1 + 5) * XDR_UNIT + (2 + 2 + 8 + 4) * XDR_UNIT +
-			(1 + 5) * XDR_UNIT, (u32)len);
 	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(p[0]));		/* chrr_eof */
-	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(ents), be32_to_cpu(p[1]));
+	p += 1;
 
-	/* The predecessor array is last: absent alone, then present. */
-	p += len / XDR_UNIT - 7;
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(ents), be32_to_cpu(p[0]));
+	KUNIT_EXPECT_EQ(test, nfs_ok, (__force __be32)p[1]);
+	KUNIT_EXPECT_EQ(test, nfserr_payload_lost, (__force __be32)p[2]);
+	p += 1 + ARRAY_SIZE(ents);				/* chrr_status */
+
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(ents), be32_to_cpu(p[0]));
+	p += 1 + ARRAY_SIZE(ents);				/* chrr_locked */
+
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(ents), be32_to_cpu(p[0]));
+	p += 1 + ARRAY_SIZE(ents) * 4;				/* chrr_owners */
+
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(ents), be32_to_cpu(p[0]));
+	p += 1 + ARRAY_SIZE(ents) * 2;				/* chrr_guards */
+
+	/* chrr_predecessors: absent is one word, present carries an owner. */
 	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(ents), be32_to_cpu(p[0]));
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_RETAINED_ABSENT, be32_to_cpu(p[1]));
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_RETAINED_PRESENT, be32_to_cpu(p[2]));
-	KUNIT_EXPECT_EQ(test, 5U, be32_to_cpu(p[5]));
+	KUNIT_EXPECT_EQ(test, 5U, be32_to_cpu(p[5]));		/* co_client_id */
+	p += 1 + 1 + 1 + 4;
+
+	/* The walk consumed exactly the reply, and nothing followed it. */
+	KUNIT_EXPECT_EQ(test, (u32)len, (u32)((char *)p - (char *)base));
+}
+
+/*
+ * Run one operation the way a compound would, with a response buffer of a
+ * chosen size, so the capacity decision, the short form and the cleanup are
+ * the production handler's rather than a reimplementation of them.
+ */
+static __be32 nfsd_ffv2_ro_compound_op(struct kunit *test,
+				       struct nfsd_ffv2_ro_fixture *f,
+				       u32 opnum, u32 budget,
+				       bool cachethis, union nfsd4_op_u *u)
+{
+	struct nfsd4_compound_state cstate = {};
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_compoundres *resp;
+	struct nfsd4_slot *slot;
+	struct xdr_stream *xdr;
+	__be32 *page;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	resp = kunit_kzalloc(test, sizeof(*resp), GFP_KERNEL);
+	slot = kunit_kzalloc(test, sizeof(*slot), GFP_KERNEL);
+	xdr = kunit_kzalloc(test, sizeof(*xdr), GFP_KERNEL);
+	page = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	if (!args || !resp || !slot || !xdr || !page)
+		return nfserr_jukebox;
+
+	args->ffv2_digest_valid = true;
+	args->opcnt = 1;
+	resp->opcnt = 1;		/* the last operation, so no slack */
+	resp->xdr = xdr;
+	resp->rqstp = f->rqstp;
+	resp->cstate.slot = slot;
+	if (cachethis)
+		slot->sl_flags |= NFSD4_SLOT_CACHETHIS;
+
+	f->rqstp->rq_argp = args;
+	f->rqstp->rq_resp = resp;
+	f->rqstp->rq_res.head[0].iov_base = page;
+	f->rqstp->rq_res.head[0].iov_len = 0;
+	f->rqstp->rq_res.len = 0;
+	f->rqstp->rq_res.buflen = budget;
+
+	cstate.session = f->session;
+	cstate.slot = slot;
+	cstate.current_fh = *f->mapped;
+	return nfsd_ffv2_test_run_op(f->rqstp, &cstate, opnum, u);
+}
+
+/*
+ * The capacity decisions a header read makes, taken through the production
+ * handler: a reply that fits whole, one this server shortened, one that
+ * cannot carry a single entry, and an empty request that is not a capacity
+ * failure at all.
+ */
+static void nfsd_ffv2_compound_header_capacity_test(struct kunit *test)
+{
+	/*
+	 * The fixture's entries hold no retained predecessor, so each costs
+	 * the absent-arm minimum: the discriminant alone rather than an owner
+	 * triple after it.  That is also the cost the count is chosen from
+	 * before the provider runs.
+	 */
+	static const u32 fixed = (2 + 1 + 5) * XDR_UNIT;
+	static const u32 entry = 9 * XDR_UNIT;
+	struct nfsd_ffv2_ro_fixture f;
+	union nfsd4_op_u u;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+#define HEADER_OP(budget, count, cache)					\
+	({								\
+		memset(&u, 0, sizeof(u));				\
+		u.chunk_header_read.chra_stateid = f.stateid;		\
+		u.chunk_header_read.chra_offset = 0;			\
+		u.chunk_header_read.chra_count = (count);		\
+		nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_HEADER_READ, \
+					 (budget), (cache), &u);	\
+	})
+
+	/* Room for both entries: neither the server nor the provider trims. */
+	KUNIT_EXPECT_EQ(test, nfs_ok, HEADER_OP(fixed + 2 * entry, 2, false));
+	KUNIT_EXPECT_EQ(test, 2U, u.chunk_header_read.chrr_nents);
+	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
+	KUNIT_EXPECT_NULL(test, u.chunk_header_read.chrr_ents);
+	/* Releasing twice is safe; a compound may unwind after an error. */
+	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
+
+	/*
+	 * Room for one entry only.  The reply is short and says so: the
+	 * chunks left out still exist, so end of file must not be claimed.
+	 */
+	KUNIT_EXPECT_EQ(test, nfs_ok, HEADER_OP(fixed + entry, 2, false));
+	KUNIT_EXPECT_EQ(test, 1U, u.chunk_header_read.chrr_nents);
+	KUNIT_EXPECT_FALSE(test, u.chunk_header_read.chrr_eof);
+	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
+
+	/* Not even one entry fits, and a short reply of nothing is not one. */
+	KUNIT_EXPECT_EQ(test, nfserr_rep_too_big,
+			HEADER_OP(fixed + entry - XDR_UNIT, 2, false));
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_header_read.chrr_nents);
+
+	/* The same shortfall, but the client asked for its reply to be cached. */
+	KUNIT_EXPECT_EQ(test, nfserr_rep_too_big_to_cache,
+			HEADER_OP(fixed + entry - XDR_UNIT, 2, true));
+
+	/* Asking for nothing succeeds whenever the empty reply itself fits. */
+	KUNIT_EXPECT_EQ(test, nfs_ok, HEADER_OP(fixed + entry, 0, false));
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_header_read.chrr_nents);
+	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
+
+#undef HEADER_OP
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * A chunk read admits the whole payload limit before the provider runs,
+ * because nothing at this boundary bounds a chunk's size.  An ordinary
+ * response budget therefore cannot satisfy one, and the refusal happens
+ * before dispatch rather than after bytes have been built.
+ */
+static void nfsd_ffv2_compound_read_capacity_test(struct kunit *test)
+{
+	struct nfsd_ffv2_ro_fixture f;
+	union nfsd4_op_u u = {};
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	u.chunk_read.cra_stateid = f.stateid;
+	u.chunk_read.cra_count = 1;
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfserr_toosmall,
+			nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_READ,
+						 1024 * 1024, false, &u));
+	/* Refused before dispatch: the provider was never asked. */
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_read.cra_nchunks);
+	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_payload);
+
+	/* A budget above the admitted limit is served. */
+	memset(&u, 0, sizeof(u));
+	u.chunk_read.cra_stateid = f.stateid;
+	u.chunk_read.cra_count = 1;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_READ,
+						 NFSD_FFV2_MAX_PAYLOAD_BYTES +
+						 PAGE_SIZE, false, &u));
+	KUNIT_EXPECT_EQ(test, 1U, u.chunk_read.cra_nchunks);
+	nfsd_ffv2_test_release_op(OP_CHUNK_READ, &u);
+	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_chunks);
+	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_payload);
+
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
 static void nfsd_ffv2_provider_result_contract_test(struct kunit *test)
@@ -6440,6 +6621,8 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
 	KUNIT_CASE(nfsd_ffv2_encode_header_test),
+	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
+	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),

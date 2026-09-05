@@ -3749,8 +3749,11 @@ static u32 nfsd4_ffv2_read_max_bytes(u32 count)
 	u64 total = nfsd4_ffv2_bytes(NFSD4_FFV2_READ_FIXED_WORDS +
 				     (u64)count * NFSD4_FFV2_READ_ENT_WORDS);
 
-	total += NFSD_FFV2_MAX_PAYLOAD_BYTES;
-	total += (u64)count * (XDR_UNIT - 1);
+	/* No chunks, no payload: the aggregate limit bounds a reply that has one. */
+	if (count) {
+		total += NFSD_FFV2_MAX_PAYLOAD_BYTES;
+		total += (u64)count * (XDR_UNIT - 1);
+	}
 	return total > U32_MAX ? U32_MAX : (u32)total;
 }
 
@@ -4600,6 +4603,29 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 };
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/*
+ * Run one operation and release it exactly as a compound would, through the
+ * same table entry.  A test can then supply its own response buffer and see
+ * the production handler's capacity decisions, truncation and cleanup rather
+ * than a reimplementation of them.
+ */
+__be32 nfsd_ffv2_test_run_op(struct svc_rqst *rqstp,
+			     struct nfsd4_compound_state *cstate, u32 opnum,
+			     union nfsd4_op_u *u)
+{
+	if (opnum >= ARRAY_SIZE(nfsd4_ops) || !nfsd4_ops[opnum].op_func)
+		return nfserr_notsupp;
+	return nfsd4_ops[opnum].op_func(rqstp, cstate, u);
+}
+
+void nfsd_ffv2_test_release_op(u32 opnum, union nfsd4_op_u *u)
+{
+	if (opnum < ARRAY_SIZE(nfsd4_ops) && nfsd4_ops[opnum].op_release)
+		nfsd4_ops[opnum].op_release(u);
+}
+#endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
 
 /**
  * nfsd4_spo_must_allow - Determine if the compound op contains an
