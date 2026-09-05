@@ -310,6 +310,12 @@ enum nfsstat4 {
 	NFS4ERR_NOXATTR		= 10095,
 	NFS4ERR_XATTR2BIG	= 10096,
 
+	/* Flex Files v2 chunk operations */
+	NFS4ERR_PAYLOAD_NOT_ATOMIC = 10098,
+	NFS4ERR_CHUNK_LOCKED	= 10099,
+	NFS4ERR_CHUNK_GUARDED	= 10100,
+	NFS4ERR_PAYLOAD_LOST	= 10101,
+
 	/* can be used for internal errors */
 	NFS4ERR_FIRST_FREE
 };
