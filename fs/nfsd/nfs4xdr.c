@@ -6386,6 +6386,193 @@ nfsd4_encode_seek(struct nfsd4_compoundres *resp, __be32 nfserr,
 	return nfsd4_encode_offset4(xdr, seek->seek_pos);
 }
 
+/* chunk_owner4 */
+static __be32 nfsd4_encode_chunk_owner4(struct xdr_stream *xdr,
+					const struct nfsd_ffv2_chunk_owner *owner)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_uint64_t(xdr, owner->co_cohort_id);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, owner->co_client_id);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	return nfsd4_encode_uint32_t(xdr, owner->co_id);
+}
+
+/* chunk_guard4 */
+static __be32 nfsd4_encode_chunk_guard4(struct xdr_stream *xdr,
+					const struct nfsd_ffv2_chunk_guard *guard)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_uint32_t(xdr, guard->cg_gen_id);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	return nfsd4_encode_uint32_t(xdr, guard->cg_client_id);
+}
+
+/*
+ * checksum4.  The value is a counted opaque of cs_len bytes, not the fixed
+ * buffer it is held in, so only the bytes the algorithm produced go out.
+ */
+static __be32 nfsd4_encode_checksum4(struct xdr_stream *xdr,
+				     const struct nfsd_ffv2_checksum *checksum)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_uint32_t(xdr, checksum->cs_algorithm);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	return nfsd4_encode_opaque(xdr, checksum->cs_value, checksum->cs_len);
+}
+
+/*
+ * optional_retained4.  A discriminated union: an absent predecessor is the
+ * discriminant alone, so no owner and no padding follow it.
+ */
+static __be32 nfsd4_encode_optional_retained4(struct xdr_stream *xdr,
+					      const struct nfsd_ffv2_retained *pred)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_uint32_t(xdr, pred->disposition);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	if (pred->disposition == NFSD_FFV2_RETAINED_ABSENT)
+		return nfs_ok;
+	return nfsd4_encode_chunk_owner4(xdr, &pred->rp_owner);
+}
+
+/* read_chunk4 */
+static __be32 nfsd4_encode_read_chunk4(struct xdr_stream *xdr,
+				       const struct nfsd4_chunk_read *cr,
+				       const struct nfsd4_chunk_read_ent *ent)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_checksum4(xdr, &ent->cre_checksum);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, ent->cre_effective_len);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_chunk_owner4(xdr, &ent->cre_owner);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_chunk_guard4(xdr, &ent->cre_guard);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, ent->cre_payload_id);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, ent->cre_locked);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	if (xdr_stream_encode_be32(xdr, ent->cre_status) != XDR_UNIT)
+		return nfserr_resource;
+	/* cr_chunk */
+	return nfsd4_encode_opaque(xdr, cr->cra_payload + ent->cre_payload_off,
+				   ent->cre_effective_len);
+}
+
+/* CHUNK_READ4resok */
+static __be32
+nfsd4_encode_chunk_read(struct nfsd4_compoundres *resp, __be32 nfserr,
+			union nfsd4_op_u *u)
+{
+	const struct nfsd4_chunk_read *cr = &u->chunk_read;
+	struct xdr_stream *xdr = resp->xdr;
+	u32 i;
+
+	/* crr_eof */
+	nfserr = nfsd4_encode_bool(xdr, cr->cra_eof);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	/* crr_chunks<> */
+	nfserr = nfsd4_encode_uint32_t(xdr, cr->cra_nchunks);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < cr->cra_nchunks; i++) {
+		nfserr = nfsd4_encode_read_chunk4(xdr, cr, &cr->cra_chunks[i]);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+	return nfs_ok;
+}
+
+/*
+ * CHUNK_HEADER_READ4resok.  The five arrays are co-indexed and always the
+ * same length, so the one entry array is walked once for each of them.
+ */
+static __be32
+nfsd4_encode_chunk_header_read(struct nfsd4_compoundres *resp, __be32 nfserr,
+			       union nfsd4_op_u *u)
+{
+	const struct nfsd4_chunk_header_read *hr = &u->chunk_header_read;
+	struct xdr_stream *xdr = resp->xdr;
+	u32 i;
+
+	/* chrr_eof */
+	nfserr = nfsd4_encode_bool(xdr, hr->chrr_eof);
+	if (nfserr != nfs_ok)
+		return nfserr;
+
+	/* chrr_status<> */
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++)
+		if (xdr_stream_encode_be32(xdr,
+					   hr->chrr_ents[i].che_status) != XDR_UNIT)
+			return nfserr_resource;
+
+	/* chrr_locked<> */
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++) {
+		nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_ents[i].che_locked);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+
+	/* chrr_owners<> */
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++) {
+		nfserr = nfsd4_encode_chunk_owner4(xdr,
+						   &hr->chrr_ents[i].che_owner);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+
+	/* chrr_guards<> */
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++) {
+		nfserr = nfsd4_encode_chunk_guard4(xdr,
+						   &hr->chrr_ents[i].che_guard);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+
+	/* chrr_predecessors<> */
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++) {
+		nfserr = nfsd4_encode_optional_retained4(xdr,
+							 &hr->chrr_ents[i].che_predecessor);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+	return nfs_ok;
+}
+
 static __be32
 nfsd4_encode_noop(struct nfsd4_compoundres *resp, __be32 nfserr,
 		  union nfsd4_op_u *p)
@@ -6718,9 +6905,9 @@ static const nfsd4_enc nfsd4_enc_ops[] = {
 	[OP_CHUNK_COMMIT]	= nfsd4_encode_noop,
 	[OP_CHUNK_ERROR]	= nfsd4_encode_noop,
 	[OP_CHUNK_FINALIZE]	= nfsd4_encode_noop,
-	[OP_CHUNK_HEADER_READ]	= nfsd4_encode_noop,
+	[OP_CHUNK_HEADER_READ]	= nfsd4_encode_chunk_header_read,
 	[OP_CHUNK_LOCK]		= nfsd4_encode_noop,
-	[OP_CHUNK_READ]		= nfsd4_encode_noop,
+	[OP_CHUNK_READ]		= nfsd4_encode_chunk_read,
 	[OP_CHUNK_REPAIRED]	= nfsd4_encode_noop,
 	[OP_CHUNK_ROLLBACK]	= nfsd4_encode_noop,
 	[OP_CHUNK_UNLOCK]	= nfsd4_encode_noop,

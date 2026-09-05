@@ -2242,6 +2242,28 @@ static void nfsd_ffv2_replay_identity_test(struct kunit *test)
 			   nfsd4_ffv2_replay_identity_match(args, slot));
 }
 
+/*
+ * A decoded compound asks each operation for its maximum reply size, and
+ * the FFv2 read operations answer from the transport's payload limit.  A
+ * synthetic request therefore needs enough of a transport and server to be
+ * asked, even when the test only cares about decoding.
+ */
+static void nfsd_ffv2_test_attach_transport(struct svc_rqst *rqstp)
+{
+	static struct svc_xprt_class xcl = {
+		.xcl_max_payload	= RPCSVC_MAXPAYLOAD_TCP,
+	};
+	static struct svc_xprt xprt = {
+		.xpt_class		= &xcl,
+	};
+	static struct svc_serv serv = {
+		.sv_max_payload		= RPCSVC_MAXPAYLOAD_TCP,
+	};
+
+	rqstp->rq_xprt = &xprt;
+	rqstp->rq_server = &serv;
+}
+
 static void nfsd_ffv2_malformed_later_op_test(struct kunit *test)
 {
 	struct nfsd4_compoundargs *args;
@@ -2298,6 +2320,7 @@ static void nfsd_ffv2_malformed_later_op_test(struct kunit *test)
 	rqstp->rq_argp = args;
 	rqstp->rq_private = ntli;
 	rqstp->rq_authop = &auth;
+	nfsd_ffv2_test_attach_transport(rqstp);
 	KUNIT_ASSERT_TRUE(test, nfs4svc_decode_compoundargs(rqstp, &xdr));
 	KUNIT_EXPECT_TRUE(test, args->ffv2_present);
 	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
@@ -4832,6 +4855,7 @@ static bool nfsd_ffv2_ro_digest(struct kunit *test, u32 offset,
 	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
 	if (!ntli || !rqstp)
 		return false;
+	nfsd_ffv2_test_attach_transport(rqstp);
 	request_len = nfsd_ffv2_ro_compound(request, offset);
 	xdr_buf_init(&buf, request, request_len);
 	buf.len = request_len;

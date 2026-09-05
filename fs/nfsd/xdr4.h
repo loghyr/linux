@@ -39,6 +39,7 @@
 
 #include "state.h"
 #include "nfsd.h"
+#include "ffv2.h"
 
 #define NFSD4_MAX_TAGLEN	128
 #define XDR_LEN(n)                     (((n) + 3) & ~3)
@@ -863,16 +864,59 @@ struct nfsd4_ffv2 {
 	bool		target_present;
 };
 
+/*
+ * One encoded read_chunk4.  The payload is named by an offset into the
+ * operation's single payload block rather than by a pointer, so nothing has
+ * to be rebased when the block moves and a dangling payload reference is
+ * not representable.
+ */
+struct nfsd4_chunk_read_ent {
+	struct nfsd_ffv2_checksum	cre_checksum;
+	u32				cre_effective_len;
+	struct nfsd_ffv2_chunk_owner	cre_owner;
+	struct nfsd_ffv2_chunk_guard	cre_guard;
+	u32				cre_payload_id;
+	u32				cre_locked;
+	__be32				cre_status;
+	u32				cre_payload_off;
+};
+
+/*
+ * One entry of a CHUNK_HEADER_READ reply.  The five co-indexed wire arrays
+ * are held as one array of these, so co-indexing is structural: the encoder
+ * walks it once per array, and a truncation cannot leave the arrays at
+ * different lengths.
+ */
+struct nfsd4_chunk_header_ent {
+	__be32				che_status;
+	u32				che_locked;
+	struct nfsd_ffv2_chunk_owner	che_owner;
+	struct nfsd_ffv2_chunk_guard	che_guard;
+	struct nfsd_ffv2_retained	che_predecessor;
+};
+
 struct nfsd4_chunk_read {
-	stateid_t	cra_stateid;
-	u64		cra_offset;
-	u32		cra_count;
+	/* request */
+	stateid_t			cra_stateid;
+	u64				cra_offset;
+	u32				cra_count;
+	/* response, owned by this operation and freed by its release */
+	bool				cra_eof;
+	u32				cra_nchunks;
+	struct nfsd4_chunk_read_ent	*cra_chunks;
+	void				*cra_payload;
+	u32				cra_payload_len;
 };
 
 struct nfsd4_chunk_header_read {
-	stateid_t	chra_stateid;
-	u64		chra_offset;
-	u32		chra_count;
+	/* request */
+	stateid_t			chra_stateid;
+	u64				chra_offset;
+	u32				chra_count;
+	/* response, owned by this operation and freed by its release */
+	bool				chrr_eof;
+	u32				chrr_nents;
+	struct nfsd4_chunk_header_ent	*chrr_ents;
 };
 
 struct nfsd4_op {

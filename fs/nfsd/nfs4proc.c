@@ -3709,14 +3709,83 @@ NFSD4_FFV2_OP(trust_stateid, OP_TRUST_STATEID, &u->ffv2.stateid)
 NFSD4_FFV2_OP(revoke_stateid, OP_REVOKE_STATEID, &u->ffv2.stateid)
 NFSD4_FFV2_OP(bulk_revoke_stateid, OP_BULK_REVOKE_STATEID, &u->ffv2.stateid)
 
-static __be32
-nfsd4_ffv2_probe(struct svc_rqst *rqstp,
-		 struct nfsd4_compound_state *cstate, u32 opnum,
-		 const stateid_t *stateid,
-		 const struct nfsd_ffv2_chunk_request *request)
+/*
+ * XDR words a reply costs, apart from the per-chunk arrays: the operation
+ * number and status, the eof flag, and one length for each wire array.
+ */
+#define NFSD4_FFV2_READ_FIXED_WORDS	(2 + 1 + 1)
+#define NFSD4_FFV2_HEADER_FIXED_WORDS	(2 + 1 + 5)
+
+/*
+ * Words one read_chunk4 costs apart from its payload: a tagged checksum,
+ * the effective length, the owner triple, the guard pair, the payload
+ * identifier, the lock flags, the status, and the payload's own length.
+ */
+#define NFSD4_FFV2_READ_ENT_WORDS	14
+
+/*
+ * Words one header entry costs across the five arrays.  A predecessor that
+ * is absent encodes its discriminant alone; one that is present or errored
+ * carries an owner triple as well.
+ */
+#define NFSD4_FFV2_HEADER_ENT_MIN_WORDS	9
+#define NFSD4_FFV2_HEADER_ENT_MAX_WORDS	13
+
+static u32 nfsd4_ffv2_bytes(u64 words)
 {
-	struct nfsd_ffv2_admission admission = {};
-	struct nfsd_ffv2_chunk_result result = {};
+	if (words > U32_MAX / sizeof(__be32))
+		return U32_MAX;
+	return (u32)words * sizeof(__be32);
+}
+
+/*
+ * Bytes this operation may still emit.  Taken from the response buffer
+ * rather than re-derived from the session: SEQUENCE has already restricted
+ * the buffer to the negotiated response size less the authentication
+ * reserve, and it selects the cached bound when the client asked for the
+ * reply to be cached.  Re-deriving would miss both.
+ */
+static u32 nfsd4_ffv2_available(struct svc_rqst *rqstp)
+{
+	struct nfsd4_compoundres *resp = rqstp->rq_resp;
+	struct xdr_buf *buf = &resp->rqstp->rq_res;
+	u32 slack = 0;
+	u32 room;
+
+	if (!nfsd4_last_compound_op(rqstp))
+		slack = COMPOUND_ERR_SLACK_SPACE;
+	if (buf->len >= buf->buflen)
+		return 0;
+	room = buf->buflen - buf->len;
+	if (room <= slack)
+		return 0;
+	return room - slack;
+}
+
+/*
+ * The status for a reply that will not fit.  A client that asked for its
+ * reply to be cached is told the cached bound was the limit, because its
+ * remedy is to retry without caching rather than to split the request.
+ * That is the signal the generic check emits, and performing the check
+ * earlier must not discard it.
+ */
+static __be32 nfsd4_ffv2_capacity_status(struct svc_rqst *rqstp, __be32 dflt)
+{
+	struct nfsd4_compoundres *resp = rqstp->rq_resp;
+
+	if (!nfsd4_has_session(&resp->cstate))
+		return nfserr_resource;
+	if (resp->cstate.slot &&
+	    (resp->cstate.slot->sl_flags & NFSD4_SLOT_CACHETHIS))
+		return nfserr_rep_too_big_to_cache;
+	return dflt;
+}
+
+static __be32 nfsd4_ffv2_admit(struct svc_rqst *rqstp,
+			       struct nfsd4_compound_state *cstate, u32 opnum,
+			       const stateid_t *stateid,
+			       struct nfsd_ffv2_admission *admission)
+{
 	__be32 status;
 
 	status = nfsd4_ffv2_compound_status(rqstp);
@@ -3725,51 +3794,287 @@ nfsd4_ffv2_probe(struct svc_rqst *rqstp,
 	status = check_nfsd_access(cstate->current_fh.fh_export, rqstp, false);
 	if (status)
 		return status;
-	status = nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh,
-					      cstate->session, opnum, stateid,
-					      NULL, &admission);
+	return nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh,
+					    cstate->session, opnum, stateid,
+					    NULL, admission);
+}
+
+static void nfsd4_chunk_read_release(union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_read *cr = &u->chunk_read;
+
+	kfree(cr->cra_chunks);
+	cr->cra_chunks = NULL;
+	kvfree(cr->cra_payload);
+	cr->cra_payload = NULL;
+	cr->cra_nchunks = 0;
+	cr->cra_payload_len = 0;
+}
+
+static void nfsd4_chunk_header_read_release(union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_header_read *hr = &u->chunk_header_read;
+
+	kfree(hr->chrr_ents);
+	hr->chrr_ents = NULL;
+	hr->chrr_nents = 0;
+}
+
+/*
+ * Take a private copy of everything the encoder will read.  Both the array
+ * and the payload bytes it points at are borrowed from the provider and
+ * stay valid only while the execution admission is held, so the copy runs
+ * before the admission is released and the encoder never sees provider
+ * storage.  Payloads are concatenated into one block and named by offset.
+ */
+static __be32 nfsd4_ffv2_copy_read(struct nfsd4_chunk_read *cr,
+				   const struct nfsd_ffv2_chunk_result *result)
+{
+	u32 off = 0;
+	u64 total = 0;
+	u32 i;
+
+	cr->cra_eof = result->eof;
+	if (!result->count)
+		return nfs_ok;
+
+	cr->cra_chunks = kcalloc(result->count, sizeof(*cr->cra_chunks),
+				 GFP_KERNEL);
+	if (!cr->cra_chunks)
+		return nfserr_jukebox;
+
+	for (i = 0; i < result->count; i++)
+		total += result->read.chunks[i].cr_effective_len;
+	if (total) {
+		cr->cra_payload = kvmalloc(total, GFP_KERNEL);
+		if (!cr->cra_payload)
+			return nfserr_jukebox;
+	}
+	cr->cra_payload_len = total;
+
+	for (i = 0; i < result->count; i++) {
+		const struct nfsd_ffv2_read_chunk *src = &result->read.chunks[i];
+		struct nfsd4_chunk_read_ent *ent = &cr->cra_chunks[i];
+
+		ent->cre_checksum = src->cr_checksum;
+		ent->cre_effective_len = src->cr_effective_len;
+		ent->cre_owner = src->cr_owner;
+		ent->cre_guard = src->cr_guard;
+		ent->cre_payload_id = src->cr_payload_id;
+		ent->cre_locked = src->cr_locked;
+		ent->cre_status = src->cr_status;
+		ent->cre_payload_off = off;
+		if (src->cr_effective_len) {
+			memcpy(cr->cra_payload + off, src->cr_chunk,
+			       src->cr_effective_len);
+			off += src->cr_effective_len;
+		}
+	}
+	cr->cra_nchunks = result->count;
+	return nfs_ok;
+}
+
+/*
+ * The same copy for a header result.  The five co-indexed arrays become one
+ * array of entries, so the arrays cannot later be truncated to different
+ * lengths.
+ */
+static __be32 nfsd4_ffv2_copy_header(struct nfsd4_chunk_header_read *hr,
+				     const struct nfsd_ffv2_chunk_result *result)
+{
+	u32 i;
+
+	hr->chrr_eof = result->eof;
+	if (!result->count)
+		return nfs_ok;
+
+	hr->chrr_ents = kcalloc(result->count, sizeof(*hr->chrr_ents),
+				GFP_KERNEL);
+	if (!hr->chrr_ents)
+		return nfserr_jukebox;
+
+	for (i = 0; i < result->count; i++) {
+		struct nfsd4_chunk_header_ent *ent = &hr->chrr_ents[i];
+
+		ent->che_status = result->header.status[i];
+		ent->che_locked = result->header.locked[i];
+		ent->che_owner = result->header.owners[i];
+		ent->che_guard = result->header.guards[i];
+		ent->che_predecessor = result->header.predecessors[i];
+	}
+	hr->chrr_nents = result->count;
+	return nfs_ok;
+}
+
+static u32 nfsd4_ffv2_header_ent_words(const struct nfsd4_chunk_header_ent *ent)
+{
+	if (ent->che_predecessor.disposition == NFSD_FFV2_RETAINED_ABSENT)
+		return NFSD4_FFV2_HEADER_ENT_MIN_WORDS;
+	return NFSD4_FFV2_HEADER_ENT_MAX_WORDS;
+}
+
+static __be32
+nfsd4_ffv2_chunk_read_op(struct svc_rqst *rqstp,
+			 struct nfsd4_compound_state *cstate,
+			 union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_read *cr = &u->chunk_read;
+	const struct nfsd_ffv2_chunk_request request = {
+		.offset	= cr->cra_offset,
+		.count	= cr->cra_count,
+	};
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_chunk_result result = {};
+	u32 available;
+	__be32 status;
+	u64 words;
+
+	/*
+	 * A read is all or nothing: it has no short form, so a reply that
+	 * cannot fit is refused rather than trimmed.  The metadata is
+	 * bounded by the requested count and is checked before the provider
+	 * runs; the payload length is not known until the provider answers,
+	 * so the total is checked once more after the copy and before any
+	 * byte is emitted.
+	 */
+	status = nfsd4_ffv2_admit(rqstp, cstate, OP_CHUNK_READ,
+				  &cr->cra_stateid, &admission);
 	if (status)
 		return status;
-	/*
-	 * The admission is held across the provider boundary and released
-	 * once, so retirement waits for this request rather than racing it.
-	 *
-	 * The result is discarded here because no encoder exists yet: with
-	 * no provider installed this path always reports NFS4ERR_NOTSUPP,
-	 * and the encoder lands with the operation that needs it.
-	 */
-	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh, opnum,
-					  request, &result, &admission);
+
+	available = nfsd4_ffv2_available(rqstp);
+	words = NFSD4_FFV2_READ_FIXED_WORDS +
+		(u64)cr->cra_count * NFSD4_FFV2_READ_ENT_WORDS;
+	if (nfsd4_ffv2_bytes(words) > available) {
+		nfsd_ffv2_complete(&admission);
+		return nfsd4_ffv2_capacity_status(rqstp, nfserr_toosmall);
+	}
+	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh,
+					  OP_CHUNK_READ, &request, &result,
+					  &admission);
+	if (status == nfs_ok)
+		status = nfsd4_ffv2_copy_read(cr, &result);
 	nfsd_ffv2_complete(&admission);
-	return status;
+	if (status) {
+		nfsd4_chunk_read_release(u);
+		return status;
+	}
+
+	words = NFSD4_FFV2_READ_FIXED_WORDS +
+		(u64)cr->cra_nchunks * NFSD4_FFV2_READ_ENT_WORDS;
+	if ((u64)nfsd4_ffv2_bytes(words) +
+	    xdr_align_size(cr->cra_payload_len) > available) {
+		nfsd4_chunk_read_release(u);
+		return nfsd4_ffv2_capacity_status(rqstp, nfserr_toosmall);
+	}
+	return nfs_ok;
 }
 
 static __be32
-nfsd4_ffv2_chunk_read_probe(struct svc_rqst *rqstp,
-			    struct nfsd4_compound_state *cstate,
-			    union nfsd4_op_u *u)
+nfsd4_ffv2_chunk_header_read_op(struct svc_rqst *rqstp,
+				struct nfsd4_compound_state *cstate,
+				union nfsd4_op_u *u)
 {
-	const struct nfsd_ffv2_chunk_request request = {
-		.offset	= u->chunk_read.cra_offset,
-		.count	= u->chunk_read.cra_count,
-	};
+	struct nfsd4_chunk_header_read *hr = &u->chunk_header_read;
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_chunk_result result = {};
+	struct nfsd_ffv2_chunk_request request;
+	u32 available, fixed, kept, used, count;
+	bool shortened;
+	__be32 status;
 
-	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_READ,
-				&u->chunk_read.cra_stateid, &request);
+	/*
+	 * A header read has a short form: when the full reply will not fit,
+	 * as many entries as do fit are returned and the client resumes
+	 * after them.  The count is chosen before the provider runs, using
+	 * the cheapest entry shape, so the provider is not asked for far
+	 * more than can be encoded; the exact entries are chosen after the
+	 * copy, once each entry's real shape is known.
+	 */
+	status = nfsd4_ffv2_admit(rqstp, cstate, OP_CHUNK_HEADER_READ,
+				  &hr->chra_stateid, &admission);
+	if (status)
+		return status;
+
+	available = nfsd4_ffv2_available(rqstp);
+	fixed = nfsd4_ffv2_bytes(NFSD4_FFV2_HEADER_FIXED_WORDS);
+	count = 0;
+	if (fixed <= available)
+		count = (available - fixed) /
+			nfsd4_ffv2_bytes(NFSD4_FFV2_HEADER_ENT_MIN_WORDS);
+	if (fixed > available || (hr->chra_count && !count)) {
+		nfsd_ffv2_complete(&admission);
+		return nfsd4_ffv2_capacity_status(rqstp, nfserr_rep_too_big);
+	}
+	count = min(hr->chra_count, count);
+
+	request.offset = hr->chra_offset;
+	request.count = count;
+	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh,
+					  OP_CHUNK_HEADER_READ, &request,
+					  &result, &admission);
+	if (status == nfs_ok)
+		status = nfsd4_ffv2_copy_header(hr, &result);
+	nfsd_ffv2_complete(&admission);
+	if (status) {
+		nfsd4_chunk_header_read_release(u);
+		return status;
+	}
+
+	/* Keep the longest run of entries that fits. */
+	used = fixed;
+	for (kept = 0; kept < hr->chrr_nents; kept++) {
+		u32 cost = nfsd4_ffv2_bytes(nfsd4_ffv2_header_ent_words(&hr->chrr_ents[kept]));
+
+		if (used + cost > available)
+			break;
+		used += cost;
+	}
+	shortened = kept < hr->chrr_nents;
+	/*
+	 * Dropping every entry of a non-empty answer is not a short reply,
+	 * it is a reply that does not fit: returning zero entries would
+	 * leave the client resuming where it started.  An answer that was
+	 * empty to begin with is a legitimate end-of-range success.
+	 */
+	if (!kept && hr->chrr_nents) {
+		nfsd4_chunk_header_read_release(u);
+		return nfsd4_ffv2_capacity_status(rqstp, nfserr_rep_too_big);
+	}
+	hr->chrr_nents = kept;
+	/*
+	 * End of file describes the range, not the reply.  It survives a
+	 * provider-shortened answer and is cleared by one this server
+	 * shortened, because the chunks dropped here still exist.
+	 */
+	if (shortened)
+		hr->chrr_eof = false;
+	return nfs_ok;
 }
 
-static __be32
-nfsd4_ffv2_chunk_header_read_probe(struct svc_rqst *rqstp,
-				   struct nfsd4_compound_state *cstate,
-				   union nfsd4_op_u *u)
+/*
+ * Reply-size estimates for the compound decoder, which runs before the
+ * provider has produced anything.  They are upper bounds on what the
+ * encoder can emit for the requested count, using the costliest shape each
+ * entry can take, and are capped by what the transport can carry.
+ */
+static u32 nfsd4_chunk_read_rsize(const struct svc_rqst *rqstp,
+				  const struct nfsd4_op *op)
 {
-	const struct nfsd_ffv2_chunk_request request = {
-		.offset	= u->chunk_header_read.chra_offset,
-		.count	= u->chunk_header_read.chra_count,
-	};
+	u64 words = op_encode_hdr_size + 1 + 1 +
+		    (u64)op->u.chunk_read.cra_count * NFSD4_FFV2_READ_ENT_WORDS;
 
-	return nfsd4_ffv2_probe(rqstp, cstate, OP_CHUNK_HEADER_READ,
-				&u->chunk_header_read.chra_stateid, &request);
+	return min_t(u32, nfsd4_ffv2_bytes(words), nfsd4_max_payload(rqstp));
+}
+
+static u32 nfsd4_chunk_header_read_rsize(const struct svc_rqst *rqstp,
+					 const struct nfsd4_op *op)
+{
+	u64 words = op_encode_hdr_size + 1 + 5 +
+		    (u64)op->u.chunk_header_read.chra_count *
+		    NFSD4_FFV2_HEADER_ENT_MAX_WORDS;
+
+	return min_t(u32, nfsd4_ffv2_bytes(words), nfsd4_max_payload(rqstp));
 }
 
 static const struct nfsd4_operation nfsd4_ops[] = {
@@ -4210,9 +4515,10 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_HEADER_READ] = {
-		.op_func = nfsd4_ffv2_chunk_header_read_probe,
+		.op_func = nfsd4_ffv2_chunk_header_read_op,
 		.op_name = "OP_CHUNK_HEADER_READ",
-		.op_rsize_bop = nfsd4_only_status_rsize,
+		.op_rsize_bop = nfsd4_chunk_header_read_rsize,
+		.op_release = nfsd4_chunk_header_read_release,
 	},
 	[OP_CHUNK_LOCK] = {
 		.op_func = nfsd4_ffv2_chunk_lock,
@@ -4221,9 +4527,10 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_rsize_bop = nfsd4_only_status_rsize,
 	},
 	[OP_CHUNK_READ] = {
-		.op_func = nfsd4_ffv2_chunk_read_probe,
+		.op_func = nfsd4_ffv2_chunk_read_op,
 		.op_name = "OP_CHUNK_READ",
-		.op_rsize_bop = nfsd4_only_status_rsize,
+		.op_rsize_bop = nfsd4_chunk_read_rsize,
+		.op_release = nfsd4_chunk_read_release,
 	},
 	[OP_CHUNK_REPAIRED] = {
 		.op_func = nfsd4_ffv2_chunk_repaired,
