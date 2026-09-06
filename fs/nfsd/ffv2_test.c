@@ -6278,14 +6278,33 @@ static int nfsd_ffv2_nl_check(struct nfsd_ffv2_nl *nl, const struct nlmsghdr *nl
 	return 0;
 }
 
-/* The error a message carries, once it is known to be one. */
-static int nfsd_ffv2_nl_error(const struct nlmsghdr *nlh)
+/*
+ * The error a message carries, once it is known to be one.
+ *
+ * An acknowledgment echoes the request it answers, so the echo is checked
+ * before the error is believed: type and sequence always, and the
+ * generic-netlink command and version too when the payload was echoed rather
+ * than capped.  An error taken from someone else's request is worse than no
+ * error at all.
+ */
+static int nfsd_ffv2_nl_error(struct nfsd_ffv2_nl *nl, const struct nlmsghdr *nlh,
+			      u16 type, u8 cmd, u8 version)
 {
 	const struct nlmsgerr *e;
 
 	if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*e)))
 		return -EBADMSG;
 	e = nlmsg_data(nlh);
+	if (e->msg.nlmsg_seq != nl->seq || e->msg.nlmsg_type != type)
+		return -EBADMSG;
+	if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN)) {
+		const struct genlmsghdr *gnlh;
+
+		gnlh = (const struct genlmsghdr *)((const char *)&e->msg +
+						   NLMSG_HDRLEN);
+		if (gnlh->cmd != cmd || gnlh->version != version)
+			return -EPROTO;
+	}
 	return e->error;
 }
 
@@ -6305,7 +6324,7 @@ static int nfsd_ffv2_nl_check_genl(const struct nlmsghdr *nlh, u8 cmd, u8 versio
 	return 0;
 }
 
-static noinline int nfsd_ffv2_nl_ack(struct nfsd_ffv2_nl *nl)
+static noinline int nfsd_ffv2_nl_ack(struct nfsd_ffv2_nl *nl, u8 cmd)
 {
 	char buf[NFSD_FFV2_NL_BUF];
 	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
@@ -6321,7 +6340,8 @@ static noinline int nfsd_ffv2_nl_ack(struct nfsd_ffv2_nl *nl)
 		return error;
 	if (nlh->nlmsg_type != NLMSG_ERROR)
 		return -EPROTO;
-	error = nfsd_ffv2_nl_error(nlh);
+	error = nfsd_ffv2_nl_error(nl, nlh, nl->family, cmd,
+				   SUNRPC_FAMILY_VERSION);
 	if (error)
 		return error;
 	/* Nothing may follow an acknowledgment for a single request. */
@@ -6339,6 +6359,7 @@ static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
 	unsigned int rem;
 	size_t off;
 	int got, nrem, error;
+	u16 family;
 
 	off = nfsd_ffv2_nl_begin(buf, GENL_ID_CTRL, CTRL_CMD_GETFAMILY,
 				 ++nl->seq, 0);
@@ -6359,7 +6380,8 @@ static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
 	if (error)
 		return error;
 	if (nlh->nlmsg_type == NLMSG_ERROR) {
-		error = nfsd_ffv2_nl_error(nlh);
+		error = nfsd_ffv2_nl_error(nl, nlh, GENL_ID_CTRL,
+					   CTRL_CMD_GETFAMILY, 1);
 		return error ? error : -ENOENT;
 	}
 	if (nlh->nlmsg_type != GENL_ID_CTRL)
@@ -6367,15 +6389,26 @@ static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
 	error = nfsd_ffv2_nl_check_genl(nlh, CTRL_CMD_NEWFAMILY, 2);
 	if (error)
 		return error;
+	/*
+	 * The whole attribute stream is walked before the answer is used: a
+	 * message that happens to carry the wanted attribute and then trails
+	 * malformed bytes is not a well-formed message, and returning early
+	 * on the first match would accept it.
+	 */
+	family = 0;
 	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem) {
-		if (nla_type(nla) == CTRL_ATTR_FAMILY_ID) {
-			if (nla_len(nla) < (int)sizeof(u16))
-				return -EBADMSG;
-			nl->family = nla_get_u16(nla);
-			return nl->family ? 0 : -ENOENT;
-		}
+		if (nla_type(nla) != CTRL_ATTR_FAMILY_ID)
+			continue;
+		if (nla_len(nla) < (int)sizeof(u16))
+			return -EBADMSG;
+		family = nla_get_u16(nla);
 	}
-	return -ENOENT;
+	if (nrem)
+		return -EBADMSG;
+	if (!family)
+		return -ENOENT;
+	nl->family = family;
+	return 0;
 }
 
 static int nfsd_ffv2_nl_open(struct net *net, struct nfsd_ffv2_nl *nl)
@@ -6456,7 +6489,7 @@ static noinline int nfsd_ffv2_nl_seed_ip(struct nfsd_ffv2_nl *nl,
 	error = nfsd_ffv2_nl_send(nl, buf, off);
 	if (error < 0)
 		return error;
-	return nfsd_ffv2_nl_ack(nl);
+	return nfsd_ffv2_nl_ack(nl, SUNRPC_CMD_IP_MAP_SET_REQS);
 }
 
 /*
@@ -6495,7 +6528,7 @@ static noinline int nfsd_ffv2_nl_seed_gid_raw(struct nfsd_ffv2_nl *nl, u32 uid,
 	error = nfsd_ffv2_nl_send(nl, buf, off);
 	if (error < 0)
 		return error;
-	return nfsd_ffv2_nl_ack(nl);
+	return nfsd_ffv2_nl_ack(nl, SUNRPC_CMD_UNIX_GID_SET_REQS);
 }
 
 /*
@@ -6547,7 +6580,9 @@ static noinline int nfsd_ffv2_nl_pending(struct nfsd_ffv2_nl *nl, u8 cmd,
 				return 0;
 			}
 			if (nlh->nlmsg_type == NLMSG_ERROR) {
-				error = nfsd_ffv2_nl_error(nlh);
+				error = nfsd_ffv2_nl_error(nl, nlh,
+							   nl->family, cmd,
+							   SUNRPC_FAMILY_VERSION);
 				return error ? error : -EBADMSG;
 			}
 			if (nlh->nlmsg_type != nl->family)
@@ -6559,6 +6594,8 @@ static noinline int nfsd_ffv2_nl_pending(struct nfsd_ffv2_nl *nl, u8 cmd,
 			nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem)
 				if (nla_type(nla) == nest_type)
 					(*count)++;
+			if (nrem)
+				return -EBADMSG;	/* malformed residue */
 		}
 		if (rem)
 			return -EBADMSG;		/* trailing partial header */
@@ -6591,7 +6628,7 @@ static int nfsd_ffv2_nl_flush(struct nfsd_ffv2_nl *nl, u32 mask)
 	error = nfsd_ffv2_nl_send(nl, buf, off);
 	if (error < 0)
 		return error;
-	return nfsd_ffv2_nl_ack(nl);
+	return nfsd_ffv2_nl_ack(nl, SUNRPC_CMD_CACHE_FLUSH);
 }
 
 /*
@@ -6928,7 +6965,16 @@ static void nfsd_ffv2_auth_cache_p0_probe_test(struct kunit *test)
 	seeded = true;
 	error = nfsd_ffv2_nl_seed_gid_raw(&nl, uid, expiry, false);
 	pr_info("FFV2P0: partial-seed gid=%d\n", error);
-	KUNIT_EXPECT_LT(test, error, 0);
+	if (error >= 0) {
+		/*
+		 * The rollback below is only meaningful if this seed really
+		 * failed.  If the parser accepted a request with no uid, the
+		 * case proves nothing and must not continue as though it did.
+		 */
+		KUNIT_FAIL(test,
+			   "a gid seed with no uid was accepted: %d", error);
+		goto out;
+	}
 
 	error = nfsd_ffv2_nl_flush(&nl, 0);
 	if (error) {
