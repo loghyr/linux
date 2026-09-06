@@ -6279,27 +6279,46 @@ static int nfsd_ffv2_nl_check(struct nfsd_ffv2_nl *nl, const struct nlmsghdr *nl
 }
 
 /*
- * The error a message carries, once it is known to be one.
+ * Read the result out of an acknowledgment, having first established that it
+ * is one, that it answers the outstanding request, and that it is the whole
+ * datagram.  The checks come before the error is taken, so an error belonging
+ * to another exchange cannot be returned as this one's.
  *
- * An acknowledgment echoes the request it answers, so the echo is checked
- * before the error is believed: type and sequence always, and the
- * generic-netlink command and version too when the payload was echoed rather
- * than capped.  An error taken from someone else's request is worse than no
- * error at all.
+ * The request is echoed back only when it was not capped.  When it was, what
+ * follows the echoed header is extended-acknowledgment data, which must not
+ * be read as a generic-netlink header; the flag says which case this is, and
+ * the length alone cannot.
  */
-static int nfsd_ffv2_nl_error(struct nfsd_ffv2_nl *nl, const struct nlmsghdr *nlh,
-			      u16 type, u8 cmd, u8 version)
+static int nfsd_ffv2_nl_parse_ack(struct nfsd_ffv2_nl *nl, const void *buf,
+				  unsigned int len, u16 type, u8 cmd,
+				  u8 version)
 {
+	const struct nlmsghdr *nlh = buf;
 	const struct nlmsgerr *e;
+	int error;
 
+	error = nfsd_ffv2_nl_check(nl, nlh, len);
+	if (error)
+		return error;
+	if (nlh->nlmsg_type != NLMSG_ERROR)
+		return -EPROTO;
 	if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*e)))
 		return -EBADMSG;
+	/* Nothing may follow: a single request is answered by one message. */
+	if (len != NLMSG_ALIGN(nlh->nlmsg_len))
+		return -EBADMSG;
+
 	e = nlmsg_data(nlh);
 	if (e->msg.nlmsg_seq != nl->seq || e->msg.nlmsg_type != type)
 		return -EBADMSG;
-	if (nlh->nlmsg_len >= NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN)) {
+
+	if (!(nlh->nlmsg_flags & NLM_F_CAPPED)) {
 		const struct genlmsghdr *gnlh;
 
+		if (e->msg.nlmsg_len < NLMSG_LENGTH(GENL_HDRLEN))
+			return -EBADMSG;
+		if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN))
+			return -EBADMSG;
 		gnlh = (const struct genlmsghdr *)((const char *)&e->msg +
 						   NLMSG_HDRLEN);
 		if (gnlh->cmd != cmd || gnlh->version != version)
@@ -6327,38 +6346,67 @@ static int nfsd_ffv2_nl_check_genl(const struct nlmsghdr *nlh, u8 cmd, u8 versio
 static noinline int nfsd_ffv2_nl_ack(struct nfsd_ffv2_nl *nl, u8 cmd)
 {
 	char buf[NFSD_FFV2_NL_BUF];
-	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-	unsigned int rem;
-	int got, error;
+	int got;
 
 	got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
 	if (got < 0)
 		return got;
-	rem = (unsigned int)got;
-	error = nfsd_ffv2_nl_check(nl, nlh, rem);
-	if (error)
-		return error;
-	if (nlh->nlmsg_type != NLMSG_ERROR)
-		return -EPROTO;
-	error = nfsd_ffv2_nl_error(nl, nlh, nl->family, cmd,
-				   SUNRPC_FAMILY_VERSION);
-	if (error)
-		return error;
-	/* Nothing may follow an acknowledgment for a single request. */
-	if (rem - NLMSG_ALIGN(nlh->nlmsg_len) != 0)
-		return -EBADMSG;
-	return 0;
+	return nfsd_ffv2_nl_parse_ack(nl, buf, (unsigned int)got, nl->family,
+				      cmd, SUNRPC_FAMILY_VERSION);
 }
 
 /* Resolve the runtime family id; the UAPI name is not an nlmsg_type. */
+/*
+ * Take the family identifier out of a controller reply.  The whole attribute
+ * stream is walked before the answer is used: a message that carries the
+ * wanted attribute and then trails malformed bytes is not well formed, and
+ * stopping at the first match would accept it.
+ */
+static int nfsd_ffv2_nl_parse_family(struct nfsd_ffv2_nl *nl, const void *buf,
+				     unsigned int len, u16 *family)
+{
+	const struct nlmsghdr *nlh = buf;
+	const struct nlattr *nla;
+	int nrem, error;
+	u16 found = 0;
+
+	error = nfsd_ffv2_nl_check(nl, nlh, len);
+	if (error)
+		return error;
+	if (nlh->nlmsg_type == NLMSG_ERROR) {
+		error = nfsd_ffv2_nl_parse_ack(nl, buf, len, GENL_ID_CTRL,
+					       CTRL_CMD_GETFAMILY, 1);
+		return error ? error : -ENOENT;
+	}
+	if (nlh->nlmsg_type != GENL_ID_CTRL)
+		return -EPROTO;
+	if (nlh->nlmsg_len < NLMSG_LENGTH(GENL_HDRLEN))
+		return -EBADMSG;
+	error = nfsd_ffv2_nl_check_genl(nlh, CTRL_CMD_NEWFAMILY, 2);
+	if (error)
+		return error;
+
+	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem) {
+		if (nla_type(nla) != CTRL_ATTR_FAMILY_ID)
+			continue;
+		if (nla_len(nla) < (int)sizeof(u16))
+			return -EBADMSG;
+		found = nla_get_u16(nla);
+	}
+	if (nrem)
+		return -EBADMSG;
+	if (!found)
+		return -ENOENT;
+	*family = found;
+	return 0;
+}
+
 static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
 {
 	char buf[NFSD_FFV2_NL_BUF];
 	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-	struct nlattr *nla;
-	unsigned int rem;
 	size_t off;
-	int got, nrem, error;
+	int got, error;
 	u16 family;
 
 	off = nfsd_ffv2_nl_begin(buf, GENL_ID_CTRL, CTRL_CMD_GETFAMILY,
@@ -6375,38 +6423,9 @@ static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
 	got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
 	if (got < 0)
 		return got;
-	rem = (unsigned int)got;
-	error = nfsd_ffv2_nl_check(nl, nlh, rem);
+	error = nfsd_ffv2_nl_parse_family(nl, buf, (unsigned int)got, &family);
 	if (error)
 		return error;
-	if (nlh->nlmsg_type == NLMSG_ERROR) {
-		error = nfsd_ffv2_nl_error(nl, nlh, GENL_ID_CTRL,
-					   CTRL_CMD_GETFAMILY, 1);
-		return error ? error : -ENOENT;
-	}
-	if (nlh->nlmsg_type != GENL_ID_CTRL)
-		return -EPROTO;
-	error = nfsd_ffv2_nl_check_genl(nlh, CTRL_CMD_NEWFAMILY, 2);
-	if (error)
-		return error;
-	/*
-	 * The whole attribute stream is walked before the answer is used: a
-	 * message that happens to carry the wanted attribute and then trails
-	 * malformed bytes is not a well-formed message, and returning early
-	 * on the first match would accept it.
-	 */
-	family = 0;
-	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem) {
-		if (nla_type(nla) != CTRL_ATTR_FAMILY_ID)
-			continue;
-		if (nla_len(nla) < (int)sizeof(u16))
-			return -EBADMSG;
-		family = nla_get_u16(nla);
-	}
-	if (nrem)
-		return -EBADMSG;
-	if (!family)
-		return -ENOENT;
 	nl->family = family;
 	return 0;
 }
@@ -6580,9 +6599,13 @@ static noinline int nfsd_ffv2_nl_pending(struct nfsd_ffv2_nl *nl, u8 cmd,
 				return 0;
 			}
 			if (nlh->nlmsg_type == NLMSG_ERROR) {
-				error = nfsd_ffv2_nl_error(nl, nlh,
-							   nl->family, cmd,
-							   SUNRPC_FAMILY_VERSION);
+				/*
+				 * An error ends the dump, so it must also be
+				 * the whole datagram; the parse enforces that.
+				 */
+				error = nfsd_ffv2_nl_parse_ack(nl, nlh, rem,
+							       nl->family, cmd,
+							       SUNRPC_FAMILY_VERSION);
 				return error ? error : -EBADMSG;
 			}
 			if (nlh->nlmsg_type != nl->family)
@@ -6769,6 +6792,136 @@ out:
  * to the single cleanup path rather than letting a later phase report a
  * success it did not earn.
  */
+/*
+ * The reply parser, exercised against replies a socket will not readily
+ * produce.  These are the shapes that would be believed if the checks were
+ * written loosely: an acknowledgment whose payload was capped and followed by
+ * extended-acknowledgment data, an error with another message behind it, and
+ * a well-formed attribute followed by rubbish.  Each must be refused.
+ */
+static void nfsd_ffv2_auth_cache_nl_parser_test(struct kunit *test)
+{
+	struct nfsd_ffv2_nl nl = { .portid = 0x2a, .family = 23, .seq = 7 };
+	char buf[256];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct nlmsgerr *e;
+	struct nlattr *nla;
+	size_t len;
+	u16 family;
+
+	/*
+	 * A capped acknowledgment: the request was not echoed, so what sits
+	 * behind the echoed header is extended-acknowledgment data.  Reading
+	 * it as a generic-netlink header would find a command of zero and
+	 * reject a reply that is perfectly good, so the capped flag decides.
+	 */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_ERROR;
+	nlh->nlmsg_flags = NLM_F_CAPPED | NLM_F_ACK_TLVS;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	e = nlmsg_data(nlh);
+	e->error = 0;
+	e->msg.nlmsg_type = nl.family;
+	e->msg.nlmsg_seq = nl.seq;
+	e->msg.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	len = NLMSG_HDRLEN + sizeof(*e);
+	nla = (struct nlattr *)(buf + NLMSG_ALIGN(len));
+	nla->nla_type = NLMSGERR_ATTR_MSG;
+	nla->nla_len = NLA_HDRLEN + 4;
+	memcpy(nla_data(nla), "abc", 4);
+	len = NLMSG_ALIGN(len) + NLA_ALIGN(nla->nla_len);
+	nlh->nlmsg_len = len;
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_nl_parse_ack(&nl, buf, len, nl.family,
+					       SUNRPC_CMD_IP_MAP_SET_REQS,
+					       SUNRPC_FAMILY_VERSION));
+
+	/* The same reply, with a command that is not the one asked for. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_ERROR;
+	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	e = nlmsg_data(nlh);
+	e->error = 0;
+	e->msg.nlmsg_type = nl.family;
+	e->msg.nlmsg_seq = nl.seq;
+	e->msg.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	((struct genlmsghdr *)((char *)&e->msg + NLMSG_HDRLEN))->cmd =
+		SUNRPC_CMD_CACHE_FLUSH;
+	((struct genlmsghdr *)((char *)&e->msg + NLMSG_HDRLEN))->version =
+		SUNRPC_FAMILY_VERSION;
+	len = NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN);
+	nlh->nlmsg_len = len;
+	KUNIT_EXPECT_EQ(test, -EPROTO,
+			nfsd_ffv2_nl_parse_ack(&nl, buf, NLMSG_ALIGN(len),
+					       nl.family,
+					       SUNRPC_CMD_IP_MAP_SET_REQS,
+					       SUNRPC_FAMILY_VERSION));
+
+	/*
+	 * A negative acknowledgment with another message behind it.  The
+	 * error must not be returned: a datagram carrying more than the one
+	 * answer is not the answer to one request.
+	 */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_ERROR;
+	nlh->nlmsg_flags = NLM_F_CAPPED;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(*e));
+	e = nlmsg_data(nlh);
+	e->error = -EINVAL;
+	e->msg.nlmsg_type = nl.family;
+	e->msg.nlmsg_seq = nl.seq;
+	e->msg.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	len = NLMSG_ALIGN(nlh->nlmsg_len) + NLMSG_HDRLEN;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_ack(&nl, buf, len, nl.family,
+					       SUNRPC_CMD_IP_MAP_SET_REQS,
+					       SUNRPC_FAMILY_VERSION));
+
+	/*
+	 * A controller reply whose family identifier is valid but which then
+	 * trails bytes too short to be an attribute.  Stopping at the first
+	 * match would return the identifier and never see them.
+	 */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = GENL_ID_CTRL;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	((struct genlmsghdr *)nlmsg_data(nlh))->cmd = CTRL_CMD_NEWFAMILY;
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = 2;
+	len = NLMSG_HDRLEN + GENL_HDRLEN;
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID;
+	nla->nla_len = NLA_HDRLEN + sizeof(u16);
+	*(u16 *)nla_data(nla) = 23;
+	len += NLA_ALIGN(nla->nla_len);
+	len += NLA_HDRLEN / 2;			/* not a whole attribute */
+	nlh->nlmsg_len = len;
+	family = 0;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_family(&nl, buf,
+						  NLMSG_ALIGN(len), &family));
+	KUNIT_EXPECT_EQ(test, 0, (int)family);
+
+	/* A reply for someone else's request is refused before anything else. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_ERROR;
+	nlh->nlmsg_flags = NLM_F_CAPPED;
+	nlh->nlmsg_seq = nl.seq + 1;
+	nlh->nlmsg_pid = nl.portid;
+	nlh->nlmsg_len = NLMSG_LENGTH(sizeof(*e));
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_ack(&nl, buf,
+					       NLMSG_ALIGN(nlh->nlmsg_len),
+					       nl.family,
+					       SUNRPC_CMD_IP_MAP_SET_REQS,
+					       SUNRPC_FAMILY_VERSION));
+}
+
 static void nfsd_ffv2_auth_cache_p0_probe_test(struct kunit *test)
 {
 	static const char domain[] = "ffv2-p0-test-domain";
@@ -8136,6 +8289,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
 	KUNIT_CASE(nfsd_ffv2_encode_header_test),
+	KUNIT_CASE(nfsd_ffv2_auth_cache_nl_parser_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_p0_probe_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_second_net_test),
 	KUNIT_CASE(nfsd_ffv2_transport_null_test),
