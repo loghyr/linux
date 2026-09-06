@@ -3068,6 +3068,37 @@ check_if_stalefh_allowed(struct nfsd4_compoundargs *args)
 }
 #endif
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static struct nfsd_ffv2_reply_shape nfsd_ffv2_last_reply;
+static atomic_t nfsd_ffv2_ops_released = ATOMIC_INIT(0);
+
+/*
+ * Record what the server built for this reply, as values only, while the
+ * pages are still the request's.  Nothing here keeps a pointer to them and
+ * nothing changes who owns them.
+ */
+static void nfsd_ffv2_record_reply_shape(struct svc_rqst *rqstp)
+{
+	const struct xdr_buf *buf = &rqstp->rq_res;
+
+	nfsd_ffv2_last_reply.head_len = buf->head[0].iov_len;
+	nfsd_ffv2_last_reply.page_len = buf->page_len;
+	nfsd_ffv2_last_reply.pages_used =
+		rqstp->rq_next_page > rqstp->rq_respages ?
+		rqstp->rq_next_page - rqstp->rq_respages : 0;
+	nfsd_ffv2_last_reply.ops_released =
+		atomic_read(&nfsd_ffv2_ops_released);
+	nfsd_ffv2_last_reply.valid = true;
+}
+
+void nfsd_ffv2_test_reply_shape(struct nfsd_ffv2_reply_shape *shape)
+{
+	*shape = nfsd_ffv2_last_reply;
+}
+#else
+static inline void nfsd_ffv2_record_reply_shape(struct svc_rqst *rqstp) {}
+#endif
+
 /*
  * COMPOUND call.
  */
@@ -3230,6 +3261,7 @@ encode_op:
 	BUG_ON(cstate->replay_owner);
 out:
 	cstate->status = status;
+	nfsd_ffv2_record_reply_shape(rqstp);
 	return rpc_success;
 }
 
@@ -3814,6 +3846,10 @@ static void nfsd4_chunk_read_release(union nfsd4_op_u *u)
 {
 	struct nfsd4_chunk_read *cr = &u->chunk_read;
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	atomic_inc(&nfsd_ffv2_ops_released);
+#endif
+
 	kfree(cr->cra_chunks);
 	cr->cra_chunks = NULL;
 	kvfree(cr->cra_payload);
@@ -3825,6 +3861,10 @@ static void nfsd4_chunk_read_release(union nfsd4_op_u *u)
 static void nfsd4_chunk_header_read_release(union nfsd4_op_u *u)
 {
 	struct nfsd4_chunk_header_read *hr = &u->chunk_header_read;
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	atomic_inc(&nfsd_ffv2_ops_released);
+#endif
 
 	kfree(hr->chrr_ents);
 	hr->chrr_ents = NULL;

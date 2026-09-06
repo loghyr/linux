@@ -101,6 +101,9 @@ struct nfsd_ffv2_provider_probe_counters {
 	atomic64_t	callbacks;
 	/* Results the boundary refused to hand back. */
 	atomic64_t	malformed;
+	/* Admissions completed, and provider references released. */
+	atomic64_t	admissions_completed;
+	atomic64_t	provider_released;
 	atomic64_t	last_generation;
 };
 
@@ -1587,6 +1590,7 @@ static bool nfsd_ffv2_result_valid(u32 opnum, u32 chunk_size,
 /* Drop a callback's reference, releasing a removal waiting on the last. */
 static void nfsd_ffv2_provider_put(struct nfsd_ffv2_provider *provider)
 {
+	atomic64_inc(&nfsd_ffv2_probe_counters.provider_released);
 	if (refcount_dec_and_test(&provider->ref))
 		complete(&provider->gone);
 }
@@ -4561,6 +4565,21 @@ void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn)
 	nfsd_ffv2_provider_shutdown(nn);
 }
 
+/*
+ * Release counts a test can read: admissions completed, provider references
+ * dropped, and callbacks entered.  Values only, so nothing here exposes a
+ * provider or an admission.
+ */
+void nfsd_ffv2_test_release_counters(u64 *admissions, u64 *providers)
+{
+	if (admissions)
+		*admissions =
+			atomic64_read(&nfsd_ffv2_probe_counters.admissions_completed);
+	if (providers)
+		*providers =
+			atomic64_read(&nfsd_ffv2_probe_counters.provider_released);
+}
+
 /* Providers the namespace-exit fence had to retire, for a test to see. */
 u64 nfsd_ffv2_test_provider_fenced(void)
 {
@@ -4872,6 +4891,7 @@ void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 	generation = xchg(&admission->generation, NULL);
 	if (!generation)
 		return;
+	atomic64_inc(&nfsd_ffv2_probe_counters.admissions_completed);
 	anchor = admission->anchor;
 
 	spin_lock(&generation->admissions_lock);

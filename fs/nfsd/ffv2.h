@@ -589,6 +589,23 @@ void nfsd_ffv2_test_fh_set_chunk_size(struct svc_fh *fhp, u32 chunk_size);
 void *nfsd_ffv2_test_provider_unpublish(struct nfsd_net *nn);
 void nfsd_ffv2_test_provider_drain(void *handle);
 u64 nfsd_ffv2_test_provider_fenced(void);
+void nfsd_ffv2_test_release_counters(u64 *admissions, u64 *providers);
+
+/*
+ * What the server built for the last compound reply, as values: the head's
+ * length, the reply's page length and page count, and how far the reply's
+ * page cursor advanced.  Recorded before the transport takes the pages, and
+ * holding no pointer to any of them.
+ */
+struct nfsd_ffv2_reply_shape {
+	u32	head_len;
+	u32	page_len;
+	u32	pages_used;
+	u32	ops_released;
+	bool	valid;
+};
+
+void nfsd_ffv2_test_reply_shape(struct nfsd_ffv2_reply_shape *shape);
 u64 nfsd_ffv2_test_provider_callbacks(void);
 const struct nfsd_ffv2_object *
 nfsd_ffv2_test_binding_object(const struct nfsd_ffv2_binding *binding);

@@ -4120,7 +4120,10 @@ struct nfsd_ffv2_ro_fixture {
 	/* Set when the fixture also runs a real service with a listener. */
 	struct nfsd_ffv2_worker_ctx	worker;
 	bool				worker_installed;
-	bool				service_started;
+	/* Set once a service may exist, whether or not the start succeeded. */
+	bool				service_attempted;
+	/* The start's own error, kept apart from any cleanup error. */
+	int				service_error;
 	bool				root_held;
 	/* Set when the publication wait expired; see the init comment. */
 	bool				publish_timed_out;
@@ -4250,15 +4253,18 @@ static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
 		f->domain = NULL;
 	}
 	/*
-	 * The service and its worker go before the namespace does: threads
-	 * are stopped and joined first, so nothing is still running against
-	 * this fixture's storage when it is freed.
+	 * The service goes after the FFv2 state it was started over, not
+	 * before it.  Stopping the last thread drives this namespace's nfsd
+	 * teardown, which waits on that state, so a teardown that stopped
+	 * the threads first would wait for something it had not released
+	 * yet.  Ownership is not conditional on the start having succeeded:
+	 * a failed start can still leave a service and a thread behind.
 	 */
-	if (f->service_started) {
+	if (f->service_attempted || (f->nn && f->nn->nfsd_serv)) {
 		complete_all(&f->worker.run);
 		complete_all(&f->worker.allow_complete);
 		nfsd_shutdown_threads(f->net);
-		f->service_started = false;
+		f->service_attempted = false;
 	}
 	if (f->worker_installed) {
 		nfsd_ffv2_worker_ctx_remove(&f->worker);
@@ -4412,13 +4418,18 @@ static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
 			return false;
 		}
 		f->worker_installed = true;
+		/*
+		 * From here a service may exist even if the start reports a
+		 * failure, so teardown owns it before the result is known.
+		 */
+		f->service_attempted = true;
 		wire_error = nfsd_ffv2_start_test_service(f->net, &f->worker);
 		if (wire_error) {
+			f->service_error = wire_error;
 			KUNIT_FAIL(test, "fixture listener start failed: %d",
 				   wire_error);
 			return false;
 		}
-		f->service_started = true;
 		complete(&f->worker.run);
 	}
 
@@ -5997,6 +6008,39 @@ static int nfsd_ffv2_ro_listener_port(struct nfsd_net *nn)
 	return port;
 }
 
+/*
+ * Read exactly @len bytes, or give up.  The socket carries a receive
+ * deadline, so a service that stops answering ends the read rather than the
+ * test case.
+ */
+static int nfsd_ffv2_ro_recvfull(struct socket *sock, void *buf, size_t len)
+{
+	unsigned long deadline = jiffies + 5 * HZ;
+	size_t have = 0;
+
+	while (have < len) {
+		struct msghdr msg = {};
+		struct kvec iov = {
+			.iov_base	= (char *)buf + have,
+			.iov_len	= len - have,
+		};
+		int got;
+
+		got = kernel_recvmsg(sock, &msg, &iov, 1, iov.iov_len,
+				     MSG_DONTWAIT);
+		if (got == -EAGAIN) {
+			if (time_after(jiffies, deadline))
+				return -ETIMEDOUT;
+			msleep(20);
+			continue;
+		}
+		if (got <= 0)
+			return got ? got : -ECONNRESET;
+		have += got;
+	}
+	return 0;
+}
+
 /* Nothing in a fresh namespace can be reached until loopback is up. */
 static int nfsd_ffv2_ro_loopback_up(struct net *net)
 {
@@ -6024,15 +6068,21 @@ static void nfsd_ffv2_transport_null_test(struct kunit *test)
 	__be32 call[16], reply[16];
 	struct sockaddr_in addr = {};
 	struct nfsd_ffv2_ro_fixture f;
+	struct nfsd_ffv2_reply_shape shape = {};
+	u64 admissions_before, providers_before;
+	u64 admissions, providers;
 	struct socket *sock = NULL;
 	struct msghdr msg = {};
 	struct kvec iov;
 	int port, error;
+	__be32 marker;
 	__be32 xid;
+	u32 frame;
 	u32 words;
 
 	if (!nfsd_ffv2_ro_fixture_init_wired(test, &f))
 		goto out;
+	nfsd_ffv2_test_release_counters(&admissions_before, &providers_before);
 
 	if (nfsd_ffv2_ro_loopback_up(f.net)) {
 		KUNIT_FAIL(test, "could not bring the namespace loopback up");
@@ -6086,20 +6136,55 @@ static void nfsd_ffv2_transport_null_test(struct kunit *test)
 		goto out;
 	}
 
-	memset(&msg, 0, sizeof(msg));
-	iov.iov_base = reply;
-	iov.iov_len = sizeof(reply);
-	error = kernel_recvmsg(sock, &msg, &iov, 1, iov.iov_len, 0);
-	if (error < 7 * XDR_UNIT) {
-		KUNIT_FAIL(test, "no usable reply came back: %d", error);
+	/*
+	 * Read the record marker, then exactly the record it announces.  A
+	 * deadline is set on the socket first: a test that blocks here would
+	 * take the whole suite with it, and a service that answers nothing
+	 * is a result rather than something to wait out.
+	 */
+	if (nfsd_ffv2_ro_recvfull(sock, &marker, XDR_UNIT)) {
+		KUNIT_FAIL(test, "no record marker came back");
+		goto out;
+	}
+	frame = be32_to_cpu(marker);
+	if (!(frame & 0x80000000)) {
+		KUNIT_FAIL(test, "the reply was fragmented, which is unexpected");
+		goto out;
+	}
+	frame &= 0x7fffffff;
+	/* xid, direction, accept state, two verifier words, and the status. */
+	if (frame < 6 * XDR_UNIT || frame > sizeof(reply) ||
+	    frame % XDR_UNIT) {
+		KUNIT_FAIL(test, "the reply's length is not usable: %u", frame);
+		goto out;
+	}
+	if (nfsd_ffv2_ro_recvfull(sock, reply, frame)) {
+		KUNIT_FAIL(test, "the reply was truncated");
 		goto out;
 	}
 
 	/* Answered, accepted, and executed, for the call that was sent. */
-	KUNIT_EXPECT_EQ(test, xid, reply[1]);
-	KUNIT_EXPECT_EQ(test, 1U, be32_to_cpu(reply[2]));	/* REPLY */
-	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[3]));	/* accepted */
-	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[6]));	/* success */
+	KUNIT_EXPECT_EQ(test, xid, reply[0]);
+	KUNIT_EXPECT_EQ(test, 1U, be32_to_cpu(reply[1]));	/* REPLY */
+	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[2]));	/* accepted */
+	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[5]));	/* success */
+
+	/*
+	 * The observation the server records for a compound reply is not
+	 * recorded here, because a NULL call is not a compound.  Checking
+	 * that keeps this test to what it actually shows: a real listener
+	 * accepted and answered a request.  It says nothing about an FFv2
+	 * compound or a page-spliced reply, neither of which it sends, and
+	 * it confirms the observation does not fire for traffic that never
+	 * reached the compound path.
+	 */
+	nfsd_ffv2_test_reply_shape(&shape);
+	KUNIT_EXPECT_FALSE(test, shape.valid);
+
+	/* No provider was reached, so nothing was admitted or released. */
+	nfsd_ffv2_test_release_counters(&admissions, &providers);
+	KUNIT_EXPECT_EQ(test, admissions_before, admissions);
+	KUNIT_EXPECT_EQ(test, providers_before, providers);
 
 out:
 	if (sock)
