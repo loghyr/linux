@@ -4137,6 +4137,8 @@ struct nfsd_ffv2_ro_fixture {
 	 * threads have stopped, and nothing else may still be sending then.
 	 */
 	struct nfsd_ffv2_nl		*nl;
+	/* The phase-four flush's own result, for the test to assert on. */
+	int				nl_flush_error;
 	/* Set when the fixture also runs a real service with a listener. */
 	struct nfsd_ffv2_worker_ctx	worker;
 	bool				worker_installed;
@@ -4300,7 +4302,7 @@ static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
 	 * able to take one, and the flush needs a live namespace to reach.
 	 */
 	if (f->nl) {
-		nfsd_ffv2_nl_flush(f->nl, 0);
+		f->nl_flush_error = nfsd_ffv2_nl_flush(f->nl, 0);
 		nfsd_ffv2_nl_close(f->nl);
 		f->nl = NULL;
 	}
@@ -6136,6 +6138,7 @@ static int nfsd_ffv2_ro_loopback_up(struct net *net)
  */
 struct nfsd_ffv2_nl {
 	struct socket	*sock;
+	u32		portid;
 	u16		family;
 	u32		seq;
 };
@@ -6257,27 +6260,74 @@ static int nfsd_ffv2_nl_recv(struct nfsd_ffv2_nl *nl, void *buf, size_t cap)
  * kernel_sendmsg() proves delivery, not that the handler ran: the handler's
  * status arrives here as NLMSG_ERROR with error == 0 for success.
  */
+/*
+ * Everything a reply must satisfy before any of it is read: it has to be a
+ * whole message, addressed to this socket, and answering the request that is
+ * outstanding.  A reply that fails any of these is rejected rather than
+ * partially believed.
+ */
+static int nfsd_ffv2_nl_check(struct nfsd_ffv2_nl *nl, const struct nlmsghdr *nlh,
+			      unsigned int len)
+{
+	if (len < NLMSG_HDRLEN || !NLMSG_OK(nlh, len))
+		return -EBADMSG;
+	if (nlh->nlmsg_pid != nl->portid)
+		return -EBADMSG;
+	if (nlh->nlmsg_seq != nl->seq)
+		return -EBADMSG;
+	return 0;
+}
+
+/* The error a message carries, once it is known to be one. */
+static int nfsd_ffv2_nl_error(const struct nlmsghdr *nlh)
+{
+	const struct nlmsgerr *e;
+
+	if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*e)))
+		return -EBADMSG;
+	e = nlmsg_data(nlh);
+	return e->error;
+}
+
+/*
+ * A generic-netlink payload must be the command and version that was asked
+ * for; a reply carrying someone else's command is not this reply.
+ */
+static int nfsd_ffv2_nl_check_genl(const struct nlmsghdr *nlh, u8 cmd, u8 version)
+{
+	const struct genlmsghdr *gnlh;
+
+	if (nlh->nlmsg_len < NLMSG_LENGTH(GENL_HDRLEN))
+		return -EBADMSG;
+	gnlh = nlmsg_data(nlh);
+	if (gnlh->cmd != cmd || gnlh->version != version)
+		return -EPROTO;
+	return 0;
+}
+
 static noinline int nfsd_ffv2_nl_ack(struct nfsd_ffv2_nl *nl)
 {
 	char buf[NFSD_FFV2_NL_BUF];
 	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
-	struct nlmsgerr *err;
-	int got;
+	unsigned int rem;
+	int got, error;
 
 	got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
 	if (got < 0)
 		return got;
-	if (got < (int)NLMSG_HDRLEN || !NLMSG_OK(nlh, (unsigned int)got))
-		return -EBADMSG;
+	rem = (unsigned int)got;
+	error = nfsd_ffv2_nl_check(nl, nlh, rem);
+	if (error)
+		return error;
 	if (nlh->nlmsg_type != NLMSG_ERROR)
 		return -EPROTO;
-	/* The payload must be a whole nlmsgerr before its error is read. */
-	if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*err)))
+	error = nfsd_ffv2_nl_error(nlh);
+	if (error)
+		return error;
+	/* Nothing may follow an acknowledgment for a single request. */
+	if (rem - NLMSG_ALIGN(nlh->nlmsg_len) != 0)
 		return -EBADMSG;
-	if (nlh->nlmsg_seq != nl->seq)
-		return -EBADMSG;
-	err = nlmsg_data(nlh);
-	return err->error;
+	return 0;
 }
 
 /* Resolve the runtime family id; the UAPI name is not an nlmsg_type. */
@@ -6286,8 +6336,9 @@ static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
 	char buf[NFSD_FFV2_NL_BUF];
 	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
 	struct nlattr *nla;
+	unsigned int rem;
 	size_t off;
-	int got, rem, error;
+	int got, nrem, error;
 
 	off = nfsd_ffv2_nl_begin(buf, GENL_ID_CTRL, CTRL_CMD_GETFAMILY,
 				 ++nl->seq, 0);
@@ -6303,23 +6354,20 @@ static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
 	got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
 	if (got < 0)
 		return got;
-	if (got < (int)NLMSG_HDRLEN || !NLMSG_OK(nlh, (unsigned int)got))
-		return -EBADMSG;
-	if (nlh->nlmsg_seq != nl->seq)
-		return -EBADMSG;
+	rem = (unsigned int)got;
+	error = nfsd_ffv2_nl_check(nl, nlh, rem);
+	if (error)
+		return error;
 	if (nlh->nlmsg_type == NLMSG_ERROR) {
-		struct nlmsgerr *e;
-
-		if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*e)))
-			return -EBADMSG;
-		e = nlmsg_data(nlh);
-		return e->error ? e->error : -ENOENT;
+		error = nfsd_ffv2_nl_error(nlh);
+		return error ? error : -ENOENT;
 	}
 	if (nlh->nlmsg_type != GENL_ID_CTRL)
 		return -EPROTO;
-	if (nlh->nlmsg_len < NLMSG_LENGTH(GENL_HDRLEN))
-		return -EBADMSG;
-	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, rem) {
+	error = nfsd_ffv2_nl_check_genl(nlh, CTRL_CMD_NEWFAMILY, 2);
+	if (error)
+		return error;
+	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem) {
 		if (nla_type(nla) == CTRL_ATTR_FAMILY_ID) {
 			if (nla_len(nla) < (int)sizeof(u16))
 				return -EBADMSG;
@@ -6332,6 +6380,7 @@ static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
 
 static int nfsd_ffv2_nl_open(struct net *net, struct nfsd_ffv2_nl *nl)
 {
+	struct sockaddr_nl bind_addr = { .nl_family = AF_NETLINK };
 	int error;
 
 	memset(nl, 0, sizeof(*nl));
@@ -6339,13 +6388,28 @@ static int nfsd_ffv2_nl_open(struct net *net, struct nfsd_ffv2_nl *nl)
 				 &nl->sock);
 	if (error)
 		return error;
+	/*
+	 * Bind before sending, so the port the kernel assigns is known and
+	 * every reply can be required to carry it.
+	 */
+	error = kernel_bind(nl->sock, (struct sockaddr_unsized *)&bind_addr,
+			    sizeof(bind_addr));
+	if (!error)
+		error = kernel_getsockname(nl->sock,
+					   (struct sockaddr *)&bind_addr);
+	if (error < 0)
+		goto out_release;
+	nl->portid = bind_addr.nl_pid;
+
 	error = nfsd_ffv2_nl_resolve(nl);
-	if (error) {
-		sock_release(nl->sock);
-		nl->sock = NULL;
-		return error;
-	}
+	if (error)
+		goto out_release;
 	return 0;
+
+out_release:
+	sock_release(nl->sock);
+	nl->sock = NULL;
+	return error;
 }
 
 static void nfsd_ffv2_nl_close(struct nfsd_ffv2_nl *nl)
@@ -6468,28 +6532,30 @@ static noinline int nfsd_ffv2_nl_pending(struct nfsd_ffv2_nl *nl, u8 cmd,
 			struct nlattr *nla;
 			int nrem;
 
-			if (nlh->nlmsg_seq != nl->seq)
-				return -EBADMSG;
+			error = nfsd_ffv2_nl_check(nl, nlh, rem);
+			if (error)
+				return error;
 			/*
-			 * Whether the dump continues is a property of the
-			 * message being read, so it is taken here rather than
-			 * after the loop has advanced past the last header.
+			 * Whether the dump continues belongs to the message
+			 * being read, so it is taken before the walk moves on.
 			 */
 			multipart = nlh->nlmsg_flags & NLM_F_MULTI;
-			if (nlh->nlmsg_type == NLMSG_DONE)
-				return 0;
-			if (nlh->nlmsg_type == NLMSG_ERROR) {
-				struct nlmsgerr *e;
-
-				if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*e)))
+			if (nlh->nlmsg_type == NLMSG_DONE) {
+				/* A completion ends the dump; nothing follows. */
+				if (rem - NLMSG_ALIGN(nlh->nlmsg_len) != 0)
 					return -EBADMSG;
-				e = nlmsg_data(nlh);
-				return e->error ? e->error : -EBADMSG;
+				return 0;
+			}
+			if (nlh->nlmsg_type == NLMSG_ERROR) {
+				error = nfsd_ffv2_nl_error(nlh);
+				return error ? error : -EBADMSG;
 			}
 			if (nlh->nlmsg_type != nl->family)
 				return -EPROTO;
-			if (nlh->nlmsg_len < NLMSG_LENGTH(GENL_HDRLEN))
-				return -EBADMSG;
+			error = nfsd_ffv2_nl_check_genl(nlh, cmd,
+							SUNRPC_FAMILY_VERSION);
+			if (error)
+				return error;
 			nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem)
 				if (nla_type(nla) == nest_type)
 					(*count)++;
@@ -6497,7 +6563,7 @@ static noinline int nfsd_ffv2_nl_pending(struct nfsd_ffv2_nl *nl, u8 cmd,
 		if (rem)
 			return -EBADMSG;		/* trailing partial header */
 		if (!multipart)
-			return -EBADMSG;		/* no NLMSG_DONE arrived */
+			return -EBADMSG;		/* no completion arrived */
 	}
 	return -EMSGSIZE;		/* dump did not terminate */
 }
@@ -6562,9 +6628,11 @@ static noinline int nfsd_ffv2_admit_authsys(struct net *net, struct nfsd_net *nn
 	struct socket *sock = NULL;
 	struct msghdr msg = {};
 	__be32 call[32];
+	__be32 reply[16];
 	struct kvec iov;
 	__be32 marker;
 	int port, error;
+	u32 frame;
 	u32 words;
 
 	port = nfsd_ffv2_ro_listener_port(nn);
@@ -6590,7 +6658,12 @@ static noinline int nfsd_ffv2_admit_authsys(struct net *net, struct nfsd_net *nn
 	call[++words] = cpu_to_be32(4);			/* version four */
 	call[++words] = cpu_to_be32(1);			/* COMPOUND */
 	call[++words] = cpu_to_be32(RPC_AUTH_UNIX);
-	call[++words] = cpu_to_be32(6 * XDR_UNIT);	/* credential length */
+	/*
+	 * The body below is five words: stamp, machine name length, uid, gid
+	 * and the group count.  The length must name exactly those, whether
+	 * or not a particular parser reads it.
+	 */
+	call[++words] = cpu_to_be32(5 * XDR_UNIT);
 	call[++words] = cpu_to_be32(0);			/* stamp */
 	call[++words] = cpu_to_be32(0);			/* machine name */
 	call[++words] = cpu_to_be32(uid);
@@ -6612,11 +6685,36 @@ static noinline int nfsd_ffv2_admit_authsys(struct net *net, struct nfsd_net *nn
 	}
 
 	/*
-	 * A reply means the request was admitted and answered.  Silence until
-	 * the deadline means authentication dropped it, which svc_process()
-	 * does without sending anything at all.
+	 * A reply means the request was admitted and answered; the reply is
+	 * checked rather than merely counted, so that four arbitrary bytes
+	 * cannot pass for one.  Silence until the deadline means the request
+	 * was never answered, which is what authentication's drop looks like
+	 * on the wire: svc_process() sends nothing at all.
 	 */
 	error = nfsd_ffv2_ro_recvfull(sock, &marker, XDR_UNIT);
+	if (error)
+		goto out;
+	frame = be32_to_cpu(marker);
+	if (!(frame & 0x80000000)) {
+		error = -EBADMSG;		/* fragmented, unexpected here */
+		goto out;
+	}
+	frame &= 0x7fffffff;
+	if (frame < 4 * XDR_UNIT || frame > sizeof(reply)) {
+		error = -EBADMSG;
+		goto out;
+	}
+	error = nfsd_ffv2_ro_recvfull(sock, reply, frame);
+	if (error)
+		goto out;
+	if (reply[0] != call[1]) {		/* the transaction it answers */
+		error = -EBADMSG;
+		goto out;
+	}
+	if (be32_to_cpu(reply[1]) != 1) {	/* REPLY */
+		error = -EBADMSG;
+		goto out;
+	}
 out:
 	sock_release(sock);
 	return error;
@@ -6645,6 +6743,7 @@ static void nfsd_ffv2_auth_cache_p0_probe_test(struct kunit *test)
 	struct net *other = NULL;
 	bool other_open = false;
 	bool seeded = false;
+	int cleanup_error = 0;
 	int pending;
 	u64 expiry;
 	int error;
@@ -6743,11 +6842,18 @@ static void nfsd_ffv2_auth_cache_p0_probe_test(struct kunit *test)
 	/* Pending drain only: this says nothing about the entries existing. */
 	error = nfsd_ffv2_nl_pending(&nl, SUNRPC_CMD_IP_MAP_GET_REQS,
 				     SUNRPC_A_IP_MAP_REQS_REQUESTS, &pending);
-	KUNIT_EXPECT_EQ(test, 0, error);
+	if (error) {
+		KUNIT_FAIL(test, "the ip_map dump did not complete: %d", error);
+		goto out;
+	}
 	KUNIT_EXPECT_EQ(test, 0, pending);
 	error = nfsd_ffv2_nl_pending(&nl, SUNRPC_CMD_UNIX_GID_GET_REQS,
 				     SUNRPC_A_UNIX_GID_REQS_REQUESTS, &pending);
-	KUNIT_EXPECT_EQ(test, 0, error);
+	if (error) {
+		KUNIT_FAIL(test, "the unix_gid dump did not complete: %d",
+			   error);
+		goto out;
+	}
 	KUNIT_EXPECT_EQ(test, 0, pending);
 
 	/* The gate: a real AUTH_SYS request is now admitted and dispatched. */
@@ -6860,10 +6966,20 @@ out:
 	 * belong to the fixture teardown, which runs them after the service
 	 * stops and before the namespace is dropped.
 	 */
-	if (seeded && f.nl)
-		nfsd_ffv2_nl_flush(&nl, 0);
+	/*
+	 * Cleanup is best effort after an earlier failure, but it is never
+	 * silent: each step's result is kept and asserted below, so a run
+	 * cannot report the gate as passed while leaving state behind.
+	 */
+	if (seeded && f.nl) {
+		error = nfsd_ffv2_nl_flush(&nl, 0);
+		if (error)
+			cleanup_error = error;
+	}
 	if (other_open) {
-		nfsd_ffv2_nl_flush(&other_nl, 0);
+		error = nfsd_ffv2_nl_flush(&other_nl, 0);
+		if (error)
+			cleanup_error = error;
 		nfsd_ffv2_nl_close(&other_nl);
 	}
 	if (other)
@@ -6876,6 +6992,102 @@ out:
 	nfsd_ffv2_test_reply_shape_reset();
 	nfsd_ffv2_test_auth_record_reset();
 	nfsd_ffv2_ro_fixture_exit(test, &f);
+
+	/*
+	 * The teardown flush runs inside the fixture exit, after the threads
+	 * have joined.  Its result is asserted here rather than discarded:
+	 * a purge that failed then would leave entries for the next test.
+	 */
+	KUNIT_EXPECT_EQ(test, 0, cleanup_error);
+	KUNIT_EXPECT_EQ(test, 0, f.nl_flush_error);
+}
+
+/*
+ * The other half of isolation, as far as one file cache allows.
+ *
+ * Admitting inside a second namespace needs a second nfsd service, and two
+ * cannot run at once: the file cache is global and holds a single up/down
+ * bit, so whichever fixture tears down first dismantles the other's cache.
+ * What can be done is to run the second namespace after the first has been
+ * released, which is what this case does: a namespace that never saw the
+ * first one's seeding starts cold, and admits only once it has been seeded
+ * in its own right.
+ *
+ * This is deliberately not the full gate.  Proving that flushing one live
+ * namespace leaves another live namespace admitting still needs the two to
+ * exist together, and that remains blocked.
+ */
+static void nfsd_ffv2_auth_cache_second_net_test(struct kunit *test)
+{
+	static const char domain[] = "ffv2-p0-second-net-domain";
+	const u32 uid = 4243;
+	struct nfsd_ffv2_auth_record rec;
+	struct nfsd_ffv2_ro_fixture f;
+	struct nfsd_ffv2_nl nl = {};
+	int cleanup_error = 0;
+	bool seeded = false;
+	u64 expiry;
+	int error;
+
+	if (!nfsd_ffv2_ro_fixture_init_wired(test, &f))
+		goto out;
+	if (nfsd_ffv2_ro_loopback_up(f.net)) {
+		KUNIT_FAIL(test, "could not bring the namespace loopback up");
+		goto out;
+	}
+	error = nfsd_ffv2_nl_open(f.net, &nl);
+	if (error) {
+		KUNIT_FAIL(test, "no sender in this namespace: %d", error);
+		goto out;
+	}
+	f.nl = &nl;
+
+	/* Cold: nothing this namespace has done can admit yet. */
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(f.net, f.nn, uid);
+	pr_info("FFV2P0B: cold admit=%d\n", error);
+	if (error != -ETIMEDOUT) {
+		KUNIT_FAIL(test, "an unseeded namespace admitted: %d", error);
+		goto out;
+	}
+
+	expiry = ktime_get_real_seconds() + 300;
+	error = nfsd_ffv2_nl_seed_ip(&nl, "nfsd", "127.0.0.1", domain, expiry);
+	if (!error) {
+		seeded = true;
+		error = nfsd_ffv2_nl_seed_gid(&nl, uid, expiry);
+	}
+	if (error) {
+		KUNIT_FAIL(test, "this namespace refused a seed: %d", error);
+		goto out;
+	}
+
+	/* Seeded in its own right: it admits, with its own domain. */
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(f.net, f.nn, uid);
+	pr_info("FFV2P0B: seeded admit=%d\n", error);
+	if (error) {
+		KUNIT_FAIL(test, "a seeded namespace did not admit: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_test_auth_record(&rec);
+	KUNIT_EXPECT_TRUE(test, rec.have_client);
+	KUNIT_EXPECT_STREQ(test, rec.domain, domain);
+	KUNIT_EXPECT_EQ(test, 0U, rec.ngroups);
+	pr_info("FFV2P0B: admitted domain=%s ngroups=%u\n", rec.domain,
+		rec.ngroups);
+
+out:
+	if (seeded && f.nl) {
+		error = nfsd_ffv2_nl_flush(&nl, 0);
+		if (error)
+			cleanup_error = error;
+	}
+	nfsd_ffv2_test_reply_shape_reset();
+	nfsd_ffv2_test_auth_record_reset();
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+	KUNIT_EXPECT_EQ(test, 0, cleanup_error);
+	KUNIT_EXPECT_EQ(test, 0, f.nl_flush_error);
 }
 
 static void nfsd_ffv2_transport_null_test(struct kunit *test)
@@ -7879,6 +8091,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
 	KUNIT_CASE(nfsd_ffv2_encode_header_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_p0_probe_test),
+	KUNIT_CASE(nfsd_ffv2_auth_cache_second_net_test),
 	KUNIT_CASE(nfsd_ffv2_transport_null_test),
 	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
