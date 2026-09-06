@@ -6313,11 +6313,22 @@ static int nfsd_ffv2_nl_parse_ack(struct nfsd_ffv2_nl *nl, const void *buf,
 		return -EBADMSG;
 
 	if (!(nlh->nlmsg_flags & NLM_F_CAPPED)) {
+		unsigned int echoed_at, available;
 		const struct genlmsghdr *gnlh;
 
+		/*
+		 * The echoed message declares its own length, and a length
+		 * larger than what arrived would send the read past the end
+		 * of the datagram.  What it claims is checked against what is
+		 * physically there before any of it is read.
+		 */
+		echoed_at = NLMSG_HDRLEN + offsetof(struct nlmsgerr, msg);
+		if (nlh->nlmsg_len <= echoed_at)
+			return -EBADMSG;
+		available = nlh->nlmsg_len - echoed_at;
 		if (e->msg.nlmsg_len < NLMSG_LENGTH(GENL_HDRLEN))
 			return -EBADMSG;
-		if (nlh->nlmsg_len < NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN))
+		if (NLMSG_ALIGN(e->msg.nlmsg_len) > available)
 			return -EBADMSG;
 		gnlh = (const struct genlmsghdr *)((const char *)&e->msg +
 						   NLMSG_HDRLEN);
@@ -6386,10 +6397,20 @@ static int nfsd_ffv2_nl_parse_family(struct nfsd_ffv2_nl *nl, const void *buf,
 	if (error)
 		return error;
 
+	/* One reply answers one request; nothing may follow it. */
+	if (len != NLMSG_ALIGN(nlh->nlmsg_len))
+		return -EBADMSG;
+
 	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem) {
 		if (nla_type(nla) != CTRL_ATTR_FAMILY_ID)
 			continue;
 		if (nla_len(nla) < (int)sizeof(u16))
+			return -EBADMSG;
+		/*
+		 * Two identifiers for one family is a contradiction, not a
+		 * choice: taking either would be a guess.
+		 */
+		if (found)
 			return -EBADMSG;
 		found = nla_get_u16(nla);
 	}
@@ -6557,6 +6578,64 @@ static noinline int nfsd_ffv2_nl_seed_gid_raw(struct nfsd_ffv2_nl *nl, u32 uid,
  * deferral; it never proves an entry exists.  Multipart is terminated on
  * NLMSG_DONE, with a bounded message budget.
  */
+/*
+ * Scan one datagram of a dump, adding to @count and reporting through @done
+ * whether the completion was seen.  Kept apart from the receive so the shapes
+ * a socket will not readily produce can be handed to it directly.
+ */
+static int nfsd_ffv2_nl_parse_dump(struct nfsd_ffv2_nl *nl, const void *buf,
+				   unsigned int len, u8 cmd, u16 nest_type,
+				   int *count, bool *done)
+{
+	const struct nlmsghdr *nlh = buf;
+	bool multipart = false;
+	unsigned int rem = len;
+	int error;
+
+	*done = false;
+	for (; NLMSG_OK(nlh, rem); nlh = NLMSG_NEXT(nlh, rem)) {
+		const struct nlattr *nla;
+		int nrem;
+
+		error = nfsd_ffv2_nl_check(nl, nlh, rem);
+		if (error)
+			return error;
+		/*
+		 * Whether the dump continues belongs to the message being
+		 * read, so it is taken before the walk moves on.
+		 */
+		multipart = nlh->nlmsg_flags & NLM_F_MULTI;
+		if (nlh->nlmsg_type == NLMSG_DONE) {
+			/* A completion ends the dump; nothing follows it. */
+			if (rem != NLMSG_ALIGN(nlh->nlmsg_len))
+				return -EBADMSG;
+			*done = true;
+			return 0;
+		}
+		if (nlh->nlmsg_type == NLMSG_ERROR) {
+			error = nfsd_ffv2_nl_parse_ack(nl, nlh, rem, nl->family,
+						       cmd,
+						       SUNRPC_FAMILY_VERSION);
+			return error ? error : -EBADMSG;
+		}
+		if (nlh->nlmsg_type != nl->family)
+			return -EPROTO;
+		error = nfsd_ffv2_nl_check_genl(nlh, cmd, SUNRPC_FAMILY_VERSION);
+		if (error)
+			return error;
+		nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem)
+			if (nla_type(nla) == nest_type)
+				(*count)++;
+		if (nrem)
+			return -EBADMSG;		/* malformed residue */
+	}
+	if (rem)
+		return -EBADMSG;		/* trailing partial header */
+	if (!multipart)
+		return -EBADMSG;		/* no completion will come */
+	return 0;
+}
+
 static noinline int nfsd_ffv2_nl_pending(struct nfsd_ffv2_nl *nl, u8 cmd,
 					 u16 nest_type, int *count)
 {
@@ -6572,58 +6651,17 @@ static noinline int nfsd_ffv2_nl_pending(struct nfsd_ffv2_nl *nl, u8 cmd,
 		return error;
 
 	while (budget--) {
-		struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
 		int got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
-		bool multipart = false;
-		unsigned int rem;
+		bool done;
 
 		if (got < 0)
 			return got;
-		rem = (unsigned int)got;
-		for (; NLMSG_OK(nlh, rem); nlh = NLMSG_NEXT(nlh, rem)) {
-			struct nlattr *nla;
-			int nrem;
-
-			error = nfsd_ffv2_nl_check(nl, nlh, rem);
-			if (error)
-				return error;
-			/*
-			 * Whether the dump continues belongs to the message
-			 * being read, so it is taken before the walk moves on.
-			 */
-			multipart = nlh->nlmsg_flags & NLM_F_MULTI;
-			if (nlh->nlmsg_type == NLMSG_DONE) {
-				/* A completion ends the dump; nothing follows. */
-				if (rem - NLMSG_ALIGN(nlh->nlmsg_len) != 0)
-					return -EBADMSG;
-				return 0;
-			}
-			if (nlh->nlmsg_type == NLMSG_ERROR) {
-				/*
-				 * An error ends the dump, so it must also be
-				 * the whole datagram; the parse enforces that.
-				 */
-				error = nfsd_ffv2_nl_parse_ack(nl, nlh, rem,
-							       nl->family, cmd,
-							       SUNRPC_FAMILY_VERSION);
-				return error ? error : -EBADMSG;
-			}
-			if (nlh->nlmsg_type != nl->family)
-				return -EPROTO;
-			error = nfsd_ffv2_nl_check_genl(nlh, cmd,
-							SUNRPC_FAMILY_VERSION);
-			if (error)
-				return error;
-			nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem)
-				if (nla_type(nla) == nest_type)
-					(*count)++;
-			if (nrem)
-				return -EBADMSG;	/* malformed residue */
-		}
-		if (rem)
-			return -EBADMSG;		/* trailing partial header */
-		if (!multipart)
-			return -EBADMSG;		/* no completion arrived */
+		error = nfsd_ffv2_nl_parse_dump(nl, buf, (unsigned int)got, cmd,
+						nest_type, count, &done);
+		if (error)
+			return error;
+		if (done)
+			return 0;
 	}
 	return -EMSGSIZE;		/* dump did not terminate */
 }
@@ -6661,7 +6699,8 @@ static int nfsd_ffv2_nl_flush(struct nfsd_ffv2_nl *nl, u32 mask)
  * design could not: whether a kernel generic-netlink socket in the fixture's
  * own namespace can drive the per-net SunRPC auth-cache provisioning API at
  * all.  Everything it touches is per-net and is flushed before the namespace
- * is dropped.  No RPC is sent and no provider is enabled.
+ * is dropped.  No session is established, no session operation is
+ * sent, and no provider is enabled.
  */
 
 /*
@@ -6920,6 +6959,173 @@ static void nfsd_ffv2_auth_cache_nl_parser_test(struct kunit *test)
 					       nl.family,
 					       SUNRPC_CMD_IP_MAP_SET_REQS,
 					       SUNRPC_FAMILY_VERSION));
+
+	/*
+	 * An acknowledgment whose echoed message claims more than arrived.
+	 * Believing that length would read the command from past the end of
+	 * the datagram.
+	 */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_ERROR;
+	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	e = nlmsg_data(nlh);
+	e->error = 0;
+	e->msg.nlmsg_type = nl.family;
+	e->msg.nlmsg_seq = nl.seq;
+	e->msg.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN) + 64;	/* over-claimed */
+	len = NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN);
+	nlh->nlmsg_len = len;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_ack(&nl, buf, NLMSG_ALIGN(len),
+					       nl.family,
+					       SUNRPC_CMD_IP_MAP_SET_REQS,
+					       SUNRPC_FAMILY_VERSION));
+
+	/* A positive family reply with a complete message behind it. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = GENL_ID_CTRL;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	((struct genlmsghdr *)nlmsg_data(nlh))->cmd = CTRL_CMD_NEWFAMILY;
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = 2;
+	len = NLMSG_HDRLEN + GENL_HDRLEN;
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID;
+	nla->nla_len = NLA_HDRLEN + sizeof(u16);
+	*(u16 *)nla_data(nla) = 23;
+	len += NLA_ALIGN(nla->nla_len);
+	nlh->nlmsg_len = len;
+	{
+		struct nlmsghdr *second = (struct nlmsghdr *)(buf +
+							      NLMSG_ALIGN(len));
+
+		second->nlmsg_len = NLMSG_HDRLEN;
+		second->nlmsg_type = NLMSG_DONE;
+		second->nlmsg_seq = nl.seq;
+		second->nlmsg_pid = nl.portid;
+	}
+	family = 0;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_family(&nl, buf,
+						  NLMSG_ALIGN(len) + NLMSG_HDRLEN,
+						  &family));
+	KUNIT_EXPECT_EQ(test, 0, (int)family);
+
+	/* Two family identifiers is a contradiction, not a choice. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = GENL_ID_CTRL;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	((struct genlmsghdr *)nlmsg_data(nlh))->cmd = CTRL_CMD_NEWFAMILY;
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = 2;
+	len = NLMSG_HDRLEN + GENL_HDRLEN;
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID;
+	nla->nla_len = NLA_HDRLEN + sizeof(u16);
+	*(u16 *)nla_data(nla) = 23;
+	len += NLA_ALIGN(nla->nla_len);
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID;
+	nla->nla_len = NLA_HDRLEN + sizeof(u16);
+	*(u16 *)nla_data(nla) = 24;
+	len += NLA_ALIGN(nla->nla_len);
+	nlh->nlmsg_len = len;
+	family = 0;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_family(&nl, buf, NLMSG_ALIGN(len),
+						  &family));
+	KUNIT_EXPECT_EQ(test, 0, (int)family);
+
+	/* A well-formed single identifier is still accepted. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = GENL_ID_CTRL;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	((struct genlmsghdr *)nlmsg_data(nlh))->cmd = CTRL_CMD_NEWFAMILY;
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = 2;
+	len = NLMSG_HDRLEN + GENL_HDRLEN;
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID;
+	nla->nla_len = NLA_HDRLEN + sizeof(u16);
+	*(u16 *)nla_data(nla) = 23;
+	len += NLA_ALIGN(nla->nla_len);
+	nlh->nlmsg_len = len;
+	family = 0;
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_nl_parse_family(&nl, buf, NLMSG_ALIGN(len),
+						  &family));
+	KUNIT_EXPECT_EQ(test, 23, (int)family);
+
+	/* A dump completion with anything behind it ends nothing cleanly. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_DONE;
+	nlh->nlmsg_flags = NLM_F_MULTI;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	nlh->nlmsg_len = NLMSG_HDRLEN;
+	{
+		struct nlmsghdr *second = (struct nlmsghdr *)(buf +
+							      NLMSG_HDRLEN);
+		int count = 0;
+		bool done = true;
+
+		second->nlmsg_len = NLMSG_HDRLEN;
+		second->nlmsg_type = NLMSG_DONE;
+		second->nlmsg_seq = nl.seq;
+		second->nlmsg_pid = nl.portid;
+		KUNIT_EXPECT_EQ(test, -EBADMSG,
+				nfsd_ffv2_nl_parse_dump(&nl, buf,
+							2 * NLMSG_HDRLEN,
+							SUNRPC_CMD_IP_MAP_GET_REQS,
+							SUNRPC_A_IP_MAP_REQS_REQUESTS,
+							&count, &done));
+		KUNIT_EXPECT_FALSE(test, done);
+	}
+
+	/* A lone completion is the ordinary end of a dump. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_DONE;
+	nlh->nlmsg_flags = NLM_F_MULTI;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	nlh->nlmsg_len = NLMSG_HDRLEN;
+	{
+		int count = 0;
+		bool done = false;
+
+		KUNIT_EXPECT_EQ(test, 0,
+				nfsd_ffv2_nl_parse_dump(&nl, buf, NLMSG_HDRLEN,
+							SUNRPC_CMD_IP_MAP_GET_REQS,
+							SUNRPC_A_IP_MAP_REQS_REQUESTS,
+							&count, &done));
+		KUNIT_EXPECT_TRUE(test, done);
+		KUNIT_EXPECT_EQ(test, 0, count);
+	}
+
+	/* A dump that ends without a completion and without multipart. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = nl.family;
+	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	((struct genlmsghdr *)nlmsg_data(nlh))->cmd =
+		SUNRPC_CMD_IP_MAP_GET_REQS;
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = SUNRPC_FAMILY_VERSION;
+	nlh->nlmsg_len = NLMSG_HDRLEN + GENL_HDRLEN;
+	{
+		int count = 0;
+		bool done = true;
+
+		KUNIT_EXPECT_EQ(test, -EBADMSG,
+				nfsd_ffv2_nl_parse_dump(&nl, buf,
+							NLMSG_ALIGN(nlh->nlmsg_len),
+							SUNRPC_CMD_IP_MAP_GET_REQS,
+							SUNRPC_A_IP_MAP_REQS_REQUESTS,
+							&count, &done));
+		KUNIT_EXPECT_FALSE(test, done);
+	}
 }
 
 static void nfsd_ffv2_auth_cache_p0_probe_test(struct kunit *test)
