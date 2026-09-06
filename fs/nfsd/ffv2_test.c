@@ -19,6 +19,8 @@
 #include <linux/rtnetlink.h>
 #include <linux/net.h>
 #include <net/sock.h>
+#include <net/genetlink.h>
+#include <uapi/linux/sunrpc_netlink.h>
 #include "ffv2.h"
 #include "ffv2_trust.h"
 #include "export.h"
@@ -6098,6 +6100,541 @@ static int nfsd_ffv2_ro_loopback_up(struct net *net)
  * buffer length -- is established by that path rather than by a test, which
  * is the point of arriving this way.
  */
+
+/*
+ * P0 authentication-cache netlink probe helpers.
+ *
+ * These drive the existing per-net SunRPC generic-netlink provisioning API
+ * from a kernel socket in the fixture's own network namespace.  No production
+ * code is involved: this is a test client for a UAPI the kernel already
+ * exports.  Ownership is local -- the sender is created by
+ * nfsd_ffv2_nl_open(), used only from the owning test, and released by
+ * nfsd_ffv2_nl_close() before the namespace is dropped.
+ */
+struct nfsd_ffv2_nl {
+	struct socket	*sock;
+	u16		family;
+	u32		seq;
+};
+
+#define NFSD_FFV2_NL_BUF	512
+
+/* Reserve one attribute, leaving the padding zeroed.  NULL if it will not fit. */
+static struct nlattr *nfsd_ffv2_nl_reserve(void *buf, size_t cap, size_t *off,
+					   u16 type, u16 payload)
+{
+	size_t total = NLA_ALIGN(NLA_HDRLEN + payload);
+	struct nlattr *nla;
+
+	if (*off + total > cap)
+		return NULL;
+	nla = (struct nlattr *)((char *)buf + *off);
+	nla->nla_type = type;
+	nla->nla_len = NLA_HDRLEN + payload;
+	memset((char *)nla + NLA_HDRLEN, 0, total - NLA_HDRLEN);
+	*off += total;
+	return nla;
+}
+
+static int nfsd_ffv2_nl_put(void *buf, size_t cap, size_t *off, u16 type,
+			    const void *data, u16 len)
+{
+	struct nlattr *nla = nfsd_ffv2_nl_reserve(buf, cap, off, type, len);
+
+	if (!nla)
+		return -EMSGSIZE;
+	memcpy(nla_data(nla), data, len);
+	return 0;
+}
+
+static int nfsd_ffv2_nl_put_str(void *buf, size_t cap, size_t *off, u16 type,
+				const char *str)
+{
+	return nfsd_ffv2_nl_put(buf, cap, off, type, str, strlen(str) + 1);
+}
+
+static int nfsd_ffv2_nl_put_u64(void *buf, size_t cap, size_t *off, u16 type,
+				u64 val)
+{
+	return nfsd_ffv2_nl_put(buf, cap, off, type, &val, sizeof(val));
+}
+
+static int nfsd_ffv2_nl_put_u32(void *buf, size_t cap, size_t *off, u16 type,
+				u32 val)
+{
+	return nfsd_ffv2_nl_put(buf, cap, off, type, &val, sizeof(val));
+}
+
+/*
+ * Start a request.  The destination is always explicit: sock_create_kern()
+ * leaves sock->file NULL, and __netlink_ns_capable() only skips the
+ * file_ns_capable() half when NETLINK_SKB_DST is set, which netlink_sendmsg()
+ * sets only for a message that carries a destination address.  Sending with
+ * msg_name == NULL would dereference that NULL file.
+ */
+static size_t nfsd_ffv2_nl_begin(void *buf, u16 type, u8 cmd, u32 seq,
+				 u16 flags)
+{
+	struct nlmsghdr *nlh = buf;
+	struct genlmsghdr *gnlh;
+
+	memset(buf, 0, NLMSG_HDRLEN + GENL_HDRLEN);
+	nlh->nlmsg_type = type;
+	nlh->nlmsg_flags = NLM_F_REQUEST | flags;
+	nlh->nlmsg_seq = seq;
+	nlh->nlmsg_pid = 0;
+	gnlh = nlmsg_data(nlh);
+	gnlh->cmd = cmd;
+	gnlh->version = SUNRPC_FAMILY_VERSION;
+	return NLMSG_HDRLEN + GENL_HDRLEN;
+}
+
+static int nfsd_ffv2_nl_send(struct nfsd_ffv2_nl *nl, void *buf, size_t len)
+{
+	struct sockaddr_nl dst = {
+		.nl_family	= AF_NETLINK,
+		.nl_pid		= 0,		/* the kernel */
+		.nl_groups	= 0,
+	};
+	struct nlmsghdr *nlh = buf;
+	struct msghdr msg = {
+		.msg_name	= &dst,
+		.msg_namelen	= sizeof(dst),
+	};
+	struct kvec iov = { .iov_base = buf, .iov_len = len };
+
+	nlh->nlmsg_len = len;
+	return kernel_sendmsg(nl->sock, &msg, &iov, 1, len);
+}
+
+/* One bounded receive.  Returns the byte count, or a negative errno. */
+static int nfsd_ffv2_nl_recv(struct nfsd_ffv2_nl *nl, void *buf, size_t cap)
+{
+	unsigned long deadline = jiffies + 5 * HZ;
+
+	for (;;) {
+		struct msghdr msg = {};
+		struct kvec iov = { .iov_base = buf, .iov_len = cap };
+		int got;
+
+		got = kernel_recvmsg(nl->sock, &msg, &iov, 1, cap,
+				     MSG_DONTWAIT);
+		if (got == -EAGAIN) {
+			if (time_after(jiffies, deadline))
+				return -ETIMEDOUT;
+			msleep(20);
+			continue;
+		}
+		return got ? got : -ECONNRESET;
+	}
+}
+
+/*
+ * Consume the acknowledgment for the request just sent.  A successful
+ * kernel_sendmsg() proves delivery, not that the handler ran: the handler's
+ * status arrives here as NLMSG_ERROR with error == 0 for success.
+ */
+static noinline int nfsd_ffv2_nl_ack(struct nfsd_ffv2_nl *nl)
+{
+	char buf[NFSD_FFV2_NL_BUF];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct nlmsgerr *err;
+	int got;
+
+	got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
+	if (got < 0)
+		return got;
+	if (got < NLMSG_HDRLEN || !NLMSG_OK(nlh, (unsigned int)got))
+		return -EBADMSG;
+	if (nlh->nlmsg_type != NLMSG_ERROR)
+		return -EPROTO;
+	if (nlmsg_len(nlh) < (int)sizeof(*err))
+		return -EBADMSG;
+	err = nlmsg_data(nlh);
+	return err->error;
+}
+
+/* Resolve the runtime family id; the UAPI name is not an nlmsg_type. */
+static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
+{
+	char buf[NFSD_FFV2_NL_BUF];
+	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct nlattr *nla;
+	size_t off;
+	int got, rem, error;
+
+	off = nfsd_ffv2_nl_begin(buf, GENL_ID_CTRL, CTRL_CMD_GETFAMILY,
+				 ++nl->seq, 0);
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = 1;
+	error = nfsd_ffv2_nl_put_str(buf, sizeof(buf), &off,
+				     CTRL_ATTR_FAMILY_NAME, SUNRPC_FAMILY_NAME);
+	if (error)
+		return error;
+	error = nfsd_ffv2_nl_send(nl, buf, off);
+	if (error < 0)
+		return error;
+
+	got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
+	if (got < 0)
+		return got;
+	if (got < NLMSG_HDRLEN || !NLMSG_OK(nlh, (unsigned int)got))
+		return -EBADMSG;
+	if (nlh->nlmsg_type == NLMSG_ERROR) {
+		struct nlmsgerr *e = nlmsg_data(nlh);
+
+		return e->error ? e->error : -ENOENT;
+	}
+	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, rem) {
+		if (nla_type(nla) == CTRL_ATTR_FAMILY_ID) {
+			nl->family = nla_get_u16(nla);
+			return 0;
+		}
+	}
+	return -ENOENT;
+}
+
+static int nfsd_ffv2_nl_open(struct net *net, struct nfsd_ffv2_nl *nl)
+{
+	int error;
+
+	memset(nl, 0, sizeof(*nl));
+	error = sock_create_kern(net, AF_NETLINK, SOCK_RAW, NETLINK_GENERIC,
+				 &nl->sock);
+	if (error)
+		return error;
+	error = nfsd_ffv2_nl_resolve(nl);
+	if (error) {
+		sock_release(nl->sock);
+		nl->sock = NULL;
+		return error;
+	}
+	return 0;
+}
+
+static void nfsd_ffv2_nl_close(struct nfsd_ffv2_nl *nl)
+{
+	if (nl->sock) {
+		sock_release(nl->sock);
+		nl->sock = NULL;
+	}
+}
+
+/* Seed one positive auth.unix.ip entry for the given address. */
+static noinline int nfsd_ffv2_nl_seed_ip(struct nfsd_ffv2_nl *nl,
+					 const char *class, const char *addr,
+					 const char *domain, u64 expiry)
+{
+	char buf[NFSD_FFV2_NL_BUF];
+	struct nlattr *nest;
+	size_t off, nest_at;
+	int error;
+
+	off = nfsd_ffv2_nl_begin(buf, nl->family, SUNRPC_CMD_IP_MAP_SET_REQS,
+				 ++nl->seq, NLM_F_ACK);
+	nest_at = off;
+	nest = nfsd_ffv2_nl_reserve(buf, sizeof(buf), &off,
+				    SUNRPC_A_IP_MAP_REQS_REQUESTS |
+				    NLA_F_NESTED, 0);
+	if (!nest)
+		return -EMSGSIZE;
+	error = nfsd_ffv2_nl_put_str(buf, sizeof(buf), &off,
+				     SUNRPC_A_IP_MAP_CLASS, class);
+	if (!error)
+		error = nfsd_ffv2_nl_put_str(buf, sizeof(buf), &off,
+					     SUNRPC_A_IP_MAP_ADDR, addr);
+	if (!error && domain)
+		error = nfsd_ffv2_nl_put_str(buf, sizeof(buf), &off,
+					     SUNRPC_A_IP_MAP_DOMAIN, domain);
+	if (!error)
+		error = nfsd_ffv2_nl_put_u64(buf, sizeof(buf), &off,
+					     SUNRPC_A_IP_MAP_EXPIRY, expiry);
+	if (error)
+		return error;
+	nest->nla_len = off - nest_at;
+
+	error = nfsd_ffv2_nl_send(nl, buf, off);
+	if (error < 0)
+		return error;
+	return nfsd_ffv2_nl_ack(nl);
+}
+
+/*
+ * Seed one auth.unix.gid entry with an empty group list.  At this tip the
+ * attribute spelled NEGATIVE does not set CACHE_NEGATIVE: both it and an
+ * empty GIDS list produce a valid positive entry holding groups_alloc(0).
+ * The empty-GIDS spelling is used so the name cannot mislead a later reader.
+ */
+static noinline int nfsd_ffv2_nl_seed_gid_raw(struct nfsd_ffv2_nl *nl, u32 uid,
+					      u64 expiry, bool with_uid)
+{
+	char buf[NFSD_FFV2_NL_BUF];
+	struct nlattr *nest;
+	size_t off, nest_at;
+	int error;
+
+	off = nfsd_ffv2_nl_begin(buf, nl->family, SUNRPC_CMD_UNIX_GID_SET_REQS,
+				 ++nl->seq, NLM_F_ACK);
+	nest_at = off;
+	nest = nfsd_ffv2_nl_reserve(buf, sizeof(buf), &off,
+				    SUNRPC_A_UNIX_GID_REQS_REQUESTS |
+				    NLA_F_NESTED, 0);
+	if (!nest)
+		return -EMSGSIZE;
+	error = 0;
+	if (with_uid)
+		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+					     SUNRPC_A_UNIX_GID_UID, uid);
+	if (!error)
+		error = nfsd_ffv2_nl_put_u64(buf, sizeof(buf), &off,
+					     SUNRPC_A_UNIX_GID_EXPIRY, expiry);
+	if (error)
+		return error;
+	nest->nla_len = off - nest_at;
+
+	error = nfsd_ffv2_nl_send(nl, buf, off);
+	if (error < 0)
+		return error;
+	return nfsd_ffv2_nl_ack(nl);
+}
+
+/*
+ * GET_REQS is a pending-request dump, not entry readback: it walks the
+ * cache's outstanding upcalls.  A resolved entry has no pending request, so a
+ * successful seed makes this count zero.  It proves the absence of a
+ * deferral; it never proves an entry exists.  Multipart is terminated on
+ * NLMSG_DONE, with a bounded message budget.
+ */
+static noinline int nfsd_ffv2_nl_pending(struct nfsd_ffv2_nl *nl, u8 cmd,
+					 u16 nest_type, int *count)
+{
+	char buf[NFSD_FFV2_NL_BUF];
+	int budget = 16;
+	size_t off;
+	int error;
+
+	*count = 0;
+	off = nfsd_ffv2_nl_begin(buf, nl->family, cmd, ++nl->seq, NLM_F_DUMP);
+	error = nfsd_ffv2_nl_send(nl, buf, off);
+	if (error < 0)
+		return error;
+
+	while (budget--) {
+		struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+		int got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
+		unsigned int rem;
+
+		if (got < 0)
+			return got;
+		rem = (unsigned int)got;
+		for (; NLMSG_OK(nlh, rem); nlh = NLMSG_NEXT(nlh, rem)) {
+			struct nlattr *nla;
+			int nrem;
+
+			if (nlh->nlmsg_type == NLMSG_DONE)
+				return 0;
+			if (nlh->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *e = nlmsg_data(nlh);
+
+				return e->error ? e->error : -EBADMSG;
+			}
+			nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem)
+				if (nla_type(nla) == nest_type)
+					(*count)++;
+		}
+		if (!(nlh->nlmsg_flags & NLM_F_MULTI))
+			return 0;
+	}
+	return -EMSGSIZE;		/* dump did not terminate */
+}
+
+static int nfsd_ffv2_nl_seed_gid(struct nfsd_ffv2_nl *nl, u32 uid, u64 expiry)
+{
+	return nfsd_ffv2_nl_seed_gid_raw(nl, uid, expiry, true);
+}
+
+/* Flush by mask; zero means the handler's default, which is both caches. */
+static noinline int nfsd_ffv2_nl_flush(struct nfsd_ffv2_nl *nl, u32 mask)
+{
+	char buf[NFSD_FFV2_NL_BUF];
+	size_t off;
+	int error;
+
+	off = nfsd_ffv2_nl_begin(buf, nl->family, SUNRPC_CMD_CACHE_FLUSH,
+				 ++nl->seq, NLM_F_ACK);
+	if (mask) {
+		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+					     SUNRPC_A_CACHE_FLUSH_MASK, mask);
+		if (error)
+			return error;
+	}
+	error = nfsd_ffv2_nl_send(nl, buf, off);
+	if (error < 0)
+		return error;
+	return nfsd_ffv2_nl_ack(nl);
+}
+
+/*
+ * P0: the authentication-cache netlink probe.
+ *
+ * This is a transport gate, not a session test.  It answers one question the
+ * design could not: whether a kernel generic-netlink socket in the fixture's
+ * own namespace can drive the per-net SunRPC auth-cache provisioning API at
+ * all.  Everything it touches is per-net and is flushed before the namespace
+ * is dropped.  No RPC is sent and no provider is enabled.
+ */
+static void nfsd_ffv2_auth_cache_p0_probe_test(struct kunit *test)
+{
+	const char *domain = "ffv2-p0-test-domain";
+	struct nfsd_ffv2_ro_fixture f;
+	struct nfsd_ffv2_nl nl;
+	struct net *other = NULL;
+	int pending;
+	u64 expiry;
+	int error;
+
+	if (!nfsd_ffv2_ro_fixture_init_wired(test, &f))
+		goto out;
+	if (nfsd_ffv2_ro_loopback_up(f.net)) {
+		KUNIT_FAIL(test, "could not bring the namespace loopback up");
+		goto out;
+	}
+
+	/* T2: sender in the fixture net, and the runtime family id. */
+	error = nfsd_ffv2_nl_open(f.net, &nl);
+	pr_info("FFV2P0: open=%d family=%u\n", error, nl.family);
+	if (error) {
+		KUNIT_FAIL(test,
+			   "generic netlink is not reachable from a kernel socket: %d",
+			   error);
+		goto out;
+	}
+	KUNIT_EXPECT_NE(test, 0, (int)nl.family);
+
+	/*
+	 * T3: the capability gate.  Every sunrpc command carries
+	 * GENL_ADMIN_PERM, which needs CAP_NET_ADMIN in init_user_ns for the
+	 * sending task -- not in the fixture net's user namespace.
+	 */
+	pr_info("FFV2P0: ns_capable(init_user_ns, CAP_NET_ADMIN)=%d\n",
+		ns_capable(&init_user_ns, CAP_NET_ADMIN));
+
+	expiry = ktime_get_real_seconds() + 300;
+
+	/* T5: cold-key positive ip_map, then the zero-group unix_gid. */
+	error = nfsd_ffv2_nl_seed_ip(&nl, "nfsd", "127.0.0.1", domain, expiry);
+	pr_info("FFV2P0: seed ip_map ack=%d\n", error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+
+	error = nfsd_ffv2_nl_seed_gid(&nl, 0, expiry);
+	pr_info("FFV2P0: seed unix_gid ack=%d\n", error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+
+	/* T8: bounded multipart dump; pending drain only, not entry readback. */
+	error = nfsd_ffv2_nl_pending(&nl, SUNRPC_CMD_IP_MAP_GET_REQS,
+				     SUNRPC_A_IP_MAP_REQS_REQUESTS, &pending);
+	pr_info("FFV2P0: ip_map pending=%d (rc=%d)\n", pending, error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+	KUNIT_EXPECT_EQ(test, 0, pending);
+
+	error = nfsd_ffv2_nl_pending(&nl, SUNRPC_CMD_UNIX_GID_GET_REQS,
+				     SUNRPC_A_UNIX_GID_REQS_REQUESTS, &pending);
+	pr_info("FFV2P0: unix_gid pending=%d (rc=%d)\n", pending, error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+	KUNIT_EXPECT_EQ(test, 0, pending);
+
+	/* T6: replacement in place -- reseeding the same key must not fail. */
+	error = nfsd_ffv2_nl_seed_ip(&nl, "nfsd", "127.0.0.1", domain, expiry);
+	pr_info("FFV2P0: reseed ip_map ack=%d\n", error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+
+	/* T7: the handlers' error paths must reject, not insert. */
+	error = nfsd_ffv2_nl_seed_ip(&nl, "nfsd", "not-an-address", domain,
+				     expiry);
+	pr_info("FFV2P0: bad address ack=%d\n", error);
+	KUNIT_EXPECT_LT(test, error, 0);
+
+	error = nfsd_ffv2_nl_seed_ip(&nl, "this-class-is-far-too-long",
+				     "127.0.0.1", domain, expiry);
+	pr_info("FFV2P0: oversize class ack=%d\n", error);
+	KUNIT_EXPECT_LT(test, error, 0);
+
+	error = nfsd_ffv2_nl_seed_ip(&nl, "nfsd", "127.0.0.1", NULL, expiry);
+	pr_info("FFV2P0: missing domain ack=%d\n", error);
+	KUNIT_EXPECT_LT(test, error, 0);
+
+	/*
+	 * T9: cross-net isolation.  The handlers select the cache with
+	 * genl_info_net(), so a sender in another net must not be able to
+	 * reach this fixture's caches.  Behavioural admission in the second
+	 * net belongs to the session slice; what is checked here is that the
+	 * second net has its own caches and its own pending state.
+	 */
+	other = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (!IS_ERR(other)) {
+		struct nfsd_ffv2_nl nl2;
+
+		error = nfsd_ffv2_nl_open(other, &nl2);
+		pr_info("FFV2P0: second net open=%d\n", error);
+		if (!error) {
+			error = nfsd_ffv2_nl_pending(&nl2,
+						     SUNRPC_CMD_IP_MAP_GET_REQS,
+						     SUNRPC_A_IP_MAP_REQS_REQUESTS,
+						     &pending);
+			pr_info("FFV2P0: second net ip_map pending=%d (rc=%d)\n",
+				pending, error);
+			KUNIT_EXPECT_EQ(test, 0, error);
+			nfsd_ffv2_nl_close(&nl2);
+		}
+	} else {
+		pr_info("FFV2P0: second net unavailable: %ld\n", PTR_ERR(other));
+		other = NULL;
+	}
+
+	/* T10: each mask reaches exactly its own cache, and zero is default. */
+	error = nfsd_ffv2_nl_flush(&nl, SUNRPC_CACHE_TYPE_IP_MAP);
+	pr_info("FFV2P0: flush mask=IP_MAP ack=%d\n", error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+
+	error = nfsd_ffv2_nl_flush(&nl, SUNRPC_CACHE_TYPE_UNIX_GID);
+	pr_info("FFV2P0: flush mask=UNIX_GID ack=%d\n", error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+
+	/*
+	 * C8/step 9: rollback must be executable at the moment a seed fails,
+	 * which is why the sender is retained rather than released after
+	 * phase 0.  Seed one cache, fail the other, then flush both.
+	 */
+	error = nfsd_ffv2_nl_seed_ip(&nl, "nfsd", "127.0.0.1", domain, expiry);
+	KUNIT_EXPECT_EQ(test, 0, error);
+	/*
+	 * The gid seed must genuinely fail here, or the rollback below proves
+	 * nothing.  An expiry of zero is *not* a failure -- it parses and
+	 * yields an already-expired entry -- so the uid, which the parser
+	 * requires, is omitted instead.
+	 */
+	error = nfsd_ffv2_nl_seed_gid_raw(&nl, 0, expiry, false);
+	pr_info("FFV2P0: partial-seed gid ack=%d\n", error);
+	KUNIT_EXPECT_LT(test, error, 0);
+	error = nfsd_ffv2_nl_flush(&nl, 0);
+	pr_info("FFV2P0: rollback flush ack=%d\n", error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+
+	/*
+	 * Step 10: the phase-4 flush runs on this still-live sender, after
+	 * the service is stopped by the fixture teardown below and before the
+	 * namespace is dropped.  The sender is closed here, ahead of put_net().
+	 */
+	error = nfsd_ffv2_nl_flush(&nl, 0);
+	pr_info("FFV2P0: phase-4 flush ack=%d\n", error);
+	KUNIT_EXPECT_EQ(test, 0, error);
+
+	nfsd_ffv2_nl_close(&nl);
+	if (other)
+		put_net(other);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
 static void nfsd_ffv2_transport_null_test(struct kunit *test)
 {
 	__be32 call[16], reply[16];
@@ -7098,6 +7635,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
 	KUNIT_CASE(nfsd_ffv2_encode_header_test),
+	KUNIT_CASE(nfsd_ffv2_auth_cache_p0_probe_test),
 	KUNIT_CASE(nfsd_ffv2_transport_null_test),
 	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
