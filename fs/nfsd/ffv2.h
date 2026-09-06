@@ -600,8 +600,13 @@ void nfsd_ffv2_test_release_counters(u64 *admissions, u64 *providers);
 struct nfsd_ffv2_reply_shape {
 	u32	head_len;
 	u32	page_len;
+	u32	page_base;
 	u32	pages_used;
+	u32	pages_available;
+	u64	admissions_released;
+	u64	providers_released;
 	u32	ops_released;
+	u32	sequence;
 	bool	valid;
 };
 

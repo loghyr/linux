@@ -292,7 +292,8 @@ static void nfsd_ffv2_count_release(void *payload)
 
 static int
 nfsd_ffv2_start_test_service(struct net *net,
-			     struct nfsd_ffv2_worker_ctx *worker)
+			     struct nfsd_ffv2_worker_ctx *worker,
+			     int *startup_error)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 	bool cleanup = false;
@@ -311,6 +312,13 @@ nfsd_ffv2_start_test_service(struct net *net,
 	nfsd_vers(nn, 3, NFSD_CLEAR);
 	nfsd_vers(nn, 4, NFSD_SET);
 	error = nfsd_svc(1, &threads, net, current_cred(), NULL);
+	/*
+	 * What the service itself said, kept before the cleanup below can
+	 * replace it: a cleanup status describes the cleanup, not the reason
+	 * the start failed.
+	 */
+	if (startup_error)
+		*startup_error = error == 1 ? 0 : error;
 	if (error == 1) {
 		error = 0;
 	} else if (error >= 0) {
@@ -823,7 +831,7 @@ static void nfsd_ffv2_service_integration_test(struct kunit *test)
 		goto out_put_net;
 	worker_installed = true;
 
-	error = nfsd_ffv2_start_test_service(net, &worker);
+	error = nfsd_ffv2_start_test_service(net, &worker, NULL);
 	if (error)
 		goto out_cleanup;
 	service_up = true;
@@ -902,7 +910,7 @@ static void nfsd_ffv2_service_integration_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, nn->nfsd_shutdown_in_progress);
 	KUNIT_EXPECT_PTR_EQ(test, nn->nfsd_serv, NULL);
 
-	error = nfsd_ffv2_start_test_service(net, &worker);
+	error = nfsd_ffv2_start_test_service(net, &worker, NULL);
 	if (error)
 		goto out_cleanup;
 	service_up = true;
@@ -1009,7 +1017,7 @@ static void nfsd_ffv2_production_netns_integration_test(struct kunit *test)
 	if (error)
 		goto out_cleanup;
 	worker_installed = true;
-	error = nfsd_ffv2_start_test_service(net, &worker);
+	error = nfsd_ffv2_start_test_service(net, &worker, NULL);
 	if (error)
 		goto out_cleanup;
 	service_up = true;
@@ -1118,7 +1126,7 @@ static void nfsd_ffv2_production_pre_exit_overlap_test(struct kunit *test)
 	if (error)
 		goto out_cleanup;
 	worker_installed = true;
-	error = nfsd_ffv2_start_test_service(net, &worker);
+	error = nfsd_ffv2_start_test_service(net, &worker, NULL);
 	if (error)
 		goto out_cleanup;
 	service_up = true;
@@ -1208,7 +1216,7 @@ static void nfsd_ffv2_shutdown_start_failure_test(struct kunit *test)
 		return;
 	}
 	nn = net_generic(net, nfsd_net_id);
-	error = nfsd_ffv2_start_test_service(net, NULL);
+	error = nfsd_ffv2_start_test_service(net, NULL, NULL);
 	if (error)
 		goto out_put_net;
 
@@ -1274,7 +1282,7 @@ static void nfsd_ffv2_partial_start_cleanup_test(struct kunit *test)
 	}
 	nn = net_generic(net, nfsd_net_id);
 	nfsd_ffv2_test_set_start_failure(true);
-	error = nfsd_ffv2_start_test_service(net, NULL);
+	error = nfsd_ffv2_start_test_service(net, NULL, NULL);
 	nfsd_ffv2_test_set_start_failure(false);
 	KUNIT_EXPECT_EQ(test, error, -EIO);
 	mutex_lock(&nfsd_mutex);
@@ -2515,7 +2523,7 @@ static void nfsd_ffv2_authority_unknown_locator_test(struct kunit *test)
 	if (error)
 		goto out_cleanup;
 	worker_installed = true;
-	error = nfsd_ffv2_start_test_service(net, &worker);
+	error = nfsd_ffv2_start_test_service(net, &worker, NULL);
 	if (error)
 		goto out_cleanup;
 	service_up = true;
@@ -3505,7 +3513,7 @@ static void nfsd_ffv2_no_fh_generation_race_test(struct kunit *test)
 	if (error)
 		goto out_cleanup;
 	worker_installed = true;
-	error = nfsd_ffv2_start_test_service(net, &worker);
+	error = nfsd_ffv2_start_test_service(net, &worker, NULL);
 	if (error)
 		goto out_cleanup;
 	service_up = true;
@@ -4200,6 +4208,25 @@ static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
 {
 	struct nfsd_ffv2_generation *generation;
 
+	/*
+	 * Teardown in four phases, because the order is not free: stopping
+	 * the last nfsd thread drives this namespace's nfsd teardown, and
+	 * that waits on FFv2 state.  So the FFv2 side stops first, the
+	 * threads join second, and everything the fixture still owns is
+	 * released only after both -- while it is all still valid for
+	 * whatever is shutting down to look at.
+	 */
+
+	/* One: the worker hook stops gating anything. */
+	if (f->worker_installed) {
+		complete_all(&f->worker.run);
+		complete_all(&f->worker.allow_complete);
+	}
+
+	/*
+	 * Two: admissions stop and the generation and provider retire, with
+	 * the export, dentry, root and cache still in place.
+	 */
 	if (f->provider_installed) {
 		nfsd_ffv2_test_provider_remove(f->nn);
 		f->provider_installed = false;
@@ -4212,6 +4239,13 @@ static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
 		nfsd_ffv2_binding_put(f->binding);
 		f->binding = NULL;
 	}
+	/*
+	 * The fixture's own object and its reference to the published export
+	 * go here too, before the retirement rather than after it: retiring
+	 * the generation waits for them, so releasing them later would be
+	 * waiting on something still held.  The export cache itself, the
+	 * dentry, the root and the file cache all stay until phase four.
+	 */
 	if (f->published) {
 		exp_put(f->published);
 		f->published = NULL;
@@ -4232,6 +4266,23 @@ static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
 		mutex_unlock(&nfsd_mutex);
 		f->service_up = false;
 	}
+
+	/*
+	 * Three: the threads join, so the per-net shutdown they drive finds
+	 * no live generation and does ordinary teardown.  Ownership does not
+	 * depend on the start having succeeded: a failed start can still
+	 * have left a service and a thread behind.
+	 */
+	if (f->service_attempted || (f->nn && f->nn->nfsd_serv)) {
+		nfsd_shutdown_threads(f->net);
+		f->service_attempted = false;
+	}
+
+	/* Four: what the fixture still holds, and the namespace last. */
+	if (f->worker_installed) {
+		nfsd_ffv2_worker_ctx_remove(&f->worker);
+		f->worker_installed = false;
+	}
 	if (f->net)
 		nfsd_export_flush(f->net);
 	if (f->filecache_up) {
@@ -4251,24 +4302,6 @@ static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
 	if (f->domain) {
 		auth_domain_put(f->domain);
 		f->domain = NULL;
-	}
-	/*
-	 * The service goes after the FFv2 state it was started over, not
-	 * before it.  Stopping the last thread drives this namespace's nfsd
-	 * teardown, which waits on that state, so a teardown that stopped
-	 * the threads first would wait for something it had not released
-	 * yet.  Ownership is not conditional on the start having succeeded:
-	 * a failed start can still leave a service and a thread behind.
-	 */
-	if (f->service_attempted || (f->nn && f->nn->nfsd_serv)) {
-		complete_all(&f->worker.run);
-		complete_all(&f->worker.allow_complete);
-		nfsd_shutdown_threads(f->net);
-		f->service_attempted = false;
-	}
-	if (f->worker_installed) {
-		nfsd_ffv2_worker_ctx_remove(&f->worker);
-		f->worker_installed = false;
 	}
 	if (f->net) {
 		put_net(f->net);
@@ -4423,11 +4456,13 @@ static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
 		 * failure, so teardown owns it before the result is known.
 		 */
 		f->service_attempted = true;
-		wire_error = nfsd_ffv2_start_test_service(f->net, &f->worker);
+		wire_error = nfsd_ffv2_start_test_service(f->net,
+							  &f->worker,
+							  &f->service_error);
 		if (wire_error) {
-			f->service_error = wire_error;
-			KUNIT_FAIL(test, "fixture listener start failed: %d",
-				   wire_error);
+			KUNIT_FAIL(test,
+				   "fixture listener start failed: %d (cleanup %d)",
+				   f->service_error, wire_error);
 			return false;
 		}
 		complete(&f->worker.run);
@@ -6152,9 +6187,12 @@ static void nfsd_ffv2_transport_null_test(struct kunit *test)
 		goto out;
 	}
 	frame &= 0x7fffffff;
-	/* xid, direction, accept state, two verifier words, and the status. */
-	if (frame < 6 * XDR_UNIT || frame > sizeof(reply) ||
-	    frame % XDR_UNIT) {
+	/*
+	 * A NULL reply is exactly six words and no body: the transaction
+	 * identifier, the direction, the accept state, an empty verifier,
+	 * and the status.  Anything longer is not the reply to this call.
+	 */
+	if (frame != 6 * XDR_UNIT || frame > sizeof(reply)) {
 		KUNIT_FAIL(test, "the reply's length is not usable: %u", frame);
 		goto out;
 	}
@@ -6167,6 +6205,8 @@ static void nfsd_ffv2_transport_null_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xid, reply[0]);
 	KUNIT_EXPECT_EQ(test, 1U, be32_to_cpu(reply[1]));	/* REPLY */
 	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[2]));	/* accepted */
+	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[3]));	/* verifier */
+	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[4]));	/* empty */
 	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[5]));	/* success */
 
 	/*

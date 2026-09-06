@@ -3069,34 +3069,69 @@ check_if_stalefh_allowed(struct nfsd4_compoundargs *args)
 #endif
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static DEFINE_SPINLOCK(nfsd_ffv2_reply_lock);
 static struct nfsd_ffv2_reply_shape nfsd_ffv2_last_reply;
 static atomic_t nfsd_ffv2_ops_released = ATOMIC_INIT(0);
 
 /*
- * Record what the server built for this reply, as values only, while the
- * pages are still the request's.  Nothing here keeps a pointer to them and
- * nothing changes who owns them.
+ * Snapshot the release counts a compound starts from, so what it did can be
+ * reported as a difference rather than as a running total that another
+ * request may have moved.
  */
-static void nfsd_ffv2_record_reply_shape(struct svc_rqst *rqstp)
+static void nfsd_ffv2_reply_baseline(struct nfsd_ffv2_reply_shape *base)
+{
+	nfsd_ffv2_test_release_counters(&base->admissions_released,
+					&base->providers_released);
+	base->ops_released = atomic_read(&nfsd_ffv2_ops_released);
+}
+
+/*
+ * Record what the server built for this reply, as values only, after the
+ * last operation is encoded and while the pages are still the request's.
+ * Nothing here keeps a pointer to a page and nothing changes who owns one.
+ * Two requests cannot interleave in the record: it is written under a lock
+ * and carries a sequence, so a reader can tell one reply from the next.
+ */
+static void nfsd_ffv2_record_reply_shape(struct svc_rqst *rqstp,
+					 const struct nfsd_ffv2_reply_shape *base)
 {
 	const struct xdr_buf *buf = &rqstp->rq_res;
+	struct nfsd_ffv2_reply_shape shape = {};
+	u64 admissions, providers;
 
-	nfsd_ffv2_last_reply.head_len = buf->head[0].iov_len;
-	nfsd_ffv2_last_reply.page_len = buf->page_len;
-	nfsd_ffv2_last_reply.pages_used =
-		rqstp->rq_next_page > rqstp->rq_respages ?
-		rqstp->rq_next_page - rqstp->rq_respages : 0;
-	nfsd_ffv2_last_reply.ops_released =
-		atomic_read(&nfsd_ffv2_ops_released);
-	nfsd_ffv2_last_reply.valid = true;
+	shape.head_len = buf->head[0].iov_len;
+	shape.page_len = buf->page_len;
+	shape.page_base = buf->page_base;
+	shape.pages_used = rqstp->rq_next_page > rqstp->rq_respages ?
+			   rqstp->rq_next_page - rqstp->rq_respages : 0;
+	shape.pages_available = rqstp->rq_page_end > rqstp->rq_respages ?
+				rqstp->rq_page_end - rqstp->rq_respages : 0;
+	nfsd_ffv2_test_release_counters(&admissions, &providers);
+	shape.admissions_released = admissions - base->admissions_released;
+	shape.providers_released = providers - base->providers_released;
+	shape.ops_released = atomic_read(&nfsd_ffv2_ops_released) -
+			     base->ops_released;
+	shape.valid = true;
+
+	spin_lock(&nfsd_ffv2_reply_lock);
+	shape.sequence = nfsd_ffv2_last_reply.sequence + 1;
+	nfsd_ffv2_last_reply = shape;
+	spin_unlock(&nfsd_ffv2_reply_lock);
 }
 
 void nfsd_ffv2_test_reply_shape(struct nfsd_ffv2_reply_shape *shape)
 {
+	spin_lock(&nfsd_ffv2_reply_lock);
 	*shape = nfsd_ffv2_last_reply;
+	spin_unlock(&nfsd_ffv2_reply_lock);
 }
 #else
-static inline void nfsd_ffv2_record_reply_shape(struct svc_rqst *rqstp) {}
+struct nfsd_ffv2_reply_shape;
+static inline void
+nfsd_ffv2_reply_baseline(struct nfsd_ffv2_reply_shape *base) {}
+static inline void
+nfsd_ffv2_record_reply_shape(struct svc_rqst *rqstp,
+			     const struct nfsd_ffv2_reply_shape *base) {}
 #endif
 
 /*
@@ -3105,6 +3140,7 @@ static inline void nfsd_ffv2_record_reply_shape(struct svc_rqst *rqstp) {}
 static __be32
 nfsd4_proc_compound(struct svc_rqst *rqstp)
 {
+	struct nfsd_ffv2_reply_shape ffv2_baseline = {};
 	struct nfsd4_compoundargs *args = rqstp->rq_argp;
 	struct nfsd4_compoundres *resp = rqstp->rq_resp;
 	struct nfsd4_op	*op;
@@ -3115,6 +3151,7 @@ nfsd4_proc_compound(struct svc_rqst *rqstp)
 	struct nfsd_thread_local_info *ntli = rqstp->rq_private;
 	__be32		status;
 
+	nfsd_ffv2_reply_baseline(&ffv2_baseline);
 	resp->xdr = &rqstp->rq_res_stream;
 	resp->statusp = resp->xdr->p;
 
@@ -3261,7 +3298,7 @@ encode_op:
 	BUG_ON(cstate->replay_owner);
 out:
 	cstate->status = status;
-	nfsd_ffv2_record_reply_shape(rqstp);
+	nfsd_ffv2_record_reply_shape(rqstp, &ffv2_baseline);
 	return rpc_success;
 }
 
