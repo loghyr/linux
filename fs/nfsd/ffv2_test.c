@@ -16,6 +16,9 @@
 #include <linux/sunrpc/svc_xprt.h>
 #include <net/net_namespace.h>
 
+#include <linux/rtnetlink.h>
+#include <linux/net.h>
+#include <net/sock.h>
 #include "ffv2.h"
 #include "ffv2_trust.h"
 #include "export.h"
@@ -4114,6 +4117,10 @@ struct nfsd_ffv2_ro_fixture {
 	bool				filecache_up;
 	bool				registration_open;
 	bool				provider_installed;
+	/* Set when the fixture also runs a real service with a listener. */
+	struct nfsd_ffv2_worker_ctx	worker;
+	bool				worker_installed;
+	bool				service_started;
 	bool				root_held;
 	/* Set when the publication wait expired; see the init comment. */
 	bool				publish_timed_out;
@@ -4242,6 +4249,21 @@ static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
 		auth_domain_put(f->domain);
 		f->domain = NULL;
 	}
+	/*
+	 * The service and its worker go before the namespace does: threads
+	 * are stopped and joined first, so nothing is still running against
+	 * this fixture's storage when it is freed.
+	 */
+	if (f->service_started) {
+		complete_all(&f->worker.run);
+		complete_all(&f->worker.allow_complete);
+		nfsd_shutdown_threads(f->net);
+		f->service_started = false;
+	}
+	if (f->worker_installed) {
+		nfsd_ffv2_worker_ctx_remove(&f->worker);
+		f->worker_installed = false;
+	}
 	if (f->net) {
 		put_net(f->net);
 		f->net = NULL;
@@ -4264,7 +4286,8 @@ static void nfsd_ffv2_ro_fixture_exit(struct kunit *test,
 static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
 					   struct nfsd_ffv2_ro_fixture *f,
 					   unsigned long publish_wait,
-					   bool timeout_expected)
+					   bool timeout_expected,
+					   bool with_transport)
 {
 	struct nfsd_ffv2_ro_publish_ctx pubctx = {};
 	struct nfsd_ffv2_transition_publish_ctx *publish = &pubctx.publish;
@@ -4302,6 +4325,7 @@ static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
 	f->nn = net_generic(f->net, nfsd_net_id);
 	f->xprt->xpt_net = f->net;
 	f->rqstp->rq_xprt = f->xprt;
+
 	/*
 	 * nfs4_state_create_net() initialises this lock when the v4 state
 	 * machine starts, which the fixture does not do: only the FFv2
@@ -4369,6 +4393,33 @@ static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
 	if (error) {
 		KUNIT_FAIL(test, "fixture service start failed: %d", error);
 		return false;
+	}
+
+	/*
+	 * A fixture that will be reached over the wire runs a real service
+	 * and listener too.  It comes after the fixture's own service state,
+	 * export and filecache are up, because the service needs them, and
+	 * before anything is published, which is the order the other tests
+	 * in this file establish.
+	 */
+	if (with_transport) {
+		int wire_error;
+
+		wire_error = nfsd_ffv2_worker_ctx_install(&f->worker, f->net);
+		if (wire_error) {
+			KUNIT_FAIL(test, "fixture worker install failed: %d",
+				   wire_error);
+			return false;
+		}
+		f->worker_installed = true;
+		wire_error = nfsd_ffv2_start_test_service(f->net, &f->worker);
+		if (wire_error) {
+			KUNIT_FAIL(test, "fixture listener start failed: %d",
+				   wire_error);
+			return false;
+		}
+		f->service_started = true;
+		complete(&f->worker.run);
 	}
 
 	/*
@@ -4514,7 +4565,17 @@ static bool nfsd_ffv2_ro_fixture_init(struct kunit *test,
 				      struct nfsd_ffv2_ro_fixture *f)
 {
 	return nfsd_ffv2_ro_fixture_init_wait(test, f,
-					      NFSD_FFV2_RO_PUBLISH_WAIT, false);
+					      NFSD_FFV2_RO_PUBLISH_WAIT, false,
+					      false);
+}
+
+/* The same fixture, also running a real service with a loopback listener. */
+static bool nfsd_ffv2_ro_fixture_init_wired(struct kunit *test,
+					    struct nfsd_ffv2_ro_fixture *f)
+{
+	return nfsd_ffv2_ro_fixture_init_wait(test, f,
+					      NFSD_FFV2_RO_PUBLISH_WAIT, false,
+					      true);
 }
 
 /*
@@ -5495,7 +5556,7 @@ static void nfsd_ffv2_provider_publish_timeout_test(struct kunit *test)
 	 * One jiffy against a worker that sleeps for longer than that wait
 	 * whatever HZ is, so the timeout branch is always the one taken.
 	 */
-	if (!nfsd_ffv2_ro_fixture_init_wait(test, &f, 1, true))
+	if (!nfsd_ffv2_ro_fixture_init_wait(test, &f, 1, true, false))
 		goto out;
 
 	KUNIT_EXPECT_TRUE(test, f.publish_timed_out);
@@ -5915,6 +5976,134 @@ static void nfsd_ffv2_compound_read_capacity_test(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_payload);
 
 out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/* The service's own listener, so a client can find it. */
+static int nfsd_ffv2_ro_listener_port(struct nfsd_net *nn)
+{
+	struct svc_serv *serv = nn->nfsd_serv;
+	struct svc_xprt *xprt;
+	int port = -ENOENT;
+
+	if (!serv)
+		return -ENOENT;
+	spin_lock_bh(&serv->sv_lock);
+	list_for_each_entry(xprt, &serv->sv_permsocks, xpt_list) {
+		port = svc_xprt_local_port(xprt);
+		break;
+	}
+	spin_unlock_bh(&serv->sv_lock);
+	return port;
+}
+
+/* Nothing in a fresh namespace can be reached until loopback is up. */
+static int nfsd_ffv2_ro_loopback_up(struct net *net)
+{
+	int error;
+
+	rtnl_lock();
+	error = dev_change_flags(net->loopback_dev,
+				 net->loopback_dev->flags | IFF_UP, NULL);
+	rtnl_unlock();
+	return error;
+}
+
+/*
+ * One real request, arriving the way requests arrive.
+ *
+ * This is the smallest exchange that proves the whole path: the fixture's
+ * service, its listener, a client that reaches it, and a reply built by the
+ * server for a request the server received.  Everything a later encoder
+ * test needs -- the page array, the head and page split, the cursor, the
+ * buffer length -- is established by that path rather than by a test, which
+ * is the point of arriving this way.
+ */
+static void nfsd_ffv2_transport_null_test(struct kunit *test)
+{
+	__be32 call[16], reply[16];
+	struct sockaddr_in addr = {};
+	struct nfsd_ffv2_ro_fixture f;
+	struct socket *sock = NULL;
+	struct msghdr msg = {};
+	struct kvec iov;
+	int port, error;
+	__be32 xid;
+	u32 words;
+
+	if (!nfsd_ffv2_ro_fixture_init_wired(test, &f))
+		goto out;
+
+	if (nfsd_ffv2_ro_loopback_up(f.net)) {
+		KUNIT_FAIL(test, "could not bring the namespace loopback up");
+		goto out;
+	}
+	port = nfsd_ffv2_ro_listener_port(f.nn);
+	if (port <= 0) {
+		KUNIT_FAIL(test, "the service has no listener: %d", port);
+		goto out;
+	}
+
+	error = sock_create_kern(f.net, PF_INET, SOCK_STREAM, IPPROTO_TCP,
+				 &sock);
+	if (error) {
+		KUNIT_FAIL(test, "failed to create a client socket: %d", error);
+		goto out;
+	}
+	addr.sin_family = AF_INET;
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	addr.sin_port = htons(port);
+	error = kernel_connect(sock, (struct sockaddr_unsized *)&addr,
+			       sizeof(addr), 0);
+	if (error) {
+		KUNIT_FAIL(test, "failed to reach the service: %d", error);
+		goto out;
+	}
+
+	/*
+	 * An RPC NULL call: a record mark, then a call naming the NFS
+	 * program and version four, with no authentication to speak of.
+	 */
+	xid = cpu_to_be32(0x46465632);
+	words = 0;
+	call[++words] = xid;
+	call[++words] = cpu_to_be32(0);		/* CALL */
+	call[++words] = cpu_to_be32(2);		/* RPC version */
+	call[++words] = cpu_to_be32(100003);	/* NFS */
+	call[++words] = cpu_to_be32(4);		/* version */
+	call[++words] = cpu_to_be32(0);		/* NULL */
+	call[++words] = cpu_to_be32(0);		/* credential flavour */
+	call[++words] = cpu_to_be32(0);		/* credential length */
+	call[++words] = cpu_to_be32(0);		/* verifier flavour */
+	call[++words] = cpu_to_be32(0);		/* verifier length */
+	call[0] = cpu_to_be32(0x80000000 | (words * XDR_UNIT));
+
+	iov.iov_base = call;
+	iov.iov_len = (words + 1) * XDR_UNIT;
+	error = kernel_sendmsg(sock, &msg, &iov, 1, iov.iov_len);
+	if (error != (int)iov.iov_len) {
+		KUNIT_FAIL(test, "the call was not sent whole: %d", error);
+		goto out;
+	}
+
+	memset(&msg, 0, sizeof(msg));
+	iov.iov_base = reply;
+	iov.iov_len = sizeof(reply);
+	error = kernel_recvmsg(sock, &msg, &iov, 1, iov.iov_len, 0);
+	if (error < 7 * XDR_UNIT) {
+		KUNIT_FAIL(test, "no usable reply came back: %d", error);
+		goto out;
+	}
+
+	/* Answered, accepted, and executed, for the call that was sent. */
+	KUNIT_EXPECT_EQ(test, xid, reply[1]);
+	KUNIT_EXPECT_EQ(test, 1U, be32_to_cpu(reply[2]));	/* REPLY */
+	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[3]));	/* accepted */
+	KUNIT_EXPECT_EQ(test, 0U, be32_to_cpu(reply[6]));	/* success */
+
+out:
+	if (sock)
+		sock_release(sock);
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
@@ -6784,6 +6973,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
 	KUNIT_CASE(nfsd_ffv2_encode_header_test),
+	KUNIT_CASE(nfsd_ffv2_transport_null_test),
 	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
