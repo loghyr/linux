@@ -1032,6 +1032,56 @@ nfsd(void *vrqstp)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static DEFINE_SPINLOCK(nfsd_ffv2_auth_lock);
+static struct nfsd_ffv2_auth_record nfsd_ffv2_last_auth;
+
+/*
+ * Record what export authentication settled on for this request.  It runs
+ * once the program's authentication callback has already returned SVC_OK, so
+ * it observes the production result rather than producing one: a request that
+ * authentication drops never reaches here, which is what makes the absence of
+ * a record meaningful to a test.  Values are copied; no reference is taken.
+ */
+static void nfsd_ffv2_record_auth(struct svc_rqst *rqstp)
+{
+	struct nfsd_ffv2_auth_record rec = {};
+
+	rec.prog = rqstp->rq_prog;
+	rec.vers = rqstp->rq_vers;
+	rec.proc = rqstp->rq_proc;
+	rec.have_client = rqstp->rq_client;
+	if (rec.have_client && rqstp->rq_client->name)
+		strscpy(rec.domain, rqstp->rq_client->name, sizeof(rec.domain));
+	if (rqstp->rq_cred.cr_group_info)
+		rec.ngroups = rqstp->rq_cred.cr_group_info->ngroups;
+	rec.valid = true;
+
+	spin_lock(&nfsd_ffv2_auth_lock);
+	rec.sequence = nfsd_ffv2_last_auth.sequence + 1;
+	nfsd_ffv2_last_auth = rec;
+	spin_unlock(&nfsd_ffv2_auth_lock);
+}
+
+void nfsd_ffv2_test_auth_record(struct nfsd_ffv2_auth_record *rec)
+{
+	spin_lock(&nfsd_ffv2_auth_lock);
+	*rec = nfsd_ffv2_last_auth;
+	spin_unlock(&nfsd_ffv2_auth_lock);
+}
+EXPORT_SYMBOL_GPL(nfsd_ffv2_test_auth_record);
+
+void nfsd_ffv2_test_auth_record_reset(void)
+{
+	spin_lock(&nfsd_ffv2_auth_lock);
+	memset(&nfsd_ffv2_last_auth, 0, sizeof(nfsd_ffv2_last_auth));
+	spin_unlock(&nfsd_ffv2_auth_lock);
+}
+EXPORT_SYMBOL_GPL(nfsd_ffv2_test_auth_record_reset);
+#else
+static inline void nfsd_ffv2_record_auth(struct svc_rqst *rqstp) {}
+#endif
+
 /**
  * nfsd_dispatch - Process an NFS or NFSACL or LOCALIO Request
  * @rqstp: incoming request
@@ -1044,6 +1094,7 @@ nfsd(void *vrqstp)
  */
 int nfsd_dispatch(struct svc_rqst *rqstp)
 {
+	nfsd_ffv2_record_auth(rqstp);
 	struct nfsd_thread_local_info *ntli = rqstp->rq_private;
 	const struct svc_procedure *proc = rqstp->rq_procinfo;
 	__be32 *statp = rqstp->rq_accept_statp;

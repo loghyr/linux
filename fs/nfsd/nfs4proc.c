@@ -3125,6 +3125,17 @@ void nfsd_ffv2_test_reply_shape(struct nfsd_ffv2_reply_shape *shape)
 	*shape = nfsd_ffv2_last_reply;
 	spin_unlock(&nfsd_ffv2_reply_lock);
 }
+
+/*
+ * Clear the record, so a test that sent a compound of its own does not leave
+ * one standing for a later test that asks whether any compound was recorded.
+ */
+void nfsd_ffv2_test_reply_shape_reset(void)
+{
+	spin_lock(&nfsd_ffv2_reply_lock);
+	memset(&nfsd_ffv2_last_reply, 0, sizeof(nfsd_ffv2_last_reply));
+	spin_unlock(&nfsd_ffv2_reply_lock);
+}
 #else
 struct nfsd_ffv2_reply_shape;
 static inline void

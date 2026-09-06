@@ -610,7 +610,30 @@ struct nfsd_ffv2_reply_shape {
 	bool	valid;
 };
 
+/*
+ * What the server's export authentication produced for the last request it
+ * dispatched, as values only: the program coordinates, whether a client
+ * domain was selected, that domain's name, and how many supplementary
+ * groups the credential carries once svc_set_client() has run.  Recorded
+ * after authentication succeeds and before the procedure runs, holding no
+ * reference to the domain or to the credential.
+ */
+struct nfsd_ffv2_auth_record {
+	u32	prog;
+	u32	vers;
+	u32	proc;
+	u32	ngroups;
+	u32	sequence;
+	char	domain[64];
+	bool	have_client;
+	bool	valid;
+};
+
+void nfsd_ffv2_test_auth_record(struct nfsd_ffv2_auth_record *rec);
+void nfsd_ffv2_test_auth_record_reset(void);
+
 void nfsd_ffv2_test_reply_shape(struct nfsd_ffv2_reply_shape *shape);
+void nfsd_ffv2_test_reply_shape_reset(void);
 u64 nfsd_ffv2_test_provider_callbacks(void);
 const struct nfsd_ffv2_object *
 nfsd_ffv2_test_binding_object(const struct nfsd_ffv2_binding *binding);
