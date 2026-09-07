@@ -7665,14 +7665,35 @@ struct nfsd_ffv2_auth_service {
 	struct net		*net;
 	struct nfsd_net		*nn;
 	struct nfsd_ffv2_nl	nl;
+	/*
+	 * @service_up is cleared by a normal stop, so it cannot say whether
+	 * the namespace ever had a service.  @started can: the per-net
+	 * disposal lock and list are initialised by the service start and by
+	 * nothing else, so only a namespace that started one may be looked at
+	 * afterwards.
+	 */
 	bool			service_up;
+	bool			started;
 	bool			nl_open;
 	int			flush_error;
 };
 
-static bool nfsd_ffv2_auth_service_start(struct kunit *test,
-					 struct nfsd_ffv2_auth_service *s,
-					 const char *side)
+/*
+ * Where a deliberately failed start gives up.  Everything before the chosen
+ * point runs for real, so the teardown being tested is the teardown that a
+ * genuine failure at that point would leave behind.
+ */
+enum nfsd_ffv2_auth_fail {
+	NFSD_FFV2_AUTH_FAIL_NONE = 0,
+	NFSD_FFV2_AUTH_FAIL_BEFORE_SERVICE,
+	NFSD_FFV2_AUTH_FAIL_AFTER_SERVICE,
+	NFSD_FFV2_AUTH_FAIL_AFTER_LOOPBACK,
+};
+
+static bool nfsd_ffv2_auth_service_start_fail(struct kunit *test,
+					      struct nfsd_ffv2_auth_service *s,
+					      const char *side,
+					      enum nfsd_ffv2_auth_fail fail)
 {
 	int error;
 
@@ -7684,6 +7705,8 @@ static bool nfsd_ffv2_auth_service_start(struct kunit *test,
 		return false;
 	}
 	s->nn = net_generic(s->net, nfsd_net_id);
+	if (fail == NFSD_FFV2_AUTH_FAIL_BEFORE_SERVICE)
+		return false;
 
 	error = nfsd_ffv2_start_test_service(s->net, NULL, NULL);
 	if (error) {
@@ -7691,11 +7714,17 @@ static bool nfsd_ffv2_auth_service_start(struct kunit *test,
 		return false;
 	}
 	s->service_up = true;
+	s->started = true;
+	if (fail == NFSD_FFV2_AUTH_FAIL_AFTER_SERVICE)
+		return false;
 
 	if (nfsd_ffv2_ro_loopback_up(s->net)) {
 		KUNIT_FAIL(test, "%s: could not bring the loopback up", side);
 		return false;
 	}
+	if (fail == NFSD_FFV2_AUTH_FAIL_AFTER_LOOPBACK)
+		return false;
+
 	error = nfsd_ffv2_nl_open(s->net, &s->nl);
 	if (error) {
 		KUNIT_FAIL(test, "%s: no sender: %d", side, error);
@@ -7705,6 +7734,14 @@ static bool nfsd_ffv2_auth_service_start(struct kunit *test,
 	return true;
 }
 
+static bool nfsd_ffv2_auth_service_start(struct kunit *test,
+					 struct nfsd_ffv2_auth_service *s,
+					 const char *side)
+{
+	return nfsd_ffv2_auth_service_start_fail(test, s, side,
+						 NFSD_FFV2_AUTH_FAIL_NONE);
+}
+
 /*
  * Stop the service, then empty the caches, in that order and for the same
  * reason the read-only fixture uses it: removing an entry can revisit a
@@ -7712,6 +7749,9 @@ static bool nfsd_ffv2_auth_service_start(struct kunit *test,
  * the flush needs a namespace that is still there to reach.  The namespace
  * reference is the caller's to drop, so it can still look at what the
  * shutdown left behind.
+ *
+ * Safe on a half-built service and safe to repeat: a start that fails after
+ * the service is up leaves one running, and this is what stops it.
  */
 static void nfsd_ffv2_auth_service_stop(struct nfsd_ffv2_auth_service *s)
 {
@@ -7778,13 +7818,11 @@ static void nfsd_ffv2_auth_cache_two_service_test(struct kunit *test)
 	struct nfsd_ffv2_auth_service a = {};
 	struct nfsd_ffv2_auth_service b = {};
 	struct nfsd_ffv2_auth_record rec;
-	bool a_running = false;
 	u64 expiry;
 	int error;
 
 	if (!nfsd_ffv2_auth_service_start(test, &a, "A"))
 		goto out;
-	a_running = true;
 	if (!nfsd_ffv2_auth_service_start(test, &b, "B"))
 		goto out;
 
@@ -7888,7 +7926,6 @@ static void nfsd_ffv2_auth_cache_two_service_test(struct kunit *test)
 	 * cache still up, because B is still holding it.
 	 */
 	nfsd_ffv2_auth_service_stop(&a);
-	a_running = false;
 	KUNIT_EXPECT_EQ(test, 0, a.flush_error);
 	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_dispose_list_empty(a.net));
 
@@ -7905,14 +7942,84 @@ static void nfsd_ffv2_auth_cache_two_service_test(struct kunit *test)
 out:
 	nfsd_ffv2_test_reply_shape_reset();
 	nfsd_ffv2_test_auth_record_reset();
-	if (b.net) {
-		nfsd_ffv2_auth_service_stop(&b);
+	/*
+	 * Both are stopped whatever happened, and stopping decides what to do
+	 * from the state each one is actually in: a start that failed while
+	 * bringing up a loopback or a sender still left a service running.
+	 * Only a namespace that completed a service start has a disposal lock
+	 * and list to look at.
+	 */
+	nfsd_ffv2_auth_service_stop(&b);
+	if (b.started) {
 		KUNIT_EXPECT_EQ(test, 0, b.flush_error);
 		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_dispose_list_empty(b.net));
 	}
-	if (a_running)
-		nfsd_ffv2_auth_service_stop(&a);
+	nfsd_ffv2_auth_service_stop(&a);
 	nfsd_ffv2_auth_service_put(&b);
+	nfsd_ffv2_auth_service_put(&a);
+}
+
+/*
+ * The teardown itself, driven from each point a start can give up.
+ *
+ * A stays up throughout, so each case also shows that one service failing
+ * leaves the other one serving.  What is checked after every teardown is that
+ * neither namespace still has a service, that a namespace which never started
+ * one is never asked about a disposal list it does not have, and that a fresh
+ * service can still be started afterwards, which no leftover global state
+ * would allow.
+ */
+static void nfsd_ffv2_auth_cache_service_cleanup_test(struct kunit *test)
+{
+	static const enum nfsd_ffv2_auth_fail points[] = {
+		NFSD_FFV2_AUTH_FAIL_BEFORE_SERVICE,
+		NFSD_FFV2_AUTH_FAIL_AFTER_SERVICE,
+		NFSD_FFV2_AUTH_FAIL_AFTER_LOOPBACK,
+	};
+	struct nfsd_ffv2_auth_service a;
+	struct nfsd_ffv2_auth_service b;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(points); i++) {
+		if (!nfsd_ffv2_auth_service_start(test, &a, "A")) {
+			nfsd_ffv2_auth_service_stop(&a);
+			nfsd_ffv2_auth_service_put(&a);
+			return;
+		}
+
+		KUNIT_EXPECT_FALSE(test,
+				   nfsd_ffv2_auth_service_start_fail(test, &b,
+								     "B",
+								     points[i]));
+		pr_info("FFV2P0D: injected failure %u started=%d\n",
+			(unsigned int)points[i], b.started);
+
+		nfsd_ffv2_auth_service_stop(&b);
+		nfsd_ffv2_auth_service_stop(&a);
+
+		/* Nothing is left running on either side. */
+		mutex_lock(&nfsd_mutex);
+		KUNIT_EXPECT_PTR_EQ(test, a.nn->nfsd_serv, NULL);
+		if (b.net)
+			KUNIT_EXPECT_PTR_EQ(test, b.nn->nfsd_serv, NULL);
+		mutex_unlock(&nfsd_mutex);
+
+		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_dispose_list_empty(a.net));
+		if (b.started)
+			KUNIT_EXPECT_TRUE(test,
+					  nfsd_ffv2_dispose_list_empty(b.net));
+
+		nfsd_ffv2_auth_service_put(&b);
+		nfsd_ffv2_auth_service_put(&a);
+	}
+
+	/* Nothing left behind stops the next service from starting. */
+	if (nfsd_ffv2_auth_service_start(test, &a, "after")) {
+		nfsd_ffv2_auth_service_stop(&a);
+		KUNIT_EXPECT_EQ(test, 0, a.flush_error);
+		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_dispose_list_empty(a.net));
+	}
+	nfsd_ffv2_auth_service_stop(&a);
 	nfsd_ffv2_auth_service_put(&a);
 }
 
@@ -8920,6 +9027,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_auth_cache_p0_probe_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_second_net_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_auth_cache_two_service_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_auth_cache_service_cleanup_test),
 	KUNIT_CASE(nfsd_ffv2_transport_null_test),
 	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
