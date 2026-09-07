@@ -6854,9 +6854,10 @@ out:
  * arrived, errors and completions with other messages behind them, and family
  * identifiers that are nested, mis-sized, or given twice.
  *
- * Most must be refused.  Two must not: a capped acknowledgment is ordinary,
- * and so is a lone dump completion, and a parser that rejected either would
- * be wrong in the other direction.
+ * Most must be refused.  Three must not, and are checked here for that
+ * reason: a capped acknowledgment, an echoed acknowledgment claiming exactly
+ * what arrived, and a lone dump completion are all ordinary, and a parser
+ * that rejected any of them would be wrong in the other direction.
  */
 static void nfsd_ffv2_auth_cache_nl_parser_test(struct kunit *test)
 {
@@ -7149,8 +7150,12 @@ static void nfsd_ffv2_auth_cache_nl_parser_test(struct kunit *test)
 
 	/*
 	 * An echoed length near the top of the range.  Rounding it up before
-	 * checking it would wrap to a small number and let it through the
-	 * test that was meant to stop it.
+	 * checking it wraps to a small number, and the fit test then passes.
+	 *
+	 * Everything else about this reply is well formed, including the
+	 * embedded command and version, so the only thing that can reject it
+	 * is the bound on the length itself.  Without that bound the reply is
+	 * accepted outright.
 	 */
 	memset(buf, 0, sizeof(buf));
 	nlh->nlmsg_type = NLMSG_ERROR;
@@ -7162,6 +7167,10 @@ static void nfsd_ffv2_auth_cache_nl_parser_test(struct kunit *test)
 	e->msg.nlmsg_type = nl.family;
 	e->msg.nlmsg_seq = nl.seq;
 	e->msg.nlmsg_len = UINT_MAX - 1;
+	((struct genlmsghdr *)((char *)&e->msg + NLMSG_HDRLEN))->cmd =
+		SUNRPC_CMD_IP_MAP_SET_REQS;
+	((struct genlmsghdr *)((char *)&e->msg + NLMSG_HDRLEN))->version =
+		SUNRPC_FAMILY_VERSION;
 	len = NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN);
 	nlh->nlmsg_len = len;
 	KUNIT_EXPECT_EQ(test, -EBADMSG,
