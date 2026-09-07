@@ -4449,9 +4449,19 @@ static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
 	mutex_lock(&nfsd_mutex);
 	error = nfsd_ffv2_service_up(f->nn);
 	f->service_up = !error;
-	if (!error)
+	/*
+	 * Only a fixture without a real service brings the global file cache
+	 * up itself.  A wired fixture's nfsd_svc() brings it up through
+	 * nfsd_users, the count that keeps it up while any other service is
+	 * still live; a fixture that raised it here as well would hold an
+	 * ownership the count knows nothing about.  What is recorded is the
+	 * transition this caller actually performed, not whether the service
+	 * started.
+	 */
+	if (!error && !with_transport) {
 		error = nfsd_file_ffv2_test_cache_start();
-	f->filecache_up = !error && f->service_up;
+		f->filecache_up = !error;
+	}
 	if (!error)
 		error = nfsd_ffv2_registration_begin(f->nn, &f->registration);
 	f->registration_open = !error;
@@ -4463,10 +4473,10 @@ static bool nfsd_ffv2_ro_fixture_init_wait(struct kunit *test,
 
 	/*
 	 * A fixture that will be reached over the wire runs a real service
-	 * and listener too.  It comes after the fixture's own service state,
-	 * export and filecache are up, because the service needs them, and
-	 * before anything is published, which is the order the other tests
-	 * in this file establish.
+	 * and listener too.  It comes after the fixture's own service state
+	 * and export are up, because the service needs them, and before
+	 * anything is published, which is the order the other tests in this
+	 * file establish.  The service brings the file cache up itself.
 	 */
 	if (with_transport) {
 		int wire_error;
