@@ -6328,6 +6328,14 @@ static int nfsd_ffv2_nl_parse_ack(struct nfsd_ffv2_nl *nl, const void *buf,
 		available = nlh->nlmsg_len - echoed_at;
 		if (e->msg.nlmsg_len < NLMSG_LENGTH(GENL_HDRLEN))
 			return -EBADMSG;
+		/*
+		 * The echoed length is whatever arrived, so it is checked
+		 * before it is rounded: NLMSG_ALIGN() of a value near the
+		 * top of the range wraps to a small one, and a wrapped
+		 * length would pass the fit test it was meant to fail.
+		 */
+		if (e->msg.nlmsg_len > UINT_MAX - (NLMSG_ALIGNTO - 1))
+			return -EBADMSG;
 		if (NLMSG_ALIGN(e->msg.nlmsg_len) > available)
 			return -EBADMSG;
 		gnlh = (const struct genlmsghdr *)((const char *)&e->msg +
@@ -6378,6 +6386,7 @@ static int nfsd_ffv2_nl_parse_family(struct nfsd_ffv2_nl *nl, const void *buf,
 {
 	const struct nlmsghdr *nlh = buf;
 	const struct nlattr *nla;
+	bool have_family = false;
 	int nrem, error;
 	u16 found = 0;
 
@@ -6404,19 +6413,26 @@ static int nfsd_ffv2_nl_parse_family(struct nfsd_ffv2_nl *nl, const void *buf,
 	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem) {
 		if (nla_type(nla) != CTRL_ATTR_FAMILY_ID)
 			continue;
-		if (nla_len(nla) < (int)sizeof(u16))
+		/* A family identifier is a scalar, not a nest. */
+		if (nla->nla_type & NLA_F_NESTED)
+			return -EBADMSG;
+		/* Exactly the width it is defined to have, no more. */
+		if (nla_len(nla) != (int)sizeof(u16))
 			return -EBADMSG;
 		/*
 		 * Two identifiers for one family is a contradiction, not a
-		 * choice: taking either would be a guess.
+		 * choice: taking either would be a guess.  Presence is
+		 * tracked separately from the value, so a first identifier
+		 * of zero is still a first identifier.
 		 */
-		if (found)
+		if (have_family)
 			return -EBADMSG;
+		have_family = true;
 		found = nla_get_u16(nla);
 	}
 	if (nrem)
 		return -EBADMSG;
-	if (!found)
+	if (!have_family || !found)
 		return -ENOENT;
 	*family = found;
 	return 0;
@@ -6833,10 +6849,14 @@ out:
  */
 /*
  * The reply parser, exercised against replies a socket will not readily
- * produce.  These are the shapes that would be believed if the checks were
- * written loosely: an acknowledgment whose payload was capped and followed by
- * extended-acknowledgment data, an error with another message behind it, and
- * a well-formed attribute followed by rubbish.  Each must be refused.
+ * produce: a capped acknowledgment carrying extended-acknowledgment data, an
+ * echoed command that was never sent, an echoed length larger than what
+ * arrived, errors and completions with other messages behind them, and family
+ * identifiers that are nested, mis-sized, or given twice.
+ *
+ * Most must be refused.  Two must not: a capped acknowledgment is ordinary,
+ * and so is a lone dump completion, and a parser that rejected either would
+ * be wrong in the other direction.
  */
 static void nfsd_ffv2_auth_cache_nl_parser_test(struct kunit *test)
 {
@@ -7126,6 +7146,121 @@ static void nfsd_ffv2_auth_cache_nl_parser_test(struct kunit *test)
 							&count, &done));
 		KUNIT_EXPECT_FALSE(test, done);
 	}
+
+	/*
+	 * An echoed length near the top of the range.  Rounding it up before
+	 * checking it would wrap to a small number and let it through the
+	 * test that was meant to stop it.
+	 */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_ERROR;
+	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	e = nlmsg_data(nlh);
+	e->error = 0;
+	e->msg.nlmsg_type = nl.family;
+	e->msg.nlmsg_seq = nl.seq;
+	e->msg.nlmsg_len = UINT_MAX - 1;
+	len = NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN);
+	nlh->nlmsg_len = len;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_ack(&nl, buf, NLMSG_ALIGN(len),
+					       nl.family,
+					       SUNRPC_CMD_IP_MAP_SET_REQS,
+					       SUNRPC_FAMILY_VERSION));
+
+	/* An echo claiming exactly what arrived is not over-claiming. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = NLMSG_ERROR;
+	nlh->nlmsg_flags = 0;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	e = nlmsg_data(nlh);
+	e->error = 0;
+	e->msg.nlmsg_type = nl.family;
+	e->msg.nlmsg_seq = nl.seq;
+	e->msg.nlmsg_len = NLMSG_LENGTH(GENL_HDRLEN);
+	((struct genlmsghdr *)((char *)&e->msg + NLMSG_HDRLEN))->cmd =
+		SUNRPC_CMD_IP_MAP_SET_REQS;
+	((struct genlmsghdr *)((char *)&e->msg + NLMSG_HDRLEN))->version =
+		SUNRPC_FAMILY_VERSION;
+	len = NLMSG_LENGTH(sizeof(*e) + GENL_HDRLEN);
+	nlh->nlmsg_len = len;
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_nl_parse_ack(&nl, buf, NLMSG_ALIGN(len),
+					       nl.family,
+					       SUNRPC_CMD_IP_MAP_SET_REQS,
+					       SUNRPC_FAMILY_VERSION));
+
+	/* A family identifier is a scalar; a nest in its place is refused. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = GENL_ID_CTRL;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	((struct genlmsghdr *)nlmsg_data(nlh))->cmd = CTRL_CMD_NEWFAMILY;
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = 2;
+	len = NLMSG_HDRLEN + GENL_HDRLEN;
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID | NLA_F_NESTED;
+	nla->nla_len = NLA_HDRLEN + sizeof(u16);
+	*(u16 *)nla_data(nla) = 23;
+	len += NLA_ALIGN(nla->nla_len);
+	nlh->nlmsg_len = len;
+	family = 0;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_family(&nl, buf, NLMSG_ALIGN(len),
+						  &family));
+	KUNIT_EXPECT_EQ(test, 0, (int)family);
+
+	/* Wider than the scalar it is defined to be. */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = GENL_ID_CTRL;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	((struct genlmsghdr *)nlmsg_data(nlh))->cmd = CTRL_CMD_NEWFAMILY;
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = 2;
+	len = NLMSG_HDRLEN + GENL_HDRLEN;
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID;
+	nla->nla_len = NLA_HDRLEN + sizeof(u32);
+	*(u32 *)nla_data(nla) = 23;
+	len += NLA_ALIGN(nla->nla_len);
+	nlh->nlmsg_len = len;
+	family = 0;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_family(&nl, buf, NLMSG_ALIGN(len),
+						  &family));
+	KUNIT_EXPECT_EQ(test, 0, (int)family);
+
+	/*
+	 * A first identifier of zero followed by a second.  Tracking presence
+	 * by the value alone would miss this, and take the second as if it
+	 * were the only one.
+	 */
+	memset(buf, 0, sizeof(buf));
+	nlh->nlmsg_type = GENL_ID_CTRL;
+	nlh->nlmsg_seq = nl.seq;
+	nlh->nlmsg_pid = nl.portid;
+	((struct genlmsghdr *)nlmsg_data(nlh))->cmd = CTRL_CMD_NEWFAMILY;
+	((struct genlmsghdr *)nlmsg_data(nlh))->version = 2;
+	len = NLMSG_HDRLEN + GENL_HDRLEN;
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID;
+	nla->nla_len = NLA_HDRLEN + sizeof(u16);
+	*(u16 *)nla_data(nla) = 0;
+	len += NLA_ALIGN(nla->nla_len);
+	nla = (struct nlattr *)(buf + len);
+	nla->nla_type = CTRL_ATTR_FAMILY_ID;
+	nla->nla_len = NLA_HDRLEN + sizeof(u16);
+	*(u16 *)nla_data(nla) = 23;
+	len += NLA_ALIGN(nla->nla_len);
+	nlh->nlmsg_len = len;
+	family = 0;
+	KUNIT_EXPECT_EQ(test, -EBADMSG,
+			nfsd_ffv2_nl_parse_family(&nl, buf, NLMSG_ALIGN(len),
+						  &family));
+	KUNIT_EXPECT_EQ(test, 0, (int)family);
 }
 
 static void nfsd_ffv2_auth_cache_p0_probe_test(struct kunit *test)
