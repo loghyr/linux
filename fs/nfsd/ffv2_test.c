@@ -7649,6 +7649,273 @@ out:
 	KUNIT_EXPECT_EQ(test, 0, f.nl_flush_error);
 }
 
+/*
+ * One namespace running a real service with a loopback listener and a
+ * netlink sender, and nothing else.
+ *
+ * The read-only fixture cannot be used for two live namespaces: it publishes
+ * an FFv2 export, and an FFv2 reservation is held per superblock across the
+ * whole machine rather than per namespace, so a second fixture rooted in the
+ * same filesystem is refused.  This gate does not need an FFv2 export.  An
+ * AUTH_SYS admission is decided before any operation is dispatched, and the
+ * COMPOUND used here carries none, so a service, a listener and the two
+ * authentication caches are the whole requirement.
+ */
+struct nfsd_ffv2_auth_service {
+	struct net		*net;
+	struct nfsd_net		*nn;
+	struct nfsd_ffv2_nl	nl;
+	bool			service_up;
+	bool			nl_open;
+	int			flush_error;
+};
+
+static bool nfsd_ffv2_auth_service_start(struct kunit *test,
+					 struct nfsd_ffv2_auth_service *s,
+					 const char *side)
+{
+	int error;
+
+	memset(s, 0, sizeof(*s));
+	s->net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(s->net)) {
+		KUNIT_FAIL(test, "%s: no namespace: %ld", side, PTR_ERR(s->net));
+		s->net = NULL;
+		return false;
+	}
+	s->nn = net_generic(s->net, nfsd_net_id);
+
+	error = nfsd_ffv2_start_test_service(s->net, NULL, NULL);
+	if (error) {
+		KUNIT_FAIL(test, "%s: service start failed: %d", side, error);
+		return false;
+	}
+	s->service_up = true;
+
+	if (nfsd_ffv2_ro_loopback_up(s->net)) {
+		KUNIT_FAIL(test, "%s: could not bring the loopback up", side);
+		return false;
+	}
+	error = nfsd_ffv2_nl_open(s->net, &s->nl);
+	if (error) {
+		KUNIT_FAIL(test, "%s: no sender: %d", side, error);
+		return false;
+	}
+	s->nl_open = true;
+	return true;
+}
+
+/*
+ * Stop the service, then empty the caches, in that order and for the same
+ * reason the read-only fixture uses it: removing an entry can revisit a
+ * request deferred on it, so no transport may still be able to take one, and
+ * the flush needs a namespace that is still there to reach.  The namespace
+ * reference is the caller's to drop, so it can still look at what the
+ * shutdown left behind.
+ */
+static void nfsd_ffv2_auth_service_stop(struct nfsd_ffv2_auth_service *s)
+{
+	if (s->service_up) {
+		nfsd_shutdown_threads(s->net);
+		s->service_up = false;
+	}
+	if (s->nl_open) {
+		s->flush_error = nfsd_ffv2_nl_flush(&s->nl, 0);
+		nfsd_ffv2_nl_close(&s->nl);
+		s->nl_open = false;
+	}
+}
+
+static void nfsd_ffv2_auth_service_put(struct nfsd_ffv2_auth_service *s)
+{
+	if (s->net) {
+		put_net(s->net);
+		s->net = NULL;
+		net_ns_barrier();
+	}
+}
+
+/*
+ * True when a namespace's delayed disposal list has drained.  Read under
+ * that namespace's own lock, on a net the caller still holds a reference to:
+ * the list is inline in struct nfsd_net, so a per-net shutdown leaves nothing
+ * here for this to chase.
+ */
+static bool nfsd_ffv2_dispose_list_empty(struct net *net)
+{
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
+	bool empty;
+
+	spin_lock(&nn->fcache_dispose_lock);
+	empty = list_empty(&nn->fcache_dispose_list);
+	spin_unlock(&nn->fcache_dispose_lock);
+	return empty;
+}
+
+/*
+ * The isolation gate, with both namespaces live at once.
+ *
+ * The sequential case above shows that a namespace starts cold and admits only
+ * after its own seeding.  What it cannot show is the simultaneous property,
+ * that flushing one live namespace leaves another live namespace admitting,
+ * because that needs the two to exist together.
+ *
+ * Neither service brings the global file cache up on its own account: each
+ * nfsd_svc() does, through the count that keeps it up for the second service
+ * while the first one stops.  That is what makes stopping A underneath B safe
+ * to ask about at all.
+ *
+ * The drained-list checks are cleanup assertions on a namespace whose service
+ * has already stopped.  They are not evidence about a disposal producer racing
+ * a per-net shutdown; nothing here drives one.
+ */
+static void nfsd_ffv2_auth_cache_two_service_test(struct kunit *test)
+{
+	static const char domain_a[] = "ffv2-p0-service-a-domain";
+	static const char domain_b[] = "ffv2-p0-service-b-domain";
+	const u32 uid_a = 4244;
+	const u32 uid_b = 4245;
+	struct nfsd_ffv2_auth_service a = {};
+	struct nfsd_ffv2_auth_service b = {};
+	struct nfsd_ffv2_auth_record rec;
+	bool a_running = false;
+	u64 expiry;
+	int error;
+
+	if (!nfsd_ffv2_auth_service_start(test, &a, "A"))
+		goto out;
+	a_running = true;
+	if (!nfsd_ffv2_auth_service_start(test, &b, "B"))
+		goto out;
+
+	/*
+	 * Both services are live, so the global file cache is up and the start
+	 * seam reports that without touching it.  This is a diagnostic only:
+	 * neither service owns the cache, and the seam must not be called once
+	 * a service has stopped, because it brings the cache back up when the
+	 * bit is clear.
+	 */
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_file_ffv2_test_cache_start();
+	mutex_unlock(&nfsd_mutex);
+	pr_info("FFV2P0C: cache start while both are live=%d\n", error);
+	KUNIT_EXPECT_EQ(test, -EBUSY, error);
+
+	expiry = ktime_get_real_seconds() + 300;
+
+	/* A is cold until it is seeded in its own right. */
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(a.net, a.nn, uid_a);
+	pr_info("FFV2P0C: A cold admit=%d\n", error);
+	if (error != -ETIMEDOUT) {
+		KUNIT_FAIL(test, "an unseeded A admitted: %d", error);
+		goto out;
+	}
+	error = nfsd_ffv2_nl_seed_ip(&a.nl, "nfsd", "127.0.0.1", domain_a,
+				     expiry);
+	if (!error)
+		error = nfsd_ffv2_nl_seed_gid(&a.nl, uid_a, expiry);
+	if (error) {
+		KUNIT_FAIL(test, "A refused a seed: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(a.net, a.nn, uid_a);
+	pr_info("FFV2P0C: A seeded admit=%d\n", error);
+	if (error) {
+		KUNIT_FAIL(test, "a seeded A did not admit: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_test_auth_record(&rec);
+	KUNIT_EXPECT_TRUE(test, rec.have_client);
+	KUNIT_EXPECT_STREQ(test, rec.domain, domain_a);
+
+	/*
+	 * B is cold while A is seeded and live.  This is the half the
+	 * sequential case could not reach: A's entries exist right now.
+	 */
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(b.net, b.nn, uid_b);
+	pr_info("FFV2P0C: B cold admit while A is seeded=%d\n", error);
+	if (error != -ETIMEDOUT) {
+		KUNIT_FAIL(test, "A's seed admitted in B: %d", error);
+		goto out;
+	}
+	error = nfsd_ffv2_nl_seed_ip(&b.nl, "nfsd", "127.0.0.1", domain_b,
+				     expiry);
+	if (!error)
+		error = nfsd_ffv2_nl_seed_gid(&b.nl, uid_b, expiry);
+	if (error) {
+		KUNIT_FAIL(test, "B refused a seed: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(b.net, b.nn, uid_b);
+	pr_info("FFV2P0C: B seeded admit=%d\n", error);
+	if (error) {
+		KUNIT_FAIL(test, "a seeded B did not admit: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_test_auth_record(&rec);
+	KUNIT_EXPECT_TRUE(test, rec.have_client);
+	KUNIT_EXPECT_STREQ(test, rec.domain, domain_b);
+
+	/* The gate: flushing A, with B live, must leave B admitting. */
+	error = nfsd_ffv2_nl_flush(&a.nl, 0);
+	if (error) {
+		KUNIT_FAIL(test, "A refused a flush: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(b.net, b.nn, uid_b);
+	pr_info("FFV2P0C: B admit after flushing A=%d\n", error);
+	if (error) {
+		KUNIT_FAIL(test, "A's flush stopped B admitting: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_test_auth_record(&rec);
+	KUNIT_EXPECT_STREQ(test, rec.domain, domain_b);
+
+	/* And A must have stopped, so the flush did reach something. */
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(a.net, a.nn, uid_a);
+	pr_info("FFV2P0C: A admit after its own flush=%d\n", error);
+	KUNIT_EXPECT_EQ(test, -ETIMEDOUT, error);
+
+	/*
+	 * A stops while B keeps serving.  This is the teardown that was
+	 * unreachable before: A's per-net shutdown runs with the global file
+	 * cache still up, because B is still holding it.
+	 */
+	nfsd_ffv2_auth_service_stop(&a);
+	a_running = false;
+	KUNIT_EXPECT_EQ(test, 0, a.flush_error);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_dispose_list_empty(a.net));
+
+	nfsd_ffv2_test_auth_record_reset();
+	error = nfsd_ffv2_admit_authsys(b.net, b.nn, uid_b);
+	pr_info("FFV2P0C: B admit after A stopped=%d\n", error);
+	if (error) {
+		KUNIT_FAIL(test, "stopping A stopped B admitting: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_test_auth_record(&rec);
+	KUNIT_EXPECT_STREQ(test, rec.domain, domain_b);
+
+out:
+	nfsd_ffv2_test_reply_shape_reset();
+	nfsd_ffv2_test_auth_record_reset();
+	if (b.net) {
+		nfsd_ffv2_auth_service_stop(&b);
+		KUNIT_EXPECT_EQ(test, 0, b.flush_error);
+		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_dispose_list_empty(b.net));
+	}
+	if (a_running)
+		nfsd_ffv2_auth_service_stop(&a);
+	nfsd_ffv2_auth_service_put(&b);
+	nfsd_ffv2_auth_service_put(&a);
+}
+
 static void nfsd_ffv2_transport_null_test(struct kunit *test)
 {
 	__be32 call[16], reply[16];
@@ -8652,6 +8919,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_auth_cache_nl_parser_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_p0_probe_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_second_net_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_auth_cache_two_service_test),
 	KUNIT_CASE(nfsd_ffv2_transport_null_test),
 	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
