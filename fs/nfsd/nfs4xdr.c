@@ -6446,6 +6446,51 @@ static __be32 nfsd4_encode_optional_retained4(struct xdr_stream *xdr,
 }
 
 /* read_chunk4 */
+/*
+ * One chunk payload, as a length-prefixed opaque.
+ *
+ * nfsd4_encode_opaque() reserves the whole opaque in one call, and a
+ * reservation cannot exceed a page: xdr_get_next_encode_buffer() refuses
+ * anything larger before it looks at capacity.  A chunk payload is sized
+ * by the layout and is normally far larger than that, so the bytes are
+ * copied a segment at a time instead -- whatever remains of the current
+ * one, then a page at a time.  Only the last segment can end mid-word,
+ * and its padding is zeroed rather than left as whatever the page held.
+ *
+ * A result of entirely empty chunks allocates no payload block at all, so
+ * @buf is NULL there and only the length word is emitted.
+ */
+static __be32 nfsd4_encode_chunk_payload(struct xdr_stream *xdr,
+					 const u8 *buf, u32 len)
+{
+	u32 pad = xdr_pad_size(len);
+	__be32 nfserr;
+	u32 this;
+	__be32 *p;
+
+	nfserr = nfsd4_encode_uint32_t(xdr, len);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	if (!len)
+		return nfs_ok;
+
+	this = min_t(u32, len, (u32)((char *)xdr->end - (char *)xdr->p));
+	while (len) {
+		if (!this)
+			this = min_t(u32, len, PAGE_SIZE);
+		p = xdr_reserve_space(xdr, this);
+		if (!p)
+			return nfserr_resource;
+		memcpy(p, buf, this);
+		buf += this;
+		len -= this;
+		if (!len && pad)
+			memset((char *)p + this, 0, pad);
+		this = min_t(u32, len, PAGE_SIZE);
+	}
+	return nfs_ok;
+}
+
 static __be32 nfsd4_encode_read_chunk4(struct xdr_stream *xdr,
 				       const struct nfsd4_chunk_read *cr,
 				       const struct nfsd4_chunk_read_ent *ent)
@@ -6476,10 +6521,11 @@ static __be32 nfsd4_encode_read_chunk4(struct xdr_stream *xdr,
 	 * cr_chunk.  A result of entirely empty chunks allocates no payload
 	 * block at all, so the base is only offset when there is one.
 	 */
-	return nfsd4_encode_opaque(xdr,
-				   cr->cra_payload ?
-				   cr->cra_payload + ent->cre_payload_off : "",
-				   ent->cre_effective_len);
+	return nfsd4_encode_chunk_payload(xdr,
+					  cr->cra_payload ?
+					  cr->cra_payload + ent->cre_payload_off :
+					  NULL,
+					  ent->cre_effective_len);
 }
 
 /* CHUNK_READ4resok */

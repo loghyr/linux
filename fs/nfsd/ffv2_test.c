@@ -9672,6 +9672,142 @@ out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
+/* One encoded word, wherever in the reply buffer it landed. */
+static u32 nfsd_ffv2_ro_word(struct xdr_buf *buf, u32 offset)
+{
+	__be32 word = 0;
+
+	read_bytes_from_xdr_buf(buf, offset, &word, sizeof(word));
+	return be32_to_cpu(word);
+}
+
+/*
+ * Encode one reply into a buffer that has a page vector, not just a head,
+ * and hand back its length.  A payload larger than a page has nowhere to
+ * go in a single-page buffer, so the transitions this exercises are the
+ * point of the buffer.
+ */
+#define NFSD_FFV2_RO_ENCODE_PAGES	4
+
+static int nfsd_ffv2_ro_encode_paged(struct kunit *test, union nfsd4_op_u *u,
+				     struct xdr_buf *buf, struct page **pages,
+				     unsigned int npages)
+{
+	struct xdr_stream xdr;
+	__be32 *head;
+	__be32 status;
+	unsigned int i;
+
+	head = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	if (!head)
+		return -ENOMEM;
+	/* Poison, so an unwritten pad byte cannot read as a zeroed one. */
+	memset(head, 0xa5, PAGE_SIZE);
+	for (i = 0; i < npages; i++) {
+		pages[i] = alloc_page(GFP_KERNEL);
+		if (!pages[i])
+			return -ENOMEM;
+		memset(page_address(pages[i]), 0xa5, PAGE_SIZE);
+	}
+
+	memset(buf, 0, sizeof(*buf));
+	buf->head[0].iov_base = head;
+	buf->head[0].iov_len = 0;
+	buf->pages = pages;
+	buf->buflen = PAGE_SIZE * (npages + 1);
+	xdr.buf = buf;
+	xdr.iov = buf->head;
+	xdr.p = head;
+	xdr.end = (__be32 *)((char *)head + PAGE_SIZE);
+	xdr.page_ptr = buf->pages - 1;
+	xdr.rqst = NULL;
+	xdr_reset_scratch_buffer(&xdr);
+
+	status = nfsd_ffv2_test_encode_chunk_read(&xdr, u);
+	if (status != nfs_ok)
+		return -EIO;
+	return buf->len;
+}
+
+/*
+ * A single chunk payload larger than a page.
+ *
+ * The payload is a counted opaque, and a reservation cannot exceed a page:
+ * one reservation for the whole opaque fails outright for a chunk this
+ * size, whatever the response budget says.  A chunk size comes from the
+ * layout and is normally far larger than a page, so this is the ordinary
+ * case rather than an extreme one.  The bytes are checked either side of
+ * the boundary the copy crosses, and the tail padding is checked because
+ * the length is deliberately not a multiple of four.
+ */
+static void nfsd_ffv2_encode_large_payload_test(struct kunit *test)
+{
+	static const u32 len = PAGE_SIZE + 509;
+	struct page *pages[NFSD_FFV2_RO_ENCODE_PAGES] = {};
+	struct nfsd4_chunk_read_ent ent = {};
+	struct nfsd4_chunk_read *cr;
+	union nfsd4_op_u u = {};
+	struct xdr_buf buf;
+	unsigned int i;
+	u8 *payload;
+	u8 byte;
+	int size;
+
+	payload = kvmalloc(len, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, payload);
+	for (i = 0; i < len; i++)
+		payload[i] = (u8)(i & 0xff);
+
+	ent.cre_checksum.cs_algorithm = 1;
+	ent.cre_checksum.cs_len = 4;
+	memset(ent.cre_checksum.cs_value, 0x5a, 4);
+	ent.cre_effective_len = len;
+	ent.cre_payload_off = 0;
+	ent.cre_status = nfs_ok;
+
+	cr = &u.chunk_read;
+	cr->cra_eof = true;
+	cr->cra_nchunks = 1;
+	cr->cra_chunks = &ent;
+	cr->cra_payload = payload;
+	cr->cra_payload_len = len;
+
+	size = nfsd_ffv2_ro_encode_paged(test, &u, &buf, pages,
+					 NFSD_FFV2_RO_ENCODE_PAGES);
+	if (size < 0) {
+		KUNIT_FAIL(test, "encoding a large payload failed: %d", size);
+		goto out;
+	}
+
+	/* eof, the chunk count, then the chunk's own fields. */
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 0));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 4));
+	KUNIT_EXPECT_EQ(test, len, nfsd_ffv2_ro_word(&buf, 8 + 12));
+	KUNIT_EXPECT_EQ(test, len, nfsd_ffv2_ro_word(&buf, 8 + 52));
+
+	/* The payload itself, either side of the page it crosses. */
+	read_bytes_from_xdr_buf(&buf, 8 + 56, &byte, 1);
+	KUNIT_EXPECT_EQ(test, 0, byte);
+	read_bytes_from_xdr_buf(&buf, 8 + 56 + PAGE_SIZE - 1, &byte, 1);
+	KUNIT_EXPECT_EQ(test, (u8)((PAGE_SIZE - 1) & 0xff), byte);
+	read_bytes_from_xdr_buf(&buf, 8 + 56 + PAGE_SIZE, &byte, 1);
+	KUNIT_EXPECT_EQ(test, (u8)(PAGE_SIZE & 0xff), byte);
+	read_bytes_from_xdr_buf(&buf, 8 + 56 + len - 1, &byte, 1);
+	KUNIT_EXPECT_EQ(test, (u8)((len - 1) & 0xff), byte);
+
+	/* The tail padding is zeroed, not left as the poison. */
+	for (i = 0; i < xdr_pad_size(len); i++) {
+		read_bytes_from_xdr_buf(&buf, 8 + 56 + len + i, &byte, 1);
+		KUNIT_EXPECT_EQ(test, 0, byte);
+	}
+	KUNIT_EXPECT_EQ(test, 8 + 56 + xdr_align_size(len), (u32)size);
+out:
+	for (i = 0; i < NFSD_FFV2_RO_ENCODE_PAGES; i++)
+		if (pages[i])
+			__free_page(pages[i]);
+	kvfree(payload);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -9729,6 +9865,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_malformed_result_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
+	KUNIT_CASE(nfsd_ffv2_encode_large_payload_test),
 	KUNIT_CASE(nfsd_ffv2_provider_unadmitted_test),
 	KUNIT_CASE(nfsd_ffv2_encode_header_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_nl_parser_test),
