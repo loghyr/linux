@@ -980,6 +980,22 @@ nfsd_file_close_inode(struct inode *inode)
 	spin_unlock(&nfsd_gc_lock);
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/**
+ * nfsd_file_ffv2_test_close_inode - drive a delayed close from a test
+ * @inode: inode of the file to attempt to remove
+ *
+ * Runs the deferred-close producer that the fsnotify and setlease
+ * notifiers use, so a test can queue an nfsd_file for delayed disposal
+ * without an fsnotify event or a lease.  The producer body is the
+ * production one; this adds no lock, no ordering, and no state.
+ */
+void nfsd_file_ffv2_test_close_inode(struct inode *inode)
+{
+	nfsd_file_close_inode(inode);
+}
+#endif
+
 /**
  * nfsd_file_close_inode_sync - attempt to forcibly close a nfsd_file
  * @inode: inode of the file to attempt to remove

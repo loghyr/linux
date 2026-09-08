@@ -138,5 +138,6 @@ int nfsd_file_cache_stats_show(struct seq_file *m, void *v);
 int nfsd_file_ffv2_test_cache_start(void);
 struct nfsd_file *nfsd_file_ffv2_test_alloc(struct inode *inode,
 					    unsigned int may, bool want_gc);
+void nfsd_file_ffv2_test_close_inode(struct inode *inode);
 #endif
 #endif /* _FS_NFSD_FILECACHE_H */
