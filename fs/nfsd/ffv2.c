@@ -104,6 +104,8 @@ struct nfsd_ffv2_provider_probe_counters {
 	/* Admissions completed, and provider references released. */
 	atomic64_t	admissions_completed;
 	atomic64_t	provider_released;
+	/* Crossings refused because the caller held no live admission. */
+	atomic64_t	unadmitted;
 	atomic64_t	last_generation;
 };
 
@@ -1793,7 +1795,8 @@ nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
  * Return: the provider's status, NFS4ERR_STALE when the binding no longer
  * names the active generation, NFS4ERR_NOTSUPP when no provider is
  * installed, or NFS4ERR_SERVERFAULT for a malformed provider result or a
- * caller with no execution admission.
+ * caller whose execution admission is missing, already completed, or
+ * another task's.
  */
 __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				u32 opnum,
@@ -1811,12 +1814,24 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	/*
 	 * The admission is what a successful result's borrowed storage is
 	 * bounded by, so there is no correct way to cross this boundary
-	 * without one.  Refuse rather than hand back pointers nothing holds
-	 * a reference for; a caller reaching here without an admission is a
-	 * kernel bug, not a client one.
+	 * without a live one.  A structure that merely exists is not
+	 * enough: completion consumes an admission exactly once and returns
+	 * immediately for one already spent, so a provider reference parked
+	 * on a spent admission would never be dropped and provider removal
+	 * would wait for it forever.  An admission belonging to another
+	 * task bounds that task's execution, not this one's.
+	 *
+	 * Refuse both rather than hand back pointers nothing holds a
+	 * reference for.  This is a caller error rather than a client one,
+	 * and it is counted rather than warned: the condition is reachable
+	 * from a test on purpose, and a warning would taint the kernel that
+	 * proves the refusal works.
 	 */
-	if (WARN_ON_ONCE(!admission))
+	if (!admission || !admission->generation ||
+	    admission->task != current) {
+		atomic64_inc(&nfsd_ffv2_probe_counters.unadmitted);
 		return nfserr_serverfault;
+	}
 	had_provider = admission->provider;
 
 	if (opnum == OP_CHUNK_READ)
@@ -1875,7 +1890,7 @@ stale:
 int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v)
 {
 	seq_printf(m,
-		   "read=%lld header_read=%lld mapped=%lld stale=%lld fail_closed=%lld callbacks=%lld malformed=%lld last_generation=%lld\n",
+		   "read=%lld header_read=%lld mapped=%lld stale=%lld fail_closed=%lld callbacks=%lld malformed=%lld unadmitted=%lld last_generation=%lld\n",
 		   atomic64_read(&nfsd_ffv2_probe_counters.read),
 		   atomic64_read(&nfsd_ffv2_probe_counters.header_read),
 		   atomic64_read(&nfsd_ffv2_probe_counters.mapped),
@@ -1883,6 +1898,7 @@ int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v)
 		   atomic64_read(&nfsd_ffv2_probe_counters.fail_closed),
 		   atomic64_read(&nfsd_ffv2_probe_counters.callbacks),
 		   atomic64_read(&nfsd_ffv2_probe_counters.malformed),
+		   atomic64_read(&nfsd_ffv2_probe_counters.unadmitted),
 		   atomic64_read(&nfsd_ffv2_probe_counters.last_generation));
 	return 0;
 }
@@ -4449,6 +4465,12 @@ u64 nfsd_ffv2_test_provider_entries(void)
 u64 nfsd_ffv2_test_provider_callbacks(void)
 {
 	return atomic64_read(&nfsd_ffv2_probe_counters.callbacks);
+}
+
+/* Crossings refused for want of a live admission. */
+u64 nfsd_ffv2_test_provider_unadmitted(void)
+{
+	return atomic64_read(&nfsd_ffv2_probe_counters.unadmitted);
 }
 
 /**

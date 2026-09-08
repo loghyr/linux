@@ -1367,6 +1367,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	u64 generation_id;
 	__be32 status;
 	int error;
+	u64 unadmitted;
 
 	ordinary = kunit_kzalloc(test, sizeof(*ordinary), GFP_KERNEL);
 	derived = kunit_kzalloc(test, sizeof(*derived), GFP_KERNEL);
@@ -1770,26 +1771,33 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 	binding = NULL;
 	retained = published;
 	/*
-	 * The boundary requires an admission even where no provider can be
-	 * reached, so hand it a zeroed one; completing that is a no-op.
+	 * The boundary requires a *live* admission, and this context has no
+	 * generation to take one against, so a zeroed one is refused before
+	 * anything else is decided -- ahead of the missing provider and
+	 * ahead of the stale binding.  The refusal is counted rather than
+	 * warned.  What the refused paths would otherwise report is covered
+	 * by the read-only fixture tests, which hold real admissions.
 	 */
+	unadmitted = nfsd_ffv2_test_provider_unadmitted();
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_provider_probe(rqstp, mapped, OP_CHUNK_READ,
 						 &chunks, &chunk_result,
 						 U32_MAX, &probe_admission),
-			nfserr_notsupp);
+			nfserr_serverfault);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_provider_probe(rqstp, mapped,
 						 OP_CHUNK_HEADER_READ,
 						 &chunks, &chunk_result,
 						 U32_MAX, &probe_admission),
-			nfserr_notsupp);
+			nfserr_serverfault);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_provider_probe(rqstp, ordinary,
 						 OP_CHUNK_READ,
 						 &chunks, &chunk_result,
 						 U32_MAX, &probe_admission),
-			nfserr_stale);
+			nfserr_serverfault);
+	KUNIT_EXPECT_EQ(test, unadmitted + 3,
+			nfsd_ffv2_test_provider_unadmitted());
 
 	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
 	published = nfsd_export_cache_update(&exp);
@@ -9539,6 +9547,131 @@ next:
 			    "global file cache was still held after cleanup");
 }
 
+/* One thread's admission, held live while another thread tries to use it. */
+struct nfsd_ffv2_foreign_admission {
+	struct nfsd_ffv2_ro_fixture	*f;
+	struct nfsd_ffv2_admission	admission;
+	__be32				status;
+	struct completion		admitted;
+	struct completion		release;
+};
+
+static int nfsd_ffv2_foreign_admission_thread(void *data)
+{
+	struct nfsd_ffv2_foreign_admission *ctx = data;
+
+	ctx->status = nfsd_ffv2_test_validate_operation(ctx->f->rqstp,
+							ctx->f->mapped,
+							ctx->f->session,
+							OP_CHUNK_READ,
+							&ctx->f->stateid, NULL,
+							&ctx->admission);
+	complete(&ctx->admitted);
+	wait_for_completion(&ctx->release);
+	if (ctx->status == nfs_ok)
+		nfsd_ffv2_complete(&ctx->admission);
+	return 0;
+}
+
+/*
+ * The boundary refuses to cross without a live admission.
+ *
+ * A structure that merely exists is not one.  Completion consumes an
+ * admission exactly once and returns immediately for one already spent,
+ * so a provider reference parked on a spent admission would never be
+ * dropped and provider removal would then wait for it forever.  An
+ * admission held by another task bounds that task, not this one.
+ *
+ * The refusals are proved by removing the provider afterwards, which is
+ * what a leaked reference would prevent.
+ */
+static void nfsd_ffv2_provider_unadmitted_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 2 };
+	struct nfsd_ffv2_foreign_admission foreign = {};
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	struct task_struct *thread;
+	u64 callbacks, refused;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	/* An admission that was never taken. */
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	refused = nfsd_ffv2_test_provider_unadmitted();
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_provider_probe(f.rqstp, f.mapped,
+						 OP_CHUNK_READ, &req, &result,
+						 U32_MAX, &admission));
+	KUNIT_EXPECT_EQ(test, refused + 1,
+			nfsd_ffv2_test_provider_unadmitted());
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+
+	/* One that was taken and has already been completed. */
+	KUNIT_ASSERT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_validate_operation(f.rqstp, f.mapped,
+							  f.session,
+							  OP_CHUNK_READ,
+							  &f.stateid, NULL,
+							  &admission));
+	nfsd_ffv2_complete(&admission);
+	refused = nfsd_ffv2_test_provider_unadmitted();
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_provider_probe(f.rqstp, f.mapped,
+						 OP_CHUNK_READ, &req, &result,
+						 U32_MAX, &admission));
+	KUNIT_EXPECT_EQ(test, refused + 1,
+			nfsd_ffv2_test_provider_unadmitted());
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+
+	/* A live admission, but another task's. */
+	foreign.f = &f;
+	init_completion(&foreign.admitted);
+	init_completion(&foreign.release);
+	thread = kthread_run(nfsd_ffv2_foreign_admission_thread, &foreign,
+			     "ffv2-foreign");
+	if (IS_ERR(thread)) {
+		KUNIT_FAIL(test, "failed to start the admitting thread");
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&foreign.admitted, 15 * HZ)) {
+		KUNIT_FAIL(test, "the admitting thread never admitted");
+		goto out;
+	}
+	if (foreign.status == nfs_ok) {
+		refused = nfsd_ffv2_test_provider_unadmitted();
+		KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+				nfsd_ffv2_provider_probe(f.rqstp, f.mapped,
+							 OP_CHUNK_READ, &req,
+							 &result, U32_MAX,
+							 &admission));
+		KUNIT_EXPECT_EQ(test, refused + 1,
+				nfsd_ffv2_test_provider_unadmitted());
+	} else {
+		KUNIT_FAIL(test, "the admitting thread failed: 0x%x",
+			   be32_to_cpu(foreign.status));
+	}
+	complete(&foreign.release);
+
+	/* An authorized crossing still works. */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+
+	/*
+	 * Nothing leaked: removal waits for the last provider reference, so
+	 * it returns only because every crossing gave its reference back.
+	 */
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -9596,6 +9729,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_malformed_result_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
+	KUNIT_CASE(nfsd_ffv2_provider_unadmitted_test),
 	KUNIT_CASE(nfsd_ffv2_encode_header_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_nl_parser_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_p0_probe_test),
