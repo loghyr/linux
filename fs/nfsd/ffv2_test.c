@@ -7792,6 +7792,377 @@ static bool nfsd_ffv2_dispose_list_empty(struct net *net)
 	return empty;
 }
 
+/* One per producer cycle; the repetition schedule needs the most. */
+#define NFSD_FFV2_DP_MAX_FILES		4
+/* The directory those files live in, exported on its own. */
+#define NFSD_FFV2_DP_ROOT_NAME		"ffv2-dp-root"
+/* How long a released worker is given to reach its request loop. */
+#define NFSD_FFV2_DP_WORKER_WAIT	HZ
+/* How long the nfsd thread is given to drain what a producer published. */
+#define NFSD_FFV2_DP_DRAIN_WAIT		(15 * HZ)
+
+/* A real regular file under the exported directory, owned by the service. */
+struct nfsd_ffv2_dp_file {
+	struct path	path;
+	bool		created;
+};
+
+/*
+ * A service for the delayed-producer schedules: one namespace, one nfsd
+ * thread parked before its request loop, one ordinary export, and the files
+ * it serves.  Nothing FFv2 is published here.  Publication is what would
+ * leave the export in the service state, which refuses ordinary access, and
+ * what would claim the superblock, which would refuse a second export on it.
+ */
+struct nfsd_ffv2_dp_service {
+	struct net			*net;
+	struct nfsd_net			*nn;
+	struct svc_rqst			*rqstp;
+	struct svc_xprt			*xprt;
+	struct auth_domain		*domain;
+	struct path			root;
+	struct path			export_root;
+	struct svc_export		*export;
+	struct nfsd_ffv2_worker_ctx	worker;
+	struct nfsd_ffv2_dp_file	files[NFSD_FFV2_DP_MAX_FILES];
+	unsigned int			file_count;
+	bool				root_held;
+	bool				export_root_held;
+	bool				worker_installed;
+	bool				worker_released;
+	bool				service_up;
+};
+
+static bool nfsd_ffv2_dp_service_start(struct kunit *test,
+				       struct nfsd_ffv2_dp_service *s)
+{
+	struct qstr name = QSTR(NFSD_FFV2_DP_ROOT_NAME);
+	struct svc_export *seeded;
+	struct svc_export exp;
+	struct dentry *child;
+	int error;
+
+	memset(s, 0, sizeof(*s));
+	s->rqstp = kunit_kzalloc(test, sizeof(*s->rqstp), GFP_KERNEL);
+	s->xprt = kunit_kzalloc(test, sizeof(*s->xprt), GFP_KERNEL);
+	if (!s->rqstp || !s->xprt) {
+		KUNIT_FAIL(test, "failed to allocate producer request");
+		return false;
+	}
+
+	s->net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(s->net)) {
+		KUNIT_FAIL(test, "no namespace: %ld", PTR_ERR(s->net));
+		s->net = NULL;
+		return false;
+	}
+	s->nn = net_generic(s->net, nfsd_net_id);
+	s->xprt->xpt_net = s->net;
+	s->rqstp->rq_xprt = s->xprt;
+
+	s->domain = unix_domain_find("ffv2-dp-kunit");
+	if (!s->domain) {
+		KUNIT_FAIL(test, "failed to create producer auth domain");
+		return false;
+	}
+
+	/*
+	 * fh_verify() looks the export up by rq_client, and nfsd_setuser()
+	 * dereferences the credential's group list.  A zero-filled request
+	 * has neither.
+	 */
+	s->rqstp->rq_client = s->domain;
+	s->rqstp->rq_cred.cr_flavor = RPC_AUTH_UNIX;
+	s->rqstp->rq_cred.cr_uid = GLOBAL_ROOT_UID;
+	s->rqstp->rq_cred.cr_gid = GLOBAL_ROOT_GID;
+	s->rqstp->rq_cred.cr_group_info = groups_alloc(0);
+	if (!s->rqstp->rq_cred.cr_group_info) {
+		KUNIT_FAIL(test, "failed to allocate producer groups");
+		return false;
+	}
+
+	get_fs_root(current->fs, &s->root);
+	s->root_held = true;
+
+	/* A directory of its own: an export is keyed by client and path. */
+	child = start_creating(mnt_idmap(s->root.mnt), s->root.dentry, &name);
+	if (IS_ERR(child)) {
+		KUNIT_FAIL(test, "failed to start export root: %ld",
+			   PTR_ERR(child));
+		return false;
+	}
+	child = vfs_mkdir(mnt_idmap(s->root.mnt), d_inode(s->root.dentry),
+			  child, 0700, NULL);
+	if (IS_ERR(child)) {
+		KUNIT_FAIL(test, "failed to create export root: %ld",
+			   PTR_ERR(child));
+		return false;
+	}
+	s->export_root.mnt = mntget(s->root.mnt);
+	s->export_root.dentry = dget(child);
+	s->export_root_held = true;
+	end_creating(child);
+
+	nfsd_ffv2_init_test_export(&exp, s->nn, s->domain, &s->export_root);
+	/*
+	 * This transport has no originating port, so the check in
+	 * nfsd_setuser_and_check_port() has nothing meaningful to look at.
+	 * Carry the ordinary "insecure" export option rather than claiming
+	 * on the request that it came from a reserved port.
+	 */
+	exp.ex_flags |= NFSEXP_INSECURE_PORT;
+	seeded = nfsd_export_cache_update(&exp);
+	if (IS_ERR(seeded)) {
+		KUNIT_FAIL(test, "export publication failed: %ld",
+			   PTR_ERR(seeded));
+		return false;
+	}
+	s->export = seeded;
+
+	/*
+	 * Install the park before the service starts, so the thread it
+	 * creates stops in the hook ahead of its request loop and never
+	 * becomes a consumer while a schedule is observing.
+	 */
+	error = nfsd_ffv2_worker_ctx_install(&s->worker, s->net);
+	if (error) {
+		KUNIT_FAIL(test, "worker install failed: %d", error);
+		return false;
+	}
+	s->worker_installed = true;
+
+	error = nfsd_ffv2_start_test_service(s->net, &s->worker, NULL);
+	if (error) {
+		KUNIT_FAIL(test, "service start failed: %d", error);
+		return false;
+	}
+	s->service_up = true;
+	return true;
+}
+
+/*
+ * Teardown in the order the parts depend on each other.
+ *
+ * The worker context is the one that bites: it is a global singleton holding
+ * storage this frame owns, and removing it is what waits for a thread still
+ * inside the hook.  It has to come after the threads are joined, or the wait
+ * is for a thread nothing has stopped, and before the storage goes out of
+ * scope.  Leaving it installed would also fail every later install.
+ */
+static void nfsd_ffv2_dp_service_stop(struct kunit *test,
+				      struct nfsd_ffv2_dp_service *s)
+{
+	if (s->worker_installed && !s->worker_released) {
+		complete_all(&s->worker.run);
+		complete_all(&s->worker.allow_complete);
+		s->worker_released = true;
+	}
+	if (s->service_up) {
+		nfsd_shutdown_threads(s->net);
+		s->service_up = false;
+	}
+	if (s->worker_installed) {
+		nfsd_ffv2_worker_ctx_remove(&s->worker);
+		s->worker_installed = false;
+	}
+
+	while (s->file_count) {
+		struct nfsd_ffv2_dp_file *df = &s->files[--s->file_count];
+		struct dentry *parent;
+		struct inode *dir;
+		int error;
+
+		if (!df->created)
+			continue;
+		parent = dget_parent(df->path.dentry);
+		dir = d_inode(parent);
+		inode_lock_nested(dir, I_MUTEX_PARENT);
+		error = vfs_unlink(mnt_idmap(df->path.mnt), dir,
+				   df->path.dentry, NULL);
+		inode_unlock(dir);
+		dput(parent);
+		/*
+		 * The path reference belongs to this frame and goes either
+		 * way.  @created is what says the file is still on the
+		 * filesystem, so it survives a failed unlink.
+		 */
+		path_put(&df->path);
+		if (error)
+			KUNIT_FAIL(test, "failed to unlink producer file: %d",
+				   error);
+		else
+			df->created = false;
+	}
+	if (s->export) {
+		exp_put(s->export);
+		s->export = NULL;
+	}
+	if (s->net)
+		nfsd_export_flush(s->net);
+	if (s->export_root_held) {
+		struct qstr name = QSTR(NFSD_FFV2_DP_ROOT_NAME);
+		struct dentry *victim;
+
+		path_put(&s->export_root);
+		s->export_root_held = false;
+		victim = start_removing(mnt_idmap(s->root.mnt), s->root.dentry,
+					&name);
+		if (IS_ERR(victim)) {
+			KUNIT_FAIL(test,
+				   "failed to start removing the export root: %ld",
+				   PTR_ERR(victim));
+		} else {
+			int error = vfs_rmdir(mnt_idmap(s->root.mnt),
+					      d_inode(s->root.dentry), victim,
+					      NULL);
+
+			end_removing(victim);
+			if (error)
+				KUNIT_FAIL(test,
+					   "failed to remove the export root: %d",
+					   error);
+		}
+	}
+	if (s->root_held) {
+		path_put(&s->root);
+		s->root_held = false;
+	}
+	if (s->rqstp) {
+		if (s->rqstp->rq_cred.cr_group_info) {
+			put_group_info(s->rqstp->rq_cred.cr_group_info);
+			s->rqstp->rq_cred.cr_group_info = NULL;
+		}
+		s->rqstp->rq_client = NULL;
+	}
+	if (s->domain) {
+		auth_domain_put(s->domain);
+		s->domain = NULL;
+	}
+	if (s->net) {
+		put_net(s->net);
+		s->net = NULL;
+		net_ns_barrier();
+	}
+}
+
+static struct nfsd_ffv2_dp_file *
+nfsd_ffv2_dp_file_create(struct kunit *test, struct nfsd_ffv2_dp_service *s,
+			 const char *name)
+{
+	struct nfsd_ffv2_dp_file *df;
+	struct file *file;
+
+	if (s->file_count >= ARRAY_SIZE(s->files)) {
+		KUNIT_FAIL(test, "too many producer files");
+		return NULL;
+	}
+	df = &s->files[s->file_count];
+	file = file_open_root(&s->export_root, name,
+			      O_CREAT | O_EXCL | O_RDWR, 0600);
+	if (IS_ERR(file)) {
+		KUNIT_FAIL(test, "failed to create backing file %s: %ld",
+			   name, PTR_ERR(file));
+		return NULL;
+	}
+	df->path = file->f_path;
+	path_get(&df->path);
+	fput(file);
+	df->created = true;
+	s->file_count++;
+	return df;
+}
+
+/*
+ * Acquire a garbage-collected file through the production path.
+ *
+ * fh_verify() resolves a handle only when it does not already carry a
+ * dentry, so hand it one.  Every permission check it performs still runs;
+ * what is skipped is the wire encoding and the fsid lookup, neither of
+ * which these schedules are about.
+ *
+ * nfsd_file_do_acquire() calls nfsd_setuser(), which overrides the calling
+ * task's credentials and restores nothing.  An nfsd thread reverts at its
+ * request boundary; this caller has none, so the override would outlive the
+ * test.  Save and restore around the call, with nothing in between that can
+ * leave the frame.
+ */
+static __be32 nfsd_ffv2_dp_acquire(struct nfsd_ffv2_dp_service *s,
+				   struct nfsd_ffv2_dp_file *df,
+				   struct nfsd_file **nfp)
+{
+	const struct cred *save_cred;
+	struct svc_fh fh;
+	__be32 status;
+
+	fh_init(&fh, NFS4_FHSIZE);
+	fh.fh_export = nfsd_export_get(s->export);
+	fh.fh_dentry = dget(df->path.dentry);
+	save_cred = get_current_cred();
+	status = nfsd_file_acquire_gc(s->rqstp, &fh, NFSD_MAY_READ, nfp);
+	put_cred(revert_creds(save_cred));
+	fh_put(&fh);
+	return status;
+}
+
+/*
+ * One producer cycle: a fresh file, acquired and then released so the cache
+ * holds the only reference, the real delayed-close producer, and the
+ * publication it must have made.
+ *
+ * The non-empty check is the whole point.  Every later assertion in these
+ * schedules is that the list is *empty*, which a list nothing was ever put
+ * on satisfies for free.
+ */
+static bool nfsd_ffv2_dp_publish(struct kunit *test,
+				 struct nfsd_ffv2_dp_service *s,
+				 struct nfsd_ffv2_dp_file *df)
+{
+	struct nfsd_file *nf = NULL;
+	__be32 status;
+
+	status = nfsd_ffv2_dp_acquire(s, df, &nf);
+	if (status != nfs_ok) {
+		KUNIT_FAIL(test, "producer file acquire failed: %u",
+			   be32_to_cpu(status));
+		return false;
+	}
+	nfsd_file_put(nf);
+	nfsd_file_ffv2_test_close_inode(d_inode(df->path.dentry));
+	if (nfsd_ffv2_dispose_list_empty(s->net)) {
+		KUNIT_FAIL(test,
+			   "producer published nothing to the disposal list");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Let the parked worker go, all the way back into its request loop.
+ *
+ * Releasing the park is not one completion: the worker runs an admission and
+ * waits twice more before it returns.  Until it does, it is not in the loop,
+ * so nothing is consuming the disposal list.  The admission's own result is
+ * incidental here and is not asserted on.
+ */
+static bool nfsd_ffv2_dp_worker_release(struct kunit *test,
+					struct nfsd_ffv2_dp_service *s)
+{
+	complete(&s->worker.run);
+	if (!wait_for_completion_timeout(&s->worker.admitted,
+					 NFSD_FFV2_DP_WORKER_WAIT)) {
+		KUNIT_FAIL(test, "worker did not reach admission");
+		return false;
+	}
+	complete(&s->worker.allow_complete);
+	if (!wait_for_completion_timeout(&s->worker.returned,
+					 NFSD_FFV2_DP_WORKER_WAIT)) {
+		KUNIT_FAIL(test, "worker did not return to its request loop");
+		return false;
+	}
+	s->worker_released = true;
+	return true;
+}
+
 /*
  * The isolation gate, with both namespaces live at once.
  *
@@ -8965,6 +9336,209 @@ out:
 	kfree(ops);
 }
 
+/*
+ * S1: a delayed producer publishes to its own namespace's disposal list.
+ *
+ * The worker is parked before its request loop for the whole observation, so
+ * the only thing that could have put an entry on the list is the producer,
+ * and nothing can have taken it off again.
+ */
+static void nfsd_ffv2_delayed_producer_publish_test(struct kunit *test)
+{
+	struct nfsd_ffv2_dp_service s;
+	struct nfsd_ffv2_dp_file *df;
+
+	if (!nfsd_ffv2_dp_service_start(test, &s))
+		goto out;
+	df = nfsd_ffv2_dp_file_create(test, &s, "s1");
+	if (!df)
+		goto out;
+	if (!nfsd_ffv2_dp_publish(test, &s, df))
+		goto out;
+	nfsd_ffv2_dp_worker_release(test, &s);
+out:
+	nfsd_ffv2_dp_service_stop(test, &s);
+}
+
+/*
+ * S2: repeated producers, each on a file of its own.
+ *
+ * A cycle cannot reuse a file.  The producer unhashes its victim before
+ * queueing it, so a second call against the same inode finds nothing in the
+ * cache's hash table and publishes silently nothing.
+ */
+static void nfsd_ffv2_delayed_producer_repeat_test(struct kunit *test)
+{
+	static const char * const names[] = { "s2-0", "s2-1", "s2-2", "s2-3" };
+	struct nfsd_ffv2_dp_service s;
+	struct nfsd_ffv2_dp_file *df;
+	unsigned int i;
+
+	if (!nfsd_ffv2_dp_service_start(test, &s))
+		goto out;
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		df = nfsd_ffv2_dp_file_create(test, &s, names[i]);
+		if (!df)
+			goto out;
+		if (!nfsd_ffv2_dp_publish(test, &s, df))
+			goto out;
+	}
+	nfsd_ffv2_dp_worker_release(test, &s);
+out:
+	nfsd_ffv2_dp_service_stop(test, &s);
+}
+
+/*
+ * S3: the nfsd thread drains what the producer published.
+ *
+ * The publication is established while the worker is still parked, so the
+ * drain that follows is measured against something known to have been there.
+ * The wait is bounded because this is a wakeup-driven event; the thread also
+ * disposes once per pass of its request loop, so a lost wakeup costs time
+ * rather than correctness.  A timeout is a failure.
+ */
+static void nfsd_ffv2_delayed_producer_drain_test(struct kunit *test)
+{
+	struct nfsd_ffv2_dp_service s;
+	struct nfsd_ffv2_dp_file *df;
+	unsigned long deadline;
+	bool drained = false;
+
+	if (!nfsd_ffv2_dp_service_start(test, &s))
+		goto out;
+	df = nfsd_ffv2_dp_file_create(test, &s, "s3");
+	if (!df)
+		goto out;
+	if (!nfsd_ffv2_dp_publish(test, &s, df))
+		goto out;
+	if (!nfsd_ffv2_dp_worker_release(test, &s))
+		goto out;
+
+	deadline = jiffies + NFSD_FFV2_DP_DRAIN_WAIT;
+	while (!time_after(jiffies, deadline)) {
+		if (nfsd_ffv2_dispose_list_empty(s.net)) {
+			drained = true;
+			break;
+		}
+		msleep(50);
+	}
+	KUNIT_EXPECT_TRUE_MSG(test, drained,
+			      "nfsd thread did not drain the disposal list");
+out:
+	nfsd_ffv2_dp_service_stop(test, &s);
+}
+
+/*
+ * S4: a per-net shutdown with entries on the disposal list.
+ *
+ * This does not attribute the drain.  Teardown releases the worker before the
+ * per-net shutdown runs, so either the thread or the shutdown's own final
+ * pass may have emptied the list and the test cannot tell which.  What it
+ * covers is bounded: that entries outstanding across that boundary leave the
+ * list empty and the namespace's disposal state intact.  It is list and
+ * lifetime evidence, not exhaustive use-after-free detection.
+ *
+ * The namespace is pinned for the observation because the service drops its
+ * own reference during teardown, and the list lives in struct nfsd_net.
+ */
+static void nfsd_ffv2_delayed_producer_shutdown_test(struct kunit *test)
+{
+	struct nfsd_ffv2_dp_service s;
+	struct nfsd_ffv2_dp_file *df;
+	struct net *pinned = NULL;
+
+	if (!nfsd_ffv2_dp_service_start(test, &s))
+		goto out;
+	df = nfsd_ffv2_dp_file_create(test, &s, "s4");
+	if (!df)
+		goto out;
+	if (!nfsd_ffv2_dp_publish(test, &s, df))
+		goto out;
+	pinned = get_net(s.net);
+out:
+	nfsd_ffv2_dp_service_stop(test, &s);
+	if (pinned) {
+		KUNIT_EXPECT_TRUE_MSG(test,
+				      nfsd_ffv2_dispose_list_empty(pinned),
+				      "disposal list outlived the per-net shutdown");
+		put_net(pinned);
+		net_ns_barrier();
+	}
+}
+
+/*
+ * S5: cleanup after a failure at each stage.
+ *
+ * The stages are defined by how far through the setup they get, because
+ * cleanup of a state that was never reached proves nothing.  The early
+ * stages stop before the producer runs and so assert no publication.  The
+ * last stage leaves the worker parked, which teardown has to cope with.
+ *
+ * The check that matters comes after the loop.  A service that leaked would
+ * hold nfsd_users above zero and leave the global file cache up, so the
+ * ownership seam would refuse to bring it up; that it succeeds is what says
+ * nothing was orphaned.
+ */
+static void nfsd_ffv2_delayed_producer_cleanup_test(struct kunit *test)
+{
+	enum {
+		NFSD_FFV2_DP_STOP_AFTER_START,
+		NFSD_FFV2_DP_STOP_AFTER_CREATE,
+		NFSD_FFV2_DP_STOP_AFTER_ACQUIRE,
+		NFSD_FFV2_DP_STOP_AFTER_PRODUCE,
+		NFSD_FFV2_DP_STOP_PARKED,
+		NFSD_FFV2_DP_STOP_COUNT,
+	};
+	struct nfsd_ffv2_dp_service s;
+	unsigned int stage;
+	int error;
+
+	for (stage = 0; stage < NFSD_FFV2_DP_STOP_COUNT; stage++) {
+		struct nfsd_ffv2_dp_file *df;
+		struct nfsd_file *nf = NULL;
+		__be32 status;
+
+		if (!nfsd_ffv2_dp_service_start(test, &s))
+			goto next;
+		if (stage == NFSD_FFV2_DP_STOP_AFTER_START)
+			goto next;
+
+		df = nfsd_ffv2_dp_file_create(test, &s, "s5");
+		if (!df)
+			goto next;
+		if (stage == NFSD_FFV2_DP_STOP_AFTER_CREATE)
+			goto next;
+
+		if (stage == NFSD_FFV2_DP_STOP_AFTER_ACQUIRE) {
+			status = nfsd_ffv2_dp_acquire(&s, df, &nf);
+			if (status != nfs_ok)
+				KUNIT_FAIL(test,
+					   "cleanup stage acquire failed: %u",
+					   be32_to_cpu(status));
+			else
+				nfsd_file_put(nf);
+			goto next;
+		}
+
+		if (!nfsd_ffv2_dp_publish(test, &s, df))
+			goto next;
+		if (stage == NFSD_FFV2_DP_STOP_AFTER_PRODUCE)
+			goto next;
+
+		/* NFSD_FFV2_DP_STOP_PARKED: teardown releases the worker. */
+next:
+		nfsd_ffv2_dp_service_stop(test, &s);
+	}
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_file_ffv2_test_cache_start();
+	if (!error)
+		nfsd_file_cache_shutdown();
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ_MSG(test, error, 0,
+			    "global file cache was still held after cleanup");
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -9028,6 +9602,11 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_auth_cache_second_net_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_auth_cache_two_service_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_auth_cache_service_cleanup_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_delayed_producer_publish_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_delayed_producer_repeat_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_delayed_producer_drain_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_delayed_producer_shutdown_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_delayed_producer_cleanup_test),
 	KUNIT_CASE(nfsd_ffv2_transport_null_test),
 	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
