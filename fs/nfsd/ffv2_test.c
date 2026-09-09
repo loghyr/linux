@@ -11752,6 +11752,86 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
 }
 
+/*
+ * Namespace exit arriving in the interval after OFF and before the signal.
+ *
+ * This is the schedule the earlier reports listed as uncovered.  The gate
+ * deliberately reads OFF before its owner signals, so an exit arriving
+ * there finds nothing to close and returns at once -- and what keeps that
+ * safe is the execution reference the owner still holds on the anchor,
+ * which is what a namespace waiting to be destroyed waits for.  Both halves
+ * are asserted: the exit does not block, and the reference is still there
+ * until the owner has finished with it.
+ *
+ * No new seam is needed for this; the close hooks already reach the point.
+ */
+static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_call_ctx owner = {}, exiting = {};
+	struct task_struct *owner_task, *exit_task;
+	struct completion published, resume;
+	unsigned int parked_ref;
+	struct nfsd_net *nn;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	init_completion(&published);
+	init_completion(&resume);
+	init_completion(&owner.done);
+	init_completion(&exiting.done);
+	owner.nn = nn;
+	exiting.nn = nn;
+	owner.net = &init_net;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	nfsd_ffv2_prototype_test_close_hooks(NULL, NULL, &published, &resume);
+	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
+				 "ffv2-proto-owner");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&published, 30 * HZ) != 0);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+
+	/* The owner has given up the gate's reference but not its own. */
+	parked_ref = nfsd_ffv2_test_anchor_refcount(nn);
+	KUNIT_EXPECT_GT(test, parked_ref, 1u);
+
+	exit_task = kthread_run(nfsd_ffv2_prototype_pre_exit_thread, &exiting,
+				"ffv2-proto-exit");
+	if (IS_ERR(exit_task)) {
+		KUNIT_FAIL(test, "failed to start the exiting thread");
+		complete(&resume);
+		wait_for_completion(&owner.done);
+		kthread_stop(owner_task);
+		return;
+	}
+	/* It finds an off gate and returns, rather than waiting on a signal. */
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&exiting.done,
+						      30 * HZ) != 0);
+	/* And it did not disturb the owner, which is still holding on. */
+	KUNIT_EXPECT_EQ(test, 0,
+			wait_for_completion_timeout(&owner.done, HZ / 5));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_GT(test, nfsd_ffv2_test_anchor_refcount(nn), 1u);
+
+	complete(&resume);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
+	kthread_stop(owner_task);
+	kthread_stop(exit_task);
+	KUNIT_EXPECT_EQ(test, 0, owner.result);
+	/* Only once it has finished does the anchor come back down. */
+	KUNIT_EXPECT_LT(test, nfsd_ffv2_test_anchor_refcount(nn), parked_ref);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_NET_EXITING, nn->ffv2.net_state);
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -12162,6 +12242,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_pre_exit_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_supersede_cycle_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_close_signal_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_close_pre_exit_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_challenge_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_nonce_reap_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
