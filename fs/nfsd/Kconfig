@@ -103,6 +103,25 @@ config NFSD_FFV2_KUNIT_TEST
 
 	  If unsure, say N.
 
+config NFSD_FFV2_PROTOTYPE_AUTH
+	bool "Prototype authority profile for nfsd Flex Files v2"
+	depends on NFSD_V4
+	default n
+	help
+	  Allow an administrator holding CAP_SYS_ADMIN in one reserved network
+	  namespace to stand in for the metadata server that would otherwise
+	  authenticate to this data server, so that the read path can be
+	  demonstrated before that authentication exists.
+
+	  This is a demonstrator, not a deployment option.  It admits only the
+	  two Flex Files v2 read operations, it claims the namespace's single
+	  authority source so no metadata server can share the namespace with
+	  it, and it trusts an administrator where a production server would
+	  require a machine credential.  Do not enable it on a server that
+	  exports anything you care about.
+
+	  If unsure, say N.
+
 config NFSD_FFV2_LIVE_TEST
 	bool "Live test controls for nfsd Flex Files v2"
 	depends on DEBUG_FS && NFSD=y && NFSD_V4

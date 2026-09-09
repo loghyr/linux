@@ -24,6 +24,7 @@
 
 #include "export.h"
 #include "ffv2.h"
+#include "ffv2_prototype.h"
 #include "ffv2_trust.h"
 #include "filecache.h"
 #include "nfsfh.h"
@@ -412,6 +413,27 @@ static int nfsd_ffv2_object_validate(struct svc_export *exp,
 				     struct nfsd_ffv2_object *object);
 static void
 nfsd_ffv2_generation_put(struct nfsd_ffv2_generation *generation);
+
+/**
+ * nfsd_ffv2_anchor_hold - keep a namespace's FFv2 anchor alive
+ * @nn: the namespace
+ *
+ * For a caller outside this file that has to outlive its own transaction:
+ * the prototype gate holds one of these from enable to final teardown, so
+ * the anchor its state lives in cannot be destroyed underneath it.
+ *
+ * Return: true when the reference was taken.
+ */
+bool nfsd_ffv2_anchor_hold(struct nfsd_net *nn)
+{
+	return nfsd_ffv2_anchor_get(&nn->ffv2);
+}
+
+/* Release a reference taken by nfsd_ffv2_anchor_hold(). */
+void nfsd_ffv2_anchor_release(struct nfsd_net *nn)
+{
+	nfsd_ffv2_anchor_put(&nn->ffv2);
+}
 
 /**
  * nfsd_ffv2_source_claim_locked - claim the namespace's authority source
@@ -4778,6 +4800,7 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 	anchor->authority_work = 0;
 	anchor->authority_tokens_open = true;
 	anchor->authority_work_open = true;
+	nfsd_ffv2_prototype_net_init(nn);
 }
 
 void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
@@ -4787,6 +4810,12 @@ void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
 
 	if (WARN_ON_ONCE(!nfsd_ffv2_anchor_get(anchor)))
 		return;
+	/*
+	 * The prototype gate first, and completely: it owns objects this
+	 * namespace's fence would otherwise find still published, and its
+	 * teardown is the one thing here that can still be starting up.
+	 */
+	nfsd_ffv2_prototype_net_pre_exit(nn);
 	nfsd_ffv2_updates_set_open(&nn->ffv2_participant, false);
 	nfsd_ffv2_updates_wait(&nn->ffv2_participant);
 	/*
@@ -4844,6 +4873,7 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	WARN_ON_ONCE(rcu_access_pointer(anchor->provider));
 	mutex_unlock(&anchor->lock);
 	WARN_ON_ONCE(!nfsd_ffv2_authority_admissions_idle(anchor));
+	nfsd_ffv2_prototype_net_destroy(nn);
 	nfsd_ffv2_anchor_put(anchor);
 	wait_for_completion(&anchor->released);
 	mutex_destroy(&anchor->lock);

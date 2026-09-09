@@ -10,6 +10,8 @@
 #include <linux/spinlock.h>
 #include <linux/wait.h>
 
+#include "ffv2_prototype.h"
+
 struct net;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
@@ -153,6 +155,10 @@ struct nfsd_ffv2_anchor {
 	 */
 	spinlock_t			prototype_gate_lock;
 	enum nfsd_ffv2_source		source;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+	/* The prototype authority gate built on that reservation. */
+	struct nfsd_ffv2_prototype	prototype;
+#endif
 	/*
 	 * Authority epoch allocation and the closeable authority-token and
 	 * retirement-work admissions.  One lock covers both gates and the
@@ -181,6 +187,8 @@ int nfsd_ffv2_export_update_validate(struct nfsd_ffv2_export_update *update);
 int nfsd_ffv2_export_update_end(struct svc_export *exp,
 				struct nfsd_ffv2_export_update *update);
 void nfsd_ffv2_export_update_abort(struct nfsd_ffv2_export_update *update);
+bool nfsd_ffv2_anchor_hold(struct nfsd_net *nn);
+void nfsd_ffv2_anchor_release(struct nfsd_net *nn);
 int nfsd_ffv2_source_claim_locked(struct nfsd_net *nn,
 				  enum nfsd_ffv2_source want);
 int nfsd_ffv2_source_claim_gated(struct nfsd_ffv2_anchor *anchor,
@@ -491,6 +499,7 @@ enum nfsd_ffv2_fault_phase {
 	NFSD_FFV2_FAULT_GENERATION_ACTIVATE,
 	NFSD_FFV2_FAULT_REPLY_BUILD,
 	NFSD_FFV2_FAULT_TRUST_REPLACE,
+	NFSD_FFV2_FAULT_PROTOTYPE_SETUP,
 };
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_LIVE_TEST) || \

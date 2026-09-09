@@ -22,6 +22,7 @@
 #include <net/genetlink.h>
 #include <uapi/linux/sunrpc_netlink.h>
 #include "ffv2.h"
+#include "ffv2_prototype.h"
 #include "ffv2_trust.h"
 #include "export.h"
 #include "filecache.h"
@@ -9850,6 +9851,452 @@ out:
 	kvfree(payload);
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+/*
+ * Prototype authority gate.
+ *
+ * The gate's hard part is the interval after an enable has claimed the
+ * namespace and before it has opened: a namespace exit or a second
+ * administrator arriving there must not find a half-built gate to tear
+ * down, and must not tear it down twice.  The tests below hold an enable
+ * inside that interval with the setup hook and then drive the other
+ * callers against it, so the handoff is exercised rather than assumed.
+ */
+
+struct nfsd_ffv2_prototype_call_ctx {
+	struct nfsd_net		*nn;
+	const struct net	*net;
+	int			result;
+	struct completion	done;
+};
+
+static int nfsd_ffv2_prototype_enable_thread(void *data)
+{
+	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
+
+	ctx->result = nfsd_ffv2_prototype_enable(ctx->nn, ctx->net);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static int nfsd_ffv2_prototype_disable_thread(void *data)
+{
+	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
+
+	ctx->result = nfsd_ffv2_prototype_disable(ctx->nn, ctx->net);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static int nfsd_ffv2_prototype_pre_exit_thread(void *data)
+{
+	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
+
+	nfsd_ffv2_net_pre_exit(ctx->nn);
+	ctx->result = 0;
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+/* Wait until @want callers are parked on the close owner's completion. */
+static bool nfsd_ffv2_prototype_wait_waiters(struct nfsd_net *nn,
+					     unsigned int want)
+{
+	unsigned long deadline = jiffies + 15 * HZ;
+
+	while (nfsd_ffv2_prototype_test_close_waiters(nn) < want) {
+		if (time_after(jiffies, deadline))
+			return false;
+		msleep(20);
+	}
+	return true;
+}
+
+/* Wait for the gate to reach @want, so a race is observed rather than timed. */
+static bool nfsd_ffv2_prototype_wait_state(struct nfsd_net *nn,
+					   enum nfsd_ffv2_prototype_state want)
+{
+	unsigned long deadline = jiffies + 15 * HZ;
+
+	while (nfsd_ffv2_prototype_state_get(nn) != want) {
+		if (time_after(jiffies, deadline))
+			return false;
+		msleep(20);
+	}
+	return true;
+}
+
+/*
+ * The ordinary cycle, and the exclusions around it: one gate per
+ * namespace, no metadata-server source while it is up, and repeated
+ * transitions refused rather than silently accepted.
+ */
+static void nfsd_ffv2_prototype_gate_test(struct kunit *test)
+{
+	struct nfsd_net *nn;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	/* Disabling a gate that is off is a repeated transition, not a no-op. */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_prototype_disable(nn, &init_net));
+
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OPEN,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_PROTOTYPE,
+			nfsd_ffv2_source_get(nn));
+
+	/* A second gate, and a metadata-server source, are both refused. */
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_prototype_enable(nn, &init_net));
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_MDS));
+	mutex_unlock(&nfsd_mutex);
+
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_prototype_disable(nn, &init_net));
+
+	/* The namespace is claimable again, by either source. */
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_MDS));
+	mutex_unlock(&nfsd_mutex);
+	nfsd_ffv2_source_release(nn, NFSD_FFV2_SOURCE_MDS);
+}
+
+/*
+ * CAP_SYS_ADMIN is not a claim to somebody else's prototype: the four
+ * commands after enable require the identity that enabled, and each
+ * component of it counts.
+ */
+static void nfsd_ffv2_prototype_owner_test(struct kunit *test)
+{
+	const struct cred *old_cred;
+	struct cred *other_cred;
+	struct nfsd_net *nn;
+	struct net *other;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	other = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(other));
+
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+
+	/* A different network namespace is a different administrator. */
+	KUNIT_EXPECT_EQ(test, -EPERM, nfsd_ffv2_prototype_disable(nn, other));
+
+	/* So is the same one in a different user identity. */
+	other_cred = prepare_creds();
+	KUNIT_ASSERT_NOT_NULL(test, other_cred);
+	other_cred->fsuid = make_kuid(current_user_ns(), 1);
+	other_cred->uid = other_cred->fsuid;
+	old_cred = override_creds(other_cred);
+	KUNIT_EXPECT_EQ(test, -EPERM,
+			nfsd_ffv2_prototype_disable(nn, &init_net));
+	revert_creds(old_cred);
+	put_cred(other_cred);
+
+	/* The gate is untouched by either refusal. */
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OPEN,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+	put_net(other);
+}
+
+/*
+ * A setup that fails while nobody else is closing takes the close role
+ * itself and runs both phases, so the reservation and every reference it
+ * staged are returned rather than stranded in ENABLING.
+ */
+static void nfsd_ffv2_prototype_setup_failure_test(struct kunit *test)
+{
+	struct nfsd_net *nn;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_PROTOTYPE_SETUP);
+	KUNIT_EXPECT_EQ(test, -ENOMEM,
+			nfsd_ffv2_prototype_enable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_FAULT_PROTOTYPE_SETUP,
+			nfsd_ffv2_fault_hit());
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
+
+	/* And the namespace is enabled normally afterwards. */
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+}
+
+/*
+ * A closer that arrives while the gate is still ENABLING takes the close
+ * role away from the enabling caller.  The enable then only rolls back
+ * what it staged, the closer alone drains and releases, and a third caller
+ * that finds CLOSING waits rather than draining a second time.
+ */
+static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_call_ctx enable = {}, first = {}, second = {};
+	struct task_struct *enable_task, *first_task, *second_task;
+	struct completion reached, proceed;
+	struct nfsd_net *nn;
+	bool closing, waited;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	init_completion(&reached);
+	init_completion(&proceed);
+	init_completion(&enable.done);
+	init_completion(&first.done);
+	init_completion(&second.done);
+	enable.nn = nn;
+	first.nn = nn;
+	second.nn = nn;
+	enable.net = &init_net;
+	first.net = &init_net;
+	second.net = &init_net;
+	nfsd_ffv2_prototype_test_setup_hook(&reached, &proceed);
+
+	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
+				  "ffv2-proto-enable");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&reached, 15 * HZ) != 0);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_ENABLING,
+			nfsd_ffv2_prototype_state_get(nn));
+
+	first_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &first,
+				 "ffv2-proto-close1");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(first_task));
+	/*
+	 * The close role is claimed before the enabling caller is released,
+	 * which is the interval this test exists for.
+	 */
+	closing = nfsd_ffv2_prototype_wait_state(nn,
+						 NFSD_FFV2_PROTOTYPE_CLOSING);
+	KUNIT_EXPECT_TRUE(test, closing);
+	second_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &second,
+				  "ffv2-proto-close2");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(second_task));
+	/*
+	 * Wait until that closer is actually parked on the owner's
+	 * completion.  Starting a thread is not the same as running one, and
+	 * a second closer that arrived after the teardown had finished would
+	 * be reporting that the gate is off rather than that it waited.
+	 */
+	waited = nfsd_ffv2_prototype_wait_waiters(nn, 1);
+	KUNIT_EXPECT_TRUE(test, waited);
+
+	complete(&proceed);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&enable.done, 30 * HZ) != 0);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&first.done, 30 * HZ) != 0);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&second.done, 30 * HZ) != 0);
+	kthread_stop(enable_task);
+	kthread_stop(first_task);
+	kthread_stop(second_task);
+
+	/* The enable never opened, the first closer owned the teardown. */
+	KUNIT_EXPECT_EQ(test, -EBUSY, enable.result);
+	KUNIT_EXPECT_EQ(test, 0, first.result);
+	KUNIT_EXPECT_EQ(test, -EBUSY, second.result);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
+}
+
+/*
+ * The same handoff, with namespace exit as the closer.  Exit joins the
+ * gate's completion rather than releasing the namespace underneath a setup
+ * that is still running.
+ */
+static void nfsd_ffv2_prototype_enabling_pre_exit_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_call_ctx enable = {}, exiting = {};
+	struct task_struct *enable_task, *exit_task;
+	struct completion reached, proceed;
+	struct nfsd_net *nn;
+	bool closing;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	init_completion(&reached);
+	init_completion(&proceed);
+	init_completion(&enable.done);
+	init_completion(&exiting.done);
+	enable.nn = nn;
+	exiting.nn = nn;
+	enable.net = &init_net;
+	nfsd_ffv2_prototype_test_setup_hook(&reached, &proceed);
+
+	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
+				  "ffv2-proto-enable");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&reached, 15 * HZ) != 0);
+
+	exit_task = kthread_run(nfsd_ffv2_prototype_pre_exit_thread, &exiting,
+				"ffv2-proto-exit");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(exit_task));
+	closing = nfsd_ffv2_prototype_wait_state(nn,
+						 NFSD_FFV2_PROTOTYPE_CLOSING);
+	KUNIT_EXPECT_TRUE(test, closing);
+	/* Exit is still inside the gate, not past it. */
+	KUNIT_EXPECT_EQ(test, 0, exiting.result);
+
+	complete(&proceed);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&enable.done, 30 * HZ) != 0);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&exiting.done, 30 * HZ) != 0);
+	kthread_stop(enable_task);
+	kthread_stop(exit_task);
+
+	KUNIT_EXPECT_EQ(test, -EBUSY, enable.result);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_NET_EXITING, nn->ffv2.net_state);
+}
+
+/*
+ * Challenges.  A registration has to name something this server issued, to
+ * the administrator it issued it to, before it expired -- and each of those
+ * failures has to be distinguishable, because they mean different things to
+ * whoever is driving the demonstrator.
+ */
+static void nfsd_ffv2_prototype_challenge_test(struct kunit *test)
+{
+	u8 first[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u8 second[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u8 forged[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	const struct cred *old_cred;
+	struct cred *other_cred;
+	u64 expires = 0, before;
+	struct nfsd_net *nn;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	/* A gate that is off issues nothing. */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_prototype_challenge(nn, &init_net, first,
+						      &expires));
+
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	before = ktime_get_ns();
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(nn, &init_net, first,
+						      &expires));
+	KUNIT_EXPECT_GT(test, expires, before);
+	KUNIT_EXPECT_LE(test, expires,
+			before + 2 * NFSD_FFV2_PROTOTYPE_NONCE_TTL_NS);
+	KUNIT_EXPECT_EQ(test, 1u, nfsd_ffv2_prototype_test_nonce_count(nn));
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     first));
+
+	/* Two challenges are two distinct nonces, both live. */
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(nn, &init_net, second,
+						      &expires));
+	KUNIT_EXPECT_NE(test, 0,
+			memcmp(first, second,
+			       NFSD_FFV2_PROTOTYPE_NONCE_LEN));
+	KUNIT_EXPECT_EQ(test, 2u, nfsd_ffv2_prototype_test_nonce_count(nn));
+
+	/*
+	 * A nonce with the right index and the wrong remainder is unknown,
+	 * not merely refused: knowing which record a guess landed on would
+	 * tell the guesser that the index was right.
+	 */
+	memcpy(forged, first, sizeof(forged));
+	forged[sizeof(forged) - 1] ^= 0xff;
+	KUNIT_EXPECT_EQ(test, -ENOENT,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     forged));
+	/* And an index that names nothing is unknown too. */
+	memset(forged, 0xff, sizeof(forged));
+	KUNIT_EXPECT_EQ(test, -ENOENT,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     forged));
+
+	/* Another administrator cannot present this one's challenge. */
+	other_cred = prepare_creds();
+	KUNIT_ASSERT_NOT_NULL(test, other_cred);
+	other_cred->fsuid = make_kuid(current_user_ns(), 1);
+	other_cred->uid = other_cred->fsuid;
+	old_cred = override_creds(other_cred);
+	KUNIT_EXPECT_EQ(test, -EPERM,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     first));
+	KUNIT_EXPECT_EQ(test, -EPERM,
+			nfsd_ffv2_prototype_challenge(nn, &init_net, forged,
+						      &expires));
+	revert_creds(old_cred);
+	put_cred(other_cred);
+
+	/* An expired challenge reports its expiry once and is then gone. */
+	nfsd_ffv2_prototype_test_nonce_age(nn, first);
+	KUNIT_EXPECT_EQ(test, -ETIMEDOUT,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     first));
+	KUNIT_EXPECT_EQ(test, 1u, nfsd_ffv2_prototype_test_nonce_count(nn));
+	KUNIT_EXPECT_EQ(test, -ENOENT,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     first));
+
+	/* Challenges do not survive the gate that issued them. */
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, 0u, nfsd_ffv2_prototype_test_nonce_count(nn));
+	KUNIT_EXPECT_EQ(test, -ENOENT,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     second));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+}
+#endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
+
 /*
  * A namespace admits one FFv2 authority source.  The second claimant is
  * refused whichever order the two arrive in, a holder cannot claim a second
@@ -10006,6 +10453,14 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_size_mismatch_test),
 	KUNIT_CASE(nfsd_ffv2_provider_install_race_test),
 	KUNIT_CASE(nfsd_ffv2_source_reservation_test),
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+	KUNIT_CASE(nfsd_ffv2_prototype_gate_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_owner_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_setup_failure_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_enabling_close_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_enabling_pre_exit_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_challenge_test),
+#endif
 	{}
 };
 
