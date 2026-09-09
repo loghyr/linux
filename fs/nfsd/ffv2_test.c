@@ -11228,6 +11228,96 @@ out:
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
+/*
+ * A superseded enable, and the cycle that follows it.
+ *
+ * The enabling caller that loses the gate has to wait for the close owner
+ * before it returns, and the completion it waits on is reused by the next
+ * cycle.  If it registered that wait after signalling that its setup was
+ * over, the close owner could finish and a new enable could reinitialise
+ * the completion in between, leaving the loser waiting for a teardown that
+ * belongs to somebody else.
+ *
+ * This stops the loser in exactly that gap and asks whether a new enable
+ * can start.  It must not: the wait is registered before the signal, so the
+ * next enable is refused until the loser has consumed it.
+ */
+static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_call_ctx enable = {}, closer = {};
+	struct completion reached, proceed, parked, resume;
+	struct task_struct *enable_task, *close_task;
+	struct nfsd_net *nn;
+	bool closing;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	init_completion(&reached);
+	init_completion(&proceed);
+	init_completion(&parked);
+	init_completion(&resume);
+	init_completion(&enable.done);
+	init_completion(&closer.done);
+	enable.nn = nn;
+	closer.nn = nn;
+	enable.net = &init_net;
+	closer.net = &init_net;
+	nfsd_ffv2_prototype_test_setup_hook(&reached, &proceed);
+
+	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
+				  "ffv2-proto-enable");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&reached, 15 * HZ) != 0);
+
+	close_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &closer,
+				 "ffv2-proto-close");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(close_task));
+	closing = nfsd_ffv2_prototype_wait_state(nn,
+						 NFSD_FFV2_PROTOTYPE_CLOSING);
+	KUNIT_EXPECT_TRUE(test, closing);
+
+	/* Stop the loser between registering its wait and consuming it. */
+	nfsd_ffv2_prototype_test_supersede_hook(&parked, &resume);
+	complete(&proceed);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&parked, 30 * HZ) != 0);
+
+	/* The close owner may finish; the loser has not returned yet. */
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&closer.done,
+						      30 * HZ) != 0);
+	KUNIT_EXPECT_EQ(test, 0, closer.result);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, 1u,
+			nfsd_ffv2_prototype_test_close_waiters(nn));
+	/*
+	 * And no new cycle may start while that wait is outstanding, which
+	 * is what stops the loser being carried into one.
+	 */
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_prototype_enable(nn, &init_net));
+
+	complete(&resume);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&enable.done,
+						      30 * HZ) != 0);
+	kthread_stop(enable_task);
+	kthread_stop(close_task);
+	KUNIT_EXPECT_EQ(test, -EBUSY, enable.result);
+	KUNIT_EXPECT_EQ(test, 0u,
+			nfsd_ffv2_prototype_test_close_waiters(nn));
+
+	/* With the wait consumed, the namespace enables again. */
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -11636,6 +11726,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_setup_failure_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_close_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_pre_exit_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_supersede_cycle_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_challenge_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_nonce_reap_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),

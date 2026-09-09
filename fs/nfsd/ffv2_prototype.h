@@ -174,6 +174,8 @@ void nfsd_ffv2_prototype_test_setup_hook(struct completion *reached,
 					 struct completion *proceed);
 void nfsd_ffv2_prototype_test_publish_hook(struct completion *reached,
 					   struct completion *proceed);
+void nfsd_ffv2_prototype_test_supersede_hook(struct completion *reached,
+					     struct completion *proceed);
 void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
 					  struct dentry *dentry,
 					  const u8 *inner, u16 inner_len,

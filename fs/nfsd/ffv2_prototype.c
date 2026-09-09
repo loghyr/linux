@@ -200,6 +200,37 @@ void nfsd_ffv2_prototype_test_publish_hook(struct completion *reached,
 	WRITE_ONCE(nfsd_ffv2_prototype_publish_reached, reached);
 }
 
+/*
+ * The gap between a superseded enable registering its wait and consuming
+ * it.  A test stops there to ask whether a new enable can start a cycle
+ * this caller would then be carried into.
+ */
+static struct completion *nfsd_ffv2_prototype_supersede_reached;
+static struct completion *nfsd_ffv2_prototype_supersede_proceed;
+
+void nfsd_ffv2_prototype_test_supersede_hook(struct completion *reached,
+					     struct completion *proceed)
+{
+	WRITE_ONCE(nfsd_ffv2_prototype_supersede_proceed, proceed);
+	WRITE_ONCE(nfsd_ffv2_prototype_supersede_reached, reached);
+}
+
+static void nfsd_ffv2_prototype_supersede_pause(void)
+{
+	struct completion *reached =
+		READ_ONCE(nfsd_ffv2_prototype_supersede_reached);
+	struct completion *proceed =
+		READ_ONCE(nfsd_ffv2_prototype_supersede_proceed);
+
+	if (!reached)
+		return;
+	WRITE_ONCE(nfsd_ffv2_prototype_supersede_reached, NULL);
+	WRITE_ONCE(nfsd_ffv2_prototype_supersede_proceed, NULL);
+	complete(reached);
+	if (proceed)
+		wait_for_completion(proceed);
+}
+
 static void nfsd_ffv2_prototype_publish_pause(void)
 {
 	struct completion *reached =
@@ -218,6 +249,7 @@ static void nfsd_ffv2_prototype_publish_pause(void)
 #else
 static inline void nfsd_ffv2_prototype_setup_pause(void) { }
 static inline void nfsd_ffv2_prototype_publish_pause(void) { }
+static inline void nfsd_ffv2_prototype_supersede_pause(void) { }
 #endif
 
 void nfsd_ffv2_prototype_net_init(struct nfsd_net *nn)
@@ -482,7 +514,19 @@ static int nfsd_ffv2_prototype_setup_finish(struct nfsd_net *nn,
 	mutex_lock(&nfsd_mutex);
 	spin_lock(&anchor->prototype_gate_lock);
 	if (proto->state != NFSD_FFV2_PROTOTYPE_ENABLING) {
+		/*
+		 * Superseded.  The wait is registered here, before this
+		 * caller signals that its setup is over, and not after: the
+		 * close owner is only waiting for that signal, and once it
+		 * has it there is nothing to stop it finishing, publishing
+		 * OFF and letting the next enable reinitialise the
+		 * completion this caller has not reached yet.  Counted from
+		 * inside this section, the next enable is refused until the
+		 * wait has been consumed, so there is no cycle for it to be
+		 * carried into.
+		 */
 		superseded = true;
+		proto->close_waiters++;
 	} else if (error) {
 		proto->close_claimed = true;
 		proto->state = NFSD_FFV2_PROTOTYPE_CLOSING;
@@ -511,9 +555,7 @@ static int nfsd_ffv2_prototype_setup_finish(struct nfsd_net *nn,
 		 * the close owner still holds the reservation would make an
 		 * immediate retry fail for a reason that has already passed.
 		 */
-		spin_lock(&anchor->prototype_gate_lock);
-		proto->close_waiters++;
-		spin_unlock(&anchor->prototype_gate_lock);
+		nfsd_ffv2_prototype_supersede_pause();
 		nfsd_ffv2_prototype_close_wait(nn);
 		return error ? error : -EBUSY;
 	}
