@@ -54,7 +54,6 @@
 enum nfsd_ffv2_prototype_nonce_state {
 	NFSD_FFV2_NONCE_ISSUED,
 	NFSD_FFV2_NONCE_COMMITTED,
-	NFSD_FFV2_NONCE_RETIRED,
 };
 
 /*
@@ -143,6 +142,9 @@ static_assert(NFSD_FFV2_FH_MAX <= NFS4_FHSIZE,
 	      "the registration bundle carries a mapped handle verbatim");
 
 static void nfsd_ffv2_prototype_teardown_published(struct nfsd_net *nn);
+static int __nfsd_ffv2_prototype_close(struct nfsd_net *nn,
+				       const struct net *net,
+				       const u8 *source_uuid, u64 generation);
 
 static struct nfsd_ffv2_prototype *nfsd_ffv2_prototype_of(struct nfsd_net *nn)
 {
@@ -463,7 +465,8 @@ static void nfsd_ffv2_prototype_close_wait(struct nfsd_net *nn)
  */
 static int nfsd_ffv2_prototype_close_claim(struct nfsd_net *nn,
 					   const struct net *net, u32 secid,
-					   bool owner_check)
+					   bool owner_check,
+					   const u8 *source_uuid, u64 generation)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
@@ -479,6 +482,21 @@ static int nfsd_ffv2_prototype_close_claim(struct nfsd_net *nn,
 	} else if (proto->close_claimed) {
 		proto->close_waiters++;
 		result = 0;
+	} else if (source_uuid &&
+		   proto->state != NFSD_FFV2_PROTOTYPE_READY) {
+		/* Nothing is published, so there is nothing to retire. */
+		result = -EOPNOTSUPP;
+	} else if (source_uuid &&
+		   (proto->generation != generation ||
+		    memcmp(proto->source_uuid, source_uuid,
+			   sizeof(proto->source_uuid)))) {
+		/*
+		 * The name is checked here, at the point the close role is
+		 * decided, and not before it: a request naming a
+		 * registration that has already gone must be refused rather
+		 * than allowed to retire the one that replaced it.
+		 */
+		result = -ESTALE;
 	} else {
 		/*
 		 * ENABLING counts: the enable that published it has not
@@ -1444,10 +1462,6 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 		goto out_put;
 	claimed = true;
 	nfsd_ffv2_prototype_commit_record(&record, req);
-	if (nonce->state == NFSD_FFV2_NONCE_RETIRED) {
-		error = -ESTALE;
-		goto out_put;
-	}
 	if (nonce->state == NFSD_FFV2_NONCE_COMMITTED) {
 		/*
 		 * The same request again is the same registration: hand back
@@ -1608,72 +1622,31 @@ out_put:
  * @source_uuid: the identifier the registration returned
  * @generation: the generation the registration returned
  *
- * Leaves the gate open, so the same administrator may register again.  The
- * nonce that named the registration is retired rather than forgotten: a
- * replay after this must be told that its registration is gone, not that
- * its nonce was never issued.
+ * This closes the gate.  Retiring the one object a gate serves and closing
+ * that gate are the same teardown, and giving them two implementations was
+ * how the second one came to run outside the close owner's fence: it could
+ * remove a provider while a replay was still being answered, and retire a
+ * committed nonce while a registration naming it was still admitted.  So
+ * this claims the close role like any other closer, names the registration
+ * it expects to find while doing so, and then runs the same teardown.
  *
- * Return: 0, -EPERM for another administrator, -EOPNOTSUPP when the gate
- * is off or nothing is registered, or -ESTALE when the pair names no
- * registration this gate made.
+ * Anything admitted before the claim keeps the gate open until it is done,
+ * because the close owner waits for the counted work to drain.  Anything
+ * arriving after it is refused: the gate is CLOSING, and nothing new is
+ * admitted to a closing gate.
+ *
+ * Return: 0 when this caller performed the teardown, -EBUSY when another
+ * closer was already performing it and this one waited it out,
+ * -EOPNOTSUPP when the gate is off or has nothing published, -ESTALE when
+ * the pair names no registration this gate made, or -EPERM for an
+ * administrator that did not enable it.
  */
 int nfsd_ffv2_prototype_unregister(struct nfsd_net *nn, const struct net *net,
 				   const u8 source_uuid[16], u64 generation)
 {
-	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
-	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
-	struct nfsd_ffv2_prototype_nonce *nonce;
-	struct nfsd_ffv2_prototype_ctx *ctx;
-	unsigned long index;
-	u32 secid = 0;
-	int error;
-
-	if (!ns_capable(net->user_ns, CAP_SYS_ADMIN))
-		return -EPERM;
-	security_cred_getsecid(current_cred(), &secid);
-	error = nfsd_ffv2_prototype_user_get(nn, net, secid);
-	if (error)
-		return error;
-
-	/*
-	 * Stop admitting mappings before anything is removed, and check the
-	 * identity against what was published under the same lock, so a
-	 * request naming a registration that has already gone is refused
-	 * rather than allowed to remove the next one.
-	 */
-	spin_lock(&anchor->prototype_gate_lock);
-	if (proto->state != NFSD_FFV2_PROTOTYPE_READY) {
-		error = -EOPNOTSUPP;
-	} else if (proto->generation != generation ||
-		   memcmp(proto->source_uuid, source_uuid,
-			  sizeof(proto->source_uuid))) {
-		error = -ESTALE;
-	} else {
-		proto->state = NFSD_FFV2_PROTOTYPE_OPEN;
-		error = 0;
-	}
-	spin_unlock(&anchor->prototype_gate_lock);
-	if (error)
-		goto out_put;
-
-	nfsd_ffv2_prototype_teardown_published(nn);
-
-	ctx = nfsd_ffv2_prototype_ctx_of(nn);
-	if (ctx) {
-		spin_lock(&anchor->prototype_gate_lock);
-		xa_for_each(&ctx->nonces, index, nonce) {
-			if (nonce->state != NFSD_FFV2_NONCE_COMMITTED ||
-			    nonce->bundle.generation != generation)
-				continue;
-			nonce->state = NFSD_FFV2_NONCE_RETIRED;
-			memzero_explicit(&nonce->bundle,
-					 sizeof(nonce->bundle));
-		}
-		spin_unlock(&anchor->prototype_gate_lock);
-	}
-out_put:
-	nfsd_ffv2_prototype_user_put(nn);
-	return error;
+	if (!generation)
+		return -EINVAL;
+	return __nfsd_ffv2_prototype_close(nn, net, source_uuid, generation);
 }
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
@@ -1819,6 +1792,35 @@ out_unlock:
 	return error;
 }
 
+/*
+ * The one way an administrator closes a gate.  DISABLE names nothing and
+ * closes whatever is there; UNREGISTER names the registration it expects
+ * to find and closes only that.  Everything after the claim is the same,
+ * because a gate with nothing published and a gate whose one registration
+ * is being retired are the same teardown.
+ */
+static int __nfsd_ffv2_prototype_close(struct nfsd_net *nn,
+				       const struct net *net,
+				       const u8 *source_uuid, u64 generation)
+{
+	u32 secid = 0;
+	int claim;
+
+	if (!ns_capable(net->user_ns, CAP_SYS_ADMIN))
+		return -EPERM;
+	security_cred_getsecid(current_cred(), &secid);
+	claim = nfsd_ffv2_prototype_close_claim(nn, net, secid, true,
+						source_uuid, generation);
+	if (claim < 0)
+		return claim;
+	if (!claim) {
+		nfsd_ffv2_prototype_close_wait(nn);
+		return -EBUSY;
+	}
+	nfsd_ffv2_prototype_close_finish(nn);
+	return 0;
+}
+
 /**
  * nfsd_ffv2_prototype_disable - close the prototype gate
  * @nn: the nfsd namespace
@@ -1831,21 +1833,7 @@ out_unlock:
  */
 int nfsd_ffv2_prototype_disable(struct nfsd_net *nn, const struct net *net)
 {
-	u32 secid = 0;
-	int claim;
-
-	if (!ns_capable(net->user_ns, CAP_SYS_ADMIN))
-		return -EPERM;
-	security_cred_getsecid(current_cred(), &secid);
-	claim = nfsd_ffv2_prototype_close_claim(nn, net, secid, true);
-	if (claim < 0)
-		return claim;
-	if (!claim) {
-		nfsd_ffv2_prototype_close_wait(nn);
-		return -EBUSY;
-	}
-	nfsd_ffv2_prototype_close_finish(nn);
-	return 0;
+	return __nfsd_ffv2_prototype_close(nn, net, NULL, 0);
 }
 
 /**
@@ -1859,7 +1847,8 @@ int nfsd_ffv2_prototype_disable(struct nfsd_net *nn, const struct net *net)
  */
 void nfsd_ffv2_prototype_net_pre_exit(struct nfsd_net *nn)
 {
-	int claim = nfsd_ffv2_prototype_close_claim(nn, NULL, 0, false);
+	int claim = nfsd_ffv2_prototype_close_claim(nn, NULL, 0, false, NULL,
+						    0);
 
 	if (claim < 0)
 		return;

@@ -10790,22 +10790,26 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 			nfsd_ffv2_prototype_unregister(f->nn, f->net,
 						       bundle->source_uuid,
 						       bundle->generation + 1));
+	/*
+	 * Retiring the object closes the gate: it is the same teardown, and
+	 * one implementation of it is what keeps a replay from racing it.
+	 */
 	KUNIT_EXPECT_EQ(test, 0,
 			nfsd_ffv2_prototype_unregister(f->nn, f->net,
 						       bundle->source_uuid,
 						       bundle->generation));
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OPEN,
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(f->nn));
-	/* The gate is still this administrator's, and still open. */
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_PROTOTYPE,
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE,
 			nfsd_ffv2_source_get(f->nn));
+	f->enabled = false;
 	/* Nothing is published, so nothing maps. */
 	again = nfsd_ffv2_test_binding_create(f->nn, &info);
 	KUNIT_EXPECT_TRUE(test, IS_ERR(again));
 	if (!IS_ERR(again))
 		nfsd_ffv2_binding_put(again);
-	/* And the nonce that named the registration is retired, not unknown. */
-	KUNIT_EXPECT_EQ(test, -ESTALE,
+	/* And the nonce that named it went with the gate that issued it. */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
 			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
 						     replay));
 	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
@@ -10849,6 +10853,7 @@ static void nfsd_ffv2_prototype_publish_window_test(struct kunit *test)
 {
 	struct nfsd_ffv2_proto_register_ctx *ctx;
 	struct nfsd_ffv2_generation *generation;
+	static const u8 unpublished[16] = { 0 };
 	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
 	struct nfsd_ffv2_proto_fixture *f;
 	struct completion reached, proceed;
@@ -10899,6 +10904,15 @@ static void nfsd_ffv2_prototype_publish_window_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, -ESTALE,
 			nfsd_ffv2_prototype_op_admit(f->nn, &counted));
 	KUNIT_EXPECT_FALSE(test, counted);
+	/*
+	 * An unregister cannot claim the gate here either.  It names the
+	 * registration it expects to find, and this one has not published
+	 * yet, so there is nothing for it to retire and nothing for it to
+	 * take the close role over.
+	 */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_prototype_unregister(f->nn, f->net,
+						       unpublished, 1));
 
 join:
 	complete(&proceed);
@@ -11318,6 +11332,147 @@ static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
 }
 
+/*
+ * What an unregister waits for, and what it refuses.
+ *
+ * Retiring the published object is the gate's own teardown, so it has to
+ * behave like one: work admitted before the close role was claimed keeps
+ * the gate open until it finishes, and work arriving after it is refused
+ * rather than allowed to run against objects that are being removed.  A
+ * held mapping is the clearest "admitted before" there is, so this holds
+ * one across the whole claim.
+ */
+struct nfsd_ffv2_proto_unregister_ctx {
+	struct nfsd_ffv2_proto_fixture	*f;
+	u8				source_uuid[16];
+	u64				generation;
+	int				result;
+	struct completion		done;
+};
+
+static int nfsd_ffv2_proto_unregister_thread(void *data)
+{
+	struct nfsd_ffv2_proto_unregister_ctx *ctx = data;
+
+	ctx->result = nfsd_ffv2_prototype_unregister(ctx->f->nn, ctx->f->net,
+						     ctx->source_uuid,
+						     ctx->generation);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_prototype_unregister_drain_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_unregister_ctx *ctx;
+	struct nfsd_ffv2_prototype_bundle *bundle, *replay;
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct nfsd_ffv2_fh_info info;
+	struct task_struct *task;
+	struct knfsd_fh outer = {};
+	struct svc_export exp;
+	u64 expires = 0;
+	bool closing;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	replay = kunit_kzalloc(test, sizeof(*replay), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	KUNIT_ASSERT_NOT_NULL(test, replay);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	nfsd_ffv2_proto_request(&req, nonce);
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     bundle));
+
+	/* One mapping, admitted before anything closes. */
+	memcpy(outer.fh_raw, bundle->handle, bundle->handle_len);
+	outer.fh_size = bundle->handle_len;
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_fh_parse(&outer, &info));
+	f->binding = nfsd_ffv2_test_binding_create(f->nn, &info);
+	if (IS_ERR(f->binding)) {
+		KUNIT_FAIL(test, "binding admission failed: %ld",
+			   PTR_ERR(f->binding));
+		f->binding = NULL;
+		goto out;
+	}
+	nfsd_ffv2_init_test_export(&exp, f->nn, f->domain, &f->root);
+	f->published = nfsd_ffv2_test_export_lookup(&exp);
+	if (!f->published) {
+		KUNIT_FAIL(test, "service export not found");
+		goto out;
+	}
+	fh_init(f->mapped, NFS4_FHSIZE);
+	f->mapped->fh_handle = outer;
+	f->mapped->fh_export = nfsd_export_get(f->published);
+	f->mapped->fh_dentry = dget(f->object_dentry);
+	f->mapped->fh_ffv2_binding = f->binding;
+	f->binding = NULL;
+
+	ctx->f = f;
+	ctx->generation = bundle->generation;
+	memcpy(ctx->source_uuid, bundle->source_uuid,
+	       sizeof(ctx->source_uuid));
+	init_completion(&ctx->done);
+	task = kthread_run(nfsd_ffv2_proto_unregister_thread, ctx,
+			   "ffv2-proto-unreg");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "failed to start the unregistering thread");
+		goto out;
+	}
+	closing = nfsd_ffv2_prototype_wait_state(f->nn,
+						 NFSD_FFV2_PROTOTYPE_CLOSING);
+	KUNIT_EXPECT_TRUE(test, closing);
+	/* It is waiting for the mapping, not finished. */
+	KUNIT_EXPECT_EQ(test, 0,
+			wait_for_completion_timeout(&ctx->done, HZ / 5));
+
+	/* Arriving after the claim: refused, not run against a teardown. */
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     replay));
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+
+	/* Release the mapping, and the teardown proceeds. */
+	fh_put(f->mapped);
+	exp_put(f->published);
+	f->published = NULL;
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&ctx->done, 60 * HZ) != 0);
+	kthread_stop(task);
+	KUNIT_EXPECT_EQ(test, 0, ctx->result);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE,
+			nfsd_ffv2_source_get(f->nn));
+	f->enabled = false;
+	generation = nfsd_ffv2_test_active_generation_get(f->nn);
+	KUNIT_EXPECT_NULL(test, generation);
+	if (generation)
+		nfsd_ffv2_test_generation_put(generation);
+	/* And the committed nonce is gone with the gate that issued it. */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     replay));
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -11733,6 +11888,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_close_race_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_short_read_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_unregister_drain_test),
 #endif
 	{}
 };
