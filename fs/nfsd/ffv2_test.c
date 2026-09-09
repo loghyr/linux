@@ -11031,6 +11031,134 @@ out:
 	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
 }
 
+/*
+ * A registration that reaches its final publication after a close owner
+ * has claimed the gate.
+ *
+ * Everything between admitting a registration and publishing it is
+ * sleepable -- an export lookup, a publication, a whole object read -- so
+ * a DISABLE can arrive in the middle of it.  This holds a registration at
+ * exactly its last step, closes the gate underneath it, and then asks what
+ * each side did: the registration must publish nothing and the close owner
+ * must have nothing of it left to remove.
+ *
+ * What proves the namespace really was returned is the registration that
+ * follows.  A provider left installed would refuse the next install, and a
+ * generation left published would refuse the next publication, so a second
+ * cycle succeeding is a stronger statement than any counter.
+ */
+static void nfsd_ffv2_prototype_publish_close_race_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_register_ctx *ctx;
+	struct nfsd_ffv2_prototype_call_ctx *closer;
+	struct nfsd_ffv2_generation *generation;
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct task_struct *task, *close_task;
+	struct nfsd_ffv2_ro_provider *spare;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct completion reached, proceed;
+	u64 expires = 0;
+	bool closing;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	closer = kunit_kzalloc(test, sizeof(*closer), GFP_KERNEL);
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, closer);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ctx->bundle = kunit_kzalloc(test, sizeof(*ctx->bundle), GFP_KERNEL);
+	spare = kunit_kzalloc(test, sizeof(*spare), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->bundle);
+	KUNIT_ASSERT_NOT_NULL(test, spare);
+	nfsd_ffv2_ro_provider_init(spare);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	/* A bundle the registration must not fill in. */
+	memset(ctx->bundle, 0xa5, sizeof(*ctx->bundle));
+	nfsd_ffv2_proto_request(&ctx->req, nonce);
+	ctx->f = f;
+	init_completion(&ctx->done);
+	init_completion(&closer->done);
+	init_completion(&reached);
+	init_completion(&proceed);
+	closer->nn = f->nn;
+	closer->net = f->net;
+	nfsd_ffv2_prototype_test_publish_hook(&reached, &proceed);
+
+	task = kthread_run(nfsd_ffv2_proto_register_thread, ctx,
+			   "ffv2-proto-reg");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "failed to start the registering thread");
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the registration never reached publication");
+		goto join;
+	}
+	close_task = kthread_run(nfsd_ffv2_prototype_disable_thread, closer,
+				 "ffv2-proto-close");
+	if (IS_ERR(close_task)) {
+		KUNIT_FAIL(test, "failed to start the closing thread");
+		goto join;
+	}
+	/* The close role is claimed while the registration is still inside. */
+	closing = nfsd_ffv2_prototype_wait_state(f->nn,
+						 NFSD_FFV2_PROTOTYPE_CLOSING);
+	KUNIT_EXPECT_TRUE(test, closing);
+
+	complete(&proceed);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&ctx->done, 60 * HZ) != 0);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&closer->done,
+						      60 * HZ) != 0);
+	kthread_stop(task);
+	kthread_stop(close_task);
+
+	/* The registration published nothing and said so. */
+	KUNIT_EXPECT_EQ(test, -EBUSY, ctx->result);
+	KUNIT_EXPECT_EQ(test, 0, closer->result);
+	KUNIT_EXPECT_EQ(test, 0xa5, ctx->bundle->handle[0]);
+	KUNIT_EXPECT_EQ(test, 0xa5a5a5a5u, ctx->bundle->handle_len);
+	/* The close owner finished, and took the generation with it. */
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE,
+			nfsd_ffv2_source_get(f->nn));
+	f->enabled = false;
+	generation = nfsd_ffv2_test_active_generation_get(f->nn);
+	KUNIT_EXPECT_NULL(test, generation);
+	if (generation)
+		nfsd_ffv2_test_generation_put(generation);
+
+	/*
+	 * And the provider slot is free.  A namespace admits one provider,
+	 * so installing one here succeeds only if the abandoned registration
+	 * really did take its own out; a provider left behind would refuse
+	 * this with -EBUSY.
+	 */
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_test_provider_install(f->nn,
+							&nfsd_ffv2_ro_provider_ops,
+							spare,
+							NFSD_FFV2_RO_CHUNK_SIZE));
+	nfsd_ffv2_test_provider_remove(f->nn);
+	goto out;
+
+join:
+	complete(&proceed);
+	wait_for_completion(&ctx->done);
+	kthread_stop(task);
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -11443,6 +11571,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_nonce_reap_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_publish_close_race_test),
 #endif
 	{}
 };

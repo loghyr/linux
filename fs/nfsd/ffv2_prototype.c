@@ -1324,6 +1324,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
 	struct nfsd_ffv2_prototype_committed record;
 	struct nfsd_ffv2_export_update registration;
+	struct nfsd_ffv2_prototype_bundle *staged;
 	struct nfsd_ffv2_prototype_nonce *nonce;
 	struct nfsd_ffv2_prototype_ctx *ctx;
 	bool slot_open = false, installed = false, claimed = false;
@@ -1445,14 +1446,22 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	if (error)
 		goto out_published;
 
-	memset(bundle, 0, sizeof(*bundle));
-	memcpy(bundle->source_uuid, object_uuid, sizeof(bundle->source_uuid));
-	get_random_bytes(bundle->service_uuid, sizeof(bundle->service_uuid));
-	get_random_bytes(bundle->replay_uuid, sizeof(bundle->replay_uuid));
-	bundle->generation = generation_id;
-	memcpy(bundle->stateid, &stateid, sizeof(bundle->stateid));
-	memcpy(bundle->handle, outer_fh.fh_raw, outer_fh.fh_size);
-	bundle->handle_len = outer_fh.fh_size;
+	/*
+	 * Staged in the record it belongs to rather than in the caller's
+	 * bundle: a registration that is refused below must hand nothing
+	 * back, and a caller cannot be given a bundle and an error for the
+	 * same request.  The record is claimed, so nothing else reads or
+	 * frees it while this is written.
+	 */
+	staged = &nonce->bundle;
+	memset(staged, 0, sizeof(*staged));
+	memcpy(staged->source_uuid, object_uuid, sizeof(staged->source_uuid));
+	get_random_bytes(staged->service_uuid, sizeof(staged->service_uuid));
+	get_random_bytes(staged->replay_uuid, sizeof(staged->replay_uuid));
+	staged->generation = generation_id;
+	memcpy(staged->stateid, &stateid, sizeof(staged->stateid));
+	memcpy(staged->handle, outer_fh.fh_raw, outer_fh.fh_size);
+	staged->handle_len = outer_fh.fh_size;
 
 	/*
 	 * The single linearization point.  Until this store a mapping is
@@ -1462,16 +1471,32 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 */
 	nfsd_ffv2_prototype_publish_pause();
 	spin_lock(&anchor->prototype_gate_lock);
+	/*
+	 * The state is checked again here, and not only when this
+	 * registration was admitted.  Everything between the two is
+	 * sleepable -- an export lookup, a publication, a whole object read
+	 * -- and a close owner may have claimed the gate during it.  If one
+	 * has, nothing is published: committing the nonce or storing READY
+	 * now would hand out a registration the owner has already decided to
+	 * tear down, and transferring ownership of the provider or the
+	 * generation would give it a second remover of each.
+	 */
+	if (proto->state != NFSD_FFV2_PROTOTYPE_OPEN || proto->close_claimed) {
+		memzero_explicit(staged, sizeof(*staged));
+		spin_unlock(&anchor->prototype_gate_lock);
+		error = -EBUSY;
+		goto out_published;
+	}
 	proto->provider = provider;
 	proto->owns_provider = true;
 	proto->generation = generation_id;
 	proto->owns_generation = true;
-	memcpy(proto->source_uuid, bundle->source_uuid,
+	memcpy(proto->source_uuid, staged->source_uuid,
 	       sizeof(proto->source_uuid));
 	nonce->committed = record;
-	nonce->bundle = *bundle;
 	nonce->state = NFSD_FFV2_NONCE_COMMITTED;
 	proto->state = NFSD_FFV2_PROTOTYPE_READY;
+	*bundle = *staged;
 	spin_unlock(&anchor->prototype_gate_lock);
 
 	nfsd_ffv2_registration_end(nn, &registration);
@@ -1484,6 +1509,10 @@ out_published:
 	/*
 	 * Nothing published here was ever reachable: the gate never reached
 	 * READY, so no mapping and no operation can be inside any of it.
+	 * The counted registration reference is still held, so a close owner
+	 * waiting for the gate to fall quiet is waiting for this unwind, and
+	 * none of the ownership bits were set, so it will find nothing of
+	 * this registration left to remove.
 	 */
 	if (installed)
 		nfsd_ffv2_provider_remove(nn);
