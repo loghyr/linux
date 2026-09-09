@@ -10674,9 +10674,17 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 	 * even though the gate has moved on to READY: a lost reply is
 	 * exactly the case a replay exists for.
 	 */
+	memset(replay, 0, sizeof(*replay));
 	KUNIT_EXPECT_EQ(test, 0,
 			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
 						     replay));
+	/* Complete, not merely equal: a zeroed reply would compare equal to
+	 * a zeroed original.
+	 */
+	KUNIT_EXPECT_EQ(test, bundle->generation, replay->generation);
+	KUNIT_EXPECT_NE(test, 0ULL, replay->generation);
+	KUNIT_EXPECT_EQ(test, bundle->handle_len, replay->handle_len);
+	KUNIT_EXPECT_GT(test, replay->handle_len, 0u);
 	KUNIT_EXPECT_EQ(test, 0, memcmp(bundle, replay, sizeof(*bundle)));
 	/* A different request wearing the same nonce is not. */
 	req.chunk_size = NFSD_FFV2_PROTO_CHUNK_SIZE * 2;

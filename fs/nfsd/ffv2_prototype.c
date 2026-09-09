@@ -1416,6 +1416,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	struct nfsd_ffv2_prototype_nonce *nonce;
 	struct nfsd_ffv2_prototype_ctx *ctx;
 	bool slot_open = false, installed = false, claimed = false;
+	bool spent = false;
 	struct knfsd_fh outer_fh = {};
 	const struct cred *cred;
 	u64 generation_id = 0;
@@ -1424,7 +1425,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	stateid_t stateid;
 	struct path path;
 	u32 secid = 0;
-	int error;
+	int error = 0;
 
 	if (!ns_capable(net->user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
@@ -1461,30 +1462,40 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	if (error)
 		goto out_put;
 	claimed = true;
+	/*
+	 * Assigned once, before anything branches on the record's state, so
+	 * every path that reads the staged bundle reads the record's own
+	 * storage and none can read an unset pointer.
+	 */
+	staged = &nonce->bundle;
 	nfsd_ffv2_prototype_commit_record(&record, req);
+
+	/*
+	 * One decision, under the lock that publishes the state it reads:
+	 * whether this nonce has already been spent, and if it has not,
+	 * whether the gate is free to serve a new registration.  The bundle
+	 * of a spent nonce is copied here rather than afterwards, because
+	 * the record's state and its bundle are one fact and reading them
+	 * apart is reading them at two different times.
+	 */
+	spin_lock(&anchor->prototype_gate_lock);
 	if (nonce->state == NFSD_FFV2_NONCE_COMMITTED) {
 		/*
 		 * The same request again is the same registration: hand back
 		 * what it produced.  Anything else wearing this nonce is a
 		 * different registration and is refused rather than merged.
 		 */
-		if (memcmp(&nonce->committed, &record, sizeof(record))) {
+		spent = true;
+		if (memcmp(&nonce->committed, &record, sizeof(record)))
 			error = -EEXIST;
-			goto out_put;
-		}
-		*bundle = nonce->bundle;
-		error = 0;
-		goto out_put;
-	}
-	/*
-	 * A nonce that has not been spent asks for a new registration, and a
-	 * gate serves one at a time.
-	 */
-	spin_lock(&anchor->prototype_gate_lock);
-	if (proto->state != NFSD_FFV2_PROTOTYPE_OPEN)
+		else
+			*bundle = *staged;
+	} else if (proto->state != NFSD_FFV2_PROTOTYPE_OPEN) {
+		/* A gate serves one registration at a time. */
 		error = -EBUSY;
+	}
 	spin_unlock(&anchor->prototype_gate_lock);
-	if (error)
+	if (spent || error)
 		goto out_put;
 	cred = ctx->cred;
 
@@ -1534,10 +1545,10 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 * Staged in the record it belongs to rather than in the caller's
 	 * bundle: a registration that is refused below must hand nothing
 	 * back, and a caller cannot be given a bundle and an error for the
-	 * same request.  The record is claimed, so nothing else reads or
-	 * frees it while this is written.
+	 * same request.  The record is claimed, so no other registration is
+	 * writing it and no replay can read it: a replay of a claimed
+	 * record is refused by the lookup.
 	 */
-	staged = &nonce->bundle;
 	memset(staged, 0, sizeof(*staged));
 	memcpy(staged->source_uuid, object_uuid, sizeof(staged->source_uuid));
 	get_random_bytes(staged->service_uuid, sizeof(staged->service_uuid));
