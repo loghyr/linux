@@ -177,7 +177,8 @@ void nfsd_ffv2_prototype_test_publish_hook(struct completion *reached,
 void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
 					  struct dentry *dentry,
 					  const u8 *inner, u16 inner_len,
-					  const void *bytes, size_t len);
+					  const void *bytes, size_t len,
+					  size_t sampled);
 int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 					 const struct net *net,
 					 const u8 *nonce);

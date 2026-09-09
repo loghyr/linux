@@ -10430,6 +10430,9 @@ struct nfsd_ffv2_proto_fixture {
 	struct path			root;
 	struct dentry			*object_dentry;
 	u8				uuid[16];
+	/* The ordinary handle the substituted resolution hands back. */
+	u8				inner[8];
+	u16				inner_len;
 	u8				bytes[NFSD_FFV2_PROTO_CHUNKS *
 					      NFSD_FFV2_PROTO_CHUNK_SIZE];
 	bool				enabled;
@@ -10440,7 +10443,7 @@ struct nfsd_ffv2_proto_fixture {
 
 static void nfsd_ffv2_proto_fixture_exit(struct nfsd_ffv2_proto_fixture *f)
 {
-	nfsd_ffv2_prototype_test_object_hook(NULL, NULL, NULL, 0, NULL, 0);
+	nfsd_ffv2_prototype_test_object_hook(NULL, NULL, NULL, 0, NULL, 0, 0);
 	if (f->mapped && f->mapped->fh_dentry) {
 		fh_put(f->mapped);
 		f->binding = NULL;
@@ -10590,9 +10593,11 @@ static bool nfsd_ffv2_proto_fixture_init(struct kunit *test,
 	 * The resolution a registration would perform, and the object's
 	 * bytes: see the hook's own comment for why neither can happen here.
 	 */
+	memcpy(f->inner, inner, sizeof(inner));
+	f->inner_len = sizeof(inner);
 	nfsd_ffv2_prototype_test_object_hook(f->seeded, f->object_dentry,
-					     inner, sizeof(inner), f->bytes,
-					     sizeof(f->bytes));
+					     f->inner, f->inner_len, f->bytes,
+					     sizeof(f->bytes), 0);
 	return true;
 }
 
@@ -11159,6 +11164,70 @@ out:
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
+/*
+ * An object that measures larger than it can supply.
+ *
+ * The snapshot is read in one call after the size is sampled, and a file
+ * that shrinks between the two returns fewer bytes than the layout
+ * describes.  The zeroed remainder of the buffer is not data the object
+ * ever held, and reporting it as though it were would hand a client
+ * fabricated bytes under a checksum this server computed over them.  The
+ * registration has to fail instead.
+ */
+static void nfsd_ffv2_prototype_short_read_test(struct kunit *test)
+{
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_prototype_bundle *bundle;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_ro_provider *spare;
+	struct nfsd_ffv2_proto_fixture *f;
+	u64 expires = 0;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	spare = kunit_kzalloc(test, sizeof(*spare), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	KUNIT_ASSERT_NOT_NULL(test, spare);
+	nfsd_ffv2_ro_provider_init(spare);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	/* Measured whole, able to supply one chunk less. */
+	nfsd_ffv2_prototype_test_object_hook(f->seeded, f->object_dentry,
+					     f->inner, f->inner_len, f->bytes,
+					     sizeof(f->bytes) -
+						NFSD_FFV2_PROTO_CHUNK_SIZE,
+					     sizeof(f->bytes));
+	nfsd_ffv2_proto_request(&req, nonce);
+	memset(bundle, 0x5a, sizeof(*bundle));
+	KUNIT_EXPECT_EQ(test, -EIO,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     bundle));
+	/* No bundle, no generation, no provider, and the gate still open. */
+	KUNIT_EXPECT_EQ(test, 0x5a, bundle->handle[0]);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OPEN,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	generation = nfsd_ffv2_test_active_generation_get(f->nn);
+	KUNIT_EXPECT_NULL(test, generation);
+	if (generation)
+		nfsd_ffv2_test_generation_put(generation);
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_test_provider_install(f->nn,
+							&nfsd_ffv2_ro_provider_ops,
+							spare,
+							NFSD_FFV2_RO_CHUNK_SIZE));
+	nfsd_ffv2_test_provider_remove(f->nn);
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -11572,6 +11641,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_close_race_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_short_read_test),
 #endif
 	{}
 };

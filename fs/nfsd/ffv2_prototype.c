@@ -889,11 +889,20 @@ static u8 nfsd_ffv2_prototype_test_inner[NFSD_FFV2_FH_INNER_MAX];
 static u16 nfsd_ffv2_prototype_test_inner_len;
 static const void *nfsd_ffv2_prototype_test_bytes;
 static size_t nfsd_ffv2_prototype_test_len;
+static size_t nfsd_ffv2_prototype_test_sampled;
 
+/*
+ * @len is what the substituted object can supply and @sampled is what its
+ * size looks like when it is measured; passing a @sampled larger than @len
+ * is how a test reproduces a file that shrank between the two, which is
+ * the one case a real read can hit and this environment otherwise cannot.
+ * Zero means the two agree.
+ */
 void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
 					  struct dentry *dentry,
 					  const u8 *inner, u16 inner_len,
-					  const void *bytes, size_t len)
+					  const void *bytes, size_t len,
+					  size_t sampled)
 {
 	if (inner_len > sizeof(nfsd_ffv2_prototype_test_inner))
 		return;
@@ -902,6 +911,7 @@ void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
 	nfsd_ffv2_prototype_test_inner_len = inner_len;
 	nfsd_ffv2_prototype_test_bytes = bytes;
 	nfsd_ffv2_prototype_test_len = len;
+	nfsd_ffv2_prototype_test_sampled = sampled ?: len;
 	nfsd_ffv2_prototype_test_dentry = dentry;
 	/* Last: the others are read only once this one is set. */
 	WRITE_ONCE(nfsd_ffv2_prototype_test_exp, exp);
@@ -1063,15 +1073,17 @@ nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
 	loff_t pos = 0;
 	size_t total;
 	u32 chunks;
+	u64 want;
 	u64 size;
 	int error;
+	int got;
 	u32 i;
 
 	file = NULL;
 	size = 0;
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 	if (nfsd_ffv2_prototype_test_bytes)
-		size = nfsd_ffv2_prototype_test_len;
+		size = nfsd_ffv2_prototype_test_sampled;
 #endif
 	if (!size) {
 		file = dentry_open(path, O_RDONLY | O_LARGEFILE, cred);
@@ -1118,20 +1130,36 @@ nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
 		goto out_free;
 	}
 
-	if (file) {
-		error = kernel_read(file, provider->bytes, total, &pos);
-		if (error < 0)
-			goto out_free;
-	}
-#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
-	else
-		memcpy(provider->bytes, nfsd_ffv2_prototype_test_bytes,
-		       min_t(size_t, total, nfsd_ffv2_prototype_test_len));
-#endif
 	/*
-	 * A short read is the tail of the file, which the zeroed buffer has
-	 * already accounted for: the last chunk is reported at its real
-	 * length and the bytes past it are never described.
+	 * Every byte the layout describes has to be read.  The request is
+	 * for whole chunks and the file may end inside the last one, so what
+	 * is owed is the smaller of the two; anything less than that means
+	 * the file shrank after it was measured, and the zeroed remainder of
+	 * the buffer is not data the object ever held.  Reporting it as
+	 * though it were would hand a client fabricated bytes under a
+	 * checksum this server computed over them.
+	 */
+	want = min_t(u64, total, size);
+	if (file) {
+		got = kernel_read(file, provider->bytes, total, &pos);
+	} else {
+		got = -EIO;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		got = min_t(size_t, total, nfsd_ffv2_prototype_test_len);
+		memcpy(provider->bytes, nfsd_ffv2_prototype_test_bytes, got);
+#endif
+	}
+	if (got < 0) {
+		error = got;
+		goto out_free;
+	}
+	if ((u64)got != want) {
+		error = -EIO;
+		goto out_free;
+	}
+	/*
+	 * The last chunk may be shorter than the rest, which the loop below
+	 * reports at its real length; the bytes past it are never described.
 	 */
 	for (i = 0; i < chunks; i++) {
 		u8 *bytes = provider->bytes + (size_t)i * chunk_size;
