@@ -11585,6 +11585,119 @@ out:
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
+/*
+ * The interval between a gate reading off and the completion that says so.
+ *
+ * The completion is shared with whatever cycle comes next, so an enable
+ * starting in that interval would reinitialise it, and the old owner's
+ * signal would then land on the new cycle -- letting one of that cycle's
+ * closers return before its own teardown had happened.
+ *
+ * Two cycles, because the two halves have to be asked separately.  The
+ * first has no other closer, so the only thing that can refuse a new enable
+ * is the close role the old owner still holds.  The second has a closer
+ * parked on the completion, so the only thing that can keep it parked is
+ * the signal not having happened.
+ */
+static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_call_ctx owner = {}, waiter = {};
+	struct completion entered, proceed, published, resume;
+	struct task_struct *owner_task, *waiter_task;
+	struct nfsd_net *nn;
+	bool closing;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	owner.nn = nn;
+	waiter.nn = nn;
+	owner.net = &init_net;
+	waiter.net = &init_net;
+
+	/* One: nothing else is closing, so nothing else can refuse. */
+	init_completion(&published);
+	init_completion(&resume);
+	init_completion(&owner.done);
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	nfsd_ffv2_prototype_test_close_hooks(NULL, NULL, &published, &resume);
+	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
+				 "ffv2-proto-owner");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&published, 30 * HZ) != 0);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, 0u,
+			nfsd_ffv2_prototype_test_close_waiters(nn));
+	/*
+	 * The gate reads off and nobody is waiting, so an enable is refused
+	 * only because the owner has not signalled yet.  This is the whole
+	 * fix: without the role held here, this enable would start a cycle
+	 * and reinitialise the completion the owner is about to signal.
+	 */
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_prototype_enable(nn, &init_net));
+	complete(&resume);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
+	kthread_stop(owner_task);
+	KUNIT_EXPECT_EQ(test, 0, owner.result);
+
+	/* Two: a closer parked on the completion, and the signal withheld. */
+	init_completion(&entered);
+	init_completion(&proceed);
+	init_completion(&published);
+	init_completion(&resume);
+	init_completion(&owner.done);
+	init_completion(&waiter.done);
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	nfsd_ffv2_prototype_test_close_hooks(&entered, &proceed, &published,
+					     &resume);
+	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
+				 "ffv2-proto-owner2");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&entered, 15 * HZ) != 0);
+	closing = nfsd_ffv2_prototype_wait_state(nn,
+						 NFSD_FFV2_PROTOTYPE_CLOSING);
+	KUNIT_EXPECT_TRUE(test, closing);
+	waiter_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &waiter,
+				  "ffv2-proto-waiter");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(waiter_task));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_wait_waiters(nn, 1));
+	KUNIT_EXPECT_EQ(test, 0,
+			wait_for_completion_timeout(&waiter.done, HZ / 5));
+
+	complete(&proceed);
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&published, 30 * HZ) != 0);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	/* The gate reads off, and the waiter is still not satisfied. */
+	KUNIT_EXPECT_EQ(test, 0,
+			wait_for_completion_timeout(&waiter.done, HZ / 5));
+
+	complete(&resume);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&waiter.done,
+						      30 * HZ) != 0);
+	kthread_stop(owner_task);
+	kthread_stop(waiter_task);
+	KUNIT_EXPECT_EQ(test, 0, owner.result);
+	KUNIT_EXPECT_EQ(test, -EBUSY, waiter.result);
+
+	/* The next cycle runs on its own completion, and closes normally. */
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -11994,6 +12107,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_close_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_pre_exit_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_supersede_cycle_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_close_signal_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_challenge_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_nonce_reap_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),

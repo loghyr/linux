@@ -217,6 +217,63 @@ void nfsd_ffv2_prototype_test_supersede_hook(struct completion *reached,
 	WRITE_ONCE(nfsd_ffv2_prototype_supersede_reached, reached);
 }
 
+/*
+ * Two points inside a close, for a test that has to be somewhere specific
+ * while another caller acts.  The first is before the owner drains
+ * anything, which is where a second closer can still arrive and become a
+ * waiter; the second is after the gate reads off and before the completion
+ * that says so is signalled, which is the interval a new cycle must not be
+ * able to start in.
+ */
+static struct completion *nfsd_ffv2_prototype_entered_reached;
+static struct completion *nfsd_ffv2_prototype_entered_proceed;
+static struct completion *nfsd_ffv2_prototype_published_reached;
+static struct completion *nfsd_ffv2_prototype_published_proceed;
+
+void nfsd_ffv2_prototype_test_close_hooks(struct completion *entered_reached,
+					  struct completion *entered_proceed,
+					  struct completion *published_reached,
+					  struct completion *published_proceed)
+{
+	WRITE_ONCE(nfsd_ffv2_prototype_entered_proceed, entered_proceed);
+	WRITE_ONCE(nfsd_ffv2_prototype_published_proceed, published_proceed);
+	WRITE_ONCE(nfsd_ffv2_prototype_published_reached, published_reached);
+	/* Last: the close reaches this one first. */
+	WRITE_ONCE(nfsd_ffv2_prototype_entered_reached, entered_reached);
+}
+
+static void nfsd_ffv2_prototype_entered_pause(void)
+{
+	struct completion *reached =
+		READ_ONCE(nfsd_ffv2_prototype_entered_reached);
+	struct completion *proceed =
+		READ_ONCE(nfsd_ffv2_prototype_entered_proceed);
+
+	if (!reached)
+		return;
+	WRITE_ONCE(nfsd_ffv2_prototype_entered_reached, NULL);
+	WRITE_ONCE(nfsd_ffv2_prototype_entered_proceed, NULL);
+	complete(reached);
+	if (proceed)
+		wait_for_completion(proceed);
+}
+
+static void nfsd_ffv2_prototype_published_pause(void)
+{
+	struct completion *reached =
+		READ_ONCE(nfsd_ffv2_prototype_published_reached);
+	struct completion *proceed =
+		READ_ONCE(nfsd_ffv2_prototype_published_proceed);
+
+	if (!reached)
+		return;
+	WRITE_ONCE(nfsd_ffv2_prototype_published_reached, NULL);
+	WRITE_ONCE(nfsd_ffv2_prototype_published_proceed, NULL);
+	complete(reached);
+	if (proceed)
+		wait_for_completion(proceed);
+}
+
 static void nfsd_ffv2_prototype_supersede_pause(void)
 {
 	struct completion *reached =
@@ -252,6 +309,8 @@ static void nfsd_ffv2_prototype_publish_pause(void)
 static inline void nfsd_ffv2_prototype_setup_pause(void) { }
 static inline void nfsd_ffv2_prototype_publish_pause(void) { }
 static inline void nfsd_ffv2_prototype_supersede_pause(void) { }
+static inline void nfsd_ffv2_prototype_entered_pause(void) { }
+static inline void nfsd_ffv2_prototype_published_pause(void) { }
 #endif
 
 void nfsd_ffv2_prototype_net_init(struct nfsd_net *nn)
@@ -399,6 +458,7 @@ static void nfsd_ffv2_prototype_close_finish(struct nfsd_net *nn)
 	struct user_namespace *userns;
 	bool drop_anchor;
 
+	nfsd_ffv2_prototype_entered_pause();
 	wait_for_completion(&proto->setup_done);
 	wait_event(proto->users_wait, nfsd_ffv2_prototype_quiet(nn));
 	/*
@@ -425,18 +485,31 @@ static void nfsd_ffv2_prototype_close_finish(struct nfsd_net *nn)
 	proto->owns_anchor = false;
 	userns = nfsd_ffv2_prototype_owner_clear(&proto->owner);
 	proto->state = NFSD_FFV2_PROTOTYPE_OFF;
-	proto->close_claimed = false;
+	/*
+	 * The close role is held past this point on purpose.  The state says
+	 * the gate is off, which is what namespace teardown checks, but the
+	 * completion below has not been signalled yet, and it is shared with
+	 * whatever cycle comes next.  An enable that started here would
+	 * reinitialise it, and this owner's signal would then land on the
+	 * new cycle's completion and let one of its closers return before
+	 * its own teardown had happened.  Holding the role is what an enable
+	 * refuses on, so no next cycle exists until the signal is out.
+	 */
 	spin_unlock(&anchor->prototype_gate_lock);
 	mutex_unlock(&nfsd_mutex);
 
 	nfsd_ffv2_prototype_ctx_free(ctx);
 	put_user_ns(userns);
+	nfsd_ffv2_prototype_published_pause();
 	/*
 	 * Only now: a waiter returning from here may go on to release the
 	 * namespace, and the reservation and every reference the gate held
 	 * are already gone.
 	 */
 	complete_all(&proto->close_done);
+	spin_lock(&anchor->prototype_gate_lock);
+	proto->close_claimed = false;
+	spin_unlock(&anchor->prototype_gate_lock);
 	if (drop_anchor)
 		nfsd_ffv2_anchor_release(nn);
 }
@@ -1770,7 +1843,14 @@ int nfsd_ffv2_prototype_enable(struct nfsd_net *nn, const struct net *net)
 
 	mutex_lock(&nfsd_mutex);
 	spin_lock(&anchor->prototype_gate_lock);
-	if (proto->state != NFSD_FFV2_PROTOTYPE_OFF || proto->close_waiters) {
+	/*
+	 * A gate is enabled only from a cycle that is completely over: the
+	 * state is off, the previous close owner has signalled and given up
+	 * its role, and nobody is still parked on the completion this cycle
+	 * would reinitialise.
+	 */
+	if (proto->state != NFSD_FFV2_PROTOTYPE_OFF || proto->close_claimed ||
+	    proto->close_waiters) {
 		error = -EBUSY;
 		goto out_unlock;
 	}
