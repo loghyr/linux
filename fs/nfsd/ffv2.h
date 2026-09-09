@@ -105,6 +105,22 @@ enum nfsd_ffv2_service_state {
 	NFSD_FFV2_SERVICE_DRAIN_FAILED,
 };
 
+/*
+ * The one FFv2 authority source a namespace has admitted.
+ *
+ * An ordinary metadata-server registration and a prototype authority
+ * profile are mutually exclusive: each derives trust from a different
+ * place, and a namespace that admitted both would answer for objects whose
+ * stateids came from issuers that never agreed with each other.  Both claim
+ * this before they prepare anything, so two administrators racing over one
+ * namespace cannot each believe they own it.
+ */
+enum nfsd_ffv2_source {
+	NFSD_FFV2_SOURCE_NONE,
+	NFSD_FFV2_SOURCE_MDS,
+	NFSD_FFV2_SOURCE_PROTOTYPE,
+};
+
 /* Opaque outside ffv2.c: the published provider and its reference. */
 struct nfsd_ffv2_provider;
 
@@ -128,6 +144,15 @@ struct nfsd_ffv2_anchor {
 	struct nfsd_ffv2_generation	*active;
 	struct nfsd_ffv2_generation	*retiring;
 	bool				registration_pending;
+	/*
+	 * The namespace's authority-source reservation, and the lock that
+	 * covers it and the prototype gate built on top of it.  Every
+	 * transition takes nfsd_mutex and then this lock, in that order and
+	 * never the reverse, so a claim cannot be decided against a source
+	 * another administrator is in the middle of claiming.
+	 */
+	spinlock_t			prototype_gate_lock;
+	enum nfsd_ffv2_source		source;
 	/*
 	 * Authority epoch allocation and the closeable authority-token and
 	 * retirement-work admissions.  One lock covers both gates and the
@@ -156,6 +181,15 @@ int nfsd_ffv2_export_update_validate(struct nfsd_ffv2_export_update *update);
 int nfsd_ffv2_export_update_end(struct svc_export *exp,
 				struct nfsd_ffv2_export_update *update);
 void nfsd_ffv2_export_update_abort(struct nfsd_ffv2_export_update *update);
+int nfsd_ffv2_source_claim_locked(struct nfsd_net *nn,
+				  enum nfsd_ffv2_source want);
+int nfsd_ffv2_source_claim_gated(struct nfsd_ffv2_anchor *anchor,
+				 enum nfsd_ffv2_source want);
+void nfsd_ffv2_source_release_gated(struct nfsd_ffv2_anchor *anchor,
+				    enum nfsd_ffv2_source held);
+void nfsd_ffv2_source_release(struct nfsd_net *nn,
+			      enum nfsd_ffv2_source held);
+enum nfsd_ffv2_source nfsd_ffv2_source_get(struct nfsd_net *nn);
 int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
 				 struct nfsd_ffv2_export_update *registration);
 void nfsd_ffv2_registration_end(struct nfsd_net *nn,

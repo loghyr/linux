@@ -346,6 +346,12 @@ struct nfsd_ffv2_trust_registry {
 
 struct nfsd_ffv2_service_context {
 	struct nfsd_ffv2_trust_registry trust;
+	/*
+	 * The namespace this context was published in.  Non-owning: the
+	 * generation this context is the payload of is drained by that
+	 * namespace's own exit fence, so the pointer cannot outlive it.
+	 */
+	struct nfsd_net		*nn;
 	struct nfsd_ffv2_reservation *reservation;
 	struct svc_export	*export;
 	struct nfsd_ffv2_object *object;
@@ -356,6 +362,12 @@ struct nfsd_ffv2_service_context {
 	u64			owner_generation;
 	bool			published;
 	bool			object_owned;
+	/*
+	 * Set when publication transferred the namespace's MDS source
+	 * reservation to this context.  The reservation then lives as long as
+	 * the generation does and is released once, here, at retirement.
+	 */
+	bool			source_claimed;
 };
 
 struct nfsd_ffv2_participant_snapshot {
@@ -400,6 +412,96 @@ static int nfsd_ffv2_object_validate(struct svc_export *exp,
 				     struct nfsd_ffv2_object *object);
 static void
 nfsd_ffv2_generation_put(struct nfsd_ffv2_generation *generation);
+
+/**
+ * nfsd_ffv2_source_claim_locked - claim the namespace's authority source
+ * @nn: the namespace being claimed
+ * @want: the source the caller intends to become
+ *
+ * The reservation is what makes an ordinary metadata-server registration
+ * and a prototype authority profile exclude each other.  A claim succeeds
+ * only from NONE, so the second of two racing claimants is refused rather
+ * than layered on top of the first, and a caller re-claiming what it
+ * already holds is refused too: that would be a second owner of one
+ * release.
+ *
+ * Caller holds nfsd_mutex.  Return: 0, -EINVAL for a claim of NONE, or
+ * -EBUSY when the namespace already has a source.
+ */
+int nfsd_ffv2_source_claim_locked(struct nfsd_net *nn,
+				  enum nfsd_ffv2_source want)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	int error;
+
+	spin_lock(&anchor->prototype_gate_lock);
+	error = nfsd_ffv2_source_claim_gated(anchor, want);
+	spin_unlock(&anchor->prototype_gate_lock);
+	return error;
+}
+
+/* The claim itself, for a caller that already holds both locks. */
+int nfsd_ffv2_source_claim_gated(struct nfsd_ffv2_anchor *anchor,
+				 enum nfsd_ffv2_source want)
+{
+	lockdep_assert_held(&nfsd_mutex);
+	lockdep_assert_held(&anchor->prototype_gate_lock);
+	if (want == NFSD_FFV2_SOURCE_NONE)
+		return -EINVAL;
+	if (anchor->source != NFSD_FFV2_SOURCE_NONE)
+		return -EBUSY;
+	anchor->source = want;
+	return 0;
+}
+
+/*
+ * The release itself, for a closer that already holds both locks because
+ * it is also deciding the gate's next state.
+ */
+void nfsd_ffv2_source_release_gated(struct nfsd_ffv2_anchor *anchor,
+				    enum nfsd_ffv2_source held)
+{
+	lockdep_assert_held(&nfsd_mutex);
+	lockdep_assert_held(&anchor->prototype_gate_lock);
+	if (!WARN_ON_ONCE(anchor->source != held))
+		anchor->source = NFSD_FFV2_SOURCE_NONE;
+}
+
+/**
+ * nfsd_ffv2_source_release - return the namespace's authority source
+ * @nn: the namespace whose reservation is being returned
+ * @held: the source the caller claimed
+ *
+ * Only the gate lock is taken.  nfsd_mutex orders the claim decisions
+ * against each other, and a release is not a decision: it is one store of
+ * NONE under the leaf lock every claim also takes, so no claim can read a
+ * value this is in the middle of writing.  Requiring the mutex here would
+ * instead make the release unreachable, because a generation retires from
+ * paths that already hold it and from paths that must not take it.
+ */
+void nfsd_ffv2_source_release(struct nfsd_net *nn, enum nfsd_ffv2_source held)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+
+	if (held == NFSD_FFV2_SOURCE_NONE)
+		return;
+	spin_lock(&anchor->prototype_gate_lock);
+	if (!WARN_ON_ONCE(anchor->source != held))
+		anchor->source = NFSD_FFV2_SOURCE_NONE;
+	spin_unlock(&anchor->prototype_gate_lock);
+}
+
+/* The source a namespace currently holds, as a value. */
+enum nfsd_ffv2_source nfsd_ffv2_source_get(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	enum nfsd_ffv2_source source;
+
+	spin_lock(&anchor->prototype_gate_lock);
+	source = anchor->source;
+	spin_unlock(&anchor->prototype_gate_lock);
+	return source;
+}
 
 static void
 nfsd_ffv2_reservation_put(struct nfsd_ffv2_reservation *reservation)
@@ -843,7 +945,8 @@ bool nfsd4_ffv2_mount_crossing_allowed(const struct path *path)
 }
 
 static struct nfsd_ffv2_service_context *
-nfsd_ffv2_service_context_alloc(struct nfsd_ffv2_reservation *reservation,
+nfsd_ffv2_service_context_alloc(struct nfsd_net *nn,
+				struct nfsd_ffv2_reservation *reservation,
 				const struct cred *cred, u64 control_root,
 				u64 owner_generation)
 {
@@ -857,6 +960,7 @@ nfsd_ffv2_service_context_alloc(struct nfsd_ffv2_reservation *reservation,
 		return NULL;
 	}
 	refcount_inc(&reservation->ref);
+	context->nn = nn;
 	context->reservation = reservation;
 	context->cred = get_cred(cred);
 	context->control_root = control_root;
@@ -1012,6 +1116,8 @@ nfsd_ffv2_transition_publish(struct nfsd_net *owner,
 		/* The generation payload now owns the authority. */
 		context->authority = registration->authority;
 		registration->authority = NULL;
+		/* ...and the source reservation the registration claimed. */
+		context->source_claimed = true;
 	}
 	mutex_unlock(&nfsd_ffv2_registry_lock);
 	mutex_unlock(&participant->inventory_lock);
@@ -1102,7 +1208,7 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 		error = -ENOMEM;
 		goto out_reopen;
 	}
-	context = nfsd_ffv2_service_context_alloc(reservation, cred,
+	context = nfsd_ffv2_service_context_alloc(owner, reservation, cred,
 						  control_root, 0);
 	if (!context) {
 		nfsd_ffv2_reservation_abort(reservation);
@@ -2009,6 +2115,12 @@ void nfsd_ffv2_service_context_release(void *payload)
 	nfsd_ffv2_reservation_fence(context->reservation);
 	if (context->object_owned)
 		nfsd_ffv2_object_free(context->object);
+	/*
+	 * Last: the namespace may admit another authority source only once
+	 * this generation's objects and trust are gone.
+	 */
+	if (context->source_claimed)
+		nfsd_ffv2_source_release(context->nn, NFSD_FFV2_SOURCE_MDS);
 	kfree(context);
 }
 
@@ -2182,10 +2294,20 @@ int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
 
 	lockdep_assert_held(&nfsd_mutex);
 	memset(registration, 0, sizeof(*registration));
+	/*
+	 * Claim the namespace's authority source before anything fallible is
+	 * prepared, so a prototype profile and this registration cannot both
+	 * get as far as publication.  The claim is released here if the
+	 * registration never publishes, and by the published generation
+	 * otherwise.
+	 */
+	error = nfsd_ffv2_source_claim_locked(nn, NFSD_FFV2_SOURCE_MDS);
+	if (error)
+		return error;
 	error = nfsd_ffv2_export_update_admit(&nn->ffv2_participant,
 					      registration);
 	if (error)
-		return error;
+		goto out_source;
 	mutex_lock(&anchor->lock);
 	if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
 	    anchor->service_state != NFSD_FFV2_SERVICE_UP) {
@@ -2199,8 +2321,11 @@ int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
 		error = 0;
 	}
 	mutex_unlock(&anchor->lock);
-	if (error)
-		nfsd_ffv2_export_update_put(registration);
+	if (!error)
+		return 0;
+	nfsd_ffv2_export_update_put(registration);
+out_source:
+	nfsd_ffv2_source_release(nn, NFSD_FFV2_SOURCE_MDS);
 	return error;
 }
 
@@ -2208,6 +2333,7 @@ void nfsd_ffv2_registration_end(struct nfsd_net *nn,
 				struct nfsd_ffv2_export_update *registration)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	bool unpublished = registration->registration_slot;
 
 	if (registration->registration_slot) {
 		mutex_lock(&anchor->lock);
@@ -2216,6 +2342,14 @@ void nfsd_ffv2_registration_end(struct nfsd_net *nn,
 		registration->registration_slot = false;
 		mutex_unlock(&anchor->lock);
 	}
+	/*
+	 * Publication consumes the slot, so a slot still held here says this
+	 * registration published nothing and the source reservation it took
+	 * has no generation to outlive.  After a successful publication the
+	 * service context owns it instead.
+	 */
+	if (unpublished)
+		nfsd_ffv2_source_release(nn, NFSD_FFV2_SOURCE_MDS);
 	/*
 	 * Registration cancellation: an authority that never reached
 	 * publication is detached here through the common helper.  After a
@@ -4635,6 +4769,8 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 	anchor->active = NULL;
 	anchor->retiring = NULL;
 	anchor->registration_pending = false;
+	spin_lock_init(&anchor->prototype_gate_lock);
+	anchor->source = NFSD_FFV2_SOURCE_NONE;
 	spin_lock_init(&anchor->authority_tokens_lock);
 	init_waitqueue_head(&anchor->authority_wait);
 	anchor->next_authority_epoch = 1;
@@ -4698,6 +4834,7 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	WARN_ON_ONCE(anchor->retiring);
 	WARN_ON_ONCE(anchor->pending);
 	WARN_ON_ONCE(anchor->registration_pending);
+	WARN_ON_ONCE(anchor->source != NFSD_FFV2_SOURCE_NONE);
 	/*
 	 * A provider is namespace-scoped and only a KUnit build can install
 	 * one; a namespace reaching teardown while one is still published

@@ -9850,6 +9850,81 @@ out:
 	kvfree(payload);
 }
 
+/*
+ * A namespace admits one FFv2 authority source.  The second claimant is
+ * refused whichever order the two arrive in, a holder cannot claim a second
+ * time, and the namespace becomes claimable again only once the holder has
+ * released.  The ordinary registration path is held to the same rule, so a
+ * prototype profile cannot be enabled underneath an open registration.
+ */
+static void nfsd_ffv2_source_reservation_test(struct kunit *test)
+{
+	struct nfsd_ffv2_export_update registration;
+	struct nfsd_net *nn;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
+
+	mutex_lock(&nfsd_mutex);
+	/* Claiming nothing is a caller error, not an idle success. */
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_NONE));
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_MDS));
+	/*
+	 * Both the other source and the one already held are refused: a
+	 * second claim of the same source would be a second owner of one
+	 * release.
+	 */
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_PROTOTYPE));
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_MDS));
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_MDS, nfsd_ffv2_source_get(nn));
+
+	nfsd_ffv2_source_release(nn, NFSD_FFV2_SOURCE_MDS);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
+
+	/* The other order excludes just as well. */
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_PROTOTYPE));
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_MDS));
+	mutex_unlock(&nfsd_mutex);
+	nfsd_ffv2_source_release(nn, NFSD_FFV2_SOURCE_PROTOTYPE);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
+
+	/*
+	 * The ordinary registration path claims the same reservation before
+	 * anything fallible, and gives it back when the registration cannot
+	 * be admitted at all.  This namespace has no attached participant,
+	 * which is the earliest way for that to happen, so what is proved
+	 * here is that the earliest failure still leaves the namespace
+	 * claimable.
+	 */
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_service_up(nn));
+	KUNIT_EXPECT_EQ(test, -ESHUTDOWN,
+			nfsd_ffv2_registration_begin(nn, &registration));
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_service_down(nn);
+	mutex_unlock(&nfsd_mutex);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -9930,6 +10005,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_pinned_reference_test),
 	KUNIT_CASE(nfsd_ffv2_provider_size_mismatch_test),
 	KUNIT_CASE(nfsd_ffv2_provider_install_race_test),
+	KUNIT_CASE(nfsd_ffv2_source_reservation_test),
 	{}
 };
 
