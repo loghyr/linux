@@ -503,8 +503,14 @@ static void nfsd_ffv2_prototype_close_finish(struct nfsd_net *nn)
 	nfsd_ffv2_prototype_published_pause();
 	/*
 	 * Only now: a waiter returning from here may go on to release the
-	 * namespace, and the reservation and every reference the gate held
-	 * are already gone.
+	 * namespace, and everything the gate owned -- the reservation, the
+	 * provider, the generation, the staged context -- has been detached.
+	 *
+	 * This owner's own execution reference on the anchor is the one thing
+	 * still held, on purpose: the completion below and the role released
+	 * after it both live in the anchor, so it cannot be let go until they
+	 * have been touched.  It is dropped as soon as they have been, and a
+	 * namespace waiting to be destroyed waits for exactly that.
 	 */
 	complete_all(&proto->close_done);
 	spin_lock(&anchor->prototype_gate_lock);

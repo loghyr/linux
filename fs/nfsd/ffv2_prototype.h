@@ -46,9 +46,17 @@ struct user_namespace;
  * The two completions are distinct on purpose.  @setup_done says the
  * enabling caller has finished and rolled back whatever it staged; it does
  * not say the namespace is quiet.  @close_done says the source reservation
- * is back, the provider is gone, and the references the gate held are
- * dropped.  Everything outside waits for @close_done, so nothing can
+ * is back, the provider is gone, and every resource the gate owned has been
+ * detached.  Everything outside waits for @close_done, so nothing can
  * release the namespace while setup is still running.
+ *
+ * One reference is deliberately still held at that point.  The close owner
+ * is about to touch @close_done and the gate state that lives beside it, so
+ * it keeps its own execution reference on the anchor across the signal and
+ * across giving up the close role, and drops it immediately afterwards.  A
+ * caller woken by @close_done must not assume that reference is already
+ * gone: what it may assume is that nothing the gate owned is left, and that
+ * the last thing keeping the anchor alive is a holder about to let go.
  */
 enum nfsd_ffv2_prototype_state {
 	NFSD_FFV2_PROTOTYPE_OFF,
