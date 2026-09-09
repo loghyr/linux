@@ -9554,6 +9554,7 @@ struct nfsd_ffv2_foreign_admission {
 	__be32				status;
 	struct completion		admitted;
 	struct completion		release;
+	struct completion		done;
 };
 
 static int nfsd_ffv2_foreign_admission_thread(void *data)
@@ -9570,6 +9571,7 @@ static int nfsd_ffv2_foreign_admission_thread(void *data)
 	wait_for_completion(&ctx->release);
 	if (ctx->status == nfs_ok)
 		nfsd_ffv2_complete(&ctx->admission);
+	complete(&ctx->done);
 	return 0;
 }
 
@@ -9632,32 +9634,57 @@ static void nfsd_ffv2_provider_unadmitted_test(struct kunit *test)
 	foreign.f = &f;
 	init_completion(&foreign.admitted);
 	init_completion(&foreign.release);
+	init_completion(&foreign.done);
 	thread = kthread_run(nfsd_ffv2_foreign_admission_thread, &foreign,
 			     "ffv2-foreign");
 	if (IS_ERR(thread)) {
 		KUNIT_FAIL(test, "failed to start the admitting thread");
 		goto out;
 	}
+	/*
+	 * From here that thread holds a live admission until it is released,
+	 * and retiring the generation waits for it.  So every way out below
+	 * releases it and waits for the thread to leave before the fixture
+	 * is torn down, including the ways out that have already failed:
+	 * abandoning a live admission would turn a diagnosed failure into a
+	 * teardown that never returns.
+	 */
 	if (!wait_for_completion_timeout(&foreign.admitted, 15 * HZ)) {
 		KUNIT_FAIL(test, "the admitting thread never admitted");
-		goto out;
+		goto join;
 	}
-	if (foreign.status == nfs_ok) {
-		refused = nfsd_ffv2_test_provider_unadmitted();
-		KUNIT_EXPECT_EQ(test, nfserr_serverfault,
-				nfsd_ffv2_provider_probe(f.rqstp, f.mapped,
-							 OP_CHUNK_READ, &req,
-							 &result, U32_MAX,
-							 &admission));
-		KUNIT_EXPECT_EQ(test, refused + 1,
-				nfsd_ffv2_test_provider_unadmitted());
-	} else {
+	if (foreign.status != nfs_ok) {
 		KUNIT_FAIL(test, "the admitting thread failed: 0x%x",
 			   be32_to_cpu(foreign.status));
+		goto join;
 	}
-	complete(&foreign.release);
 
-	/* An authorized crossing still works. */
+	/*
+	 * The live admission itself, so what refuses the crossing is the
+	 * owning task and not a spent generation.
+	 */
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	refused = nfsd_ffv2_test_provider_unadmitted();
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_provider_probe(f.rqstp, f.mapped,
+						 OP_CHUNK_READ, &req,
+						 &result, U32_MAX,
+						 &foreign.admission));
+	KUNIT_EXPECT_EQ(test, refused + 1,
+			nfsd_ffv2_test_provider_unadmitted());
+	KUNIT_EXPECT_EQ(test, callbacks,
+			nfsd_ffv2_test_provider_callbacks());
+join:
+	complete(&foreign.release);
+	if (!wait_for_completion_timeout(&foreign.done, 15 * HZ)) {
+		KUNIT_FAIL(test, "the admitting thread never left");
+		wait_for_completion(&foreign.done);
+	}
+
+	/*
+	 * The foreign admission is spent and gave its provider reference
+	 * back, so an authorized crossing still works.
+	 */
 	KUNIT_EXPECT_EQ(test, nfs_ok,
 			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
 					       &req, &result));
