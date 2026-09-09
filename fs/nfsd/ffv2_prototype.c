@@ -14,6 +14,7 @@
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/ktime.h>
+#include <linux/list.h>
 #include <linux/random.h>
 #include <linux/sunrpc/svcauth.h>
 #include <linux/unaligned.h>
@@ -89,6 +90,13 @@ struct nfsd_ffv2_prototype_nonce {
 	 * still committing to it.
 	 */
 	bool				busy;
+	/*
+	 * Off-table staging for a record the reaper removed.  Freeing under
+	 * the gate lock would be legal but pointless; carrying the record
+	 * out on this list keeps the removal and the free in one decision
+	 * without holding the lock across either.
+	 */
+	struct list_head		dead;
 	/* Set once the registration this nonce named succeeded. */
 	struct nfsd_ffv2_prototype_committed committed;
 	struct nfsd_ffv2_prototype_bundle bundle;
@@ -627,27 +635,52 @@ nfsd_ffv2_prototype_ctx_of(struct nfsd_net *nn)
 }
 
 /*
- * Remove one record, unless a registration is using it.  The decision and
- * the removal are one step under the gate lock, so a record cannot be
- * claimed between being judged unused and being freed.
+ * Take one record out of the table.
+ *
+ * Every removal happens here and every removal holds the gate lock, so a
+ * record still in the table is a record nothing else is in the middle of
+ * freeing.  A record a registration is using is left alone: it is about to
+ * be committed, and the registration is still reading it.
+ *
+ * The caller frees what it took out, after it has dropped the lock.
  */
-static bool nfsd_ffv2_prototype_nonce_drop_locked(struct nfsd_ffv2_anchor *anchor,
+static bool nfsd_ffv2_prototype_nonce_take_locked(struct nfsd_ffv2_anchor *anchor,
 						  struct nfsd_ffv2_prototype_ctx *ctx,
 						  unsigned long index,
-						  struct nfsd_ffv2_prototype_nonce *record)
+						  struct nfsd_ffv2_prototype_nonce *record,
+						  struct list_head *dead)
 {
 	lockdep_assert_held(&anchor->prototype_gate_lock);
 	if (record->busy)
 		return false;
-	if (xa_cmpxchg(&ctx->nonces, index, record, NULL, GFP_ATOMIC) !=
-	    record)
+	if (WARN_ON_ONCE(xa_erase(&ctx->nonces, index) != record))
 		return false;
 	if (!WARN_ON_ONCE(!ctx->nonce_count))
 		ctx->nonce_count--;
+	list_add(&record->dead, dead);
 	return true;
 }
 
-/* Drop challenges nobody came back for, so one gate cannot fill up. */
+/* Free what a removal took out of the table.  No lock is held here. */
+static void nfsd_ffv2_prototype_nonce_free(struct list_head *dead)
+{
+	struct nfsd_ffv2_prototype_nonce *record, *tmp;
+
+	list_for_each_entry_safe(record, tmp, dead, dead) {
+		list_del(&record->dead);
+		kfree_sensitive(record);
+	}
+}
+
+/*
+ * Drop challenges nobody came back for, so one gate cannot fill up.
+ *
+ * The whole walk runs under the gate lock.  The iterator hands back a raw
+ * pointer, and every field this has to read to judge a record -- its state,
+ * its deadline, whether a registration holds it -- is a field another
+ * caller may be changing; reading any of them outside the lock would be
+ * reading storage a concurrent challenge is entitled to have freed.
+ */
 static void nfsd_ffv2_prototype_nonce_reap(struct nfsd_net *nn,
 					   struct nfsd_ffv2_prototype_ctx *ctx)
 {
@@ -655,19 +688,18 @@ static void nfsd_ffv2_prototype_nonce_reap(struct nfsd_net *nn,
 	struct nfsd_ffv2_prototype_nonce *record;
 	u64 now = ktime_get_ns();
 	unsigned long index;
-	bool dropped;
+	LIST_HEAD(dead);
 
+	spin_lock(&anchor->prototype_gate_lock);
 	xa_for_each(&ctx->nonces, index, record) {
 		if (record->state != NFSD_FFV2_NONCE_ISSUED ||
 		    now <= record->expires)
 			continue;
-		spin_lock(&anchor->prototype_gate_lock);
-		dropped = nfsd_ffv2_prototype_nonce_drop_locked(anchor, ctx,
-								index, record);
-		spin_unlock(&anchor->prototype_gate_lock);
-		if (dropped)
-			kfree_sensitive(record);
+		nfsd_ffv2_prototype_nonce_take_locked(anchor, ctx, index,
+						      record, &dead);
 	}
+	spin_unlock(&anchor->prototype_gate_lock);
+	nfsd_ffv2_prototype_nonce_free(&dead);
 }
 
 /*
@@ -688,8 +720,8 @@ nfsd_ffv2_prototype_nonce_lookup(struct nfsd_net *nn,
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_prototype_nonce *record;
 	bool has_secid = secid != 0;
-	bool dropped = false;
 	unsigned long index;
+	LIST_HEAD(dead);
 	u64 carried;
 	int error;
 
@@ -728,8 +760,8 @@ nfsd_ffv2_prototype_nonce_lookup(struct nfsd_net *nn,
 		 * it would let the same nonce report -ETIMEDOUT forever
 		 * while occupying one of the gate's few slots.
 		 */
-		dropped = nfsd_ffv2_prototype_nonce_drop_locked(anchor, ctx,
-								index, record);
+		nfsd_ffv2_prototype_nonce_take_locked(anchor, ctx, index,
+						      record, &dead);
 		error = -ETIMEDOUT;
 	} else {
 		record->busy = claim;
@@ -737,8 +769,7 @@ nfsd_ffv2_prototype_nonce_lookup(struct nfsd_net *nn,
 		error = 0;
 	}
 	spin_unlock(&anchor->prototype_gate_lock);
-	if (dropped)
-		kfree_sensitive(record);
+	nfsd_ffv2_prototype_nonce_free(&dead);
 	return error;
 }
 
@@ -1572,15 +1603,19 @@ int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 /* Backdate one challenge so its expiry can be reached without waiting. */
 void nfsd_ffv2_prototype_test_nonce_age(struct nfsd_net *nn, const u8 *nonce)
 {
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_prototype_nonce *record;
 	struct nfsd_ffv2_prototype_ctx *ctx;
 
 	ctx = nfsd_ffv2_prototype_ctx_of(nn);
 	if (!ctx)
 		return;
-	record = xa_load(&ctx->nonces, (unsigned long)get_unaligned_be64(nonce));
+	spin_lock(&anchor->prototype_gate_lock);
+	record = xa_load(&ctx->nonces,
+			 (unsigned long)get_unaligned_be64(nonce));
 	if (record)
 		record->expires = 0;
+	spin_unlock(&anchor->prototype_gate_lock);
 }
 
 /*

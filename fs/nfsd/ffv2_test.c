@@ -10916,6 +10916,121 @@ out:
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
+/*
+ * Two challenges reaping the same expired records at once.
+ *
+ * The reaper walks a table another challenge may be erasing from, and what
+ * it reads to judge a record is storage that other caller is entitled to
+ * have freed.  This starts both walks on the same expired records and
+ * asks for the arithmetic afterwards: three records went in, three were
+ * removed once each, and two new ones remain.  A second removal of any
+ * record would take the count below zero and warn, and the run is checked
+ * for warnings.
+ */
+struct nfsd_ffv2_proto_challenge_ctx {
+	struct nfsd_net		*nn;
+	const struct net	*net;
+	struct completion	*start;
+	u8			nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u64			expires;
+	int			result;
+	struct completion	done;
+};
+
+static int nfsd_ffv2_proto_challenge_thread(void *data)
+{
+	struct nfsd_ffv2_proto_challenge_ctx *ctx = data;
+
+	wait_for_completion(ctx->start);
+	ctx->result = nfsd_ffv2_prototype_challenge(ctx->nn, ctx->net,
+						    ctx->nonce, &ctx->expires);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_prototype_nonce_reap_test(struct kunit *test)
+{
+	u8 aged[3][NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct nfsd_ffv2_proto_challenge_ctx *first, *second;
+	struct task_struct *first_task, *second_task;
+	struct completion start;
+	struct nfsd_net *nn;
+	u64 expires = 0;
+	unsigned int i;
+	int error;
+
+	first = kunit_kzalloc(test, sizeof(*first), GFP_KERNEL);
+	second = kunit_kzalloc(test, sizeof(*second), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, first);
+	KUNIT_ASSERT_NOT_NULL(test, second);
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+
+	for (i = 0; i < ARRAY_SIZE(aged); i++)
+		KUNIT_ASSERT_EQ(test, 0,
+				nfsd_ffv2_prototype_challenge(nn, &init_net,
+							      aged[i],
+							      &expires));
+	KUNIT_EXPECT_EQ(test, ARRAY_SIZE(aged),
+			nfsd_ffv2_prototype_test_nonce_count(nn));
+	for (i = 0; i < ARRAY_SIZE(aged); i++)
+		nfsd_ffv2_prototype_test_nonce_age(nn, aged[i]);
+
+	init_completion(&start);
+	init_completion(&first->done);
+	init_completion(&second->done);
+	first->nn = nn;
+	second->nn = nn;
+	first->net = &init_net;
+	second->net = &init_net;
+	first->start = &start;
+	second->start = &start;
+	first_task = kthread_run(nfsd_ffv2_proto_challenge_thread, first,
+				 "ffv2-proto-reap1");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(first_task));
+	second_task = kthread_run(nfsd_ffv2_proto_challenge_thread, second,
+				  "ffv2-proto-reap2");
+	if (IS_ERR(second_task)) {
+		KUNIT_FAIL(test, "failed to start the second challenge");
+		complete_all(&start);
+		wait_for_completion(&first->done);
+		kthread_stop(first_task);
+		goto out;
+	}
+	complete_all(&start);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&first->done,
+						      30 * HZ) != 0);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&second->done,
+						      30 * HZ) != 0);
+	kthread_stop(first_task);
+	kthread_stop(second_task);
+
+	KUNIT_EXPECT_EQ(test, 0, first->result);
+	KUNIT_EXPECT_EQ(test, 0, second->result);
+	/* The three expired records are gone, and only the two new remain. */
+	KUNIT_EXPECT_EQ(test, 2u, nfsd_ffv2_prototype_test_nonce_count(nn));
+	for (i = 0; i < ARRAY_SIZE(aged); i++)
+		KUNIT_EXPECT_EQ(test, -ENOENT,
+				nfsd_ffv2_prototype_test_nonce_check(nn,
+								     &init_net,
+								     aged[i]));
+	/* And what the two threads were issued is still usable. */
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     first->nonce));
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_test_nonce_check(nn, &init_net,
+							     second->nonce));
+out:
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -11325,6 +11440,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_close_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_pre_exit_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_challenge_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_nonce_reap_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
 #endif
