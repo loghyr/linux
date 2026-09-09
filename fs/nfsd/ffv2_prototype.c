@@ -9,9 +9,13 @@
  */
 #include <crypto/utils.h>
 #include <linux/completion.h>
+#include <linux/crc32.h>
 #include <linux/cred.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/ktime.h>
 #include <linux/random.h>
+#include <linux/sunrpc/svcauth.h>
 #include <linux/unaligned.h>
 #include <linux/xarray.h>
 #include <linux/security.h>
@@ -22,8 +26,15 @@
 #include "export.h"
 #include "ffv2.h"
 #include "ffv2_prototype.h"
+#include "ffv2_trust.h"
 #include "nfsd.h"
 #include "netns.h"
+#include "nfsfh.h"
+#include "state.h"
+#include "vfs.h"
+
+/* Longest client name a registration may name, matching the export cache. */
+#define NFSD_FFV2_PROTOTYPE_DOMAIN_MAX	NAME_MAX
 
 /*
  * One challenge.
@@ -41,6 +52,23 @@
  */
 enum nfsd_ffv2_prototype_nonce_state {
 	NFSD_FFV2_NONCE_ISSUED,
+	NFSD_FFV2_NONCE_COMMITTED,
+	NFSD_FFV2_NONCE_RETIRED,
+};
+
+/*
+ * The inputs a committed registration was made with, kept so a retry can
+ * be told from a different registration wearing the same nonce.  Copied,
+ * never aliased: the message they arrived in is long gone by the time a
+ * retry is compared against them.
+ */
+struct nfsd_ffv2_prototype_committed {
+	char	auth_domain[NFSD_FFV2_PROTOTYPE_DOMAIN_MAX + 1];
+	u8	handle[NFS4_FHSIZE];
+	u32	handle_len;
+	u32	chunk_size;
+	u32	data_count;
+	u32	parity_count;
 };
 
 struct nfsd_ffv2_prototype_nonce {
@@ -53,6 +81,17 @@ struct nfsd_ffv2_prototype_nonce {
 	const struct net		*net;
 	u32				secid;
 	bool				secid_valid;
+	/*
+	 * Set while a registration is using this record.  A registration
+	 * sleeps -- it reads a whole object -- and a challenge running
+	 * beside it drops challenges nobody came back for, so without this
+	 * the record could be freed from under the registration that is
+	 * still committing to it.
+	 */
+	bool				busy;
+	/* Set once the registration this nonce named succeeded. */
+	struct nfsd_ffv2_prototype_committed committed;
+	struct nfsd_ffv2_prototype_bundle bundle;
 };
 
 /*
@@ -82,6 +121,20 @@ struct nfsd_ffv2_prototype_ctx {
 
 /* No more challenges may be outstanding at once than a demonstrator needs. */
 #define NFSD_FFV2_PROTOTYPE_NONCE_MAX	64
+
+/*
+ * How long the trusted stateid a registration mints stays valid.  A
+ * demonstrator runs for minutes; an entry that outlived the machine it was
+ * demonstrated on would be a stateid nothing remembers issuing.
+ */
+#define NFSD_FFV2_PROTOTYPE_TRUST_TTL_SEC	3600
+
+static_assert(sizeof(stateid_t) == NFS4_STATEID_SIZE,
+	      "the registration bundle carries a stateid verbatim");
+static_assert(NFSD_FFV2_FH_MAX <= NFS4_FHSIZE,
+	      "the registration bundle carries a mapped handle verbatim");
+
+static void nfsd_ffv2_prototype_teardown_published(struct nfsd_net *nn);
 
 static struct nfsd_ffv2_prototype *nfsd_ffv2_prototype_of(struct nfsd_net *nn)
 {
@@ -121,8 +174,42 @@ static void nfsd_ffv2_prototype_setup_pause(void)
 	if (proceed)
 		wait_for_completion(proceed);
 }
+
+/*
+ * The same, for the interval a registration opens between publishing its
+ * generation and reaching READY.  That interval is the one thing the
+ * design turns on -- a mapping must be refused inside it even though the
+ * generation is already active -- and it is otherwise far too short to
+ * enter deliberately.
+ */
+static struct completion *nfsd_ffv2_prototype_publish_reached;
+static struct completion *nfsd_ffv2_prototype_publish_proceed;
+
+void nfsd_ffv2_prototype_test_publish_hook(struct completion *reached,
+					   struct completion *proceed)
+{
+	WRITE_ONCE(nfsd_ffv2_prototype_publish_proceed, proceed);
+	WRITE_ONCE(nfsd_ffv2_prototype_publish_reached, reached);
+}
+
+static void nfsd_ffv2_prototype_publish_pause(void)
+{
+	struct completion *reached =
+		READ_ONCE(nfsd_ffv2_prototype_publish_reached);
+	struct completion *proceed =
+		READ_ONCE(nfsd_ffv2_prototype_publish_proceed);
+
+	if (!reached)
+		return;
+	WRITE_ONCE(nfsd_ffv2_prototype_publish_reached, NULL);
+	WRITE_ONCE(nfsd_ffv2_prototype_publish_proceed, NULL);
+	complete(reached);
+	if (proceed)
+		wait_for_completion(proceed);
+}
 #else
 static inline void nfsd_ffv2_prototype_setup_pause(void) { }
+static inline void nfsd_ffv2_prototype_publish_pause(void) { }
 #endif
 
 void nfsd_ffv2_prototype_net_init(struct nfsd_net *nn)
@@ -272,6 +359,13 @@ static void nfsd_ffv2_prototype_close_finish(struct nfsd_net *nn)
 
 	wait_for_completion(&proto->setup_done);
 	wait_event(proto->users_wait, nfsd_ffv2_prototype_quiet(nn));
+	/*
+	 * Nothing is counted against the gate any more, so no result is
+	 * still borrowing provider storage and no mapping can be admitted.
+	 * Whatever the one registration published is removed here, and only
+	 * if it is still owned: an unregister may have removed it already.
+	 */
+	nfsd_ffv2_prototype_teardown_published(nn);
 
 	mutex_lock(&nfsd_mutex);
 	spin_lock(&anchor->prototype_gate_lock);
@@ -428,8 +522,9 @@ static int nfsd_ffv2_prototype_setup_finish(struct nfsd_net *nn,
  * is still enabling or already closing, or -EPERM for an administrator
  * other than the one that enabled it.
  */
-static int nfsd_ffv2_prototype_user_get(struct nfsd_net *nn,
-					const struct net *net, u32 secid)
+static int __nfsd_ffv2_prototype_user_get(struct nfsd_net *nn,
+					  const struct net *net, u32 secid,
+					  bool open_only)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
@@ -439,7 +534,7 @@ static int nfsd_ffv2_prototype_user_get(struct nfsd_net *nn,
 	if (proto->state == NFSD_FFV2_PROTOTYPE_OFF)
 		error = -EOPNOTSUPP;
 	else if (proto->state != NFSD_FFV2_PROTOTYPE_OPEN &&
-		 proto->state != NFSD_FFV2_PROTOTYPE_READY)
+		 (open_only || proto->state != NFSD_FFV2_PROTOTYPE_READY))
 		error = -EBUSY;
 	else if (!nfsd_ffv2_prototype_owner_is(&proto->owner, net, secid))
 		error = -EPERM;
@@ -449,6 +544,12 @@ static int nfsd_ffv2_prototype_user_get(struct nfsd_net *nn,
 		proto->users++;
 	spin_unlock(&anchor->prototype_gate_lock);
 	return error;
+}
+
+static int nfsd_ffv2_prototype_user_get(struct nfsd_net *nn,
+					const struct net *net, u32 secid)
+{
+	return __nfsd_ffv2_prototype_user_get(nn, net, secid, false);
 }
 
 static void nfsd_ffv2_prototype_user_put(struct nfsd_net *nn)
@@ -463,6 +564,49 @@ static void nfsd_ffv2_prototype_user_put(struct nfsd_net *nn)
 	spin_unlock(&anchor->prototype_gate_lock);
 	if (quiet)
 		wake_up_all(&proto->users_wait);
+}
+
+/**
+ * nfsd_ffv2_prototype_op_admit - admit one mapped operation against the gate
+ * @nn: the namespace the mapping resolved in
+ * @counted: set when a gate reference was taken and must be released
+ *
+ * A namespace whose authority came from a metadata server has no gate to
+ * pass, and is admitted without counting anything.  A namespace whose
+ * authority came from this profile is admitted only once the registration
+ * has published everything an operation needs, which is what READY means:
+ * the generation is active from the moment it is published, before its
+ * trust entry and provider exist, so the gate's own final transition is
+ * what a lookup has to wait for.  The source and the gate state are read
+ * together under one lock, so a namespace cannot appear to have neither.
+ *
+ * Return: 0 when the operation may proceed, or -ESTALE when this
+ * namespace's gate is not, or is no longer, serving.
+ */
+int nfsd_ffv2_prototype_op_admit(struct nfsd_net *nn, bool *counted)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
+	int error = 0;
+
+	*counted = false;
+	spin_lock(&anchor->prototype_gate_lock);
+	if (anchor->source != NFSD_FFV2_SOURCE_PROTOTYPE) {
+		error = 0;
+	} else if (proto->state != NFSD_FFV2_PROTOTYPE_READY) {
+		error = -ESTALE;
+	} else {
+		proto->users++;
+		*counted = true;
+	}
+	spin_unlock(&anchor->prototype_gate_lock);
+	return error;
+}
+
+/* Release the reference nfsd_ffv2_prototype_op_admit() took. */
+void nfsd_ffv2_prototype_op_release(struct nfsd_net *nn)
+{
+	nfsd_ffv2_prototype_user_put(nn);
 }
 
 /*
@@ -482,6 +626,27 @@ nfsd_ffv2_prototype_ctx_of(struct nfsd_net *nn)
 	return ctx;
 }
 
+/*
+ * Remove one record, unless a registration is using it.  The decision and
+ * the removal are one step under the gate lock, so a record cannot be
+ * claimed between being judged unused and being freed.
+ */
+static bool nfsd_ffv2_prototype_nonce_drop_locked(struct nfsd_ffv2_anchor *anchor,
+						  struct nfsd_ffv2_prototype_ctx *ctx,
+						  unsigned long index,
+						  struct nfsd_ffv2_prototype_nonce *record)
+{
+	lockdep_assert_held(&anchor->prototype_gate_lock);
+	if (record->busy)
+		return false;
+	if (xa_cmpxchg(&ctx->nonces, index, record, NULL, GFP_ATOMIC) !=
+	    record)
+		return false;
+	if (!WARN_ON_ONCE(!ctx->nonce_count))
+		ctx->nonce_count--;
+	return true;
+}
+
 /* Drop challenges nobody came back for, so one gate cannot fill up. */
 static void nfsd_ffv2_prototype_nonce_reap(struct nfsd_net *nn,
 					   struct nfsd_ffv2_prototype_ctx *ctx)
@@ -490,19 +655,18 @@ static void nfsd_ffv2_prototype_nonce_reap(struct nfsd_net *nn,
 	struct nfsd_ffv2_prototype_nonce *record;
 	u64 now = ktime_get_ns();
 	unsigned long index;
+	bool dropped;
 
 	xa_for_each(&ctx->nonces, index, record) {
 		if (record->state != NFSD_FFV2_NONCE_ISSUED ||
 		    now <= record->expires)
 			continue;
-		if (xa_cmpxchg(&ctx->nonces, index, record, NULL,
-			       GFP_KERNEL) != record)
-			continue;
 		spin_lock(&anchor->prototype_gate_lock);
-		if (!WARN_ON_ONCE(!ctx->nonce_count))
-			ctx->nonce_count--;
+		dropped = nfsd_ffv2_prototype_nonce_drop_locked(anchor, ctx,
+								index, record);
 		spin_unlock(&anchor->prototype_gate_lock);
-		kfree_sensitive(record);
+		if (dropped)
+			kfree_sensitive(record);
 	}
 }
 
@@ -518,49 +682,76 @@ static int
 nfsd_ffv2_prototype_nonce_lookup(struct nfsd_net *nn,
 				 struct nfsd_ffv2_prototype_ctx *ctx,
 				 const struct net *net, u32 secid,
-				 const u8 *value,
+				 const u8 *value, bool claim,
 				 struct nfsd_ffv2_prototype_nonce **result)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_prototype_nonce *record;
 	bool has_secid = secid != 0;
+	bool dropped = false;
 	unsigned long index;
 	u64 carried;
+	int error;
 
+	/*
+	 * The index is carried as eight bytes and used as a table index, so
+	 * a value a table index cannot hold names nothing.
+	 */
 	carried = get_unaligned_be64(value);
-	index = (unsigned long)carried;
-	if (carried != index)
+	if (carried > (u64)ULONG_MAX)
 		return -ENOENT;
+	index = carried;
+
+	/*
+	 * The whole decision is one step under the gate lock, so a record
+	 * this returns cannot be reaped between being found and being
+	 * claimed by the caller that is about to use it.
+	 */
+	spin_lock(&anchor->prototype_gate_lock);
 	record = xa_load(&ctx->nonces, index);
-	if (!record)
-		return -ENOENT;
-	if (crypto_memneq(record->value, value,
-			  NFSD_FFV2_PROTOTYPE_NONCE_LEN))
-		return -ENOENT;
-	if (record->net != net || record->userns != current_user_ns() ||
-	    !uid_eq(record->uid, current_uid()) ||
-	    record->secid_valid != has_secid ||
-	    (record->secid_valid && record->secid != secid))
-		return -EPERM;
-	if (record->state == NFSD_FFV2_NONCE_ISSUED &&
-	    ktime_get_ns() > record->expires) {
+	if (!record ||
+	    crypto_memneq(record->value, value,
+			  NFSD_FFV2_PROTOTYPE_NONCE_LEN)) {
+		error = -ENOENT;
+	} else if (record->net != net ||
+		   record->userns != current_user_ns() ||
+		   !uid_eq(record->uid, current_uid()) ||
+		   record->secid_valid != has_secid ||
+		   (record->secid_valid && record->secid != secid)) {
+		error = -EPERM;
+	} else if (record->busy) {
+		error = -EBUSY;
+	} else if (record->state == NFSD_FFV2_NONCE_ISSUED &&
+		   ktime_get_ns() > record->expires) {
 		/*
 		 * An expired challenge is gone, not merely refused: leaving
 		 * it would let the same nonce report -ETIMEDOUT forever
 		 * while occupying one of the gate's few slots.
 		 */
-		if (xa_cmpxchg(&ctx->nonces, index, record, NULL,
-			       GFP_KERNEL) == record) {
-			spin_lock(&anchor->prototype_gate_lock);
-			if (!WARN_ON_ONCE(!ctx->nonce_count))
-				ctx->nonce_count--;
-			spin_unlock(&anchor->prototype_gate_lock);
-			kfree_sensitive(record);
-		}
-		return -ETIMEDOUT;
+		dropped = nfsd_ffv2_prototype_nonce_drop_locked(anchor, ctx,
+								index, record);
+		error = -ETIMEDOUT;
+	} else {
+		record->busy = claim;
+		*result = record;
+		error = 0;
 	}
-	*result = record;
-	return 0;
+	spin_unlock(&anchor->prototype_gate_lock);
+	if (dropped)
+		kfree_sensitive(record);
+	return error;
+}
+
+/* Give back a record a registration claimed. */
+static void
+nfsd_ffv2_prototype_nonce_release(struct nfsd_net *nn,
+				  struct nfsd_ffv2_prototype_nonce *record)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+
+	spin_lock(&anchor->prototype_gate_lock);
+	record->busy = false;
+	spin_unlock(&anchor->prototype_gate_lock);
 }
 
 /**
@@ -652,6 +843,710 @@ out_put:
 }
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/*
+ * Substitute the two things a KUnit build cannot produce: the resolution
+ * of an ordinary filehandle, which goes through the exporting
+ * filesystem's export operations, and the object's bytes, which come from
+ * a file.  A KUnit root filesystem has no export operations, and the
+ * object a fixture publishes is a dentry and an inode with nothing behind
+ * it.  Everything on either side of these two steps is the production
+ * path; this is the only way to reach it here.
+ */
+static struct svc_export *nfsd_ffv2_prototype_test_exp;
+static struct dentry *nfsd_ffv2_prototype_test_dentry;
+static u8 nfsd_ffv2_prototype_test_inner[NFSD_FFV2_FH_INNER_MAX];
+static u16 nfsd_ffv2_prototype_test_inner_len;
+static const void *nfsd_ffv2_prototype_test_bytes;
+static size_t nfsd_ffv2_prototype_test_len;
+
+void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
+					  struct dentry *dentry,
+					  const u8 *inner, u16 inner_len,
+					  const void *bytes, size_t len)
+{
+	if (inner_len > sizeof(nfsd_ffv2_prototype_test_inner))
+		return;
+	if (inner_len)
+		memcpy(nfsd_ffv2_prototype_test_inner, inner, inner_len);
+	nfsd_ffv2_prototype_test_inner_len = inner_len;
+	nfsd_ffv2_prototype_test_bytes = bytes;
+	nfsd_ffv2_prototype_test_len = len;
+	nfsd_ffv2_prototype_test_dentry = dentry;
+	/* Last: the others are read only once this one is set. */
+	WRITE_ONCE(nfsd_ffv2_prototype_test_exp, exp);
+}
+
+/* Whether a test has substituted the object; see the hook above. */
+static bool nfsd_ffv2_prototype_test_armed(void)
+{
+	const struct svc_export *exp = READ_ONCE(nfsd_ffv2_prototype_test_exp);
+
+	return exp;
+}
+
+static bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp)
+{
+	struct svc_export *exp = READ_ONCE(nfsd_ffv2_prototype_test_exp);
+
+	if (!exp)
+		return false;
+	fh_init(fhp, NFS4_FHSIZE);
+	fhp->fh_export = exp_get(exp);
+	fhp->fh_dentry = dget(nfsd_ffv2_prototype_test_dentry);
+	fhp->fh_handle.fh_size = nfsd_ffv2_prototype_test_inner_len;
+	memcpy(fhp->fh_handle.fh_raw, nfsd_ffv2_prototype_test_inner,
+	       nfsd_ffv2_prototype_test_inner_len);
+	return true;
+}
+#else
+static inline bool nfsd_ffv2_prototype_test_armed(void)
+{
+	return false;
+}
+
+static inline bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp)
+{
+	return false;
+}
+#endif
+
+/*
+ * The provider this profile installs.
+ *
+ * A result borrows provider storage until the caller's execution admission
+ * completes, and callbacks run concurrently on one provider, so that
+ * storage has to be immutable and never reused for another operation.  The
+ * simplest thing that is both is a snapshot: the registered object is read
+ * once, here, and every reply is served from those bytes.
+ *
+ * That is honest for a demonstrator and would be dishonest for a store.
+ * This profile registers one read-only object, gates I/O on its superblock
+ * for the life of the registration, and has no mutating entry point at
+ * all, so nothing can change the file underneath the snapshot through this
+ * server.  A real provider has to answer from the file, which means
+ * per-operation storage with a lifetime it can hold against the admission.
+ */
+struct nfsd_ffv2_prototype_provider {
+	u32				chunk_size;
+	u32				chunks;
+	u8				*bytes;
+	struct nfsd_ffv2_read_chunk	*read;
+	__be32				*status;
+	u32				*locked;
+	struct nfsd_ffv2_chunk_owner	*owners;
+	struct nfsd_ffv2_chunk_guard	*guards;
+	struct nfsd_ffv2_retained	*predecessors;
+};
+
+static void
+nfsd_ffv2_prototype_provider_free(struct nfsd_ffv2_prototype_provider *provider)
+{
+	if (!provider)
+		return;
+	kvfree(provider->bytes);
+	kvfree(provider->read);
+	kvfree(provider->status);
+	kvfree(provider->locked);
+	kvfree(provider->owners);
+	kvfree(provider->guards);
+	kvfree(provider->predecessors);
+	kfree(provider);
+}
+
+/* Chunks this provider still holds from @offset, and whether that is all. */
+static u32 nfsd_ffv2_prototype_range(const struct nfsd_ffv2_prototype_provider *p,
+				     const struct nfsd_ffv2_chunk_request *req,
+				     bool *eof)
+{
+	u32 available;
+
+	if (req->offset >= p->chunks) {
+		*eof = true;
+		return 0;
+	}
+	available = p->chunks - (u32)req->offset;
+	if (req->count >= available) {
+		*eof = true;
+		return available;
+	}
+	*eof = false;
+	return req->count;
+}
+
+static __be32
+nfsd_ffv2_prototype_chunk_read(void *opaque,
+			       const struct nfsd_ffv2_object *object,
+			       const struct nfsd_ffv2_chunk_request *req,
+			       struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_prototype_provider *provider = opaque;
+
+	result->count = nfsd_ffv2_prototype_range(provider, req, &result->eof);
+	if (result->count)
+		result->read.chunks = &provider->read[req->offset];
+	return nfs_ok;
+}
+
+static __be32
+nfsd_ffv2_prototype_chunk_header_read(void *opaque,
+				      const struct nfsd_ffv2_object *object,
+				      const struct nfsd_ffv2_chunk_request *req,
+				      struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_prototype_provider *provider = opaque;
+	u32 first;
+
+	result->count = nfsd_ffv2_prototype_range(provider, req, &result->eof);
+	if (!result->count)
+		return nfs_ok;
+	first = (u32)req->offset;
+	result->header.status = &provider->status[first];
+	result->header.locked = &provider->locked[first];
+	result->header.owners = &provider->owners[first];
+	result->header.guards = &provider->guards[first];
+	result->header.predecessors = &provider->predecessors[first];
+	return nfs_ok;
+}
+
+static const struct nfsd_ffv2_provider_ops nfsd_ffv2_prototype_provider_ops = {
+	.chunk_read		= nfsd_ffv2_prototype_chunk_read,
+	.chunk_header_read	= nfsd_ffv2_prototype_chunk_header_read,
+};
+
+/*
+ * Read the registered object and derive everything a reply needs from it.
+ *
+ * The checksum is the zlib CRC32 of the chunk's own bytes,
+ * crc32_le(~0, data, len) ^ ~0, which is what the Flex Files v2 client
+ * computes.  It covers the payload only; the chunk header is not folded
+ * in, and no consumer of this profile verifies one yet.
+ */
+static int
+nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
+				   u32 chunk_size, u32 data_count,
+				   u64 generation,
+				   struct nfsd_ffv2_prototype_provider **result)
+{
+	struct nfsd_ffv2_prototype_provider *provider;
+	struct file *file;
+	loff_t pos = 0;
+	size_t total;
+	u32 chunks;
+	u64 size;
+	int error;
+	u32 i;
+
+	file = NULL;
+	size = 0;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (nfsd_ffv2_prototype_test_bytes)
+		size = nfsd_ffv2_prototype_test_len;
+#endif
+	if (!size) {
+		file = dentry_open(path, O_RDONLY | O_LARGEFILE, cred);
+		if (IS_ERR(file))
+			return PTR_ERR(file);
+		size = i_size_read(file_inode(file));
+	}
+	/*
+	 * A layout says how many chunks the object has; the file says how
+	 * many it can fill.  Serving the smaller of the two keeps the reply
+	 * describing bytes that exist.
+	 */
+	chunks = min_t(u64, data_count, DIV_ROUND_UP_ULL(size, chunk_size));
+	if (!chunks) {
+		error = -EINVAL;
+		goto out_close;
+	}
+	total = (size_t)chunks * chunk_size;
+
+	provider = kzalloc_obj(*provider, GFP_KERNEL);
+	if (!provider) {
+		error = -ENOMEM;
+		goto out_close;
+	}
+	provider->chunk_size = chunk_size;
+	provider->chunks = chunks;
+	provider->bytes = kvzalloc(total, GFP_KERNEL);
+	provider->read = kvcalloc(chunks, sizeof(*provider->read), GFP_KERNEL);
+	provider->status = kvcalloc(chunks, sizeof(*provider->status),
+				    GFP_KERNEL);
+	provider->locked = kvcalloc(chunks, sizeof(*provider->locked),
+				    GFP_KERNEL);
+	provider->owners = kvcalloc(chunks, sizeof(*provider->owners),
+				    GFP_KERNEL);
+	provider->guards = kvcalloc(chunks, sizeof(*provider->guards),
+				    GFP_KERNEL);
+	provider->predecessors = kvcalloc(chunks,
+					  sizeof(*provider->predecessors),
+					  GFP_KERNEL);
+	if (!provider->bytes || !provider->read || !provider->status ||
+	    !provider->locked || !provider->owners || !provider->guards ||
+	    !provider->predecessors) {
+		error = -ENOMEM;
+		goto out_free;
+	}
+
+	if (file) {
+		error = kernel_read(file, provider->bytes, total, &pos);
+		if (error < 0)
+			goto out_free;
+	}
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	else
+		memcpy(provider->bytes, nfsd_ffv2_prototype_test_bytes,
+		       min_t(size_t, total, nfsd_ffv2_prototype_test_len));
+#endif
+	/*
+	 * A short read is the tail of the file, which the zeroed buffer has
+	 * already accounted for: the last chunk is reported at its real
+	 * length and the bytes past it are never described.
+	 */
+	for (i = 0; i < chunks; i++) {
+		u8 *bytes = provider->bytes + (size_t)i * chunk_size;
+		u32 len = chunk_size;
+		u32 crc;
+
+		if ((u64)(i + 1) * chunk_size > size)
+			len = (u32)(size - (u64)i * chunk_size);
+		crc = crc32_le(~0U, bytes, len) ^ ~0U;
+
+		provider->read[i].cr_checksum.cs_algorithm =
+			NFSD_FFV2_CHECKSUM_ALG_CRC32;
+		provider->read[i].cr_checksum.cs_len =
+			NFSD_FFV2_CHECKSUM_CRC32_LEN;
+		put_unaligned_be32(crc, provider->read[i].cr_checksum.cs_value);
+		provider->read[i].cr_effective_len = len;
+		provider->read[i].cr_owner.co_cohort_id = generation;
+		provider->read[i].cr_owner.co_id = i;
+		provider->read[i].cr_guard.cg_gen_id = 1;
+		provider->read[i].cr_payload_id = i;
+		provider->read[i].cr_status = nfs_ok;
+		provider->read[i].cr_chunk = bytes;
+
+		provider->status[i] = nfs_ok;
+		provider->owners[i] = provider->read[i].cr_owner;
+		provider->guards[i] = provider->read[i].cr_guard;
+		provider->predecessors[i].disposition = NFSD_FFV2_RETAINED_ABSENT;
+	}
+	if (file)
+		fput(file);
+	*result = provider;
+	return 0;
+
+out_free:
+	nfsd_ffv2_prototype_provider_free(provider);
+out_close:
+	if (file)
+		fput(file);
+	return error;
+}
+
+/*
+ * Remove whatever the one registration published, if it is still owned.
+ * Both the unregister and the close owner come through here, and the
+ * ownership bits are taken under the gate lock, so exactly one of them
+ * removes the provider and exactly one retires the generation.
+ */
+static void nfsd_ffv2_prototype_teardown_published(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
+	struct nfsd_ffv2_prototype_provider *provider = NULL;
+	u64 generation = 0;
+
+	spin_lock(&anchor->prototype_gate_lock);
+	if (proto->owns_provider) {
+		provider = proto->provider;
+		proto->provider = NULL;
+		proto->owns_provider = false;
+	}
+	if (proto->owns_generation) {
+		generation = proto->generation;
+		proto->owns_generation = false;
+	}
+	spin_unlock(&anchor->prototype_gate_lock);
+
+	/*
+	 * The provider first: its removal waits for the callbacks and the
+	 * result-holding admissions still inside it, which is what makes the
+	 * snapshot safe to free.  Retirement then waits for the generation's
+	 * own admissions and releases the service context, its object, its
+	 * trust registry and its authority.
+	 */
+	if (provider) {
+		nfsd_ffv2_provider_remove(nn);
+		nfsd_ffv2_prototype_provider_free(provider);
+	}
+	if (generation) {
+		mutex_lock(&nfsd_mutex);
+		nfsd_ffv2_service_generation_retire(nn, generation);
+		mutex_unlock(&nfsd_mutex);
+	}
+}
+
+/* Resolve the ordinary filehandle a registration named. */
+static int nfsd_ffv2_prototype_resolve(const struct net *net,
+				       const struct cred *cred,
+				       const struct nfsd_ffv2_prototype_request *req,
+				       struct svc_fh *fhp)
+{
+	struct auth_domain *domain;
+	struct svc_cred rq_cred = {};
+	__be32 status;
+	int error;
+
+	if (nfsd_ffv2_prototype_test_resolve(fhp))
+		return 0;
+	domain = auth_domain_find((char *)req->auth_domain);
+	if (!domain)
+		return -ENOENT;
+	rq_cred.cr_uid = cred->fsuid;
+	rq_cred.cr_gid = cred->fsgid;
+	rq_cred.cr_flavor = RPC_AUTH_UNIX;
+	rq_cred.cr_group_info = groups_alloc(0);
+	if (!rq_cred.cr_group_info) {
+		auth_domain_put(domain);
+		return -ENOMEM;
+	}
+	fh_init(fhp, NFS4_FHSIZE);
+	fhp->fh_handle.fh_size = req->handle_len;
+	memcpy(fhp->fh_handle.fh_raw, req->handle, req->handle_len);
+	status = fh_verify_local((struct net *)net, &rq_cred, domain, fhp,
+				 S_IFREG, NFSD_MAY_READ);
+	put_group_info(rq_cred.cr_group_info);
+	auth_domain_put(domain);
+	if (status) {
+		fh_put(fhp);
+		error = -ESTALE;
+	} else {
+		error = 0;
+	}
+	return error;
+}
+
+/* The immutable inputs, as a committed registration records them. */
+static void
+nfsd_ffv2_prototype_commit_record(struct nfsd_ffv2_prototype_committed *rec,
+				  const struct nfsd_ffv2_prototype_request *req)
+{
+	memset(rec, 0, sizeof(*rec));
+	strscpy(rec->auth_domain, req->auth_domain, sizeof(rec->auth_domain));
+	memcpy(rec->handle, req->handle, req->handle_len);
+	rec->handle_len = req->handle_len;
+	rec->chunk_size = req->chunk_size;
+	rec->data_count = req->data_count;
+	rec->parity_count = req->parity_count;
+}
+
+/*
+ * Install the one trust entry the demonstrator reads through, and mint the
+ * stateid that names it.  The stateid is the server's: a caller that could
+ * choose it could name an entry another registration installed.
+ */
+static int nfsd_ffv2_prototype_trust(struct nfsd_net *nn,
+				     const u8 object_uuid[16],
+				     stateid_t *stateid)
+{
+	struct nfsd_ffv2_trust_request req = {};
+	__be32 status;
+
+	get_random_bytes(stateid, sizeof(*stateid));
+	stateid->si_generation = 1;
+	req.stateid = *stateid;
+	req.object_uuid = object_uuid;
+	req.actor = NFSD_FFV2_CALLER_DATA_CLIENT;
+	req.iomode = IOMODE_READ;
+	req.profile_mask = NFSD_FFV2_PROFILE_READ_DATA |
+			   NFSD_FFV2_PROFILE_READ_METADATA;
+	ktime_get_real_ts64(&req.expires);
+	req.expires.tv_sec += NFSD_FFV2_PROTOTYPE_TRUST_TTL_SEC;
+	status = nfsd_ffv2_trust_install_active(nn, NULL, &req);
+	return status == nfs_ok ? 0 : -EIO;
+}
+
+/**
+ * nfsd_ffv2_prototype_register - publish the one object this gate serves
+ * @nn: the nfsd namespace
+ * @net: the caller's network namespace
+ * @req: nonce, client name, ordinary filehandle and layout parameters
+ * @bundle: receives everything the demonstrator needs to read
+ *
+ * The transaction is staged: the nonce, the layout and the filehandle are
+ * validated and the object is read before anything is published, and each
+ * step that publishes something records that it owns it, so a failure
+ * unwinds exactly what it created.  READY is the last step and the only
+ * one a mapping can observe -- the generation is active before the trust
+ * entry and the provider exist, and no operation may cross that interval.
+ *
+ * A retry of an identical request returns the original bundle rather than
+ * publishing a second time; a retry that changed anything is refused.
+ *
+ * Return: 0, or a negative errno from the table in the design gate.
+ */
+int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
+				 const struct nfsd_ffv2_prototype_request *req,
+				 struct nfsd_ffv2_prototype_bundle *bundle)
+{
+	struct nfsd_ffv2_prototype_provider *provider = NULL;
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
+	struct nfsd_ffv2_prototype_committed record;
+	struct nfsd_ffv2_export_update registration;
+	struct nfsd_ffv2_prototype_nonce *nonce;
+	struct nfsd_ffv2_prototype_ctx *ctx;
+	bool slot_open = false, installed = false, claimed = false;
+	struct knfsd_fh outer_fh = {};
+	const struct cred *cred;
+	u64 generation_id = 0;
+	u8 object_uuid[16];
+	struct svc_fh fhp;
+	stateid_t stateid;
+	struct path path;
+	u32 secid = 0;
+	int error;
+
+	if (!ns_capable(net->user_ns, CAP_SYS_ADMIN))
+		return -EPERM;
+	/*
+	 * The layout is checked before the gate is even entered: a request
+	 * that cannot describe an object must not consume a nonce.
+	 */
+	if (!req->handle_len || req->handle_len > NFS4_FHSIZE ||
+	    !req->chunk_size || !req->data_count || req->parity_count ||
+	    req->chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES ||
+	    (u64)req->chunk_size * req->data_count > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+		return -EINVAL;
+	if (strnlen(req->auth_domain, NFSD_FFV2_PROTOTYPE_DOMAIN_MAX + 1) >
+	    NFSD_FFV2_PROTOTYPE_DOMAIN_MAX)
+		return -EINVAL;
+
+	security_cred_getsecid(current_cred(), &secid);
+	/*
+	 * A live gate is enough to be let in: whether a fresh registration
+	 * is possible depends on the nonce, and is decided once the nonce
+	 * has been looked up.  A gate that already published a registration
+	 * must still answer a replay of it.
+	 */
+	error = nfsd_ffv2_prototype_user_get(nn, net, secid);
+	if (error)
+		return error;
+	ctx = nfsd_ffv2_prototype_ctx_of(nn);
+	if (WARN_ON_ONCE(!ctx)) {
+		error = -EOPNOTSUPP;
+		goto out_put;
+	}
+	error = nfsd_ffv2_prototype_nonce_lookup(nn, ctx, net, secid,
+						 req->nonce, true, &nonce);
+	if (error)
+		goto out_put;
+	claimed = true;
+	nfsd_ffv2_prototype_commit_record(&record, req);
+	if (nonce->state == NFSD_FFV2_NONCE_RETIRED) {
+		error = -ESTALE;
+		goto out_put;
+	}
+	if (nonce->state == NFSD_FFV2_NONCE_COMMITTED) {
+		/*
+		 * The same request again is the same registration: hand back
+		 * what it produced.  Anything else wearing this nonce is a
+		 * different registration and is refused rather than merged.
+		 */
+		if (memcmp(&nonce->committed, &record, sizeof(record))) {
+			error = -EEXIST;
+			goto out_put;
+		}
+		*bundle = nonce->bundle;
+		error = 0;
+		goto out_put;
+	}
+	/*
+	 * A nonce that has not been spent asks for a new registration, and a
+	 * gate serves one at a time.
+	 */
+	spin_lock(&anchor->prototype_gate_lock);
+	if (proto->state != NFSD_FFV2_PROTOTYPE_OPEN)
+		error = -EBUSY;
+	spin_unlock(&anchor->prototype_gate_lock);
+	if (error)
+		goto out_put;
+	cred = ctx->cred;
+
+	error = nfsd_ffv2_prototype_resolve(net, cred, req, &fhp);
+	if (error)
+		goto out_put;
+	path.mnt = fhp.fh_export->ex_path.mnt;
+	path.dentry = fhp.fh_dentry;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_registration_begin_prototype(nn, &registration);
+	mutex_unlock(&nfsd_mutex);
+	if (error)
+		goto out_registration;
+	slot_open = true;
+	error = nfsd_ffv2_authority_prototype_create(nn, &registration.authority);
+	if (error)
+		goto out_registration;
+	error = nfsd_ffv2_object_register_fh(nn, &registration, &fhp,
+					     req->chunk_size, cred,
+					     !nfsd_ffv2_prototype_test_armed(),
+					     object_uuid, &outer_fh,
+					     &generation_id);
+	if (error)
+		goto out_registration;
+
+	/*
+	 * The snapshot is taken now rather than earlier because a chunk
+	 * names the generation it belongs to, and there is no generation to
+	 * name until the object has been published.
+	 */
+	error = nfsd_ffv2_prototype_provider_build(&path, cred, req->chunk_size,
+						   req->data_count,
+						   generation_id, &provider);
+	if (error)
+		goto out_published;
+	error = nfsd_ffv2_provider_install(nn, &nfsd_ffv2_prototype_provider_ops,
+					   provider, req->chunk_size);
+	if (error)
+		goto out_published;
+	installed = true;
+	error = nfsd_ffv2_prototype_trust(nn, object_uuid, &stateid);
+	if (error)
+		goto out_published;
+
+	memset(bundle, 0, sizeof(*bundle));
+	memcpy(bundle->source_uuid, object_uuid, sizeof(bundle->source_uuid));
+	get_random_bytes(bundle->service_uuid, sizeof(bundle->service_uuid));
+	get_random_bytes(bundle->replay_uuid, sizeof(bundle->replay_uuid));
+	bundle->generation = generation_id;
+	memcpy(bundle->stateid, &stateid, sizeof(bundle->stateid));
+	memcpy(bundle->handle, outer_fh.fh_raw, outer_fh.fh_size);
+	bundle->handle_len = outer_fh.fh_size;
+
+	/*
+	 * The single linearization point.  Until this store a mapping is
+	 * refused even though the generation is already active, so nothing
+	 * can have observed the interval in which the trust entry and the
+	 * provider were still being installed.
+	 */
+	nfsd_ffv2_prototype_publish_pause();
+	spin_lock(&anchor->prototype_gate_lock);
+	proto->provider = provider;
+	proto->owns_provider = true;
+	proto->generation = generation_id;
+	proto->owns_generation = true;
+	memcpy(proto->source_uuid, bundle->source_uuid,
+	       sizeof(proto->source_uuid));
+	nonce->committed = record;
+	nonce->bundle = *bundle;
+	nonce->state = NFSD_FFV2_NONCE_COMMITTED;
+	proto->state = NFSD_FFV2_PROTOTYPE_READY;
+	spin_unlock(&anchor->prototype_gate_lock);
+
+	nfsd_ffv2_registration_end(nn, &registration);
+	fh_put(&fhp);
+	nfsd_ffv2_prototype_nonce_release(nn, nonce);
+	nfsd_ffv2_prototype_user_put(nn);
+	return 0;
+
+out_published:
+	/*
+	 * Nothing published here was ever reachable: the gate never reached
+	 * READY, so no mapping and no operation can be inside any of it.
+	 */
+	if (installed)
+		nfsd_ffv2_provider_remove(nn);
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_service_generation_retire(nn, generation_id);
+	mutex_unlock(&nfsd_mutex);
+	nfsd_ffv2_prototype_provider_free(provider);
+out_registration:
+	if (slot_open)
+		nfsd_ffv2_registration_end(nn, &registration);
+	fh_put(&fhp);
+out_put:
+	if (claimed)
+		nfsd_ffv2_prototype_nonce_release(nn, nonce);
+	nfsd_ffv2_prototype_user_put(nn);
+	return error;
+}
+
+/**
+ * nfsd_ffv2_prototype_unregister - retire the object this gate published
+ * @nn: the nfsd namespace
+ * @net: the caller's network namespace
+ * @source_uuid: the identifier the registration returned
+ * @generation: the generation the registration returned
+ *
+ * Leaves the gate open, so the same administrator may register again.  The
+ * nonce that named the registration is retired rather than forgotten: a
+ * replay after this must be told that its registration is gone, not that
+ * its nonce was never issued.
+ *
+ * Return: 0, -EPERM for another administrator, -EOPNOTSUPP when the gate
+ * is off or nothing is registered, or -ESTALE when the pair names no
+ * registration this gate made.
+ */
+int nfsd_ffv2_prototype_unregister(struct nfsd_net *nn, const struct net *net,
+				   const u8 source_uuid[16], u64 generation)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
+	struct nfsd_ffv2_prototype_nonce *nonce;
+	struct nfsd_ffv2_prototype_ctx *ctx;
+	unsigned long index;
+	u32 secid = 0;
+	int error;
+
+	if (!ns_capable(net->user_ns, CAP_SYS_ADMIN))
+		return -EPERM;
+	security_cred_getsecid(current_cred(), &secid);
+	error = nfsd_ffv2_prototype_user_get(nn, net, secid);
+	if (error)
+		return error;
+
+	/*
+	 * Stop admitting mappings before anything is removed, and check the
+	 * identity against what was published under the same lock, so a
+	 * request naming a registration that has already gone is refused
+	 * rather than allowed to remove the next one.
+	 */
+	spin_lock(&anchor->prototype_gate_lock);
+	if (proto->state != NFSD_FFV2_PROTOTYPE_READY) {
+		error = -EOPNOTSUPP;
+	} else if (proto->generation != generation ||
+		   memcmp(proto->source_uuid, source_uuid,
+			  sizeof(proto->source_uuid))) {
+		error = -ESTALE;
+	} else {
+		proto->state = NFSD_FFV2_PROTOTYPE_OPEN;
+		error = 0;
+	}
+	spin_unlock(&anchor->prototype_gate_lock);
+	if (error)
+		goto out_put;
+
+	nfsd_ffv2_prototype_teardown_published(nn);
+
+	ctx = nfsd_ffv2_prototype_ctx_of(nn);
+	if (ctx) {
+		spin_lock(&anchor->prototype_gate_lock);
+		xa_for_each(&ctx->nonces, index, nonce) {
+			if (nonce->state != NFSD_FFV2_NONCE_COMMITTED ||
+			    nonce->bundle.generation != generation)
+				continue;
+			nonce->state = NFSD_FFV2_NONCE_RETIRED;
+			memzero_explicit(&nonce->bundle,
+					 sizeof(nonce->bundle));
+		}
+		spin_unlock(&anchor->prototype_gate_lock);
+	}
+out_put:
+	nfsd_ffv2_prototype_user_put(nn);
+	return error;
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 /* Run one nonce through the real lookup and report only its status. */
 int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 					 const struct net *net,
@@ -668,7 +1563,7 @@ int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 		return error;
 	ctx = nfsd_ffv2_prototype_ctx_of(nn);
 	error = ctx ? nfsd_ffv2_prototype_nonce_lookup(nn, ctx, net, secid,
-						       nonce, &record) :
+						       nonce, false, &record) :
 		      -EOPNOTSUPP;
 	nfsd_ffv2_prototype_user_put(nn);
 	return error;

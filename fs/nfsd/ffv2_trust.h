@@ -133,6 +133,12 @@ struct nfsd_ffv2_trust_request {
 
 int nfsd_ffv2_trust_registry_init(struct nfsd_ffv2_trust_registry *registry);
 void nfsd_ffv2_trust_registry_destroy(struct nfsd_ffv2_trust_registry *registry);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) || \
+	IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+__be32 nfsd_ffv2_trust_install_active(struct nfsd_net *nn,
+				      struct nfsd_ffv2_authority *authority,
+				      const struct nfsd_ffv2_trust_request *req);
+#endif
 __be32 nfsd_ffv2_trust_install(struct nfsd_ffv2_trust_registry *registry,
 			       struct nfsd_ffv2_authority *authority,
 			       struct nfsd_ffv2_object *object,

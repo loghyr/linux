@@ -91,6 +91,13 @@ struct nfsd_ffv2_export_update {
 	bool				entry_locked;
 	bool				policy_locked;
 	bool				registration_slot;
+	/*
+	 * Set when this registration claimed the namespace's authority
+	 * source, so exactly one owner releases it.  A prototype
+	 * registration runs against a reservation its gate already holds and
+	 * leaves this clear.
+	 */
+	bool				source_claimed;
 	/* Prepared authority owned by the caller until publication. */
 	struct nfsd_ffv2_authority	*authority;
 };
@@ -619,6 +626,25 @@ bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn);
  * this one, because the wait is for that admission.  Unpublish and drain
  * separately instead.
  */
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+int nfsd_ffv2_registration_begin_prototype(struct nfsd_net *nn,
+					   struct nfsd_ffv2_export_update *registration);
+int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
+					 struct nfsd_ffv2_authority **result);
+int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
+				 struct nfsd_ffv2_export_update *registration,
+				 struct svc_fh *fhp, u32 chunk_size,
+				 const struct cred *cred, bool validate_backend,
+				 u8 object_uuid[16], struct knfsd_fh *outer_fh,
+				 u64 *generation_id);
+#endif
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) || \
+	IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+int nfsd_ffv2_provider_install(struct nfsd_net *nn,
+			       const struct nfsd_ffv2_provider_ops *ops,
+			       void *data, u32 chunk_size);
+void nfsd_ffv2_provider_remove(struct nfsd_net *nn);
+#endif
 int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 				    const struct nfsd_ffv2_provider_ops *ops,
 				    void *data, u32 chunk_size);

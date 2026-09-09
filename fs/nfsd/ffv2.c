@@ -90,6 +90,8 @@ struct nfsd_ffv2_binding {
 	struct net		*net;
 	struct nfsd_ffv2_object *object;
 	struct nfsd_ffv2_admission admission;
+	/* Set when this mapping also counts against the prototype gate. */
+	bool			prototype_admitted;
 };
 
 struct nfsd_ffv2_provider_probe_counters {
@@ -1139,7 +1141,7 @@ nfsd_ffv2_transition_publish(struct nfsd_net *owner,
 		context->authority = registration->authority;
 		registration->authority = NULL;
 		/* ...and the source reservation the registration claimed. */
-		context->source_claimed = true;
+		context->source_claimed = registration->source_claimed;
 	}
 	mutex_unlock(&nfsd_ffv2_registry_lock);
 	mutex_unlock(&participant->inventory_lock);
@@ -1340,14 +1342,80 @@ static int nfsd_ffv2_object_validate(struct svc_export *exp,
 	return 0;
 }
 
+/*
+ * Publish one prepared object into a new generation.
+ *
+ * The caller has already resolved @exp and filled @object in, whichever
+ * way it names the object; from here the transaction is the same one for
+ * every caller: transition the export exactly, clone its template, and
+ * publish.  @object is consumed either way -- on success the generation's
+ * service context owns it, and on failure it is freed here -- because the
+ * publication takes ownership at a point the caller cannot observe.
+ */
+static int nfsd_ffv2_object_publish(struct nfsd_net *nn,
+				    struct nfsd_ffv2_export_update *registration,
+				    struct nfsd_ffv2_object *object,
+				    struct svc_export *exp,
+				    const u8 store_uuid[16],
+				    const u8 binding_token[32],
+				    const struct cred *cred, u64 control_root,
+				    bool validate_backend,
+				    struct knfsd_fh *outer_fh,
+				    u64 *generation_id)
+{
+	struct svc_export template;
+	int error;
+
+	error = nfsd_ffv2_export_transition_exact(exp);
+	if (error)
+		goto out_free;
+	error = nfsd_ffv2_live_test_checkpoint(NFSD_FFV2_LIVE_TEST_TRANSITION,
+					       exp);
+	if (error)
+		goto out_reopen;
+	error = nfsd_ffv2_object_validate(exp, object);
+	if (error)
+		goto out_reopen;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_TEMPLATE_CLONE)) {
+		error = -ENOMEM;
+		goto out_reopen;
+	}
+	error = nfsd_ffv2_export_template_clone(&template, exp);
+	if (error)
+		goto out_reopen;
+	error = __nfsd_ffv2_service_export_publish(nn, &template,
+						   &object->export_path,
+						   store_uuid, binding_token,
+						   cred, control_root,
+						   generation_id,
+						   validate_backend, exp,
+						   registration, object,
+						   outer_fh);
+	nfsd_ffv2_export_template_free(&template);
+	/*
+	 * A publication that failed left the object where the caller passed
+	 * it: the service context records it but takes ownership only at
+	 * publication, so nothing else will free it.
+	 */
+	if (error)
+		nfsd_ffv2_object_free(object);
+	return error;
+
+out_reopen:
+	nfsd_ffv2_export_transition_abort_exact(exp);
+out_free:
+	nfsd_ffv2_object_free(object);
+	return error;
+}
+
 int nfsd_ffv2_object_register(struct nfsd_net *nn,
 			      struct nfsd_ffv2_export_update *registration,
 			      struct nfsd_ffv2_object *object,
 			      const struct nfsd_ffv2_object_request *request,
 			      struct knfsd_fh *outer_fh, u64 *generation_id)
 {
-	struct svc_export template, *exp;
 	struct svc_fh ordinary;
+	struct svc_export *exp;
 	__be32 status;
 	int error;
 
@@ -1435,39 +1503,15 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 	}
 	fh_put(&ordinary);
 
-	error = nfsd_ffv2_export_transition_exact(exp);
-	if (error)
-		goto out_put_exp;
-	error = nfsd_ffv2_live_test_checkpoint(NFSD_FFV2_LIVE_TEST_TRANSITION,
-					       exp);
-	if (error)
-		goto out_reopen;
-	error = nfsd_ffv2_object_validate(exp, object);
-	if (error)
-		goto out_reopen;
-	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_TEMPLATE_CLONE)) {
-		error = -ENOMEM;
-		goto out_reopen;
-	}
-	error = nfsd_ffv2_export_template_clone(&template, exp);
-	if (error)
-		goto out_reopen;
-	error = __nfsd_ffv2_service_export_publish(nn, &template,
-						   &object->export_path,
-						   request->store_uuid,
-						   request->binding_token,
-						   current_cred(),
-						   request->control_root,
-						   generation_id, true, exp,
-						   registration, object, outer_fh);
-	nfsd_ffv2_export_template_free(&template);
-	if (error)
-		goto out_put_exp;
+	error = nfsd_ffv2_object_publish(nn, registration, object, exp,
+					 request->store_uuid,
+					 request->binding_token, current_cred(),
+					 request->control_root, true, outer_fh,
+					 generation_id);
+	/* The object is consumed either way; only the export is left. */
 	exp_put(exp);
-	return 0;
+	return error;
 
-out_reopen:
-	nfsd_ffv2_export_transition_abort_exact(exp);
 out_put_exp:
 	exp_put(exp);
 out_free:
@@ -1488,6 +1532,16 @@ void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding)
 	if (!refcount_dec_and_test(&binding->ref))
 		return;
 	nfsd_ffv2_complete(&binding->admission);
+	/*
+	 * After the admission, because the gate's close owner waits for this
+	 * count to reach zero and then removes the provider a result may
+	 * still have been borrowing from.
+	 */
+	if (binding->prototype_admitted) {
+		struct nfsd_net *nn = net_generic(binding->net, nfsd_net_id);
+
+		nfsd_ffv2_prototype_op_release(nn);
+	}
 	put_net(binding->net);
 	kfree(binding);
 }
@@ -1521,6 +1575,19 @@ static int nfsd_ffv2_binding_admit(struct nfsd_net *nn,
 	object = context->object;
 	if (!object->visible || object->inner_fh.fh_size != info->inner_len ||
 	    memcmp(object->inner_fh.fh_raw, info->inner, info->inner_len)) {
+		mutex_unlock(&nfsd_ffv2_registry_lock);
+		goto out_unlock;
+	}
+	/*
+	 * A namespace whose authority came from the prototype profile admits
+	 * a mapping only once that profile has finished publishing.  The
+	 * generation is active from the moment it is published, which is
+	 * before the trust entry and the provider exist, so the gate's own
+	 * READY point is what a lookup has to wait for.  A namespace with an
+	 * ordinary authority has no gate and is admitted here.
+	 */
+	error = nfsd_ffv2_prototype_op_admit(nn, &binding->prototype_admitted);
+	if (error) {
 		mutex_unlock(&nfsd_ffv2_registry_lock);
 		goto out_unlock;
 	}
@@ -1768,6 +1835,93 @@ static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
 	nfsd_ffv2_provider_drain(provider);
 	return true;
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) || \
+	IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+/**
+ * nfsd_ffv2_provider_install - install a namespace's read-only provider
+ * @nn: the namespace the provider serves
+ * @ops: read-only callbacks, which must both be supplied
+ * @data: opaque provider state passed back to each callback
+ * @chunk_size: bytes in one chunk of every object this provider serves
+ *
+ * Only one provider may be installed per namespace.  The callbacks and the
+ * state are published together, so a callback always runs against the
+ * state its own operations vector was installed with.  The installer owns
+ * both and must keep them alive until removal returns.
+ *
+ * Return: 0, -EINVAL for a missing namespace or an incomplete operations
+ * vector, -ENOMEM, -ESHUTDOWN once @nn has begun exiting, or -EBUSY when
+ * @nn already has one installed.
+ */
+int nfsd_ffv2_provider_install(struct nfsd_net *nn,
+			       const struct nfsd_ffv2_provider_ops *ops,
+			       void *data, u32 chunk_size)
+{
+	struct nfsd_ffv2_provider *provider;
+	struct nfsd_ffv2_anchor *anchor;
+
+	if (!nn || !ops || !ops->chunk_read || !ops->chunk_header_read)
+		return -EINVAL;
+	/*
+	 * A provider must say how large its chunks are, because nothing else
+	 * at this boundary does, and a reply cannot be bounded without it.
+	 * Zero is not "unknown" here: it would admit no payload at all.
+	 */
+	if (!chunk_size || chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+		return -EINVAL;
+	anchor = &nn->ffv2;
+	provider = kzalloc_obj(*provider, GFP_KERNEL);
+	if (!provider)
+		return -ENOMEM;
+	provider->ops = ops;
+	provider->data = data;
+	provider->chunk_size = chunk_size;
+	refcount_set(&provider->ref, 1);
+	init_completion(&provider->gone);
+
+	/*
+	 * Publication is part of the namespace's lifecycle, not merely of
+	 * the registry: taking the anchor lock and requiring NET_LIVE is
+	 * what makes installation and namespace exit one transaction.  A
+	 * provider published before exit closes that state is drained by the
+	 * exit fence; one attempted after it never publishes at all.
+	 */
+	mutex_lock(&anchor->lock);
+	if (anchor->net_state != NFSD_FFV2_NET_LIVE) {
+		mutex_unlock(&anchor->lock);
+		kfree(provider);
+		return -ESHUTDOWN;
+	}
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (rcu_dereference_protected(nn->ffv2.provider,
+				      lockdep_is_held(&nfsd_ffv2_registry_lock))) {
+		mutex_unlock(&nfsd_ffv2_registry_lock);
+		mutex_unlock(&anchor->lock);
+		kfree(provider);
+		return -EBUSY;
+	}
+	rcu_assign_pointer(nn->ffv2.provider, provider);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	mutex_unlock(&anchor->lock);
+	return 0;
+}
+
+/**
+ * nfsd_ffv2_provider_remove - remove @nn's read-only provider
+ * @nn: the namespace whose boundary is being closed
+ *
+ * Takes the provider out of the registry, then waits for the callbacks and
+ * admissions still holding it, so no request can be running in provider
+ * code once this returns and the caller may free its operations vector and
+ * state.  A caller that must keep an admission alive across the removal
+ * cannot use this, because the wait is for that admission.
+ */
+void nfsd_ffv2_provider_remove(struct nfsd_net *nn)
+{
+	nfsd_ffv2_provider_shutdown(nn);
+}
+#endif
 
 /*
  * Run the read-only provider installed for @nn, if one exists.  The
@@ -2087,6 +2241,8 @@ __be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp)
 out_fh:
 	fh_put(fhp);
 	nfsd_ffv2_complete(&binding->admission);
+	if (binding->prototype_admitted)
+		nfsd_ffv2_prototype_op_release(nn);
 out_binding:
 	put_net(binding->net);
 	kfree(binding);
@@ -2308,8 +2464,9 @@ nfsd_ffv2_export_update_put(struct nfsd_ffv2_export_update *update)
 		wake_up_all(&participant->update_wait);
 }
 
-int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
-				 struct nfsd_ffv2_export_update *registration)
+static int __nfsd_ffv2_registration_begin(struct nfsd_net *nn,
+					  struct nfsd_ffv2_export_update *registration,
+					  bool claim_source)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	int error;
@@ -2321,11 +2478,17 @@ int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
 	 * prepared, so a prototype profile and this registration cannot both
 	 * get as far as publication.  The claim is released here if the
 	 * registration never publishes, and by the published generation
-	 * otherwise.
+	 * otherwise.  A caller that already holds the reservation -- the
+	 * prototype gate does, from the moment it was enabled -- registers
+	 * against its own claim rather than taking a second one.
 	 */
-	error = nfsd_ffv2_source_claim_locked(nn, NFSD_FFV2_SOURCE_MDS);
-	if (error)
-		return error;
+	if (claim_source) {
+		error = nfsd_ffv2_source_claim_locked(nn,
+						      NFSD_FFV2_SOURCE_MDS);
+		if (error)
+			return error;
+		registration->source_claimed = true;
+	}
 	error = nfsd_ffv2_export_update_admit(&nn->ffv2_participant,
 					      registration);
 	if (error)
@@ -2347,8 +2510,15 @@ int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
 		return 0;
 	nfsd_ffv2_export_update_put(registration);
 out_source:
-	nfsd_ffv2_source_release(nn, NFSD_FFV2_SOURCE_MDS);
+	if (claim_source)
+		nfsd_ffv2_source_release(nn, NFSD_FFV2_SOURCE_MDS);
 	return error;
+}
+
+int nfsd_ffv2_registration_begin(struct nfsd_net *nn,
+				 struct nfsd_ffv2_export_update *registration)
+{
+	return __nfsd_ffv2_registration_begin(nn, registration, true);
 }
 
 void nfsd_ffv2_registration_end(struct nfsd_net *nn,
@@ -2368,9 +2538,11 @@ void nfsd_ffv2_registration_end(struct nfsd_net *nn,
 	 * Publication consumes the slot, so a slot still held here says this
 	 * registration published nothing and the source reservation it took
 	 * has no generation to outlive.  After a successful publication the
-	 * service context owns it instead.
+	 * service context owns it instead.  A registration that never took
+	 * one, because its caller already held the namespace, releases
+	 * nothing either way.
 	 */
-	if (unpublished)
+	if (unpublished && registration->source_claimed)
 		nfsd_ffv2_source_release(nn, NFSD_FFV2_SOURCE_MDS);
 	/*
 	 * Registration cancellation: an authority that never reached
@@ -4504,6 +4676,183 @@ out:
 	return status;
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) || \
+	IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+/**
+ * nfsd_ffv2_trust_install_active - install one trusted stateid
+ * @nn: the namespace holding the published generation
+ * @authority: issuer, or NULL for the generation's own
+ * @req: immutable description of the registration
+ *
+ * The entry point a TRUST_STATEID handler will use once it exists.  Naming
+ * an authority other than the generation's roots the entry in a different
+ * issuer epoch, which is how a test builds a stale-issuer negative that the
+ * gate must not find; the prototype profile passes NULL and installs
+ * against the authority its own registration published.
+ *
+ * Return: nfs_ok, or the wire status of the first failing check.
+ */
+__be32 nfsd_ffv2_trust_install_active(struct nfsd_net *nn,
+				      struct nfsd_ffv2_authority *authority,
+				      const struct nfsd_ffv2_trust_request *req)
+{
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	__be32 status;
+
+	generation = nfsd_ffv2_active_generation_get(nn);
+	if (!generation)
+		return nfserr_stale;
+	context = generation->payload;
+	if (!context || !context->object || !context->authority) {
+		nfsd_ffv2_generation_put_owned(generation);
+		return nfserr_stale;
+	}
+	status = nfsd_ffv2_trust_install(&context->trust,
+					 authority ? authority :
+						     context->authority,
+					 context->object,
+					 generation->identity->generation, req);
+	nfsd_ffv2_generation_put_owned(generation);
+	return status;
+}
+#endif
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+/**
+ * nfsd_ffv2_registration_begin_prototype - open a registration slot for the gate
+ * @nn: the nfsd namespace
+ * @registration: receives the opened slot
+ *
+ * As nfsd_ffv2_registration_begin(), except that it claims no authority
+ * source: the prototype gate claimed the namespace when it was enabled and
+ * holds that claim until it closes, so a second claim here would be a
+ * second owner of one release.
+ */
+int nfsd_ffv2_registration_begin_prototype(struct nfsd_net *nn,
+					   struct nfsd_ffv2_export_update *registration)
+{
+	return __nfsd_ffv2_registration_begin(nn, registration, false);
+}
+
+/**
+ * nfsd_ffv2_authority_prototype_create - authority for the prototype profile
+ * @nn: the namespace the authority belongs to
+ * @result: receives the prepared authority
+ *
+ * The ordinary constructor reads every identity fact from a live metadata
+ * server session.  This profile has no session: its authority is bound to
+ * the namespace and the service context, so the session locator, client
+ * identifier, exchange flags and machine credential stay zero and nothing
+ * consults them.  Only a control operation is matched against a session
+ * and a machine credential, and this profile refuses every operation but
+ * the two reads before that comparison is reached.
+ *
+ * Nothing links the authority to a session either, so no session death can
+ * retire it.  The gate's own teardown does, through the generation that
+ * owns it.
+ *
+ * Return: 0 with a prepared authority, -ENOMEM, or -EOVERFLOW when the
+ * namespace has no epoch left to allocate.
+ */
+int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
+					 struct nfsd_ffv2_authority **result)
+{
+	struct nfsd_ffv2_authority *authority;
+	int error;
+
+	authority = kzalloc_obj(*authority, GFP_KERNEL);
+	if (!authority)
+		return -ENOMEM;
+	refcount_set(&authority->ref, 1);
+	spin_lock_init(&authority->state_lock);
+	INIT_LIST_HEAD(&authority->session_link);
+	authority->nn = nn;
+	authority->state = NFSD_FFV2_AUTHORITY_PREPARED;
+	error = nfsd_ffv2_authority_epoch(&nn->ffv2, &authority->epoch);
+	if (error) {
+		nfsd_ffv2_authority_put(authority);
+		return error;
+	}
+	*result = authority;
+	return 0;
+}
+
+/**
+ * nfsd_ffv2_object_register_fh - register the object an ordinary handle names
+ * @nn: the nfsd namespace
+ * @registration: an open registration slot
+ * @fhp: a verified ordinary filehandle for a regular file in an export
+ * @chunk_size: bytes in one chunk of the object
+ * @cred: the credential the service context is published with
+ * @validate_backend: whether the exporting filesystem must be one nfsd can
+ *	export; false only from a KUnit build, whose root filesystem has no
+ *	export operations at all
+ * @object_uuid: receives the identifier this server minted for the object
+ * @outer_fh: receives the mapped filehandle
+ * @generation_id: receives the published generation
+ *
+ * The path-named registration derives the object from strings an
+ * administrator supplied.  This one derives it from a handle that has
+ * already been resolved and access-checked, which is what the prototype
+ * profile is given.  The object identifier, store identifier and binding
+ * token are minted here rather than accepted: a caller that could choose
+ * them could name an object that already exists.
+ *
+ * Return: 0, or a negative errno.  The object is consumed either way.
+ */
+int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
+				 struct nfsd_ffv2_export_update *registration,
+				 struct svc_fh *fhp, u32 chunk_size,
+				 const struct cred *cred, bool validate_backend,
+				 u8 object_uuid[16], struct knfsd_fh *outer_fh,
+				 u64 *generation_id)
+{
+	struct svc_export *exp = fhp->fh_export;
+	struct nfsd_ffv2_object *object;
+	u8 binding_token[32];
+	u8 store_uuid[16];
+	int error;
+
+	if (!exp || !exp->ex_uuid || !fhp->fh_dentry)
+		return -ESTALE;
+	if (!chunk_size || chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+		return -EINVAL;
+	object = nfsd_ffv2_object_alloc();
+	if (!object)
+		return -ENOMEM;
+	object->chunk_size = chunk_size;
+	kref_get(&exp->ex_client->ref);
+	object->client = exp->ex_client;
+	object->export_path = exp->ex_path;
+	path_get(&object->export_path);
+	object->export_valid = true;
+	object->object_path.mnt = exp->ex_path.mnt;
+	object->object_path.dentry = fhp->fh_dentry;
+	path_get(&object->object_path);
+	object->object_valid = true;
+	object->inner_fh = fhp->fh_handle;
+	if (object->inner_fh.fh_size < 8 ||
+	    object->inner_fh.fh_size > NFSD_FFV2_FH_INNER_MAX ||
+	    object->inner_fh.fh_size & 3) {
+		nfsd_ffv2_object_free(object);
+		return -E2BIG;
+	}
+	get_random_bytes(object_uuid, 16);
+	memcpy(object->object_uuid, object_uuid, sizeof(object->object_uuid));
+	memcpy(object->export_uuid, exp->ex_uuid, sizeof(object->export_uuid));
+	get_random_bytes(store_uuid, sizeof(store_uuid));
+	get_random_bytes(binding_token, sizeof(binding_token));
+
+	error = nfsd_ffv2_object_publish(nn, registration, object, exp,
+					 store_uuid, binding_token, cred, 0,
+					 validate_backend, outer_fh,
+					 generation_id);
+	memzero_explicit(binding_token, sizeof(binding_token));
+	return error;
+}
+#endif
+
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 /*
  * Take and drop a filehandle-less generation reference the way the gate
@@ -4526,37 +4875,12 @@ nfsd_ffv2_test_generation_refcount(struct nfsd_ffv2_generation *generation)
 	return refcount_read(&generation->ref);
 }
 
-/*
- * Install a trust entry into the active generation's registry, the way the
- * TRUST_STATEID handler will once it exists.  @authority selects the
- * issuer: NULL uses the generation's own, and any other published
- * authority roots the entry in a different issuer epoch, which is how a
- * test builds a stale-issuer negative that the gate must not find.
- */
 __be32
 nfsd_ffv2_test_trust_install_active(struct nfsd_net *nn,
 				    struct nfsd_ffv2_authority *authority,
 				    const struct nfsd_ffv2_trust_request *req)
 {
-	struct nfsd_ffv2_service_context *context;
-	struct nfsd_ffv2_generation *generation;
-	__be32 status;
-
-	generation = nfsd_ffv2_active_generation_get(nn);
-	if (!generation)
-		return nfserr_stale;
-	context = generation->payload;
-	if (!context || !context->object || !context->authority) {
-		nfsd_ffv2_generation_put_owned(generation);
-		return nfserr_stale;
-	}
-	status = nfsd_ffv2_trust_install(&context->trust,
-					 authority ? authority :
-						     context->authority,
-					 context->object,
-					 generation->identity->generation, req);
-	nfsd_ffv2_generation_put_owned(generation);
-	return status;
+	return nfsd_ffv2_trust_install_active(nn, authority, req);
 }
 
 /* Revoke one entry from the active generation's registry. */
@@ -4629,72 +4953,11 @@ u64 nfsd_ffv2_test_provider_unadmitted(void)
 	return atomic64_read(&nfsd_ffv2_probe_counters.unadmitted);
 }
 
-/**
- * nfsd_ffv2_test_provider_install - install a namespace's read-only provider
- * @nn: the namespace the provider serves
- * @ops: read-only callbacks, which must both be supplied
- * @data: opaque provider state passed back to each callback
- * @chunk_size: bytes in one chunk of every object this provider serves
- *
- * Only one provider may be installed per namespace.  The callbacks and the
- * state are published together, so a callback always runs against the
- * state its own operations vector was installed with.
- *
- * Return: 0, -EINVAL for a missing namespace or an incomplete operations
- * vector, -ENOMEM, -ESHUTDOWN once @nn has begun exiting, or -EBUSY when
- * @nn already has one installed.
- */
 int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 				    const struct nfsd_ffv2_provider_ops *ops,
 				    void *data, u32 chunk_size)
 {
-	struct nfsd_ffv2_provider *provider;
-	struct nfsd_ffv2_anchor *anchor;
-
-	if (!nn || !ops || !ops->chunk_read || !ops->chunk_header_read)
-		return -EINVAL;
-	/*
-	 * A provider must say how large its chunks are, because nothing else
-	 * at this boundary does, and a reply cannot be bounded without it.
-	 * Zero is not "unknown" here: it would admit no payload at all.
-	 */
-	if (!chunk_size || chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES)
-		return -EINVAL;
-	anchor = &nn->ffv2;
-	provider = kzalloc_obj(*provider, GFP_KERNEL);
-	if (!provider)
-		return -ENOMEM;
-	provider->ops = ops;
-	provider->data = data;
-	provider->chunk_size = chunk_size;
-	refcount_set(&provider->ref, 1);
-	init_completion(&provider->gone);
-
-	/*
-	 * Publication is part of the namespace's lifecycle, not merely of
-	 * the registry: taking the anchor lock and requiring NET_LIVE is
-	 * what makes installation and namespace exit one transaction.  A
-	 * provider published before exit closes that state is drained by the
-	 * exit fence; one attempted after it never publishes at all.
-	 */
-	mutex_lock(&anchor->lock);
-	if (anchor->net_state != NFSD_FFV2_NET_LIVE) {
-		mutex_unlock(&anchor->lock);
-		kfree(provider);
-		return -ESHUTDOWN;
-	}
-	mutex_lock(&nfsd_ffv2_registry_lock);
-	if (rcu_dereference_protected(nn->ffv2.provider,
-				      lockdep_is_held(&nfsd_ffv2_registry_lock))) {
-		mutex_unlock(&nfsd_ffv2_registry_lock);
-		mutex_unlock(&anchor->lock);
-		kfree(provider);
-		return -EBUSY;
-	}
-	rcu_assign_pointer(nn->ffv2.provider, provider);
-	mutex_unlock(&nfsd_ffv2_registry_lock);
-	mutex_unlock(&anchor->lock);
-	return 0;
+	return nfsd_ffv2_provider_install(nn, ops, data, chunk_size);
 }
 
 /*
@@ -4728,19 +4991,9 @@ void nfsd_ffv2_test_provider_drain(void *handle)
 		nfsd_ffv2_provider_drain(handle);
 }
 
-/**
- * nfsd_ffv2_test_provider_remove - remove @nn's read-only provider
- * @nn: the namespace whose boundary is being closed
- *
- * Takes the provider out of the registry, then waits for the callbacks and
- * admissions still holding it, so no request can be running in provider
- * code once this returns and the caller may free its operations vector and
- * state.  A caller that must keep an admission alive across the removal
- * cannot use this, because the wait is for that admission.
- */
 void nfsd_ffv2_test_provider_remove(struct nfsd_net *nn)
 {
-	nfsd_ffv2_provider_shutdown(nn);
+	nfsd_ffv2_provider_remove(nn);
 }
 
 /*

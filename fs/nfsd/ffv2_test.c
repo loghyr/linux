@@ -20,6 +20,7 @@
 #include <linux/net.h>
 #include <net/sock.h>
 #include <net/genetlink.h>
+#include <uapi/linux/nfsd_netlink.h>
 #include <uapi/linux/sunrpc_netlink.h>
 #include "ffv2.h"
 #include "ffv2_prototype.h"
@@ -6457,36 +6458,54 @@ static int nfsd_ffv2_nl_parse_family(struct nfsd_ffv2_nl *nl, const void *buf,
 	return 0;
 }
 
-static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl)
+/*
+ * The controller's answer carries the family's whole operation and
+ * attribute inventory, which for a family the size of nfsd does not fit in
+ * a request-sized buffer.  A truncated datagram is not a short read to be
+ * retried; it is a message that fails its own length check, so the receive
+ * has to be large enough for the answer in the first place.
+ */
+#define NFSD_FFV2_NL_FAMILY_BUF		16384
+
+static noinline int nfsd_ffv2_nl_resolve(struct nfsd_ffv2_nl *nl,
+					 const char *family_name)
 {
-	char buf[NFSD_FFV2_NL_BUF];
-	struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
+	struct nlmsghdr *nlh;
 	size_t off;
 	int got, error;
 	u16 family;
+	char *buf;
 
+	buf = kzalloc(NFSD_FFV2_NL_FAMILY_BUF, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	nlh = (struct nlmsghdr *)buf;
 	off = nfsd_ffv2_nl_begin(buf, GENL_ID_CTRL, CTRL_CMD_GETFAMILY,
 				 ++nl->seq, 0);
 	((struct genlmsghdr *)nlmsg_data(nlh))->version = 1;
-	error = nfsd_ffv2_nl_put_str(buf, sizeof(buf), &off,
-				     CTRL_ATTR_FAMILY_NAME, SUNRPC_FAMILY_NAME);
+	error = nfsd_ffv2_nl_put_str(buf, NFSD_FFV2_NL_FAMILY_BUF, &off,
+				     CTRL_ATTR_FAMILY_NAME, family_name);
 	if (error)
-		return error;
+		goto out_free;
 	error = nfsd_ffv2_nl_send(nl, buf, off);
 	if (error < 0)
-		return error;
+		goto out_free;
 
-	got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
-	if (got < 0)
-		return got;
+	got = nfsd_ffv2_nl_recv(nl, buf, NFSD_FFV2_NL_FAMILY_BUF);
+	if (got < 0) {
+		error = got;
+		goto out_free;
+	}
 	error = nfsd_ffv2_nl_parse_family(nl, buf, (unsigned int)got, &family);
-	if (error)
-		return error;
-	nl->family = family;
-	return 0;
+	if (!error)
+		nl->family = family;
+out_free:
+	kfree(buf);
+	return error;
 }
 
-static int nfsd_ffv2_nl_open(struct net *net, struct nfsd_ffv2_nl *nl)
+static int nfsd_ffv2_nl_open_named(struct net *net, struct nfsd_ffv2_nl *nl,
+				   const char *family_name)
 {
 	struct sockaddr_nl bind_addr = { .nl_family = AF_NETLINK };
 	int error;
@@ -6509,7 +6528,7 @@ static int nfsd_ffv2_nl_open(struct net *net, struct nfsd_ffv2_nl *nl)
 		goto out_release;
 	nl->portid = bind_addr.nl_pid;
 
-	error = nfsd_ffv2_nl_resolve(nl);
+	error = nfsd_ffv2_nl_resolve(nl, family_name);
 	if (error)
 		goto out_release;
 	return 0;
@@ -6520,6 +6539,22 @@ out_release:
 	return error;
 }
 
+static int nfsd_ffv2_nl_open(struct net *net, struct nfsd_ffv2_nl *nl)
+{
+	return nfsd_ffv2_nl_open_named(net, nl, SUNRPC_FAMILY_NAME);
+}
+
+/*
+ * Send one request and take the whole reply.
+ *
+ * A command that answers with attributes answers with a message of its
+ * own, not with an acknowledgment, so the caller gets the bytes back and
+ * walks them.  A command that fails answers with an acknowledgment
+ * carrying its status either way, which is returned as a negative errno.
+ *
+ * Return: the reply length, 0 for a command that succeeded with no reply,
+ * or a negative errno.
+ */
 static void nfsd_ffv2_nl_close(struct nfsd_ffv2_nl *nl)
 {
 	if (nl->sock) {
@@ -10295,6 +10330,520 @@ static void nfsd_ffv2_prototype_challenge_test(struct kunit *test)
 							     second));
 	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
 }
+
+/*
+ * Registration and one authorized read through the prototype profile.
+ *
+ * The fixture below is deliberately smaller than the read-only one: it
+ * publishes nothing itself, because the registration under test is what
+ * has to publish.  Everything it builds is what an operator would have
+ * arranged beforehand -- a service, an export, a client domain and a
+ * regular file under that export -- and nothing else.
+ */
+#define NFSD_FFV2_PROTO_CHUNK_SIZE	64
+#define NFSD_FFV2_PROTO_CHUNKS		4
+#define NFSD_FFV2_PROTO_DOMAIN		"ffv2-proto-kunit"
+
+struct nfsd_ffv2_proto_fixture {
+	struct net			*net;
+	struct nfsd_net			*nn;
+	struct nfsd4_session		*session;
+	struct svc_rqst			*rqstp;
+	struct svc_xprt			*xprt;
+	struct svc_fh			*mapped;
+	struct auth_domain		*domain;
+	struct svc_export		*seeded;
+	struct svc_export		*published;
+	struct nfsd_ffv2_binding	*binding;
+	struct path			root;
+	struct dentry			*object_dentry;
+	u8				uuid[16];
+	u8				bytes[NFSD_FFV2_PROTO_CHUNKS *
+					      NFSD_FFV2_PROTO_CHUNK_SIZE];
+	bool				enabled;
+	bool				service_up;
+	bool				filecache_up;
+	bool				root_held;
+};
+
+static void nfsd_ffv2_proto_fixture_exit(struct nfsd_ffv2_proto_fixture *f)
+{
+	nfsd_ffv2_prototype_test_object_hook(NULL, NULL, NULL, 0, NULL, 0);
+	if (f->mapped && f->mapped->fh_dentry) {
+		fh_put(f->mapped);
+		f->binding = NULL;
+	}
+	if (f->binding) {
+		nfsd_ffv2_binding_put(f->binding);
+		f->binding = NULL;
+	}
+	if (f->published) {
+		exp_put(f->published);
+		f->published = NULL;
+	}
+	if (f->seeded) {
+		exp_put(f->seeded);
+		f->seeded = NULL;
+	}
+	if (f->enabled) {
+		nfsd_ffv2_prototype_disable(f->nn, f->net);
+		f->enabled = false;
+	}
+	if (f->service_up) {
+		struct nfsd_ffv2_generation *generation;
+
+		mutex_lock(&nfsd_mutex);
+		generation = nfsd_ffv2_service_stop_begin(f->nn);
+		mutex_unlock(&nfsd_mutex);
+		nfsd_ffv2_service_stop_finish(f->nn, generation);
+		mutex_lock(&nfsd_mutex);
+		nfsd_ffv2_service_down(f->nn);
+		mutex_unlock(&nfsd_mutex);
+		f->service_up = false;
+	}
+	if (f->net)
+		nfsd_export_flush(f->net);
+	if (f->filecache_up) {
+		mutex_lock(&nfsd_mutex);
+		nfsd_file_cache_shutdown();
+		mutex_unlock(&nfsd_mutex);
+		f->filecache_up = false;
+	}
+	if (f->object_dentry) {
+		dput(f->object_dentry);
+		f->object_dentry = NULL;
+	}
+	if (f->root_held) {
+		path_put(&f->root);
+		f->root_held = false;
+	}
+	if (f->domain) {
+		auth_domain_put(f->domain);
+		f->domain = NULL;
+	}
+	if (f->net) {
+		put_net(f->net);
+		f->net = NULL;
+		net_ns_barrier();
+	}
+}
+
+static bool nfsd_ffv2_proto_fixture_init(struct kunit *test,
+					 struct nfsd_ffv2_proto_fixture *f)
+{
+	static const u8 inner[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
+	struct inode *object_inode;
+	struct svc_export exp;
+	struct svc_export *cached;
+	unsigned int i;
+	int error;
+
+	memset(f, 0, sizeof(*f));
+	memset(f->uuid, 0x3d, sizeof(f->uuid));
+	for (i = 0; i < sizeof(f->bytes); i++)
+		f->bytes[i] = (u8)(i * 7 + 1);
+
+	f->rqstp = kunit_kzalloc(test, sizeof(*f->rqstp), GFP_KERNEL);
+	f->xprt = kunit_kzalloc(test, sizeof(*f->xprt), GFP_KERNEL);
+	f->mapped = kunit_kzalloc(test, sizeof(*f->mapped), GFP_KERNEL);
+	f->session = nfsd_ffv2_test_session(test);
+	if (!f->rqstp || !f->xprt || !f->mapped || !f->session) {
+		KUNIT_FAIL(test, "failed to allocate prototype fixture");
+		return false;
+	}
+	f->net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(f->net)) {
+		KUNIT_FAIL(test, "failed to create fixture netns: %ld",
+			   PTR_ERR(f->net));
+		f->net = NULL;
+		return false;
+	}
+	f->nn = net_generic(f->net, nfsd_net_id);
+	f->xprt->xpt_net = f->net;
+	f->rqstp->rq_xprt = f->xprt;
+	spin_lock_init(&f->nn->client_lock);
+
+	f->domain = unix_domain_find(NFSD_FFV2_PROTO_DOMAIN);
+	if (!f->domain) {
+		KUNIT_FAIL(test, "failed to create fixture auth domain");
+		return false;
+	}
+	get_fs_root(current->fs, &f->root);
+	f->root_held = true;
+
+	f->object_dentry = d_alloc_name(f->root.dentry, "ffv2-proto-object");
+	if (!f->object_dentry) {
+		KUNIT_FAIL(test, "failed to allocate fixture object dentry");
+		return false;
+	}
+	object_inode = new_inode(f->root.mnt->mnt_sb);
+	if (!object_inode) {
+		KUNIT_FAIL(test, "failed to allocate fixture object inode");
+		return false;
+	}
+	object_inode->i_mode = S_IFREG | 0600;
+	object_inode->i_ino = get_next_ino();
+	set_nlink(object_inode, 1);
+	d_add(f->object_dentry, object_inode);
+
+	nfsd_ffv2_init_test_export(&exp, f->nn, f->domain, &f->root);
+	exp.ex_uuid = kmemdup(f->uuid, sizeof(f->uuid), GFP_KERNEL);
+	if (!exp.ex_uuid) {
+		KUNIT_FAIL(test, "failed to allocate fixture export UUID");
+		return false;
+	}
+	cached = nfsd_export_cache_update(&exp);
+	if (IS_ERR(cached)) {
+		KUNIT_FAIL(test, "fixture export publication failed: %ld",
+			   PTR_ERR(cached));
+		kfree(exp.ex_uuid);
+		return false;
+	}
+	f->seeded = cached;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_up(f->nn);
+	f->service_up = !error;
+	if (!error) {
+		error = nfsd_file_ffv2_test_cache_start();
+		f->filecache_up = !error;
+	}
+	mutex_unlock(&nfsd_mutex);
+	if (error) {
+		KUNIT_FAIL(test, "fixture service start failed: %d", error);
+		return false;
+	}
+
+	/*
+	 * The resolution a registration would perform, and the object's
+	 * bytes: see the hook's own comment for why neither can happen here.
+	 */
+	nfsd_ffv2_prototype_test_object_hook(f->seeded, f->object_dentry,
+					     inner, sizeof(inner), f->bytes,
+					     sizeof(f->bytes));
+	return true;
+}
+
+/* Fill in a registration request the fixture's object satisfies. */
+static void nfsd_ffv2_proto_request(struct nfsd_ffv2_prototype_request *req,
+				    const u8 *nonce)
+{
+	static const u8 handle[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
+
+	memset(req, 0, sizeof(*req));
+	req->nonce = nonce;
+	req->auth_domain = NFSD_FFV2_PROTO_DOMAIN;
+	req->handle = handle;
+	req->handle_len = sizeof(handle);
+	req->chunk_size = NFSD_FFV2_PROTO_CHUNK_SIZE;
+	req->data_count = NFSD_FFV2_PROTO_CHUNKS;
+	req->parity_count = 0;
+}
+
+/*
+ * The whole transaction: enable, challenge, register, map, read, and
+ * unregister.  What it proves is that the profile publishes an object a
+ * client can actually read through the production boundary, that a mapping
+ * is refused on either side of READY, and that a retry is recognised as
+ * the same registration rather than performed twice.
+ */
+static void nfsd_ffv2_prototype_read_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request creq = { .offset = 0, .count = 4 };
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u8 spent[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_prototype_bundle *bundle, *replay;
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct nfsd_ffv2_fh_info info;
+	struct nfsd_ffv2_binding *again;
+	struct knfsd_fh outer = {};
+	struct svc_export exp;
+	stateid_t stateid;
+	u64 expires = 0;
+	u64 callbacks;
+	unsigned int i;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	replay = kunit_kzalloc(test, sizeof(*replay), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	KUNIT_ASSERT_NOT_NULL(test, replay);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	memcpy(spent, nonce, sizeof(spent));
+	nfsd_ffv2_proto_request(&req, spent);
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     bundle));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_READY,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_PROTOTYPE,
+			nfsd_ffv2_source_get(f->nn));
+	KUNIT_EXPECT_NE(test, 0ULL, bundle->generation);
+	KUNIT_EXPECT_GT(test, bundle->handle_len, 0u);
+
+	/*
+	 * The same request again is the same registration, and is answered
+	 * even though the gate has moved on to READY: a lost reply is
+	 * exactly the case a replay exists for.
+	 */
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     replay));
+	KUNIT_EXPECT_EQ(test, 0, memcmp(bundle, replay, sizeof(*bundle)));
+	/* A different request wearing the same nonce is not. */
+	req.chunk_size = NFSD_FFV2_PROTO_CHUNK_SIZE * 2;
+	KUNIT_EXPECT_EQ(test, -EEXIST,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     replay));
+	req.chunk_size = NFSD_FFV2_PROTO_CHUNK_SIZE;
+
+	/*
+	 * A challenge is still issued while a registration is published --
+	 * nothing about it depends on the gate being idle -- but a second
+	 * registration is refused until the first is unregistered.
+	 */
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	nfsd_ffv2_proto_request(&req, nonce);
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     replay));
+	/* Back to the nonce the published registration was made with. */
+	nfsd_ffv2_proto_request(&req, spent);
+
+	/* Map what the registration handed back, exactly as PUTFH would. */
+	memcpy(outer.fh_raw, bundle->handle, bundle->handle_len);
+	outer.fh_size = bundle->handle_len;
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_fh_parse(&outer, &info));
+	f->binding = nfsd_ffv2_test_binding_create(f->nn, &info);
+	if (IS_ERR(f->binding)) {
+		KUNIT_FAIL(test, "prototype binding admission failed: %ld",
+			   PTR_ERR(f->binding));
+		f->binding = NULL;
+		goto out;
+	}
+	nfsd_ffv2_init_test_export(&exp, f->nn, f->domain, &f->root);
+	f->published = nfsd_ffv2_test_export_lookup(&exp);
+	if (!f->published) {
+		KUNIT_FAIL(test, "prototype service export not found");
+		goto out;
+	}
+	fh_init(f->mapped, NFS4_FHSIZE);
+	f->mapped->fh_handle = outer;
+	f->mapped->fh_export = nfsd_export_get(f->published);
+	f->mapped->fh_dentry = dget(f->object_dentry);
+	f->mapped->fh_ffv2_binding = f->binding;
+	f->binding = NULL;
+
+	memcpy(&stateid, bundle->stateid, sizeof(stateid));
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_validate_operation(f->rqstp, f->mapped,
+							  f->session,
+							  OP_CHUNK_READ,
+							  &stateid, NULL,
+							  &admission));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_provider_probe(f->rqstp, f->mapped,
+						 OP_CHUNK_READ, &creq, &result,
+						 U32_MAX, &admission));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, (u32)NFSD_FFV2_PROTO_CHUNKS, result.count);
+	KUNIT_EXPECT_TRUE(test, result.eof);
+	if (result.read.chunks) {
+		for (i = 0; i < result.count; i++) {
+			const struct nfsd_ffv2_read_chunk *chunk =
+				&result.read.chunks[i];
+			const u8 *want = f->bytes +
+					 i * NFSD_FFV2_PROTO_CHUNK_SIZE;
+			u32 crc = crc32_le(~0U, want,
+					   NFSD_FFV2_PROTO_CHUNK_SIZE) ^ ~0U;
+
+			KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTO_CHUNK_SIZE,
+					chunk->cr_effective_len);
+			KUNIT_EXPECT_EQ(test, nfs_ok, chunk->cr_status);
+			KUNIT_EXPECT_EQ(test, bundle->generation,
+					chunk->cr_owner.co_cohort_id);
+			KUNIT_EXPECT_EQ(test, i, chunk->cr_owner.co_id);
+			KUNIT_EXPECT_EQ(test,
+					NFSD_FFV2_CHECKSUM_ALG_CRC32,
+					chunk->cr_checksum.cs_algorithm);
+			KUNIT_EXPECT_EQ(test, NFSD_FFV2_CHECKSUM_CRC32_LEN,
+					chunk->cr_checksum.cs_len);
+			KUNIT_EXPECT_EQ(test, crc,
+					get_unaligned_be32(chunk->cr_checksum.cs_value));
+			if (!chunk->cr_chunk) {
+				KUNIT_FAIL(test, "chunk %u carried no bytes",
+					   i);
+				continue;
+			}
+			KUNIT_EXPECT_EQ(test, 0,
+					memcmp(chunk->cr_chunk, want,
+					       NFSD_FFV2_PROTO_CHUNK_SIZE));
+		}
+	} else {
+		KUNIT_FAIL(test, "read returned no chunk array");
+	}
+	nfsd_ffv2_complete(&admission);
+
+	/*
+	 * Release the mapping and the fixture's own reference to the
+	 * published export before the registration they belong to: retiring
+	 * a generation waits for its export to be released, so holding one
+	 * across the unregister would be waiting on this thread.
+	 */
+	fh_put(f->mapped);
+	exp_put(f->published);
+	f->published = NULL;
+
+	KUNIT_EXPECT_EQ(test, -ESTALE,
+			nfsd_ffv2_prototype_unregister(f->nn, f->net,
+						       bundle->source_uuid,
+						       bundle->generation + 1));
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_unregister(f->nn, f->net,
+						       bundle->source_uuid,
+						       bundle->generation));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OPEN,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	/* The gate is still this administrator's, and still open. */
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_PROTOTYPE,
+			nfsd_ffv2_source_get(f->nn));
+	/* Nothing is published, so nothing maps. */
+	again = nfsd_ffv2_test_binding_create(f->nn, &info);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(again));
+	if (!IS_ERR(again))
+		nfsd_ffv2_binding_put(again);
+	/* And the nonce that named the registration is retired, not unknown. */
+	KUNIT_EXPECT_EQ(test, -ESTALE,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     replay));
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_prototype_unregister(f->nn, f->net,
+						       bundle->source_uuid,
+						       bundle->generation));
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
+/*
+ * The interval between a registration publishing its generation and the
+ * gate reaching READY.
+ *
+ * The generation is active inside it -- publication is what makes it
+ * active -- so the only thing keeping an operation out is the gate's own
+ * final transition.  This holds a registration open in exactly that
+ * interval and asks the production admission predicate what it would say
+ * about a mapping arriving there.
+ */
+struct nfsd_ffv2_proto_register_ctx {
+	struct nfsd_ffv2_proto_fixture		*f;
+	struct nfsd_ffv2_prototype_request	req;
+	struct nfsd_ffv2_prototype_bundle	*bundle;
+	int					result;
+	struct completion			done;
+};
+
+static int nfsd_ffv2_proto_register_thread(void *data)
+{
+	struct nfsd_ffv2_proto_register_ctx *ctx = data;
+
+	ctx->result = nfsd_ffv2_prototype_register(ctx->f->nn, ctx->f->net,
+						   &ctx->req, ctx->bundle);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_prototype_publish_window_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_register_ctx *ctx;
+	struct nfsd_ffv2_generation *generation;
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct nfsd_ffv2_proto_fixture *f;
+	struct completion reached, proceed;
+	struct task_struct *task;
+	bool counted = false;
+	u64 expires = 0;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ctx->bundle = kunit_kzalloc(test, sizeof(*ctx->bundle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->bundle);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	nfsd_ffv2_proto_request(&ctx->req, nonce);
+	ctx->f = f;
+	init_completion(&ctx->done);
+	init_completion(&reached);
+	init_completion(&proceed);
+	nfsd_ffv2_prototype_test_publish_hook(&reached, &proceed);
+
+	task = kthread_run(nfsd_ffv2_proto_register_thread, ctx,
+			   "ffv2-proto-reg");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "failed to start the registering thread");
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the registration never reached publication");
+		goto join;
+	}
+
+	/* The generation is already active... */
+	generation = nfsd_ffv2_test_active_generation_get(f->nn);
+	KUNIT_EXPECT_NOT_NULL(test, generation);
+	if (generation)
+		nfsd_ffv2_test_generation_put(generation);
+	/* ...and the gate still refuses every mapping into it. */
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OPEN,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	KUNIT_EXPECT_EQ(test, -ESTALE,
+			nfsd_ffv2_prototype_op_admit(f->nn, &counted));
+	KUNIT_EXPECT_FALSE(test, counted);
+
+join:
+	complete(&proceed);
+	if (!wait_for_completion_timeout(&ctx->done, 30 * HZ)) {
+		KUNIT_FAIL(test, "the registering thread never returned");
+		wait_for_completion(&ctx->done);
+	}
+	kthread_stop(task);
+
+	KUNIT_EXPECT_EQ(test, 0, ctx->result);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_READY,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	/* And admits one once the registration has finished. */
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_op_admit(f->nn, &counted));
+	KUNIT_EXPECT_TRUE(test, counted);
+	if (counted)
+		nfsd_ffv2_prototype_op_release(f->nn);
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -10460,6 +11009,8 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_close_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_pre_exit_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_challenge_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
 #endif
 	{}
 };
