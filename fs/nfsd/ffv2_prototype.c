@@ -1193,11 +1193,11 @@ nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
 	/*
 	 * Every byte the layout describes has to be read.  The request is
 	 * for whole chunks and the file may end inside the last one, so what
-	 * is owed is the smaller of the two; anything less than that means
-	 * the file shrank after it was measured, and the zeroed remainder of
-	 * the buffer is not data the object ever held.  Reporting it as
-	 * though it were would hand a client fabricated bytes under a
-	 * checksum this server computed over them.
+	 * is owed is the smaller of the two; less than that means the file
+	 * shrank after it was measured, and the zeroed remainder of the
+	 * buffer is not data the object ever held.  Reporting it as though
+	 * it were would hand a client fabricated bytes under a checksum this
+	 * server computed over them.
 	 */
 	want = min_t(u64, total, size);
 	if (file) {
@@ -1213,10 +1213,17 @@ nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
 		error = got;
 		goto out_free;
 	}
-	if ((u64)got != want) {
+	if ((u64)got < want) {
 		error = -EIO;
 		goto out_free;
 	}
+	/*
+	 * More than that is an object that grew after it was measured, which
+	 * is not an error and not this snapshot's business: the layout was
+	 * computed from the size that was sampled, and the loop below
+	 * describes only that much, so the extra bytes are read into the
+	 * buffer and never named by any chunk.
+	 */
 	/*
 	 * The last chunk may be shorter than the rest, which the loop below
 	 * reports at its real length; the bytes past it are never described.

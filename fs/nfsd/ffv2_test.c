@@ -11481,6 +11481,110 @@ out:
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
+/*
+ * An object that grew after it was measured.
+ *
+ * The layout is computed from the size that was sampled, so a file that
+ * has since grown supplies more than the snapshot describes.  That is not
+ * an error -- nothing has been lost, and nothing beyond the sampled size
+ * is named by any chunk -- so the registration succeeds and the last chunk
+ * is still reported at the length the sample gave it.
+ */
+static void nfsd_ffv2_prototype_growth_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request creq = { .offset = 0, .count = 4 };
+	/* A sampled size that ends part way through the last chunk. */
+	static const size_t sampled = 3 * NFSD_FFV2_PROTO_CHUNK_SIZE + 8;
+	struct nfsd_ffv2_admission admission = {};
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_prototype_bundle *bundle;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct nfsd_ffv2_fh_info info;
+	struct knfsd_fh outer = {};
+	struct svc_export exp;
+	stateid_t stateid;
+	u64 expires = 0;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	/* Measured at @sampled, able to supply every byte the fixture holds. */
+	nfsd_ffv2_prototype_test_object_hook(f->seeded, f->object_dentry,
+					     f->inner, f->inner_len, f->bytes,
+					     sizeof(f->bytes), sampled);
+	nfsd_ffv2_proto_request(&req, nonce);
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     bundle));
+
+	memcpy(outer.fh_raw, bundle->handle, bundle->handle_len);
+	outer.fh_size = bundle->handle_len;
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_fh_parse(&outer, &info));
+	f->binding = nfsd_ffv2_test_binding_create(f->nn, &info);
+	if (IS_ERR(f->binding)) {
+		KUNIT_FAIL(test, "binding admission failed: %ld",
+			   PTR_ERR(f->binding));
+		f->binding = NULL;
+		goto out;
+	}
+	nfsd_ffv2_init_test_export(&exp, f->nn, f->domain, &f->root);
+	f->published = nfsd_ffv2_test_export_lookup(&exp);
+	if (!f->published) {
+		KUNIT_FAIL(test, "service export not found");
+		goto out;
+	}
+	fh_init(f->mapped, NFS4_FHSIZE);
+	f->mapped->fh_handle = outer;
+	f->mapped->fh_export = nfsd_export_get(f->published);
+	f->mapped->fh_dentry = dget(f->object_dentry);
+	f->mapped->fh_ffv2_binding = f->binding;
+	f->binding = NULL;
+
+	memcpy(&stateid, bundle->stateid, sizeof(stateid));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_validate_operation(f->rqstp, f->mapped,
+							  f->session,
+							  OP_CHUNK_READ,
+							  &stateid, NULL,
+							  &admission));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_provider_probe(f->rqstp, f->mapped,
+						 OP_CHUNK_READ, &creq, &result,
+						 U32_MAX, &admission));
+	/* Four chunks, the last of them as short as the sample made it. */
+	KUNIT_EXPECT_EQ(test, (u32)NFSD_FFV2_PROTO_CHUNKS, result.count);
+	if (result.read.chunks && result.count == NFSD_FFV2_PROTO_CHUNKS) {
+		const struct nfsd_ffv2_read_chunk *last =
+			&result.read.chunks[NFSD_FFV2_PROTO_CHUNKS - 1];
+
+		KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTO_CHUNK_SIZE,
+				result.read.chunks[0].cr_effective_len);
+		KUNIT_EXPECT_EQ(test, 8u, last->cr_effective_len);
+		if (last->cr_chunk)
+			KUNIT_EXPECT_EQ(test, 0,
+					memcmp(last->cr_chunk,
+					       f->bytes + 3 *
+						NFSD_FFV2_PROTO_CHUNK_SIZE,
+					       8));
+	} else {
+		KUNIT_FAIL(test, "read returned no chunk array");
+	}
+	nfsd_ffv2_complete(&admission);
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
@@ -11896,6 +12000,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_close_race_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_short_read_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_growth_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_unregister_drain_test),
 #endif
 	{}
