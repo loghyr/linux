@@ -9763,13 +9763,20 @@ static int nfsd_ffv2_ro_encode_paged(struct kunit *test, union nfsd4_op_u *u,
  * one reservation for the whole opaque fails outright for a chunk this
  * size, whatever the response budget says.  A chunk size comes from the
  * layout and is normally far larger than a page, so this is the ordinary
- * case rather than an extreme one.  The bytes are checked either side of
- * the boundary the copy crosses, and the tail padding is checked because
- * the length is deliberately not a multiple of four.
+ * case rather than an extreme one.
+ *
+ * The length is long enough to leave the head and then leave a page as
+ * well, because those are two different transitions: the first ends a
+ * partly filled buffer of whatever size the head had left, the second
+ * ends a full page and is the one that repeats for the rest of a real
+ * chunk.  The bytes are checked either side of both.  The tail padding is
+ * checked because the length is deliberately not a multiple of four.
  */
 static void nfsd_ffv2_encode_large_payload_test(struct kunit *test)
 {
-	static const u32 len = PAGE_SIZE + 509;
+	/* Where the payload's bytes start, once the fixed fields are out. */
+	static const u32 off = 8 + 56;
+	static const u32 len = 2 * PAGE_SIZE + 509;
 	struct page *pages[NFSD_FFV2_RO_ENCODE_PAGES] = {};
 	struct nfsd4_chunk_read_ent ent = {};
 	struct nfsd4_chunk_read *cr;
@@ -9777,6 +9784,7 @@ static void nfsd_ffv2_encode_large_payload_test(struct kunit *test)
 	struct xdr_buf buf;
 	unsigned int i;
 	u8 *payload;
+	u32 at[6];
 	u8 byte;
 	int size;
 
@@ -9812,22 +9820,29 @@ static void nfsd_ffv2_encode_large_payload_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, len, nfsd_ffv2_ro_word(&buf, 8 + 12));
 	KUNIT_EXPECT_EQ(test, len, nfsd_ffv2_ro_word(&buf, 8 + 52));
 
-	/* The payload itself, either side of the page it crosses. */
-	read_bytes_from_xdr_buf(&buf, 8 + 56, &byte, 1);
-	KUNIT_EXPECT_EQ(test, 0, byte);
-	read_bytes_from_xdr_buf(&buf, 8 + 56 + PAGE_SIZE - 1, &byte, 1);
-	KUNIT_EXPECT_EQ(test, (u8)((PAGE_SIZE - 1) & 0xff), byte);
-	read_bytes_from_xdr_buf(&buf, 8 + 56 + PAGE_SIZE, &byte, 1);
-	KUNIT_EXPECT_EQ(test, (u8)(PAGE_SIZE & 0xff), byte);
-	read_bytes_from_xdr_buf(&buf, 8 + 56 + len - 1, &byte, 1);
-	KUNIT_EXPECT_EQ(test, (u8)((len - 1) & 0xff), byte);
+	/*
+	 * The payload's own bytes: its two ends, and either side of the
+	 * point where the head is exhausted and of the point where the
+	 * first page is.
+	 */
+	at[0] = 0;
+	at[1] = PAGE_SIZE - off - 1;
+	at[2] = PAGE_SIZE - off;
+	at[3] = 2 * PAGE_SIZE - off - 1;
+	at[4] = 2 * PAGE_SIZE - off;
+	at[5] = len - 1;
+	for (i = 0; i < ARRAY_SIZE(at); i++) {
+		read_bytes_from_xdr_buf(&buf, off + at[i], &byte, 1);
+		KUNIT_EXPECT_EQ_MSG(test, (u8)(at[i] & 0xff), byte,
+				    "payload byte %u", at[i]);
+	}
 
 	/* The tail padding is zeroed, not left as the poison. */
 	for (i = 0; i < xdr_pad_size(len); i++) {
-		read_bytes_from_xdr_buf(&buf, 8 + 56 + len + i, &byte, 1);
+		read_bytes_from_xdr_buf(&buf, off + len + i, &byte, 1);
 		KUNIT_EXPECT_EQ(test, 0, byte);
 	}
-	KUNIT_EXPECT_EQ(test, 8 + 56 + xdr_align_size(len), (u32)size);
+	KUNIT_EXPECT_EQ(test, off + xdr_align_size(len), (u32)size);
 out:
 	for (i = 0; i < NFSD_FFV2_RO_ENCODE_PAGES; i++)
 		if (pages[i])
