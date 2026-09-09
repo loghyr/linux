@@ -29,6 +29,7 @@
 #include "pnfs.h"
 #include "filecache.h"
 #include "ffv2.h"
+#include "ffv2_prototype.h"
 #include "trace.h"
 #include "netlink.h"
 
@@ -2568,6 +2569,177 @@ int nfsd_nl_ffv2_object_unregister_doit(struct sk_buff *skb,
 	error = nfsd_ffv2_object_unregister(nn, generation_id, object_uuid);
 	mutex_unlock(&nfsd_mutex);
 	return error;
+}
+
+/*
+ * The Flex Files v2 prototype authority profile's five commands.
+ *
+ * They exist in every build; with the profile compiled out each reports
+ * -EOPNOTSUPP, which is how a server without it is told apart from one
+ * with it and the gate closed.  Everything they enforce beyond attribute
+ * shape -- the capability, the owner, the gate state, the nonce -- is
+ * decided in the gate itself, so a malformed or unauthorized request never
+ * reaches an allocation here.
+ */
+int nfsd_nl_ffv2_prototype_enable_doit(struct sk_buff *skb,
+				       struct genl_info *info)
+{
+	struct net *net = genl_info_net(info);
+
+	(void)skb;
+	return nfsd_ffv2_prototype_enable(net_generic(net, nfsd_net_id), net);
+}
+
+int nfsd_nl_ffv2_prototype_disable_doit(struct sk_buff *skb,
+					struct genl_info *info)
+{
+	struct net *net = genl_info_net(info);
+
+	(void)skb;
+	return nfsd_ffv2_prototype_disable(net_generic(net, nfsd_net_id), net);
+}
+
+int nfsd_nl_ffv2_prototype_challenge_doit(struct sk_buff *skb,
+					  struct genl_info *info)
+{
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct net *net = genl_info_net(info);
+	u64 expires = 0;
+	void *hdr;
+	int error;
+
+	error = nfsd_ffv2_prototype_challenge(net_generic(net, nfsd_net_id),
+					      net, nonce, &expires);
+	if (error)
+		return error;
+	skb = genlmsg_new(nla_total_size(sizeof(nonce)) +
+			  nla_total_size_64bit(sizeof(expires)), GFP_KERNEL);
+	if (!skb) {
+		error = -ENOMEM;
+		goto out_zero;
+	}
+	hdr = genlmsg_iput(skb, info);
+	if (!hdr) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+	if (nla_put(skb, NFSD_A_FFV2_PROTOTYPE_NONCE, sizeof(nonce), nonce) ||
+	    nla_put_u64_64bit(skb, NFSD_A_FFV2_PROTOTYPE_EXPIRES, expires, 0)) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+	genlmsg_end(skb, hdr);
+	memzero_explicit(nonce, sizeof(nonce));
+	return genlmsg_reply(skb, info);
+
+out_free:
+	nlmsg_free(skb);
+out_zero:
+	/*
+	 * The challenge was issued and its reply was lost.  Nothing here can
+	 * take it back, and nothing has to: it expires on its own, and this
+	 * copy of it does not outlive the failure.
+	 */
+	memzero_explicit(nonce, sizeof(nonce));
+	return error;
+}
+
+int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
+					 struct genl_info *info)
+{
+	struct nfsd_ffv2_prototype_request request = {};
+	struct nfsd_ffv2_prototype_bundle bundle;
+	struct nlattr **attrs = info->attrs;
+	struct net *net = genl_info_net(info);
+	void *hdr;
+	int error;
+
+	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_NONCE) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_HANDLE) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_DATA_COUNT) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT))
+		return -EINVAL;
+	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN],
+				     NAME_MAX, false);
+	if (error)
+		return error;
+
+	request.nonce = nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_NONCE]);
+	request.auth_domain =
+		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN]);
+	request.handle = nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_HANDLE]);
+	request.handle_len = nla_len(attrs[NFSD_A_FFV2_PROTOTYPE_HANDLE]);
+	request.chunk_size =
+		nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE]);
+	request.data_count =
+		nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_DATA_COUNT]);
+	request.parity_count =
+		nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT]);
+
+	error = nfsd_ffv2_prototype_register(net_generic(net, nfsd_net_id),
+					     net, &request, &bundle);
+	if (error)
+		return error;
+
+	skb = genlmsg_new(3 * nla_total_size(16) +
+			  nla_total_size_64bit(sizeof(bundle.generation)) +
+			  nla_total_size(sizeof(bundle.stateid)) +
+			  nla_total_size(sizeof(bundle.handle)), GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	hdr = genlmsg_iput(skb, info);
+	if (!hdr) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+	if (nla_put(skb, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID,
+		    sizeof(bundle.source_uuid), bundle.source_uuid) ||
+	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_SERVICE_UUID,
+		    sizeof(bundle.service_uuid), bundle.service_uuid) ||
+	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_REPLAY_UUID,
+		    sizeof(bundle.replay_uuid), bundle.replay_uuid) ||
+	    nla_put_u64_64bit(skb, NFSD_A_FFV2_PROTOTYPE_GENERATION,
+			      bundle.generation, 0) ||
+	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_STATEID,
+		    sizeof(bundle.stateid), bundle.stateid) ||
+	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_MAPPED_HANDLE,
+		    bundle.handle_len, bundle.handle)) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+	genlmsg_end(skb, hdr);
+	/*
+	 * A lost reply does not retire the registration: the nonce that
+	 * named it is committed, so the administrator repeats the same
+	 * request and is handed the same bundle.
+	 */
+	return genlmsg_reply(skb, info);
+
+out_free:
+	nlmsg_free(skb);
+	return error;
+}
+
+int nfsd_nl_ffv2_prototype_unregister_doit(struct sk_buff *skb,
+					   struct genl_info *info)
+{
+	struct nlattr **attrs = info->attrs;
+	struct net *net = genl_info_net(info);
+	u64 generation;
+
+	(void)skb;
+	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_GENERATION))
+		return -EINVAL;
+	generation = nla_get_u64(attrs[NFSD_A_FFV2_PROTOTYPE_GENERATION]);
+	if (!generation)
+		return -EINVAL;
+	return nfsd_ffv2_prototype_unregister(net_generic(net, nfsd_net_id),
+			net,
+			nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID]),
+			generation);
 }
 
 /**

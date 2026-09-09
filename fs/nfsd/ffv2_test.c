@@ -6555,6 +6555,78 @@ static int nfsd_ffv2_nl_open(struct net *net, struct nfsd_ffv2_nl *nl)
  * Return: the reply length, 0 for a command that succeeded with no reply,
  * or a negative errno.
  */
+/* Consume the acknowledgment that follows a reply, and nothing else. */
+static noinline int nfsd_ffv2_nl_ack_only(struct nfsd_ffv2_nl *nl, u8 cmd)
+{
+	char buf[NFSD_FFV2_NL_BUF];
+	int got;
+
+	got = nfsd_ffv2_nl_recv(nl, buf, sizeof(buf));
+	if (got < 0)
+		return got;
+	return nfsd_ffv2_nl_parse_ack(nl, buf, (unsigned int)got, nl->family,
+				      cmd, NFSD_FAMILY_VERSION);
+}
+
+static noinline int nfsd_ffv2_nl_call(struct nfsd_ffv2_nl *nl, u8 cmd,
+				      void *request, size_t len, void *reply,
+				      size_t reply_cap)
+{
+	const struct nlmsghdr *nlh;
+	int got, error;
+
+	error = nfsd_ffv2_nl_send(nl, request, len);
+	if (error < 0)
+		return error;
+	got = nfsd_ffv2_nl_recv(nl, reply, reply_cap);
+	if (got < 0)
+		return got;
+	nlh = reply;
+	error = nfsd_ffv2_nl_check(nl, nlh, (unsigned int)got);
+	if (error)
+		return error;
+	if (nlh->nlmsg_type == NLMSG_ERROR)
+		return nfsd_ffv2_nl_parse_ack(nl, reply, (unsigned int)got,
+					      nl->family, cmd,
+					      NFSD_FAMILY_VERSION);
+	if (nlh->nlmsg_type != nl->family)
+		return -EPROTO;
+	error = nfsd_ffv2_nl_check_genl(nlh, cmd, NFSD_FAMILY_VERSION);
+	if (error)
+		return error;
+	if ((unsigned int)got != NLMSG_ALIGN(nlh->nlmsg_len))
+		return -EBADMSG;
+	/*
+	 * A request that asked to be acknowledged is acknowledged as well as
+	 * answered, and the acknowledgment is a second datagram.  Take it
+	 * here: leaving it queued would make it the answer to whatever is
+	 * asked next.
+	 */
+	error = nfsd_ffv2_nl_ack_only(nl, cmd);
+	if (error)
+		return error;
+	return got;
+}
+
+/* One attribute out of a reply, by type, with its length checked. */
+static const struct nlattr *nfsd_ffv2_nl_find(const void *reply,
+					      unsigned int len, u16 type,
+					      int expected_len)
+{
+	const struct nlmsghdr *nlh = reply;
+	const struct nlattr *nla;
+	int nrem;
+
+	nlmsg_for_each_attr(nla, nlh, GENL_HDRLEN, nrem) {
+		if (nla_type(nla) != type)
+			continue;
+		if (expected_len >= 0 && nla_len(nla) != expected_len)
+			return NULL;
+		return nla;
+	}
+	return NULL;
+}
+
 static void nfsd_ffv2_nl_close(struct nfsd_ffv2_nl *nl)
 {
 	if (nl->sock) {
@@ -10921,6 +10993,249 @@ static void nfsd_ffv2_source_reservation_test(struct kunit *test)
 	mutex_unlock(&nfsd_mutex);
 }
 
+/*
+ * The prototype profile's five commands, driven through the real
+ * generic-netlink parser and policy from a socket in the namespace they
+ * act on.
+ *
+ * The same test runs in a build with the profile and in one without it,
+ * and asserts what each build owes.  A build without it answers every
+ * command -EOPNOTSUPP, which is how it is told apart from a build with it
+ * and the gate closed, where an enable succeeds.  What both owe is the
+ * same: a request the policy refuses is refused before any handler runs,
+ * so the shape of the interface does not depend on the profile being
+ * compiled in.
+ */
+static size_t nfsd_ffv2_nl_proto_begin(struct nfsd_ffv2_nl *nl, void *buf,
+				       u8 cmd)
+{
+	return nfsd_ffv2_nl_begin(buf, nl->family, cmd, ++nl->seq, NLM_F_ACK);
+}
+
+/* One prototype command with no attributes. */
+static int nfsd_ffv2_nl_proto_bare(struct nfsd_ffv2_nl *nl, u8 cmd,
+				   void *reply, size_t reply_cap)
+{
+	char buf[NFSD_FFV2_NL_BUF];
+	size_t off = nfsd_ffv2_nl_proto_begin(nl, buf, cmd);
+
+	return nfsd_ffv2_nl_call(nl, cmd, buf, off, reply, reply_cap);
+}
+
+/* A registration request, with every attribute a caller may vary. */
+struct nfsd_ffv2_nl_register_args {
+	const u8	*nonce;
+	u16		nonce_len;
+	const char	*domain;
+	u16		handle_len;
+	u32		chunk_size;
+	u32		data_count;
+	u32		parity_count;
+	bool		omit_domain;
+	u16		unknown_attr;
+};
+
+static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
+				       const struct nfsd_ffv2_nl_register_args *a,
+				       void *reply, size_t reply_cap)
+{
+	u8 handle[NFS4_FHSIZE] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+	char buf[NFSD_FFV2_NL_BUF];
+	size_t off;
+	int error;
+
+	off = nfsd_ffv2_nl_proto_begin(nl, buf,
+				       NFSD_CMD_FFV2_PROTOTYPE_REGISTER);
+	error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+				 NFSD_A_FFV2_PROTOTYPE_NONCE, a->nonce,
+				 a->nonce_len);
+	if (!error && !a->omit_domain)
+		error = nfsd_ffv2_nl_put_str(buf, sizeof(buf), &off,
+					     NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN,
+					     a->domain);
+	if (!error)
+		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+					 NFSD_A_FFV2_PROTOTYPE_HANDLE, handle,
+					 a->handle_len);
+	if (!error)
+		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+					     NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE,
+					     a->chunk_size);
+	if (!error)
+		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+					     NFSD_A_FFV2_PROTOTYPE_DATA_COUNT,
+					     a->data_count);
+	if (!error)
+		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+					     NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT,
+					     a->parity_count);
+	if (!error && a->unknown_attr)
+		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+					     a->unknown_attr, 0);
+	if (error)
+		return error;
+	return nfsd_ffv2_nl_call(nl, NFSD_CMD_FFV2_PROTOTYPE_REGISTER, buf,
+				 off, reply, reply_cap);
+}
+
+/* An unregister naming a registration that does not exist. */
+static int nfsd_ffv2_nl_proto_unregister(struct nfsd_ffv2_nl *nl, void *reply,
+					 size_t reply_cap)
+{
+	static const u8 source[16] = { 0 };
+	char buf[NFSD_FFV2_NL_BUF];
+	size_t off;
+	int error;
+
+	off = nfsd_ffv2_nl_proto_begin(nl, buf,
+				       NFSD_CMD_FFV2_PROTOTYPE_UNREGISTER);
+	error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+				 NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID, source,
+				 sizeof(source));
+	if (!error)
+		error = nfsd_ffv2_nl_put_u64(buf, sizeof(buf), &off,
+					     NFSD_A_FFV2_PROTOTYPE_GENERATION,
+					     1);
+	if (error)
+		return error;
+	return nfsd_ffv2_nl_call(nl, NFSD_CMD_FFV2_PROTOTYPE_UNREGISTER, buf,
+				 off, reply, reply_cap);
+}
+
+static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
+{
+	static const u8 stranger[NFSD_FFV2_PROTOTYPE_NONCE_LEN] = { 0 };
+	const bool built = IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH);
+	struct nfsd_ffv2_nl_register_args args = {};
+	char reply[NFSD_FFV2_NL_BUF];
+	const struct nlattr *nla;
+	struct nfsd_ffv2_nl *nl;
+	struct net *net;
+	int got, error;
+
+	nl = kunit_kzalloc(test, sizeof(*nl), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, nl);
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(net));
+	error = nfsd_ffv2_nl_open_named(net, nl, NFSD_FAMILY_NAME);
+	if (error) {
+		KUNIT_FAIL(test, "failed to reach the nfsd family: %d", error);
+		put_net(net);
+		return;
+	}
+
+	/*
+	 * Shape first, and in both builds: a malformed request never
+	 * reaches a handler, so it cannot be told which build it reached.
+	 */
+	args.nonce = stranger;
+	args.nonce_len = sizeof(stranger) - 1;
+	args.domain = "ffv2-proto-kunit";
+	args.handle_len = 8;
+	args.chunk_size = 64;
+	args.data_count = 1;
+	/* A length the policy pins exactly is a range violation, not a
+	 * malformed message: netlink distinguishes the two, and the
+	 * distinction is worth holding the interface to.
+	 */
+	KUNIT_EXPECT_EQ(test, -ERANGE,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.nonce_len = sizeof(stranger);
+	args.omit_domain = true;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.omit_domain = false;
+	/*
+	 * An attribute this command has no policy for is refused too.  Which
+	 * status netlink chooses for it is netlink's to decide, so what is
+	 * asserted is that the request did not reach a handler.
+	 */
+	args.unknown_attr = NFSD_A_FFV2_PROTOTYPE_MAX + 1;
+	KUNIT_EXPECT_LT(test,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)), 0);
+	args.unknown_attr = 0;
+
+	/* A closed gate refuses everything a repeated transition would. */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_nl_proto_bare(nl,
+						NFSD_CMD_FFV2_PROTOTYPE_DISABLE,
+						reply, sizeof(reply)));
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_nl_proto_bare(nl,
+						NFSD_CMD_FFV2_PROTOTYPE_CHALLENGE,
+						reply, sizeof(reply)));
+
+	error = nfsd_ffv2_nl_proto_bare(nl, NFSD_CMD_FFV2_PROTOTYPE_ENABLE,
+					reply, sizeof(reply));
+	if (!built) {
+		/*
+		 * The whole profile is absent, and the enable is where that
+		 * shows: everything else already refuses in both builds.
+		 */
+		KUNIT_EXPECT_EQ(test, -EOPNOTSUPP, error);
+		goto out_close;
+	}
+	KUNIT_EXPECT_EQ(test, 0, error);
+	KUNIT_EXPECT_EQ(test, -EBUSY,
+			nfsd_ffv2_nl_proto_bare(nl,
+						NFSD_CMD_FFV2_PROTOTYPE_ENABLE,
+						reply, sizeof(reply)));
+
+	/* A challenge answers with a nonce and a deadline, not an ack. */
+	got = nfsd_ffv2_nl_proto_bare(nl, NFSD_CMD_FFV2_PROTOTYPE_CHALLENGE,
+				      reply, sizeof(reply));
+	KUNIT_EXPECT_GT(test, got, 0);
+	if (got > 0) {
+		nla = nfsd_ffv2_nl_find(reply, got,
+					NFSD_A_FFV2_PROTOTYPE_NONCE,
+					NFSD_FFV2_PROTOTYPE_NONCE_LEN);
+		KUNIT_EXPECT_NOT_NULL(test, nla);
+		nla = nfsd_ffv2_nl_find(reply, got,
+					NFSD_A_FFV2_PROTOTYPE_EXPIRES,
+					sizeof(u64));
+		KUNIT_EXPECT_NOT_NULL(test, nla);
+	}
+
+	/* A nonce this gate never issued is unknown, not merely refused. */
+	KUNIT_EXPECT_EQ(test, -ENOENT,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	/*
+	 * A layout that cannot describe an object is refused before the
+	 * nonce is even consulted, so an unusable request cannot spend one.
+	 */
+	args.parity_count = 1;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.parity_count = 0;
+	args.chunk_size = 0;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.chunk_size = 64;
+
+	/* Nothing is registered, so there is nothing to unregister. */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_nl_proto_unregister(nl, reply,
+						      sizeof(reply)));
+
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_nl_proto_bare(nl,
+						NFSD_CMD_FFV2_PROTOTYPE_DISABLE,
+						reply, sizeof(reply)));
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_nl_proto_bare(nl,
+						NFSD_CMD_FFV2_PROTOTYPE_DISABLE,
+						reply, sizeof(reply)));
+out_close:
+	nfsd_ffv2_nl_close(nl);
+	put_net(net);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -11002,6 +11317,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_size_mismatch_test),
 	KUNIT_CASE(nfsd_ffv2_provider_install_race_test),
 	KUNIT_CASE(nfsd_ffv2_source_reservation_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_nl_test),
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
 	KUNIT_CASE(nfsd_ffv2_prototype_gate_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_owner_test),

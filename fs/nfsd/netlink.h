@@ -46,6 +46,16 @@ int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 				      struct genl_info *info);
 int nfsd_nl_ffv2_object_unregister_doit(struct sk_buff *skb,
 					struct genl_info *info);
+int nfsd_nl_ffv2_prototype_enable_doit(struct sk_buff *skb,
+				       struct genl_info *info);
+int nfsd_nl_ffv2_prototype_disable_doit(struct sk_buff *skb,
+					struct genl_info *info);
+int nfsd_nl_ffv2_prototype_challenge_doit(struct sk_buff *skb,
+					  struct genl_info *info);
+int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
+					 struct genl_info *info);
+int nfsd_nl_ffv2_prototype_unregister_doit(struct sk_buff *skb,
+					   struct genl_info *info);
 
 enum {
 	NFSD_NLGRP_NONE,

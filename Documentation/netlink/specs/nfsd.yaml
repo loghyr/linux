@@ -374,6 +374,63 @@ attribute-sets:
         checks:
           exact-len: 16
 
+  -
+    name: ffv2-prototype
+    attributes:
+      -
+        name: nonce
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: expires
+        type: u64
+      -
+        name: auth-domain
+        type: string
+      -
+        name: handle
+        type: binary
+        checks:
+          max-len: 128
+      -
+        name: chunk-size
+        type: u32
+      -
+        name: data-count
+        type: u32
+      -
+        name: parity-count
+        type: u32
+      -
+        name: source-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: service-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: replay-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: generation
+        type: u64
+      -
+        name: stateid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: mapped-handle
+        type: binary
+        checks:
+          max-len: 128
+
 operations:
   list:
     -
@@ -588,6 +645,64 @@ operations:
         request:
           attributes:
             - object-uuid
+            - generation
+
+    -
+      name: ffv2-prototype-enable
+      doc: >-
+        Open this network namespace's Flex Files v2 prototype authority
+        gate.  The caller becomes its owner; no other administrator may
+        register against it, close it, or unregister from it.
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do: {}
+    -
+      name: ffv2-prototype-disable
+      doc: close this network namespace's prototype authority gate
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do: {}
+    -
+      name: ffv2-prototype-challenge
+      doc: issue one nonce a prototype registration must present
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do:
+        reply:
+          attributes:
+            - nonce
+            - expires
+    -
+      name: ffv2-prototype-register
+      doc: publish the one object a prototype authority gate serves
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - nonce
+            - auth-domain
+            - handle
+            - chunk-size
+            - data-count
+            - parity-count
+        reply:
+          attributes:
+            - source-uuid
+            - service-uuid
+            - replay-uuid
+            - generation
+            - stateid
+            - mapped-handle
+    -
+      name: ffv2-prototype-unregister
+      doc: retire the object a prototype authority gate published
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - source-uuid
             - generation
 
 mcast-groups:

@@ -136,6 +136,22 @@ static const struct nla_policy nfsd_ffv2_object_unregister_nl_policy[NFSD_A_FFV2
 	[NFSD_A_FFV2_OBJECT_GENERATION] = { .type = NLA_U64, },
 };
 
+/* NFSD_CMD_FFV2_PROTOTYPE_REGISTER - do */
+static const struct nla_policy nfsd_ffv2_prototype_register_nl_policy[NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT + 1] = {
+	[NFSD_A_FFV2_PROTOTYPE_NONCE] = NLA_POLICY_EXACT_LEN(32),
+	[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN] = { .type = NLA_NUL_STRING, },
+	[NFSD_A_FFV2_PROTOTYPE_HANDLE] = NLA_POLICY_MAX_LEN(128),
+	[NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE] = { .type = NLA_U32, },
+	[NFSD_A_FFV2_PROTOTYPE_DATA_COUNT] = { .type = NLA_U32, },
+	[NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT] = { .type = NLA_U32, },
+};
+
+/* NFSD_CMD_FFV2_PROTOTYPE_UNREGISTER - do */
+static const struct nla_policy nfsd_ffv2_prototype_unregister_nl_policy[NFSD_A_FFV2_PROTOTYPE_GENERATION + 1] = {
+	[NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID] = NLA_POLICY_EXACT_LEN(16),
+	[NFSD_A_FFV2_PROTOTYPE_GENERATION] = { .type = NLA_U64, },
+};
+
 /* Ops table for nfsd */
 static const struct genl_split_ops nfsd_nl_ops[] = {
 	{
@@ -255,6 +271,35 @@ static const struct genl_split_ops nfsd_nl_ops[] = {
 		.doit		= nfsd_nl_ffv2_object_unregister_doit,
 		.policy		= nfsd_ffv2_object_unregister_nl_policy,
 		.maxattr	= NFSD_A_FFV2_OBJECT_GENERATION,
+		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+	},
+	{
+		.cmd	= NFSD_CMD_FFV2_PROTOTYPE_ENABLE,
+		.doit	= nfsd_nl_ffv2_prototype_enable_doit,
+		.flags	= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+	},
+	{
+		.cmd	= NFSD_CMD_FFV2_PROTOTYPE_DISABLE,
+		.doit	= nfsd_nl_ffv2_prototype_disable_doit,
+		.flags	= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+	},
+	{
+		.cmd	= NFSD_CMD_FFV2_PROTOTYPE_CHALLENGE,
+		.doit	= nfsd_nl_ffv2_prototype_challenge_doit,
+		.flags	= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+	},
+	{
+		.cmd		= NFSD_CMD_FFV2_PROTOTYPE_REGISTER,
+		.doit		= nfsd_nl_ffv2_prototype_register_doit,
+		.policy		= nfsd_ffv2_prototype_register_nl_policy,
+		.maxattr	= NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT,
+		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
+	},
+	{
+		.cmd		= NFSD_CMD_FFV2_PROTOTYPE_UNREGISTER,
+		.doit		= nfsd_nl_ffv2_prototype_unregister_doit,
+		.policy		= nfsd_ffv2_prototype_unregister_nl_policy,
+		.maxattr	= NFSD_A_FFV2_PROTOTYPE_GENERATION,
 		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
 	},
 };
