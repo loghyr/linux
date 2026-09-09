@@ -11691,11 +11691,65 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0, owner.result);
 	KUNIT_EXPECT_EQ(test, -EBUSY, waiter.result);
 
-	/* The next cycle runs on its own completion, and closes normally. */
-	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
-	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
+	/*
+	 * Three: the same shape again, in a cycle that follows a completed
+	 * one.  The completion this cycle's closers use has already been
+	 * fired once, by the owner above, so a waiter parked on it now is
+	 * parked on a reinitialised completion; if it were not, the old
+	 * signal would satisfy it the moment it arrived.
+	 */
+	init_completion(&entered);
+	init_completion(&proceed);
+	init_completion(&published);
+	init_completion(&resume);
+	init_completion(&owner.done);
+	init_completion(&waiter.done);
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	nfsd_ffv2_prototype_test_close_hooks(&entered, &proceed, &published,
+					     &resume);
+	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
+				 "ffv2-proto-owner3");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&entered, 15 * HZ) != 0);
+	closing = nfsd_ffv2_prototype_wait_state(nn,
+						 NFSD_FFV2_PROTOTYPE_CLOSING);
+	KUNIT_EXPECT_TRUE(test, closing);
+	waiter_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &waiter,
+				  "ffv2-proto-waiter3");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(waiter_task));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_wait_waiters(nn, 1));
+	KUNIT_EXPECT_EQ(test, 0,
+			wait_for_completion_timeout(&waiter.done, HZ / 5));
+
+	complete(&proceed);
+	KUNIT_ASSERT_TRUE(test,
+			  wait_for_completion_timeout(&published, 30 * HZ) != 0);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
+	/* Still parked: this cycle's owner has not signalled either. */
+	KUNIT_EXPECT_EQ(test, 0,
+			wait_for_completion_timeout(&waiter.done, HZ / 5));
+	KUNIT_EXPECT_EQ(test, 1u,
+			nfsd_ffv2_prototype_test_close_waiters(nn));
+
+	complete(&resume);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&waiter.done,
+						      30 * HZ) != 0);
+	kthread_stop(owner_task);
+	kthread_stop(waiter_task);
+	KUNIT_EXPECT_EQ(test, 0, owner.result);
+	KUNIT_EXPECT_EQ(test, -EBUSY, waiter.result);
+	KUNIT_EXPECT_EQ(test, 0u,
+			nfsd_ffv2_prototype_test_close_waiters(nn));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
+			nfsd_ffv2_prototype_state_get(nn));
+	/* And the namespace enables again, on a completion of its own. */
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+	KUNIT_EXPECT_EQ(test, 0, nfsd_ffv2_prototype_disable(nn, &init_net));
 }
 
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
