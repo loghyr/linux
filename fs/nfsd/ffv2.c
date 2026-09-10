@@ -5052,25 +5052,44 @@ void nfsd_ffv2_test_destroy_entry_hook(struct nfsd_net *nn,
 				       struct completion *entered)
 {
 	if (!nn || !entered) {
-		/* Disarm target first: it is what a notification matches. */
+		/*
+		 * Disarm the target first: it is the gate a notification has
+		 * to pass, so clearing it stops one before the completion it
+		 * would have signalled goes away.
+		 */
 		WRITE_ONCE(nfsd_ffv2_destroy_entry_nn, NULL);
 		WRITE_ONCE(nfsd_ffv2_destroy_entry, NULL);
 		return;
 	}
 	WRITE_ONCE(nfsd_ffv2_destroy_entry, entered);
-	/* Last: a reader that sees the target sees the completion too. */
-	WRITE_ONCE(nfsd_ffv2_destroy_entry_nn, nn);
+	/*
+	 * Published last, and with a release, because the target is what a
+	 * notification matches on: a CPU that sees this target must also see
+	 * the completion stored above it.  Two plain stores would let a
+	 * weakly ordered reader match the new target, load the completion
+	 * that was there before it -- NULL -- and consume the arming without
+	 * ever signalling it, leaving the armer waiting for a notification
+	 * that has already been spent.
+	 */
+	smp_store_release(&nfsd_ffv2_destroy_entry_nn, nn);
 }
 
 static void nfsd_ffv2_destroy_entered(struct nfsd_net *nn)
 {
 	struct completion *entered;
 
-	if (READ_ONCE(nfsd_ffv2_destroy_entry_nn) != nn)
+	/* Pairs with the release above: the target gates the completion. */
+	if (smp_load_acquire(&nfsd_ffv2_destroy_entry_nn) != nn)
 		return;
 	entered = READ_ONCE(nfsd_ffv2_destroy_entry);
 	WRITE_ONCE(nfsd_ffv2_destroy_entry_nn, NULL);
 	WRITE_ONCE(nfsd_ffv2_destroy_entry, NULL);
+	/*
+	 * A published target always came with a completion, so this cannot
+	 * be NULL; it is checked rather than assumed because getting it
+	 * wrong would be a missed notification rather than a crash, and a
+	 * missed notification is what this whole protocol is about.
+	 */
 	if (entered)
 		complete(entered);
 }
