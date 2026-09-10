@@ -9992,7 +9992,7 @@ static int nfsd_ffv2_prototype_disable_thread(void *data)
 	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
 
 	ctx->result = nfsd_ffv2_prototype_disable(ctx->nn, ctx->net);
-	complete(&ctx->done);
+	complete_all(&ctx->done);
 	nfsd_ffv2_test_thread_park();
 	return 0;
 }
@@ -10008,7 +10008,7 @@ static int nfsd_ffv2_proto_destroy_thread(void *data)
 
 	nfsd_ffv2_net_destroy(ctx->nn);
 	ctx->result = 0;
-	complete(&ctx->done);
+	complete_all(&ctx->done);
 	nfsd_ffv2_test_thread_park();
 	return 0;
 }
@@ -10019,7 +10019,7 @@ static int nfsd_ffv2_prototype_pre_exit_thread(void *data)
 
 	nfsd_ffv2_net_pre_exit(ctx->nn);
 	ctx->result = 0;
-	complete(&ctx->done);
+	complete_all(&ctx->done);
 	nfsd_ffv2_test_thread_park();
 	return 0;
 }
@@ -11787,7 +11787,7 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	struct nfsd_ffv2_prototype_call_ctx owner = {}, exiting = {};
 	struct nfsd_ffv2_prototype_call_ctx destroying = {};
 	struct task_struct *owner_task, *exit_task, *destroy_task;
-	struct completion published, resume;
+	struct completion published, resume, entered;
 	unsigned int parked_ref;
 	struct nfsd_net *nn;
 	int error;
@@ -11799,6 +11799,7 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 
 	init_completion(&published);
 	init_completion(&resume);
+	init_completion(&entered);
 	init_completion(&owner.done);
 	init_completion(&exiting.done);
 	init_completion(&destroying.done);
@@ -11850,10 +11851,12 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	 * owner is still holding one.
 	 */
 	kunit_remove_action(test, nfsd_ffv2_test_net_exit, nn);
+	nfsd_ffv2_test_destroy_entry_hook(&entered);
 	destroy_task = kthread_run(nfsd_ffv2_proto_destroy_thread, &destroying,
 				   "ffv2-proto-destroy");
 	if (IS_ERR(destroy_task)) {
 		KUNIT_FAIL(test, "failed to start the destroying thread");
+		nfsd_ffv2_test_destroy_entry_hook(NULL);
 		complete(&resume);
 		wait_for_completion(&owner.done);
 		kthread_stop(owner_task);
@@ -11861,9 +11864,19 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 		nfsd_ffv2_net_destroy(nn);
 		return;
 	}
+	/*
+	 * Wait until destruction says it has dropped the namespace's own
+	 * reference and is about to wait for the last one.  Without that,
+	 * "destruction has not finished" is satisfied just as well by a
+	 * thread the scheduler has not run yet, and would say nothing about
+	 * what is holding destruction up.
+	 */
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&entered, 30 * HZ) != 0);
+	/* Inside the wait, and the only reference left is the owner's. */
 	KUNIT_EXPECT_EQ(test, 0,
 			wait_for_completion_timeout(&destroying.done, HZ / 5));
-	KUNIT_EXPECT_GT(test, nfsd_ffv2_test_anchor_refcount(nn), 0u);
+	KUNIT_EXPECT_EQ(test, 1u, nfsd_ffv2_test_anchor_refcount(nn));
 
 	/* The owner signals, gives up the role, and lets the anchor go. */
 	complete(&resume);

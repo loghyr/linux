@@ -5029,6 +5029,36 @@ __be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
 }
 #endif
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static struct completion *nfsd_ffv2_destroy_entry;
+
+/**
+ * nfsd_ffv2_test_destroy_entry_hook - watch for destruction reaching its wait
+ * @entered: completion signalled once, or NULL to disarm
+ *
+ * A test that has to know destruction is waiting for the anchor's last
+ * reference, rather than merely not having been scheduled yet, arms this
+ * and waits for it before it draws any conclusion from destruction not
+ * having finished.
+ */
+void nfsd_ffv2_test_destroy_entry_hook(struct completion *entered)
+{
+	WRITE_ONCE(nfsd_ffv2_destroy_entry, entered);
+}
+
+static void nfsd_ffv2_destroy_entered(void)
+{
+	struct completion *entered = READ_ONCE(nfsd_ffv2_destroy_entry);
+
+	if (!entered)
+		return;
+	WRITE_ONCE(nfsd_ffv2_destroy_entry, NULL);
+	complete(entered);
+}
+#else
+static inline void nfsd_ffv2_destroy_entered(void) { }
+#endif
+
 void nfsd_ffv2_net_init(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
@@ -5128,6 +5158,13 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	WARN_ON_ONCE(!nfsd_ffv2_authority_admissions_idle(anchor));
 	nfsd_ffv2_prototype_net_destroy(nn);
 	nfsd_ffv2_anchor_put(anchor);
+	/*
+	 * The namespace's own reference is gone; what is left, if anything,
+	 * is a holder still running.  Announcing the boundary here is what
+	 * lets a test tell "destruction is waiting" from "destruction has
+	 * not started".  It is a no-op in every ordinary build.
+	 */
+	nfsd_ffv2_destroy_entered();
 	wait_for_completion(&anchor->released);
 	mutex_destroy(&anchor->lock);
 }

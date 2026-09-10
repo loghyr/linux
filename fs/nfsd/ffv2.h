@@ -541,6 +541,9 @@ static inline void nfsd_ffv2_live_test_debugfs_init(struct dentry *parent) { }
 static inline void nfsd_ffv2_live_test_exit(void) { }
 #endif
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_test_destroy_entry_hook(struct completion *entered);
+#endif
 int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
 			   void (*release)(void *), u64 *generation);
 int nfsd_ffv2_test_admit(struct nfsd_net *nn,
