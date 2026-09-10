@@ -11755,15 +11755,14 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 /*
  * Namespace exit arriving in the interval after OFF and before the signal.
  *
- * This is the schedule the earlier reports listed as uncovered.  The gate
- * deliberately reads OFF before its owner signals, so an exit arriving
- * there finds nothing to close and returns at once -- and what keeps that
- * safe is the execution reference the owner still holds on the anchor,
- * which is what a namespace waiting to be destroyed waits for.  Both halves
- * are asserted: the exit does not block, and the reference is still there
- * until the owner has finished with it.
+ * The gate reads OFF before its owner signals, so an exit arriving there
+ * finds no gate work to claim and returns at once rather than waiting on
+ * the completion.  What keeps that safe is the execution reference the
+ * owner still holds on the anchor: destruction waits for the anchor's last
+ * reference, not for the gate.
  *
- * No new seam is needed for this; the close hooks already reach the point.
+ * What this asserts is the fence: it returns without disturbing the owner,
+ * and the reference is still held while the owner is parked.
  */
 static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 {

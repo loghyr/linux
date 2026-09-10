@@ -47,10 +47,17 @@ struct user_namespace;
  * enabling caller has finished and rolled back whatever it staged; it does
  * not say the namespace is quiet.  @close_done says the source reservation
  * is back, the provider is gone, and every resource the gate owned has been
- * detached.  Everything outside waits for @close_done, so nothing can
- * release the namespace while setup is still running.
+ * detached.
  *
- * One reference is deliberately still held at that point.  The close owner
+ * @close_done is not, however, something every caller waits for.  A caller
+ * that finds a close already under way joins it and waits; a caller that
+ * arrives after the gate has been published OFF finds no gate work left to
+ * claim and returns without waiting at all.  Namespace teardown takes that
+ * second path, and what keeps it safe is not this completion but the anchor:
+ * nfsd_ffv2_net_destroy() waits for the anchor's last reference, and the
+ * close owner is still holding one.
+ *
+ * That reference is deliberately still held at the signal.  The close owner
  * is about to touch @close_done and the gate state that lives beside it, so
  * it keeps its own execution reference on the anchor across the signal and
  * across giving up the close role, and drops it immediately afterwards.  A
