@@ -9997,6 +9997,22 @@ static int nfsd_ffv2_prototype_disable_thread(void *data)
 	return 0;
 }
 
+/*
+ * The final namespace destruction, on a thread of its own, so a test can
+ * ask whether it is still waiting.  It runs exactly once: the caller takes
+ * the fixture's cleanup action over before starting this.
+ */
+static int nfsd_ffv2_proto_destroy_thread(void *data)
+{
+	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
+
+	nfsd_ffv2_net_destroy(ctx->nn);
+	ctx->result = 0;
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
 static int nfsd_ffv2_prototype_pre_exit_thread(void *data)
 {
 	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
@@ -11761,13 +11777,16 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
  * owner still holds on the anchor: destruction waits for the anchor's last
  * reference, not for the gate.
  *
- * What this asserts is the fence: it returns without disturbing the owner,
- * and the reference is still held while the owner is parked.
+ * Both halves are asserted here.  The fence returns without disturbing the
+ * owner and with the reference still held; and destruction, run against the
+ * same parked owner, does not complete until that owner has signalled and
+ * let the reference go.
  */
 static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 {
 	struct nfsd_ffv2_prototype_call_ctx owner = {}, exiting = {};
-	struct task_struct *owner_task, *exit_task;
+	struct nfsd_ffv2_prototype_call_ctx destroying = {};
+	struct task_struct *owner_task, *exit_task, *destroy_task;
 	struct completion published, resume;
 	unsigned int parked_ref;
 	struct nfsd_net *nn;
@@ -11782,8 +11801,10 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	init_completion(&resume);
 	init_completion(&owner.done);
 	init_completion(&exiting.done);
+	init_completion(&destroying.done);
 	owner.nn = nn;
 	exiting.nn = nn;
+	destroying.nn = nn;
 	owner.net = &init_net;
 
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
@@ -11820,15 +11841,43 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 			nfsd_ffv2_prototype_state_get(nn));
 	KUNIT_EXPECT_GT(test, nfsd_ffv2_test_anchor_refcount(nn), 1u);
 
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_NET_EXITING, nn->ffv2.net_state);
+
+	/*
+	 * Now the destruction itself, against the same parked owner.  The
+	 * fixture's cleanup is taken over first so this runs exactly once,
+	 * and it must not get past the anchor's last reference while that
+	 * owner is still holding one.
+	 */
+	kunit_remove_action(test, nfsd_ffv2_test_net_exit, nn);
+	destroy_task = kthread_run(nfsd_ffv2_proto_destroy_thread, &destroying,
+				   "ffv2-proto-destroy");
+	if (IS_ERR(destroy_task)) {
+		KUNIT_FAIL(test, "failed to start the destroying thread");
+		complete(&resume);
+		wait_for_completion(&owner.done);
+		kthread_stop(owner_task);
+		kthread_stop(exit_task);
+		nfsd_ffv2_net_destroy(nn);
+		return;
+	}
+	KUNIT_EXPECT_EQ(test, 0,
+			wait_for_completion_timeout(&destroying.done, HZ / 5));
+	KUNIT_EXPECT_GT(test, nfsd_ffv2_test_anchor_refcount(nn), 0u);
+
+	/* The owner signals, gives up the role, and lets the anchor go. */
 	complete(&resume);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
+	/* Only then does destruction get past its wait. */
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&destroying.done,
+						      30 * HZ) != 0);
 	kthread_stop(owner_task);
 	kthread_stop(exit_task);
+	kthread_stop(destroy_task);
 	KUNIT_EXPECT_EQ(test, 0, owner.result);
-	/* Only once it has finished does the anchor come back down. */
 	KUNIT_EXPECT_LT(test, nfsd_ffv2_test_anchor_refcount(nn), parked_ref);
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_NET_EXITING, nn->ffv2.net_state);
 }
 
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
