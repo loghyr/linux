@@ -5030,33 +5030,52 @@ __be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
 #endif
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static struct nfsd_net *nfsd_ffv2_destroy_entry_nn;
 static struct completion *nfsd_ffv2_destroy_entry;
 
 /**
- * nfsd_ffv2_test_destroy_entry_hook - watch for destruction reaching its wait
+ * nfsd_ffv2_test_destroy_entry_hook - watch one namespace reach its wait
+ * @nn: the namespace whose destruction is being watched
  * @entered: completion signalled once, or NULL to disarm
  *
  * A test that has to know destruction is waiting for the anchor's last
  * reference, rather than merely not having been scheduled yet, arms this
  * and waits for it before it draws any conclusion from destruction not
  * having finished.
+ *
+ * The namespace is part of the arming because these are file-scope: a test
+ * runs beside others that create and destroy namespaces of their own, and
+ * a notification meant for one of those must not consume an arming made
+ * for this one.
  */
-void nfsd_ffv2_test_destroy_entry_hook(struct completion *entered)
+void nfsd_ffv2_test_destroy_entry_hook(struct nfsd_net *nn,
+				       struct completion *entered)
 {
+	if (!nn || !entered) {
+		/* Disarm target first: it is what a notification matches. */
+		WRITE_ONCE(nfsd_ffv2_destroy_entry_nn, NULL);
+		WRITE_ONCE(nfsd_ffv2_destroy_entry, NULL);
+		return;
+	}
 	WRITE_ONCE(nfsd_ffv2_destroy_entry, entered);
+	/* Last: a reader that sees the target sees the completion too. */
+	WRITE_ONCE(nfsd_ffv2_destroy_entry_nn, nn);
 }
 
-static void nfsd_ffv2_destroy_entered(void)
+static void nfsd_ffv2_destroy_entered(struct nfsd_net *nn)
 {
-	struct completion *entered = READ_ONCE(nfsd_ffv2_destroy_entry);
+	struct completion *entered;
 
-	if (!entered)
+	if (READ_ONCE(nfsd_ffv2_destroy_entry_nn) != nn)
 		return;
+	entered = READ_ONCE(nfsd_ffv2_destroy_entry);
+	WRITE_ONCE(nfsd_ffv2_destroy_entry_nn, NULL);
 	WRITE_ONCE(nfsd_ffv2_destroy_entry, NULL);
-	complete(entered);
+	if (entered)
+		complete(entered);
 }
 #else
-static inline void nfsd_ffv2_destroy_entered(void) { }
+static inline void nfsd_ffv2_destroy_entered(struct nfsd_net *nn) { }
 #endif
 
 void nfsd_ffv2_net_init(struct nfsd_net *nn)
@@ -5164,7 +5183,7 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	 * lets a test tell "destruction is waiting" from "destruction has
 	 * not started".  It is a no-op in every ordinary build.
 	 */
-	nfsd_ffv2_destroy_entered();
+	nfsd_ffv2_destroy_entered(nn);
 	wait_for_completion(&anchor->released);
 	mutex_destroy(&anchor->lock);
 }

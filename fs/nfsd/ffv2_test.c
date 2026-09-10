@@ -11788,8 +11788,8 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	struct nfsd_ffv2_prototype_call_ctx destroying = {};
 	struct task_struct *owner_task, *exit_task, *destroy_task;
 	struct completion published, resume, entered;
+	struct nfsd_net *nn, *stranger;
 	unsigned int parked_ref;
-	struct nfsd_net *nn;
 	int error;
 
 	nn = nfsd_ffv2_test_net(test);
@@ -11851,12 +11851,28 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	 * owner is still holding one.
 	 */
 	kunit_remove_action(test, nfsd_ffv2_test_net_exit, nn);
-	nfsd_ffv2_test_destroy_entry_hook(&entered);
+	nfsd_ffv2_test_destroy_entry_hook(nn, &entered);
+
+	/*
+	 * An arming names the namespace it is for.  Another namespace being
+	 * destroyed beside this one -- which is what the rest of the suite
+	 * does -- must not consume it, or this test would go on to wait for
+	 * a notification that had already been spent on somebody else.
+	 */
+	stranger = nfsd_ffv2_test_net(test);
+	if (stranger) {
+		nfsd_ffv2_test_net_exit(stranger);
+		KUNIT_EXPECT_EQ(test, 0,
+				wait_for_completion_timeout(&entered, HZ / 10));
+	} else {
+		KUNIT_FAIL(test, "failed to allocate the unrelated namespace");
+	}
+
 	destroy_task = kthread_run(nfsd_ffv2_proto_destroy_thread, &destroying,
 				   "ffv2-proto-destroy");
 	if (IS_ERR(destroy_task)) {
 		KUNIT_FAIL(test, "failed to start the destroying thread");
-		nfsd_ffv2_test_destroy_entry_hook(NULL);
+		nfsd_ffv2_test_destroy_entry_hook(NULL, NULL);
 		complete(&resume);
 		wait_for_completion(&owner.done);
 		kthread_stop(owner_task);
