@@ -39,9 +39,11 @@ struct user_namespace;
  * publishes ENABLING before it does any sleepable work; that reference is
  * what stops namespace exit from tearing down a half-built gate.  The first
  * caller to observe a live gate -- a second administrator, or namespace
- * pre-exit -- claims the close role and publishes CLOSING; every later
- * caller only waits.  So one actor drains, removes and releases, exactly
- * once, and everything else joins its completion.
+ * pre-exit -- claims the close role and publishes CLOSING.  A caller that
+ * arrives while that role is held waits for @close_done; one that arrives
+ * after the gate has been published OFF finds no gate work left to claim
+ * and returns without waiting.  Either way one close owner drains, removes
+ * and releases, exactly once.
  *
  * The two completions are distinct on purpose.  @setup_done says the
  * enabling caller has finished and rolled back whatever it staged; it does
@@ -49,11 +51,8 @@ struct user_namespace;
  * is back, the provider is gone, and every resource the gate owned has been
  * detached.
  *
- * @close_done is not, however, something every caller waits for.  A caller
- * that finds a close already under way joins it and waits; a caller that
- * arrives after the gate has been published OFF finds no gate work left to
- * claim and returns without waiting at all.  Namespace teardown takes that
- * second path, and what keeps it safe is not this completion but the anchor:
+ * Namespace teardown is the caller that takes the second path, and what
+ * keeps it safe is not this completion but the anchor:
  * nfsd_ffv2_net_destroy() waits for the anchor's last reference, and the
  * close owner is still holding one.
  *
