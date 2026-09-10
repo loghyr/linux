@@ -5030,6 +5030,7 @@ __be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
 #endif
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static DEFINE_SPINLOCK(nfsd_ffv2_destroy_entry_lock);
 static struct nfsd_net *nfsd_ffv2_destroy_entry_nn;
 static struct completion *nfsd_ffv2_destroy_entry;
 
@@ -5047,49 +5048,43 @@ static struct completion *nfsd_ffv2_destroy_entry;
  * runs beside others that create and destroy namespaces of their own, and
  * a notification meant for one of those must not consume an arming made
  * for this one.
+ *
+ * The target and the completion are one arming and are only ever changed
+ * together, under the lock a notification also takes.  Written separately
+ * they could be torn apart by a notification that had already matched the
+ * target: it would go on to signal whatever completion it then found, or
+ * none, and the armer would wait for a notification that had been spent on
+ * a pairing nobody made.
  */
 void nfsd_ffv2_test_destroy_entry_hook(struct nfsd_net *nn,
 				       struct completion *entered)
 {
-	if (!nn || !entered) {
-		/*
-		 * Disarm the target first: it is the gate a notification has
-		 * to pass, so clearing it stops one before the completion it
-		 * would have signalled goes away.
-		 */
-		WRITE_ONCE(nfsd_ffv2_destroy_entry_nn, NULL);
-		WRITE_ONCE(nfsd_ffv2_destroy_entry, NULL);
-		return;
-	}
-	WRITE_ONCE(nfsd_ffv2_destroy_entry, entered);
-	/*
-	 * Published last, and with a release, because the target is what a
-	 * notification matches on: a CPU that sees this target must also see
-	 * the completion stored above it.  Two plain stores would let a
-	 * weakly ordered reader match the new target, load the completion
-	 * that was there before it -- NULL -- and consume the arming without
-	 * ever signalling it, leaving the armer waiting for a notification
-	 * that has already been spent.
-	 */
-	smp_store_release(&nfsd_ffv2_destroy_entry_nn, nn);
+	bool arm = nn && entered;
+
+	spin_lock(&nfsd_ffv2_destroy_entry_lock);
+	nfsd_ffv2_destroy_entry_nn = arm ? nn : NULL;
+	nfsd_ffv2_destroy_entry = arm ? entered : NULL;
+	spin_unlock(&nfsd_ffv2_destroy_entry_lock);
 }
 
 static void nfsd_ffv2_destroy_entered(struct nfsd_net *nn)
 {
-	struct completion *entered;
+	struct completion *entered = NULL;
 
-	/* Pairs with the release above: the target gates the completion. */
-	if (smp_load_acquire(&nfsd_ffv2_destroy_entry_nn) != nn)
-		return;
-	entered = READ_ONCE(nfsd_ffv2_destroy_entry);
-	WRITE_ONCE(nfsd_ffv2_destroy_entry_nn, NULL);
-	WRITE_ONCE(nfsd_ffv2_destroy_entry, NULL);
 	/*
-	 * A published target always came with a completion, so this cannot
-	 * be NULL; it is checked rather than assumed because getting it
-	 * wrong would be a missed notification rather than a crash, and a
-	 * missed notification is what this whole protocol is about.
+	 * Matching and taking are one step, so an arming goes to exactly one
+	 * notification: a second one for the same namespace, or a disarm,
+	 * finds it already gone.  The completion is signalled after the lock
+	 * because the armer wakes on it and may free it at once, and because
+	 * this is the only place the two orders could be told apart.
 	 */
+	spin_lock(&nfsd_ffv2_destroy_entry_lock);
+	if (nfsd_ffv2_destroy_entry_nn == nn) {
+		entered = nfsd_ffv2_destroy_entry;
+		nfsd_ffv2_destroy_entry_nn = NULL;
+		nfsd_ffv2_destroy_entry = NULL;
+	}
+	spin_unlock(&nfsd_ffv2_destroy_entry_lock);
 	if (entered)
 		complete(entered);
 }

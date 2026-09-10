@@ -11912,6 +11912,58 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 #endif /* CONFIG_NFSD_FFV2_PROTOTYPE_AUTH */
 
 /*
+ * The destroy-entry hook is one arming: the namespace to match, and the
+ * completion to signal when that namespace's destruction reaches its wait.
+ * The two are set, replaced and taken together, and exactly one notification
+ * takes an arming -- so no destruction signals a completion that was not
+ * armed for it, and no arming is lost by a notification that does not
+ * signal it.
+ */
+static void nfsd_ffv2_destroy_entry_arming_test(struct kunit *test)
+{
+	struct completion first, second;
+	struct nfsd_net *watched, *stranger;
+
+	init_completion(&first);
+	init_completion(&second);
+
+	watched = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, watched);
+	stranger = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, stranger);
+
+	/* A disarm takes the arming back: the destruction it named is silent. */
+	nfsd_ffv2_test_destroy_entry_hook(watched, &first);
+	nfsd_ffv2_test_destroy_entry_hook(NULL, NULL);
+	nfsd_ffv2_test_net_exit(watched);
+	KUNIT_EXPECT_EQ(test, 0, wait_for_completion_timeout(&first, HZ / 10));
+
+	/*
+	 * Re-arming replaces both halves at once.  Were the namespace taken
+	 * on its own, the stranger's destruction would find the completion
+	 * armed for somebody else and signal that; were the completion taken
+	 * on its own, the stranger's destruction would match nothing.
+	 */
+	watched = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, watched);
+	nfsd_ffv2_test_destroy_entry_hook(watched, &first);
+	nfsd_ffv2_test_destroy_entry_hook(stranger, &second);
+	nfsd_ffv2_test_net_exit(stranger);
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&second, 30 * HZ) != 0);
+	KUNIT_EXPECT_EQ(test, 0, wait_for_completion_timeout(&first, HZ / 10));
+
+	/*
+	 * And that notification spent the arming rather than merely reading
+	 * it, so the namespace destroyed next finds nothing left to take.
+	 */
+	nfsd_ffv2_test_net_exit(watched);
+	KUNIT_EXPECT_EQ(test, 0, wait_for_completion_timeout(&second, HZ / 10));
+	KUNIT_EXPECT_EQ(test, 0, wait_for_completion_timeout(&first, HZ / 10));
+	nfsd_ffv2_test_destroy_entry_hook(NULL, NULL);
+}
+
+/*
  * A namespace admits one FFv2 authority source.  The second claimant is
  * refused whichever order the two arrive in, a holder cannot claim a second
  * time, and the namespace becomes claimable again only once the holder has
@@ -12309,6 +12361,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_pinned_reference_test),
 	KUNIT_CASE(nfsd_ffv2_provider_size_mismatch_test),
 	KUNIT_CASE(nfsd_ffv2_provider_install_race_test),
+	KUNIT_CASE(nfsd_ffv2_destroy_entry_arming_test),
 	KUNIT_CASE(nfsd_ffv2_source_reservation_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_nl_test),
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
