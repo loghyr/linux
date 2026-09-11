@@ -6255,10 +6255,11 @@ out:
 
 /*
  * A header read that had to be shortened is still a reply, so a client
- * that asked for its reply to be cached gets one.  The
- * too-big-to-cache ladder is for a reply that cannot be given at all: the
- * client's remedy there is to retry without caching, and there is nothing
- * to retry when it has just been answered.
+ * that asked for its reply to be cached gets one.  The too-big-to-cache
+ * ladder is for a reply that cannot be given at all: the client's remedy
+ * there is to retry without caching, and there is nothing to retry when it
+ * has just been answered.  That refusal is covered with the rest of the
+ * capacity ladder; what is here is the two ways a reply is shortened.
  */
 static void nfsd_ffv2_encoder_header_cachethis_test(struct kunit *test)
 {
@@ -6303,20 +6304,6 @@ static void nfsd_ffv2_encoder_header_cachethis_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, u.chunk_header_read.chrr_eof);
 	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
 	f.provider->predecessors[0].disposition = NFSD_FFV2_RETAINED_ABSENT;
-
-	/*
-	 * One word less holds no entry at all.  That is the reply that
-	 * cannot be given, and caching is what the client is told about.
-	 */
-	memset(&u, 0, sizeof(u));
-	u.chunk_header_read.chra_stateid = f.stateid;
-	u.chunk_header_read.chra_count = 2;
-	KUNIT_EXPECT_EQ(test, nfserr_rep_too_big_to_cache,
-			nfsd_ffv2_ro_compound_op(test, &f,
-						 OP_CHUNK_HEADER_READ,
-						 fixed + entry - XDR_UNIT,
-						 true, &u));
-	KUNIT_EXPECT_EQ(test, 0U, u.chunk_header_read.chrr_nents);
 
 out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
