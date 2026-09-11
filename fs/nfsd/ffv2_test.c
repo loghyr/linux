@@ -6512,7 +6512,7 @@ static void nfsd_ffv2_provider_short_result_test(struct kunit *test)
 	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 2 };
 	struct nfsd_ffv2_chunk_result result;
 	struct nfsd_ffv2_ro_fixture f;
-	u64 callbacks;
+	u64 callbacks, malformed;
 
 	if (!nfsd_ffv2_ro_fixture_init(test, &f))
 		goto out;
@@ -6528,6 +6528,7 @@ static void nfsd_ffv2_provider_short_result_test(struct kunit *test)
 
 	/* Short, and claiming the end of the range: a legitimate answer. */
 	f.provider->short_eof = true;
+	malformed = nfsd_ffv2_test_provider_malformed();
 	memset(&result, 0, sizeof(result));
 	KUNIT_EXPECT_EQ(test, nfs_ok,
 			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
@@ -6541,27 +6542,37 @@ static void nfsd_ffv2_provider_short_result_test(struct kunit *test)
 					       &f.stateid, &req, &result));
 	KUNIT_EXPECT_EQ(test, 1U, result.count);
 	KUNIT_EXPECT_TRUE(test, result.eof);
+	/* Neither answer was refused, so neither was counted. */
+	KUNIT_EXPECT_EQ(test, malformed,
+			nfsd_ffv2_test_provider_malformed());
 
 	/* Short without claiming it: refused, counted, and zeroed. */
 	f.provider->short_eof = false;
 	callbacks = nfsd_ffv2_test_provider_callbacks();
+	malformed = nfsd_ffv2_test_provider_malformed();
 	memset(&result, 0, sizeof(result));
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
 			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
 					       &req, &result));
 	KUNIT_EXPECT_EQ(test, callbacks + 1,
 			nfsd_ffv2_test_provider_callbacks());
+	/* Counted as malformed, which is what a refusal here is. */
+	KUNIT_EXPECT_EQ(test, malformed + 1,
+			nfsd_ffv2_test_provider_malformed());
 	KUNIT_EXPECT_EQ(test, 0U, result.count);
 	KUNIT_EXPECT_NULL(test, result.read.chunks);
 	KUNIT_EXPECT_FALSE(test, result.eof);
 
 	callbacks = nfsd_ffv2_test_provider_callbacks();
+	malformed = nfsd_ffv2_test_provider_malformed();
 	memset(&result, 0, sizeof(result));
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
 			nfsd_ffv2_ro_operation(&f, OP_CHUNK_HEADER_READ,
 					       &f.stateid, &req, &result));
 	KUNIT_EXPECT_EQ(test, callbacks + 1,
 			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, malformed + 1,
+			nfsd_ffv2_test_provider_malformed());
 	KUNIT_EXPECT_EQ(test, 0U, result.count);
 	KUNIT_EXPECT_NULL(test, result.header.status);
 

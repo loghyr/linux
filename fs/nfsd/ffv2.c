@@ -4953,6 +4953,12 @@ u64 nfsd_ffv2_test_provider_unadmitted(void)
 	return atomic64_read(&nfsd_ffv2_probe_counters.unadmitted);
 }
 
+/* Results refused at the boundary for not meeting the provider contract. */
+u64 nfsd_ffv2_test_provider_malformed(void)
+{
+	return atomic64_read(&nfsd_ffv2_probe_counters.malformed);
+}
+
 int nfsd_ffv2_test_provider_install(struct nfsd_net *nn,
 				    const struct nfsd_ffv2_provider_ops *ops,
 				    void *data, u32 chunk_size)
