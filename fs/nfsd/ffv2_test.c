@@ -5488,6 +5488,8 @@ out:
 
 struct nfsd_ffv2_ro_remove_ctx {
 	struct nfsd_net		*nn;
+	/* Signalled before removal is entered, so "not finished" means it. */
+	struct completion	started;
 	struct completion	done;
 };
 
@@ -5495,6 +5497,7 @@ static int nfsd_ffv2_ro_remove_thread(void *data)
 {
 	struct nfsd_ffv2_ro_remove_ctx *ctx = data;
 
+	complete(&ctx->started);
 	nfsd_ffv2_test_provider_remove(ctx->nn);
 	complete(&ctx->done);
 	nfsd_ffv2_test_thread_park();
@@ -5571,6 +5574,7 @@ static void nfsd_ffv2_provider_dynamic_free_test(struct kunit *test)
 	}
 
 	remove.nn = f.nn;
+	init_completion(&remove.started);
 	init_completion(&remove.done);
 	remove_task = kthread_run(nfsd_ffv2_ro_remove_thread, &remove,
 				  "nfsd-ffv2-ro-remove");
@@ -6300,6 +6304,151 @@ static void nfsd_ffv2_encoder_retired_provider_test(struct kunit *test)
 		}
 
 	nfsd_ffv2_test_release_op(OP_CHUNK_READ, &u);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+struct nfsd_ffv2_ro_handler_ctx {
+	struct kunit			*test;
+	struct nfsd_ffv2_ro_fixture	*f;
+	union nfsd4_op_u		u;
+	__be32				status;
+	struct completion		done;
+};
+
+/* One chunk read taken through the production handler, off the test's task. */
+static int nfsd_ffv2_ro_handler_thread(void *data)
+{
+	struct nfsd_ffv2_ro_handler_ctx *ctx = data;
+
+	ctx->u.chunk_read.cra_stateid = ctx->f->stateid;
+	ctx->u.chunk_read.cra_count = 1;
+	ctx->status = nfsd_ffv2_ro_compound_op(ctx->test, ctx->f,
+					       OP_CHUNK_READ, PAGE_SIZE,
+					       false, &ctx->u);
+	complete_all(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+/*
+ * Retirement fences the copy, not merely the callback.
+ *
+ * A read is held inside the provider, so its admission is live and the
+ * provider reference it took is held.  Removal is started behind it and
+ * cannot finish: the reference is dropped only when the handler completes
+ * its admission, which it does after the payload has been copied into
+ * storage the operation owns.  So the copy runs entirely inside a
+ * retirement that is already outstanding, and the reply encodes from the
+ * copy once that retirement has finished.
+ *
+ * What this does not do is start the removal during the copy: there is no
+ * hook inside the copy to do it deterministically, and a sleep would prove
+ * nothing.  The ordering asserted is the stronger one -- outstanding
+ * before the copy begins, finished only after the handler releases.
+ */
+static void nfsd_ffv2_encoder_copy_fence_test(struct kunit *test)
+{
+	/*
+	 * The handler context carries a whole operation union, which is too
+	 * much to put on a frame that already holds the fixture.
+	 */
+	struct nfsd_ffv2_ro_handler_ctx *read;
+	struct nfsd_ffv2_ro_remove_ctx remove = {};
+	struct task_struct *read_task = NULL;
+	struct task_struct *remove_task = NULL;
+	struct completion enter, release;
+	struct nfsd_ffv2_ro_fixture f;
+	const u8 *bytes;
+	__be32 *p;
+	int len;
+
+	read = kunit_kzalloc(test, sizeof(*read), GFP_KERNEL);
+	if (!read) {
+		KUNIT_FAIL(test, "failed to allocate the handler context");
+		return;
+	}
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	init_completion(&enter);
+	init_completion(&release);
+	f.provider->enter = &enter;
+	f.provider->release = &release;
+
+	read->test = test;
+	read->f = &f;
+	read->status = nfserr_serverfault;
+	init_completion(&read->done);
+	read_task = kthread_run(nfsd_ffv2_ro_handler_thread, read,
+				"nfsd-ffv2-ro-copy");
+	if (IS_ERR(read_task)) {
+		KUNIT_FAIL(test, "failed to start the read thread: %ld",
+			   PTR_ERR(read_task));
+		read_task = NULL;
+		goto out_unstall;
+	}
+	if (!wait_for_completion_timeout(&enter, 15 * HZ)) {
+		KUNIT_FAIL(test, "the read never entered the provider");
+		goto out_unstall;
+	}
+
+	/* Held inside the boundary: start removal behind it. */
+	remove.nn = f.nn;
+	init_completion(&remove.started);
+	init_completion(&remove.done);
+	remove_task = kthread_run(nfsd_ffv2_ro_remove_thread, &remove,
+				  "nfsd-ffv2-ro-remove");
+	if (IS_ERR(remove_task)) {
+		KUNIT_FAIL(test, "failed to start the removal thread: %ld",
+			   PTR_ERR(remove_task));
+		remove_task = NULL;
+		goto out_unstall;
+	}
+	if (!wait_for_completion_timeout(&remove.started, 15 * HZ)) {
+		KUNIT_FAIL(test, "the removal thread never started");
+		goto out_unstall;
+	}
+	/* It cannot finish while a crossing holds the provider. */
+	KUNIT_EXPECT_EQ(test, 0UL,
+			wait_for_completion_timeout(&remove.done, HZ / 2));
+
+out_unstall:
+	complete_all(&release);
+	if (read_task) {
+		KUNIT_EXPECT_NE(test, 0UL,
+				wait_for_completion_timeout(&read->done,
+							    30 * HZ));
+		KUNIT_EXPECT_EQ(test, nfs_ok, read->status);
+	}
+	if (remove_task) {
+		/* Released only once the handler completed its admission. */
+		KUNIT_EXPECT_NE(test, 0UL,
+				wait_for_completion_timeout(&remove.done,
+							    30 * HZ));
+		f.provider_installed = false;
+	}
+	f.provider->enter = NULL;
+	f.provider->release = NULL;
+
+	/* The copy outlived the retirement it was made inside. */
+	if (read_task && read->status == nfs_ok) {
+		KUNIT_EXPECT_EQ(test, 1U, read->u.chunk_read.cra_nchunks);
+		len = nfsd_ffv2_ro_encode(test, &read->u, false, &p);
+		KUNIT_EXPECT_GT(test, len, 0);
+		if (len > 0) {
+			p += 2 + NFSD4_FFV2_TEST_READ_ENT_WORDS - 1;
+			KUNIT_EXPECT_EQ(test, NFSD_FFV2_RO_CHUNK_SIZE,
+					be32_to_cpu(p[0]));
+			bytes = (const u8 *)&p[1];
+			KUNIT_EXPECT_EQ(test, 0x40, bytes[0]);
+		}
+		nfsd_ffv2_test_release_op(OP_CHUNK_READ, &read->u);
+	}
+	if (read_task)
+		kthread_stop(read_task);
+	if (remove_task)
+		kthread_stop(remove_task);
 out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
@@ -9238,6 +9387,7 @@ static void nfsd_ffv2_provider_result_lifetime_test(struct kunit *test)
 	}
 
 	remove.nn = f.nn;
+	init_completion(&remove.started);
 	init_completion(&remove.done);
 	remove_task = kthread_run(nfsd_ffv2_ro_remove_thread, &remove,
 				  "nfsd-ffv2-ro-remove");
@@ -12590,6 +12740,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_encoder_read_zero_count_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_header_cachethis_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_retired_provider_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_encoder_copy_fence_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
