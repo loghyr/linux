@@ -3991,6 +3991,8 @@ struct nfsd_ffv2_ro_provider {
 	atomic_t			header_reads;
 	/* What a deliberately short answer claims about the range. */
 	bool				short_eof;
+	/* What each chunk of a deliberately oversized answer claims. */
+	u32				aggregate_len;
 	/* Optional stall, so a test can overlap a read with retirement. */
 	struct completion		*enter;
 	struct completion		*release;
@@ -5696,6 +5698,35 @@ static __be32 nfsd_ffv2_ro_empty_read(void *opaque,
 	return nfs_ok;
 }
 
+/*
+ * A read of two chunks that are each within the size their provider
+ * serves, and whose concatenated payload is not.  The bytes are never
+ * read: the result is refused before anything copies it, so the chunks
+ * point at the fixture's own small buffer.
+ */
+static __be32
+nfsd_ffv2_ro_aggregate_read(void *opaque,
+			    const struct nfsd_ffv2_object *object,
+			    const struct nfsd_ffv2_chunk_request *req,
+			    struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_ro_provider *provider = opaque;
+	u32 i;
+
+	atomic_inc(&provider->reads);
+	if (req->count < 2)
+		return nfs_ok;
+	for (i = 0; i < 2; i++) {
+		provider->chunks[i].cr_effective_len = provider->aggregate_len;
+		provider->chunks[i].cr_chunk = provider->data[i];
+		provider->chunks[i].cr_status = nfs_ok;
+	}
+	result->count = 2;
+	result->read.chunks = provider->chunks;
+	result->eof = true;
+	return nfs_ok;
+}
+
 /* A read one chunk shorter than it was asked for. */
 static __be32
 nfsd_ffv2_ro_short_read(void *opaque, const struct nfsd_ffv2_object *object,
@@ -6590,6 +6621,82 @@ static void nfsd_ffv2_provider_short_result_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0U, result.count);
 	KUNIT_EXPECT_FALSE(test, result.eof);
 
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * The payload bound is on the concatenation, not on each chunk.  Bounding
+ * each alone would admit a whole count of chunks each just under the limit,
+ * so the running total is what is tested here: two chunks, each within the
+ * size its provider serves and each within the limit, whose sum is not.
+ *
+ * Reaching it needs a provider that serves chunks near the limit, because
+ * every chunk is refused above its provider's size first, and an object
+ * whose size disagrees with its provider's is refused before that.  Both
+ * are set here for the length of the test and put back afterwards.  No
+ * payload is allocated: the result is refused before anything copies it.
+ */
+static void nfsd_ffv2_provider_aggregate_bound_test(struct kunit *test)
+{
+	static const struct nfsd_ffv2_provider_ops aggregate = {
+		.chunk_read		= nfsd_ffv2_ro_aggregate_read,
+		.chunk_header_read	= nfsd_ffv2_ro_chunk_header_read,
+	};
+	/* Large enough that two of them exceed the limit, each within it. */
+	static const u32 chunk_size = NFSD_FFV2_MAX_PAYLOAD_BYTES / 2 + 1;
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 2 };
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks, malformed;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, &aggregate, f.provider,
+					    chunk_size)) {
+		KUNIT_FAIL(test, "failed to install the aggregate provider");
+		goto out;
+	}
+	f.provider_installed = true;
+	nfsd_ffv2_test_fh_set_chunk_size(f.mapped, chunk_size);
+
+	/* Two chunks at the size served: each is legal, the sum is not. */
+	f.provider->aggregate_len = chunk_size;
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	malformed = nfsd_ffv2_test_provider_malformed();
+	memset(&result, 0, sizeof(result));
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	/* The provider ran; it is its answer that was refused. */
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, malformed + 1,
+			nfsd_ffv2_test_provider_malformed());
+	KUNIT_EXPECT_EQ(test, 0U, result.count);
+	KUNIT_EXPECT_NULL(test, result.read.chunks);
+	KUNIT_EXPECT_FALSE(test, result.eof);
+
+	/*
+	 * Half the limit each is the largest pair that fits, and it is
+	 * served: the refusal above is the sum, not the size of a chunk or
+	 * the number of them.
+	 */
+	f.provider->aggregate_len = NFSD_FFV2_MAX_PAYLOAD_BYTES / 2;
+	malformed = nfsd_ffv2_test_provider_malformed();
+	memset(&result, 0, sizeof(result));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, 2U, result.count);
+	KUNIT_EXPECT_EQ(test, malformed,
+			nfsd_ffv2_test_provider_malformed());
+
+	nfsd_ffv2_test_fh_set_chunk_size(f.mapped, NFSD_FFV2_RO_CHUNK_SIZE);
+	f.provider->aggregate_len = 0;
 out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
@@ -12873,6 +12980,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_publish_timeout_test),
 	KUNIT_CASE(nfsd_ffv2_provider_malformed_result_test),
 	KUNIT_CASE(nfsd_ffv2_provider_short_result_test),
+	KUNIT_CASE(nfsd_ffv2_provider_aggregate_bound_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
 	KUNIT_CASE(nfsd_ffv2_encode_large_payload_test),
