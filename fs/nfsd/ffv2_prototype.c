@@ -1509,7 +1509,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	u8 object_uuid[16];
 	struct svc_fh fhp;
 	stateid_t stateid;
-	struct path path;
+	struct path path = {};
 	u32 secid = 0;
 	int error = 0;
 
@@ -1590,6 +1590,12 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 		goto out_put;
 	path.mnt = fhp.fh_export->ex_path.mnt;
 	path.dentry = fhp.fh_dentry;
+	/*
+	 * The registration releases the handle that named the object before
+	 * it publishes, so the file this profile reads is named by a
+	 * reference of this function's own from here on.
+	 */
+	path_get(&path);
 
 	mutex_lock(&nfsd_mutex);
 	error = nfsd_ffv2_registration_begin_prototype(nn, &registration);
@@ -1682,6 +1688,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 
 	nfsd_ffv2_registration_end(nn, &registration);
 	fh_put(&fhp);
+	path_put(&path);
 	nfsd_ffv2_prototype_nonce_release(nn, nonce);
 	nfsd_ffv2_prototype_user_put(nn);
 	return 0;
@@ -1706,6 +1713,7 @@ out_registration:
 		nfsd_ffv2_registration_end(nn, &registration);
 	fh_put(&fhp);
 out_put:
+	path_put(&path);
 	if (claimed)
 		nfsd_ffv2_prototype_nonce_release(nn, nonce);
 	nfsd_ffv2_prototype_user_put(nn);

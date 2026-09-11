@@ -4845,7 +4845,8 @@ int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
  * nfsd_ffv2_object_register_fh - register the object an ordinary handle names
  * @nn: the nfsd namespace
  * @registration: an open registration slot
- * @fhp: a verified ordinary filehandle for a regular file in an export
+ * @fhp: a verified ordinary filehandle for a regular file in an export,
+ *	released before the object is published
  * @chunk_size: bytes in one chunk of the object
  * @cred: the credential the service context is published with
  * @validate_backend: whether the exporting filesystem must be one nfsd can
@@ -4862,7 +4863,8 @@ int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
  * token are minted here rather than accepted: a caller that could choose
  * them could name an object that already exists.
  *
- * Return: 0, or a negative errno.  The object is consumed either way.
+ * Return: 0, or a negative errno.  The object is consumed either way, and
+ * @fhp is released once everything it named has been copied.
  */
 int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 				 struct nfsd_ffv2_export_update *registration,
@@ -4907,10 +4909,22 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 	get_random_bytes(store_uuid, sizeof(store_uuid));
 	get_random_bytes(binding_token, sizeof(binding_token));
 
+	/*
+	 * Publication converts this export into a service export, and that
+	 * transition waits for every ordinary access to the export to drain.
+	 * The handle that named the object is holding one of those accesses
+	 * and everything it supplied has already been copied, so it is
+	 * released here -- the same point at which the path-named
+	 * registration releases the handle it composed.  The export outlives
+	 * the handle by a reference of this function's own.
+	 */
+	exp = nfsd_export_get(exp);
+	fh_put(fhp);
 	error = nfsd_ffv2_object_publish(nn, registration, object, exp,
 					 store_uuid, binding_token, cred, 0,
 					 validate_backend, outer_fh,
 					 generation_id);
+	nfsd_export_put(exp);
 	memzero_explicit(binding_token, sizeof(binding_token));
 	return error;
 }
