@@ -3989,6 +3989,8 @@ struct nfsd_ffv2_ro_provider {
 	struct nfsd_ffv2_retained	predecessors[NFSD_FFV2_RO_CHUNKS];
 	atomic_t			reads;
 	atomic_t			header_reads;
+	/* What a deliberately short answer claims about the range. */
+	bool				short_eof;
 	/* Optional stall, so a test can overlap a read with retirement. */
 	struct completion		*enter;
 	struct completion		*release;
@@ -5694,6 +5696,45 @@ static __be32 nfsd_ffv2_ro_empty_read(void *opaque,
 	return nfs_ok;
 }
 
+/* A read one chunk shorter than it was asked for. */
+static __be32
+nfsd_ffv2_ro_short_read(void *opaque, const struct nfsd_ffv2_object *object,
+			const struct nfsd_ffv2_chunk_request *req,
+			struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_ro_provider *provider = opaque;
+
+	atomic_inc(&provider->reads);
+	if (!req->count)
+		return nfs_ok;
+	result->count = req->count - 1;
+	result->read.chunks = provider->chunks;
+	result->eof = provider->short_eof;
+	return nfs_ok;
+}
+
+/* The same, for a header read. */
+static __be32
+nfsd_ffv2_ro_short_header_read(void *opaque,
+			       const struct nfsd_ffv2_object *object,
+			       const struct nfsd_ffv2_chunk_request *req,
+			       struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_ro_provider *provider = opaque;
+
+	atomic_inc(&provider->header_reads);
+	if (!req->count)
+		return nfs_ok;
+	result->count = req->count - 1;
+	result->header.status = provider->status;
+	result->header.locked = provider->locked;
+	result->header.owners = provider->owners;
+	result->header.guards = provider->guards;
+	result->header.predecessors = provider->predecessors;
+	result->eof = provider->short_eof;
+	return nfs_ok;
+}
+
 /* A header read missing one of its five co-indexed arrays. */
 static __be32
 nfsd_ffv2_ro_partial_header_read(void *opaque,
@@ -6449,6 +6490,95 @@ out_unstall:
 		kthread_stop(read_task);
 	if (remove_task)
 		kthread_stop(remove_task);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
+/*
+ * Shortness at this boundary means one thing only: the provider ran out of
+ * the range it was asked for, and said so.  Capacity is the caller's
+ * shortfall and is applied to the caller's own copy afterwards, so a short
+ * answer that does not claim the end of the range has no defined meaning
+ * -- and a client that resumed after it would resume where it started,
+ * forever.  Both operations are held to it, and a refusal is counted and
+ * zeroed like any other malformed result.
+ */
+static void nfsd_ffv2_provider_short_result_test(struct kunit *test)
+{
+	static const struct nfsd_ffv2_provider_ops shortr = {
+		.chunk_read		= nfsd_ffv2_ro_short_read,
+		.chunk_header_read	= nfsd_ffv2_ro_short_header_read,
+	};
+	const struct nfsd_ffv2_chunk_request req = { .offset = 0, .count = 2 };
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	u64 callbacks;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	if (nfsd_ffv2_test_provider_install(f.nn, &shortr, f.provider,
+					    NFSD_FFV2_RO_CHUNK_SIZE)) {
+		KUNIT_FAIL(test, "failed to install the short provider");
+		goto out;
+	}
+	f.provider_installed = true;
+
+	/* Short, and claiming the end of the range: a legitimate answer. */
+	f.provider->short_eof = true;
+	memset(&result, 0, sizeof(result));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, 1U, result.count);
+	KUNIT_EXPECT_TRUE(test, result.eof);
+
+	memset(&result, 0, sizeof(result));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_HEADER_READ,
+					       &f.stateid, &req, &result));
+	KUNIT_EXPECT_EQ(test, 1U, result.count);
+	KUNIT_EXPECT_TRUE(test, result.eof);
+
+	/* Short without claiming it: refused, counted, and zeroed. */
+	f.provider->short_eof = false;
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	memset(&result, 0, sizeof(result));
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0U, result.count);
+	KUNIT_EXPECT_NULL(test, result.read.chunks);
+	KUNIT_EXPECT_FALSE(test, result.eof);
+
+	callbacks = nfsd_ffv2_test_provider_callbacks();
+	memset(&result, 0, sizeof(result));
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_HEADER_READ,
+					       &f.stateid, &req, &result));
+	KUNIT_EXPECT_EQ(test, callbacks + 1,
+			nfsd_ffv2_test_provider_callbacks());
+	KUNIT_EXPECT_EQ(test, 0U, result.count);
+	KUNIT_EXPECT_NULL(test, result.header.status);
+
+	/*
+	 * A request for nothing is answered with nothing, and that is not a
+	 * short answer: the count asked for is the count returned, so the
+	 * end of the range is not claimed and nothing is refused.
+	 */
+	memset(&result, 0, sizeof(result));
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_operation(&f, OP_CHUNK_READ, &f.stateid,
+					       &(struct nfsd_ffv2_chunk_request){
+						       .offset = 0, .count = 0
+					       }, &result));
+	KUNIT_EXPECT_EQ(test, 0U, result.count);
+	KUNIT_EXPECT_FALSE(test, result.eof);
+
 out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
@@ -12718,6 +12848,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_dynamic_free_test),
 	KUNIT_CASE(nfsd_ffv2_provider_publish_timeout_test),
 	KUNIT_CASE(nfsd_ffv2_provider_malformed_result_test),
+	KUNIT_CASE(nfsd_ffv2_provider_short_result_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
 	KUNIT_CASE(nfsd_ffv2_encode_large_payload_test),
