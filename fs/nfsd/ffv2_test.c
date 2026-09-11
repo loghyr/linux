@@ -6181,6 +6181,75 @@ out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
+/*
+ * A header read that had to be shortened is still a reply, so a client
+ * that asked for its reply to be cached gets one.  The
+ * too-big-to-cache ladder is for a reply that cannot be given at all: the
+ * client's remedy there is to retry without caching, and there is nothing
+ * to retry when it has just been answered.
+ */
+static void nfsd_ffv2_encoder_header_cachethis_test(struct kunit *test)
+{
+	/* The fixed reply and one absent-predecessor entry, as above. */
+	static const u32 fixed = (2 + 1 + 5) * XDR_UNIT;
+	static const u32 entry = 9 * XDR_UNIT;
+	struct nfsd_ffv2_ro_fixture f;
+	union nfsd4_op_u u;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	/* Room for one of the two entries asked for, and caching wanted. */
+	memset(&u, 0, sizeof(u));
+	u.chunk_header_read.chra_stateid = f.stateid;
+	u.chunk_header_read.chra_count = 2;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_compound_op(test, &f,
+						 OP_CHUNK_HEADER_READ,
+						 fixed + entry, true, &u));
+	KUNIT_EXPECT_EQ(test, 1U, u.chunk_header_read.chrr_nents);
+	/* The entries left out still exist, so the range is not ended. */
+	KUNIT_EXPECT_FALSE(test, u.chunk_header_read.chrr_eof);
+	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
+
+	/*
+	 * The same, for the entries this server drops after the copy rather
+	 * than before the provider runs.  The count is chosen from the
+	 * cheapest entry shape, so an entry that turns out to carry a
+	 * retained predecessor costs more than it was budgeted for and the
+	 * reply is trimmed once its real shape is known.
+	 */
+	f.provider->predecessors[0].disposition = NFSD_FFV2_RETAINED_PRESENT;
+	memset(&u, 0, sizeof(u));
+	u.chunk_header_read.chra_stateid = f.stateid;
+	u.chunk_header_read.chra_count = 2;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_compound_op(test, &f,
+						 OP_CHUNK_HEADER_READ,
+						 fixed + 2 * entry, true, &u));
+	KUNIT_EXPECT_EQ(test, 1U, u.chunk_header_read.chrr_nents);
+	KUNIT_EXPECT_FALSE(test, u.chunk_header_read.chrr_eof);
+	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
+	f.provider->predecessors[0].disposition = NFSD_FFV2_RETAINED_ABSENT;
+
+	/*
+	 * One word less holds no entry at all.  That is the reply that
+	 * cannot be given, and caching is what the client is told about.
+	 */
+	memset(&u, 0, sizeof(u));
+	u.chunk_header_read.chra_stateid = f.stateid;
+	u.chunk_header_read.chra_count = 2;
+	KUNIT_EXPECT_EQ(test, nfserr_rep_too_big_to_cache,
+			nfsd_ffv2_ro_compound_op(test, &f,
+						 OP_CHUNK_HEADER_READ,
+						 fixed + entry - XDR_UNIT,
+						 true, &u));
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_header_read.chrr_nents);
+
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
 /* The service's own listener, so a client can find it. */
 static int nfsd_ffv2_ro_listener_port(struct nfsd_net *nn)
 {
@@ -12465,6 +12534,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_copy_failure_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_read_zero_count_test),
+	KUNIT_CASE(nfsd_ffv2_encoder_header_cachethis_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
