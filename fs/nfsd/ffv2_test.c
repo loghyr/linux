@@ -9205,6 +9205,15 @@ static void nfsd_ffv2_provider_result_contract_test(struct kunit *test)
 	f.provider->chunks[0].cr_status = nfserr_delay;
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
 
+	/*
+	 * Neither is a number nfsstat4 does not assign.  The vocabulary is a
+	 * list of what may be reported, not a range: a status a client has
+	 * no meaning for is as much a malformed result as a status that
+	 * means something the operation may not say.
+	 */
+	f.provider->chunks[0].cr_status = cpu_to_be32(19998);
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+
 	/* EMPTY needs a synthetic payload this slice cannot verify. */
 	f.provider->chunks[0].cr_status = nfserr_noent;
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
@@ -9213,6 +9222,10 @@ static void nfsd_ffv2_provider_result_contract_test(struct kunit *test)
 
 	/* Lock state is reported beside the status, never inside it. */
 	f.provider->status[0] = nfserr_chunk_locked;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_HEADER());
+
+	/* And an unassigned number is refused here too. */
+	f.provider->status[0] = cpu_to_be32(19998);
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_HEADER());
 
 	/* An in-progress generation is a legal header status. */
