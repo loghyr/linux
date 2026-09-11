@@ -6388,6 +6388,8 @@ static int nfsd_ffv2_ro_handler_thread(void *data)
 
 struct nfsd_ffv2_ro_drain_ctx {
 	void			*handle;
+	/* Set by whichever owner drained the handle, so exactly one did. */
+	bool			drained;
 	struct completion	done;
 };
 
@@ -6397,6 +6399,7 @@ static int nfsd_ffv2_ro_drain_thread(void *data)
 	struct nfsd_ffv2_ro_drain_ctx *ctx = data;
 
 	nfsd_ffv2_test_provider_drain(ctx->handle);
+	ctx->drained = true;
 	complete(&ctx->done);
 	nfsd_ffv2_test_thread_park();
 	return 0;
@@ -6424,6 +6427,11 @@ static int nfsd_ffv2_ro_drain_thread(void *data)
  * admission from one that copies after.  That ordering is a property of
  * the handler's source -- the copy precedes nfsd_ffv2_complete() in
  * nfsd4_ffv2_chunk_read_op() -- and not of this test.
+ *
+ * The drain's handle has exactly one owner.  The worker owns it once it
+ * has been started; until then, and if it cannot be started, this
+ * function does, and drains it after the read has been released so the
+ * wait can end.  @drained records which one did it, and is required.
  */
 static void nfsd_ffv2_encoder_drain_wait_test(struct kunit *test)
 {
@@ -6437,6 +6445,7 @@ static void nfsd_ffv2_encoder_drain_wait_test(struct kunit *test)
 	struct task_struct *drain_task = NULL;
 	struct completion enter, release, entered;
 	struct nfsd_ffv2_ro_fixture f;
+	bool unpublished = false;
 	const u8 *bytes;
 	__be32 *p;
 	int len;
@@ -6477,6 +6486,8 @@ static void nfsd_ffv2_encoder_drain_wait_test(struct kunit *test)
 	 * Held inside the boundary: take the provider out of the registry
 	 * and start the wait behind it.  Unpublishing here rather than in
 	 * the drain thread is what gives the arming a provider to name, and
+	 * it passes ownership of the handle to this function until a worker
+	 * takes it.
 	 */
 	drain.handle = nfsd_ffv2_test_provider_unpublish(f.nn);
 	f.provider_installed = false;
@@ -6484,6 +6495,7 @@ static void nfsd_ffv2_encoder_drain_wait_test(struct kunit *test)
 		KUNIT_FAIL(test, "the fixture published no provider");
 		goto out_unstall;
 	}
+	unpublished = true;
 	nfsd_ffv2_test_provider_drain_hook(drain.handle, &entered);
 	drain_task = kthread_run(nfsd_ffv2_ro_drain_thread, &drain,
 				 "nfsd-ffv2-ro-drain");
@@ -6491,7 +6503,6 @@ static void nfsd_ffv2_encoder_drain_wait_test(struct kunit *test)
 		KUNIT_FAIL(test, "failed to start the drain thread: %ld",
 			   PTR_ERR(drain_task));
 		drain_task = NULL;
-		nfsd_ffv2_test_provider_drain_hook(NULL, NULL);
 		goto out_unstall;
 	}
 	/* The drain is at its wait, rather than merely not scheduled yet. */
@@ -6516,7 +6527,21 @@ out_unstall:
 		KUNIT_EXPECT_NE(test, 0UL,
 				wait_for_completion_timeout(&drain.done,
 							    30 * HZ));
+	} else if (drain.handle) {
+		/*
+		 * No worker took the handle, so the unpublished provider is
+		 * still this function's to drain.  It is drained here rather
+		 * than left behind: the fixture will not do it, having been
+		 * told the provider is no longer installed, and the
+		 * publication reference has to be put exactly once.  The
+		 * read has been released above, so the wait can end.
+		 */
+		nfsd_ffv2_test_provider_drain_hook(NULL, NULL);
+		nfsd_ffv2_test_provider_drain(drain.handle);
+		drain.drained = true;
 	}
+	if (unpublished)
+		KUNIT_EXPECT_TRUE(test, drain.drained);
 	nfsd_ffv2_test_provider_drain_hook(NULL, NULL);
 	f.provider->enter = NULL;
 	f.provider->release = NULL;
