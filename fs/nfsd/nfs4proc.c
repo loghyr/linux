@@ -3939,7 +3939,8 @@ static __be32 nfsd4_ffv2_copy_read(struct nfsd4_chunk_read *cr,
 
 	cr->cra_chunks = kcalloc(result->count, sizeof(*cr->cra_chunks),
 				 GFP_KERNEL);
-	if (!cr->cra_chunks)
+	if (!cr->cra_chunks ||
+	    nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_RESPONSE_COPY))
 		return nfserr_jukebox;
 
 	for (i = 0; i < result->count; i++)
@@ -3989,7 +3990,8 @@ static __be32 nfsd4_ffv2_copy_header(struct nfsd4_chunk_header_read *hr,
 
 	hr->chrr_ents = kcalloc(result->count, sizeof(*hr->chrr_ents),
 				GFP_KERNEL);
-	if (!hr->chrr_ents)
+	if (!hr->chrr_ents ||
+	    nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_RESPONSE_COPY))
 		return nfserr_jukebox;
 
 	for (i = 0; i < result->count; i++) {

@@ -6072,6 +6072,77 @@ out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
+/*
+ * The copy into operation-owned storage is where an allocation can fail,
+ * and it fails before any byte is emitted: the client is told to retry
+ * rather than handed half a reply.  Whatever the copy had built is
+ * released on the way out, so a compound unwinding afterwards finds
+ * nothing left to free and the next request starts from nothing.
+ */
+static void nfsd_ffv2_encoder_copy_failure_test(struct kunit *test)
+{
+	struct nfsd_ffv2_ro_fixture f;
+	union nfsd4_op_u u;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	memset(&u, 0, sizeof(u));
+	u.chunk_read.cra_stateid = f.stateid;
+	u.chunk_read.cra_count = 1;
+	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_RESPONSE_COPY);
+	KUNIT_EXPECT_EQ(test, nfserr_jukebox,
+			nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_READ,
+						 PAGE_SIZE, false, &u));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_FAULT_RESPONSE_COPY,
+			nfsd_ffv2_fault_hit());
+	/* Nothing is left for an encoder to read, or for a release to free. */
+	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_chunks);
+	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_payload);
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_read.cra_nchunks);
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_read.cra_payload_len);
+	/* The unwind still runs, and runs safely. */
+	nfsd_ffv2_test_release_op(OP_CHUNK_READ, &u);
+
+	/* The arming is spent, so the same request is served. */
+	memset(&u, 0, sizeof(u));
+	u.chunk_read.cra_stateid = f.stateid;
+	u.chunk_read.cra_count = 1;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_READ,
+						 PAGE_SIZE, false, &u));
+	KUNIT_EXPECT_EQ(test, 1U, u.chunk_read.cra_nchunks);
+	nfsd_ffv2_test_release_op(OP_CHUNK_READ, &u);
+
+	memset(&u, 0, sizeof(u));
+	u.chunk_header_read.chra_stateid = f.stateid;
+	u.chunk_header_read.chra_count = 1;
+	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_RESPONSE_COPY);
+	KUNIT_EXPECT_EQ(test, nfserr_jukebox,
+			nfsd_ffv2_ro_compound_op(test, &f,
+						 OP_CHUNK_HEADER_READ,
+						 PAGE_SIZE, false, &u));
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_FAULT_RESPONSE_COPY,
+			nfsd_ffv2_fault_hit());
+	KUNIT_EXPECT_NULL(test, u.chunk_header_read.chrr_ents);
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_header_read.chrr_nents);
+	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
+
+	memset(&u, 0, sizeof(u));
+	u.chunk_header_read.chra_stateid = f.stateid;
+	u.chunk_header_read.chra_count = 1;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_compound_op(test, &f,
+						 OP_CHUNK_HEADER_READ,
+						 PAGE_SIZE, false, &u));
+	KUNIT_EXPECT_EQ(test, 1U, u.chunk_header_read.chrr_nents);
+	nfsd_ffv2_test_release_op(OP_CHUNK_HEADER_READ, &u);
+
+	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_NONE);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
 /* The service's own listener, so a client can find it. */
 static int nfsd_ffv2_ro_listener_port(struct nfsd_net *nn)
 {
@@ -12354,6 +12425,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_transport_null_test),
 	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
+	KUNIT_CASE(nfsd_ffv2_encoder_copy_failure_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
