@@ -229,16 +229,47 @@ static void cmd_disable(struct ffv2_nl *nl)
  * A registration presents a nonce the gate issued, so the challenge and the
  * registration are one command here: the nonce is never useful on its own.
  */
+/* Append one "KEY=hex" line to the bundle a client reads. */
+static void bundle_hex(FILE *f, const char *key, const void *data, size_t len)
+{
+	const uint8_t *p = data;
+	size_t i;
+
+	if (!f)
+		return;
+	fprintf(f, "%s=", key);
+	for (i = 0; i < len; i++)
+		fprintf(f, "%02x", p[i]);
+	fprintf(f, "\n");
+}
+
+/*
+ * A registration presents a nonce the gate issued, so the challenge and the
+ * registration are one command here: the nonce is never useful on its own.
+ *
+ * The bundle this writes is the only thing a client should read.  In
+ * particular the stateid is written in XDR wire order, because the
+ * attribute the kernel hands back holds its sequence id in host order and
+ * the difference between the two is invisible in hex: leaving the choice
+ * to whoever wired up the harness is leaving a byte-reversed stateid to be
+ * discovered as a refused read.
+ */
 static void cmd_register(struct ffv2_nl *nl, const char *domain,
 			 const char *handle_hex, uint32_t chunk_size,
-			 uint32_t data_count)
+			 uint32_t data_count, const char *bundle_path)
 {
 	uint8_t reply[NLMSG_BUF_SIZE];
 	uint8_t handle[128];
 	uint8_t nonce[32];
+	uint8_t wire[16];
 	const struct nlattr *nla;
 	size_t handle_len, len, attrlen;
+	size_t mapped_len = 0, uuid_len = 0;
+	uint8_t mapped[128], uuid[16];
 	const void *value;
+	uint64_t generation;
+	uint32_t seqid;
+	FILE *bundle = NULL;
 
 	nl_start(nl, nl->family, NFSD_CMD_FFV2_PROTOTYPE_CHALLENGE);
 	len = nl_talk(nl, reply, sizeof(reply));
@@ -266,7 +297,11 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	if (!nla)
 		die("registration returned no source uuid");
 	value = nl_data(nla, &attrlen);
-	print_hex("PROTO-SOURCE-UUID", value, attrlen);
+	if (attrlen != sizeof(uuid))
+		die("source uuid is %zu bytes", attrlen);
+	memcpy(uuid, value, sizeof(uuid));
+	uuid_len = attrlen;
+	print_hex("PROTO-SOURCE-UUID", uuid, uuid_len);
 
 	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_SERVICE_UUID);
 	if (nla) {
@@ -282,36 +317,51 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	if (!nla)
 		die("registration returned no generation");
 	value = nl_data(nla, &attrlen);
-	printf("PROTO-GENERATION=%llu\n",
-	       (unsigned long long)*(const uint64_t *)value);
+	if (attrlen != sizeof(generation))
+		die("generation is %zu bytes", attrlen);
+	memcpy(&generation, value, sizeof(generation));
+	printf("PROTO-GENERATION=%llu\n", (unsigned long long)generation);
 
 	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_STATEID);
 	if (!nla)
 		die("registration returned no stateid");
 	value = nl_data(nla, &attrlen);
-	print_hex("PROTO-STATEID", value, attrlen);
-	/*
-	 * The attribute carries the server's own stateid, whose sequence id
-	 * is a host-order word; stateid4 on the wire is XDR.  Both forms are
-	 * printed because only one of them is what a client must present,
-	 * and the difference is invisible in hex.
-	 */
-	if (attrlen == 16) {
-		uint8_t wire[16];
-		uint32_t seqid;
-
-		memcpy(&seqid, value, sizeof(seqid));
-		seqid = htonl(seqid);
-		memcpy(wire, &seqid, sizeof(seqid));
-		memcpy(wire + sizeof(seqid), (const uint8_t *)value + 4, 12);
-		print_hex("PROTO-STATEID-WIRE", wire, sizeof(wire));
-	}
+	if (attrlen != sizeof(wire))
+		die("stateid is %zu bytes", attrlen);
+	print_hex("PROTO-STATEID-RAW", value, attrlen);
+	memcpy(&seqid, value, sizeof(seqid));
+	seqid = htonl(seqid);
+	memcpy(wire, &seqid, sizeof(seqid));
+	memcpy(wire + sizeof(seqid), (const uint8_t *)value + sizeof(seqid),
+	       sizeof(wire) - sizeof(seqid));
+	print_hex("PROTO-STATEID", wire, sizeof(wire));
 
 	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_MAPPED_HANDLE);
 	if (!nla)
 		die("registration returned no mapped handle");
 	value = nl_data(nla, &attrlen);
-	print_hex("PROTO-MAPPED-HANDLE", value, attrlen);
+	if (attrlen > sizeof(mapped))
+		die("mapped handle is %zu bytes", attrlen);
+	memcpy(mapped, value, attrlen);
+	mapped_len = attrlen;
+	print_hex("PROTO-MAPPED-HANDLE", mapped, mapped_len);
+
+	if (bundle_path) {
+		bundle = fopen(bundle_path, "w");
+		if (!bundle)
+			die("cannot write %s: %s", bundle_path,
+			    strerror(errno));
+		bundle_hex(bundle, "MAPPED_HANDLE", mapped, mapped_len);
+		bundle_hex(bundle, "STATEID", wire, sizeof(wire));
+		bundle_hex(bundle, "SOURCE_UUID", uuid, uuid_len);
+		fprintf(bundle, "GENERATION=%llu\n",
+			(unsigned long long)generation);
+		fprintf(bundle, "CHUNK_SIZE=%u\n", chunk_size);
+		if (fclose(bundle))
+			die("cannot complete %s: %s", bundle_path,
+			    strerror(errno));
+		printf("PROTO-BUNDLE=%s\n", bundle_path);
+	}
 	printf("PROTO-REGISTER=ok\n");
 }
 
@@ -337,7 +387,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: ffv2-proto-ctl enable\n"
-		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count>\n"
+		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count> [bundle-path]\n"
 		"       ffv2-proto-ctl unregister <source-uuid-hex> <generation>\n"
 		"       ffv2-proto-ctl disable\n");
 	exit(2);
@@ -353,10 +403,11 @@ int main(int argc, char **argv)
 
 	if (!strcmp(argv[1], "enable") && argc == 2)
 		cmd_enable(&nl);
-	else if (!strcmp(argv[1], "register") && argc == 6)
+	else if (!strcmp(argv[1], "register") && (argc == 6 || argc == 7))
 		cmd_register(&nl, argv[2], argv[3],
 			     (uint32_t)strtoul(argv[4], NULL, 0),
-			     (uint32_t)strtoul(argv[5], NULL, 0));
+			     (uint32_t)strtoul(argv[5], NULL, 0),
+			     argc == 7 ? argv[6] : NULL);
 	else if (!strcmp(argv[1], "unregister") && argc == 4)
 		cmd_unregister(&nl, argv[2], strtoull(argv[3], NULL, 0));
 	else if (!strcmp(argv[1], "disable") && argc == 2)
