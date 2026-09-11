@@ -6250,6 +6250,60 @@ out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
+/*
+ * The encoder runs in a later pass than the handler, after the admission
+ * that bounded the provider's storage has been completed.  So a provider
+ * that retires between the two changes nothing: the reply is built from
+ * storage the operation owns, and the bytes on the wire are the bytes the
+ * copy took, not whatever the provider still holds.
+ */
+static void nfsd_ffv2_encoder_retired_provider_test(struct kunit *test)
+{
+	struct nfsd_ffv2_ro_fixture f;
+	union nfsd4_op_u u;
+	const u8 *bytes;
+	__be32 *p;
+	int len;
+	u32 i;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	memset(&u, 0, sizeof(u));
+	u.chunk_read.cra_stateid = f.stateid;
+	u.chunk_read.cra_count = 1;
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_READ,
+						 PAGE_SIZE, false, &u));
+	KUNIT_ASSERT_EQ(test, 1U, u.chunk_read.cra_nchunks);
+	KUNIT_ASSERT_NOT_NULL(test, u.chunk_read.cra_payload);
+
+	/*
+	 * Retirement completes, which it could not do if the copy still
+	 * borrowed anything: removal waits for the callbacks and admissions
+	 * inside the boundary, and this operation's admission is spent.
+	 */
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+
+	len = nfsd_ffv2_ro_encode(test, &u, false, &p);
+	KUNIT_ASSERT_GT(test, len, 0);
+	KUNIT_EXPECT_EQ(test, 1U, be32_to_cpu(p[1]));		/* crr_chunks<> */
+	p += 2 + NFSD4_FFV2_TEST_READ_ENT_WORDS - 1;
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_RO_CHUNK_SIZE, be32_to_cpu(p[0]));
+	bytes = (const u8 *)&p[1];
+	for (i = 0; i < NFSD_FFV2_RO_CHUNK_SIZE; i++)
+		if (bytes[i] != 0x40) {
+			KUNIT_FAIL(test, "payload byte %u is 0x%02x, not 0x40",
+				   i, bytes[i]);
+			break;
+		}
+
+	nfsd_ffv2_test_release_op(OP_CHUNK_READ, &u);
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
 /* The service's own listener, so a client can find it. */
 static int nfsd_ffv2_ro_listener_port(struct nfsd_net *nn)
 {
@@ -12535,6 +12589,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_encoder_copy_failure_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_read_zero_count_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_header_cachethis_test),
+	KUNIT_CASE(nfsd_ffv2_encoder_retired_provider_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
