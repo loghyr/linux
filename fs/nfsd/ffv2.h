@@ -710,6 +710,8 @@ void nfsd_ffv2_test_reply_shape(struct nfsd_ffv2_reply_shape *shape);
 void nfsd_ffv2_test_reply_shape_reset(void);
 u64 nfsd_ffv2_test_provider_callbacks(void);
 u64 nfsd_ffv2_test_provider_malformed(void);
+void nfsd_ffv2_test_provider_drain_hook(void *handle,
+					struct completion *entered);
 u64 nfsd_ffv2_test_provider_unadmitted(void);
 const struct nfsd_ffv2_object *
 nfsd_ffv2_test_binding_object(const struct nfsd_ffv2_binding *binding);

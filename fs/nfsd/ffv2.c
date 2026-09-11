@@ -1817,11 +1817,74 @@ nfsd_ffv2_provider_unpublish(struct nfsd_net *nn)
 	return provider;
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static DEFINE_SPINLOCK(nfsd_ffv2_drain_entry_lock);
+static struct nfsd_ffv2_provider *nfsd_ffv2_drain_entry_provider;
+static struct completion *nfsd_ffv2_drain_entry;
+
+/**
+ * nfsd_ffv2_test_provider_drain_hook - watch one removal reach its wait
+ * @handle: the unpublished provider whose drain is being watched, or NULL
+ *	to disarm
+ * @entered: completion signalled once, or NULL to disarm
+ *
+ * A test that has to know removal is waiting for the last holder, rather
+ * than merely not having been scheduled yet, arms this and waits for it
+ * before it draws any conclusion from removal not having finished.  It is
+ * armed on the provider the test unpublished, so a removal elsewhere in
+ * the suite cannot consume it.
+ *
+ * The two are one arming and are only ever changed together, under the
+ * lock the notification also takes.
+ */
+void nfsd_ffv2_test_provider_drain_hook(void *handle,
+					struct completion *entered)
+{
+	bool arm = handle && entered;
+
+	spin_lock(&nfsd_ffv2_drain_entry_lock);
+	nfsd_ffv2_drain_entry_provider = arm ? handle : NULL;
+	nfsd_ffv2_drain_entry = arm ? entered : NULL;
+	spin_unlock(&nfsd_ffv2_drain_entry_lock);
+}
+
+static void nfsd_ffv2_drain_entered(struct nfsd_ffv2_provider *provider)
+{
+	struct completion *entered = NULL;
+
+	/*
+	 * Matching and taking are one step, so an arming goes to exactly one
+	 * notification.  The completion is signalled after the lock because
+	 * the armer wakes on it and may free it at once.
+	 */
+	spin_lock(&nfsd_ffv2_drain_entry_lock);
+	if (nfsd_ffv2_drain_entry_provider == provider) {
+		entered = nfsd_ffv2_drain_entry;
+		nfsd_ffv2_drain_entry_provider = NULL;
+		nfsd_ffv2_drain_entry = NULL;
+	}
+	spin_unlock(&nfsd_ffv2_drain_entry_lock);
+	if (entered)
+		complete(entered);
+}
+#else
+static inline void nfsd_ffv2_drain_entered(struct nfsd_ffv2_provider *provider)
+{
+}
+#endif
+
 /* Wait for the callbacks and admissions still holding @provider, then free. */
 static void nfsd_ffv2_provider_drain(struct nfsd_ffv2_provider *provider)
 {
 	synchronize_rcu();
 	nfsd_ffv2_provider_put(provider);
+	/*
+	 * The publication reference is gone; what is left, if anything, is a
+	 * holder still running.  Announcing the boundary here is what lets a
+	 * test tell "removal is waiting" from "removal has not started".  It
+	 * is a no-op in every ordinary build.
+	 */
+	nfsd_ffv2_drain_entered(provider);
 	wait_for_completion(&provider->gone);
 	kfree(provider);
 }
