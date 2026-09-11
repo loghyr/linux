@@ -194,6 +194,7 @@ void nfsd_ffv2_prototype_test_close_hooks(struct completion *entered_reached,
 					  struct completion *entered_proceed,
 					  struct completion *published_reached,
 					  struct completion *published_proceed);
+void nfsd_ffv2_prototype_test_access_hook(bool claim);
 void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
 					  struct dentry *dentry,
 					  const u8 *inner, u16 inner_len,

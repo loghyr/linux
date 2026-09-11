@@ -1056,6 +1056,20 @@ void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
 	WRITE_ONCE(nfsd_ffv2_prototype_test_exp, exp);
 }
 
+/*
+ * Whether the substituted resolve should claim an ordinary export access
+ * the way fh_verify_local() does for a real filehandle.  It is off by
+ * default because most fixtures have no use for it; a test that wants to
+ * prove the registration releases that access before publication turns it
+ * on, because without it there is no access to release.
+ */
+static bool nfsd_ffv2_prototype_test_access;
+
+void nfsd_ffv2_prototype_test_access_hook(bool claim)
+{
+	WRITE_ONCE(nfsd_ffv2_prototype_test_access, claim);
+}
+
 /* Whether a test has substituted the object; see the hook above. */
 static bool nfsd_ffv2_prototype_test_armed(void)
 {
@@ -1076,6 +1090,13 @@ static bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp)
 	fhp->fh_handle.fh_size = nfsd_ffv2_prototype_test_inner_len;
 	memcpy(fhp->fh_handle.fh_raw, nfsd_ffv2_prototype_test_inner,
 	       nfsd_ffv2_prototype_test_inner_len);
+	if (READ_ONCE(nfsd_ffv2_prototype_test_access)) {
+		if (nfsd_ffv2_export_access_get(exp)) {
+			fh_put(fhp);
+			return false;
+		}
+		fhp->fh_ffv2_admitted = true;
+	}
 	return true;
 }
 #else

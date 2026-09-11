@@ -11645,6 +11645,110 @@ out:
 }
 
 /*
+ * A registration must not wait for the access its own handle holds.
+ *
+ * Publication turns the export into a service export, and that transition
+ * waits for every ordinary access to the export to drain.  The handle a
+ * registration resolves holds one, so a registration that kept it would
+ * wait for itself.  The substituted resolve claims no access by default,
+ * which is precisely why the suite could not see that; here it is armed to
+ * claim one the way fh_verify_local() does, and a second access is held
+ * from this thread the way an unrelated reader would.
+ *
+ * The registration must then be blocked while that second access is held
+ * -- not as a matter of timing, but because the predicate the transition
+ * waits on is false for as long as it is held -- and must complete once it
+ * is released.  If the registration kept its own access it would never
+ * complete, and the bounded wait below reports that rather than hanging.
+ */
+static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_register_ctx *ctx;
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct nfsd_ffv2_proto_fixture *f;
+	struct task_struct *task = NULL;
+	bool reader = false, joined = false;
+	unsigned long deadline;
+	u64 expires = 0;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ctx->bundle = kunit_kzalloc(test, sizeof(*ctx->bundle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx->bundle);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	nfsd_ffv2_proto_request(&ctx->req, nonce);
+	ctx->f = f;
+	init_completion(&ctx->done);
+
+	/* The resolve now claims an access, as the production one does. */
+	nfsd_ffv2_prototype_test_access_hook(true);
+	/* And one more, standing in for a reader the registration must wait for. */
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_export_access_get(f->seeded));
+	reader = true;
+
+	task = kthread_run(nfsd_ffv2_proto_register_thread, ctx,
+			   "ffv2-proto-access");
+	if (IS_ERR(task)) {
+		task = NULL;
+		KUNIT_FAIL(test, "failed to start the registering thread");
+		goto out;
+	}
+
+	/*
+	 * The transition records itself on the export before it waits, so
+	 * reaching it is an observable state rather than an elapsed time.
+	 */
+	deadline = jiffies + 30 * HZ;
+	while (!nfsd_ffv2_export_is_transitioning(f->seeded) &&
+	       time_before(jiffies, deadline))
+		schedule_timeout_uninterruptible(1);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_transitioning(f->seeded));
+
+	/* It cannot finish while the reader's access is outstanding. */
+	KUNIT_EXPECT_EQ(test, 0UL,
+			wait_for_completion_timeout(&ctx->done, HZ / 4));
+
+	nfsd_ffv2_export_access_put(f->seeded);
+	reader = false;
+	joined = wait_for_completion_timeout(&ctx->done, 30 * HZ);
+	KUNIT_EXPECT_TRUE(test, joined);
+	if (!joined)
+		goto out;
+	KUNIT_EXPECT_EQ(test, 0, ctx->result);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_READY,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	if (!ctx->result)
+		KUNIT_EXPECT_EQ(test, 0,
+				nfsd_ffv2_prototype_unregister(f->nn, f->net,
+							       ctx->bundle->source_uuid,
+							       ctx->bundle->generation));
+	f->enabled = false;
+out:
+	if (reader)
+		nfsd_ffv2_export_access_put(f->seeded);
+	nfsd_ffv2_prototype_test_access_hook(false);
+	/*
+	 * The thread is joined only when its completion was observed: a
+	 * registration that kept its own access would never return, and this
+	 * test must report that rather than wait for it.
+	 */
+	if (task && joined)
+		kthread_stop(task);
+	else if (task)
+		KUNIT_FAIL(test, "the registering thread never returned");
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
+/*
  * Two challenges reaping the same expired records at once.
  *
  * The reaper walks a table another challenge may be erasing from, and what
@@ -13069,6 +13173,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_nonce_reap_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_resolve_access_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_close_race_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_short_read_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_growth_test),
