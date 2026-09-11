@@ -56,6 +56,14 @@
 #define XDR_UNIT		4
 #define MAX_MSG			(1024 * 1024)
 
+/*
+ * checksum_algorithm4.  Only CRC32 is wired, and it is always four bytes;
+ * a reply naming anything else is a reply this harness must refuse rather
+ * than describe.
+ */
+#define FFV2_CHECKSUM_ALG_CRC32	1
+#define FFV2_CHECKSUM_CRC32_LEN	4
+
 /* An encoded message under construction. */
 struct xbuf {
 	uint8_t	*b;
@@ -71,6 +79,21 @@ struct xcur {
 	bool		bad;
 };
 
+/*
+ * What a payload is required to be.  The object's bytes come from the file
+ * the harness exported; the chunk the server may return is the slice of
+ * them the registration's chunk size names, so the comparison is exact in
+ * length as well as content.
+ */
+struct probe_expect {
+	const uint8_t	*data;
+	size_t		len;
+	uint32_t	chunk_size;
+	bool		requested;
+};
+
+static struct probe_expect probe_expect;
+
 struct nfs4_client {
 	int		fd;
 	uint32_t	xid;
@@ -80,6 +103,26 @@ struct nfs4_client {
 	uint8_t		fh[NFS4_FHSIZE];
 	size_t		fh_len;
 };
+
+/*
+ * A case that decoded cleanly can still be wrong.  Integrity failures are
+ * recorded rather than printed, so the matrix finishes and the process
+ * still exits non-zero: a mismatch that only appeared in the output would
+ * be evidence of nothing.
+ */
+static unsigned int probe_failures;
+
+static void fail(const char *fmt, ...)
+{
+	va_list ap;
+
+	probe_failures++;
+	printf("PROBE-FAIL: ");
+	va_start(ap, fmt);
+	vprintf(fmt, ap);
+	va_end(ap);
+	printf("\n");
+}
 
 static void die(const char *fmt, ...)
 {
@@ -505,6 +548,29 @@ static void destroy_session(struct nfs4_client *c, uint8_t *buf, size_t cap)
  * NFS path, so the same file is known to be reachable both ways.  The
  * filehandle GETFH returns is the one a prototype registration maps.
  */
+/*
+ * Count the components a path names.  A leading slash is accepted and
+ * ignored: the path is always relative to the root the server offers, and
+ * "/export/data/x" and "export/data/x" name the same walk.  Empty
+ * components are not counted, because none is emitted for them.
+ */
+static uint32_t count_components(const char *path)
+{
+	uint32_t components = 0;
+	const char *p = path;
+
+	while (*p) {
+		while (*p == '/')
+			p++;
+		if (!*p)
+			break;
+		components++;
+		while (*p && *p != '/')
+			p++;
+	}
+	return components;
+}
+
 static void lookup_ordinary(struct nfs4_client *c, const char *path,
 			    uint8_t *buf, size_t cap)
 {
@@ -514,7 +580,9 @@ static void lookup_ordinary(struct nfs4_client *c, const char *path,
 	struct xcur cur = { .b = reply };
 	char components[256];
 	char *name, *next;
-	uint32_t nres, status, lookups = 0;
+	uint32_t compound, nres, status, results = 0;
+	uint32_t lookups = count_components(path);
+	uint32_t emitted = 0;
 	const uint8_t *data;
 	size_t len;
 
@@ -523,13 +591,9 @@ static void lookup_ordinary(struct nfs4_client *c, const char *path,
 	 * walked one component at a time from the root the server offers
 	 * rather than assumed to be one name.
 	 */
+	if (!lookups)
+		die("--file names no component");
 	snprintf(components, sizeof(components), "%s", path);
-	for (name = components; *name; name++)
-		if (*name == '/' && name != components && name[1])
-			lookups++;
-	lookups += components[0] ? 1 : 0;
-	if (components[0] == '/')
-		lookups--;
 
 	rpc_start(&x, c, 4 + lookups);
 	put_sequence(&x, c);
@@ -542,7 +606,11 @@ static void lookup_ordinary(struct nfs4_client *c, const char *path,
 			continue;
 		xu32(&x, OP_LOOKUP);
 		xopaque(&x, name, strlen(name));
+		emitted++;
 	}
+	if (emitted != lookups)
+		die("emitted %u lookups for a path counted as %u", emitted,
+		    lookups);
 	xu32(&x, OP_GETFH);
 	xu32(&x, OP_READ);
 	xput(&x, anonymous, sizeof(anonymous));
@@ -551,20 +619,24 @@ static void lookup_ordinary(struct nfs4_client *c, const char *path,
 	rpc_send(c, &x, "REQ-ORDINARY-LOOKUP");
 
 	cur.len = rpc_recv(c, reply, sizeof(reply), "REP-ORDINARY-LOOKUP");
-	rpc_reply_open(&cur, &nres);
+	compound = rpc_reply_open(&cur, &nres);
 	status = get_sequence(&cur);
+	results++;
 	if (status)
 		die("SEQUENCE failed with NFS4ERR %u", status);
 	status = op_result(&cur, OP_PUTROOTFH);
+	results++;
 	if (status)
 		die("PUTROOTFH failed with NFS4ERR %u", status);
 	while (lookups--) {
 		status = op_result(&cur, OP_LOOKUP);
+		results++;
 		if (status)
 			die("LOOKUP in %s failed with NFS4ERR %u", path,
 			    status);
 	}
 	status = op_result(&cur, OP_GETFH);
+	results++;
 	if (status)
 		die("GETFH failed with NFS4ERR %u", status);
 	data = gopaque(&cur, &len);
@@ -575,6 +647,7 @@ static void lookup_ordinary(struct nfs4_client *c, const char *path,
 	print_hex("PROBE-ORDINARY-FH", c->fh, c->fh_len);
 
 	status = op_result(&cur, OP_READ);
+	results++;
 	printf("PROBE-ORDINARY-READ-STATUS=%u\n", status);
 	if (!status) {
 		printf("PROBE-ORDINARY-READ-EOF=%u\n", gu32(&cur));
@@ -586,6 +659,15 @@ static void lookup_ordinary(struct nfs4_client *c, const char *path,
 	}
 	if (cur.bad)
 		die("truncated ordinary lookup reply");
+	if (nres != results)
+		fail("ordinary lookup announced %u results and carried %u",
+		     nres, results);
+	if (compound != status)
+		fail("ordinary lookup compound status %u disagrees with its last operation's %u",
+		     compound, status);
+	if (cur.off != cur.len)
+		fail("ordinary lookup reply carries %zu bytes after its last result",
+		     cur.len - cur.off);
 }
 
 /* stateid4: a sequence id and the twelve opaque bytes that follow it. */
@@ -665,22 +747,45 @@ static void decode_header_read(struct xcur *c)
 		if (disposition != 0)
 			get_owner(c, "HDR-PREDECESSOR-OWNER", i);
 	}
-	if (c->bad)
-		die("truncated CHUNK_HEADER_READ reply");
+	if (c->bad) {
+		fail("truncated CHUNK_HEADER_READ reply");
+		return;
+	}
 	for (i = 1; i < 5; i++)
-		if (counts[i] != counts[0])
-			die("co-indexed array %u has length %u, not %u", i,
-			    counts[i], counts[0]);
+		if (counts[i] != counts[0]) {
+			fail("co-indexed array %u has length %u, not %u", i,
+			     counts[i], counts[0]);
+			return;
+		}
 	printf("HDR-ARRAYS-COINDEXED=ok\n");
 }
 
 /*
- * CHUNK_READ4resok.  The payload's checksum is recomputed here rather than
- * trusted: a reply that named a length and carried different bytes would
- * otherwise pass unnoticed.
+ * The bytes a chunk is required to carry: the slice of the object that the
+ * registration's chunk size names at @offset, which is shorter than a whole
+ * chunk only where the object ends.
  */
-static void decode_chunk_read(struct xcur *c, const uint8_t *expect,
-			      size_t expect_len)
+static size_t expected_chunk(uint64_t offset, const uint8_t **bytes)
+{
+	size_t remaining;
+
+	*bytes = NULL;
+	if (!probe_expect.requested || offset >= probe_expect.len)
+		return 0;
+	remaining = probe_expect.len - (size_t)offset;
+	*bytes = probe_expect.data + offset;
+	return remaining < probe_expect.chunk_size ? remaining :
+						     probe_expect.chunk_size;
+}
+
+/*
+ * CHUNK_READ4resok.  Every field a reply could get wrong is checked rather
+ * than printed: the algorithm, the checksum width, the checksum itself
+ * recomputed from the received bytes, the payload length against the length
+ * the entry declared, and the payload against the object it claims to be a
+ * chunk of.  A case that fails any of these is a failed case.
+ */
+static void decode_chunk_read(struct xcur *c, uint64_t offset)
 {
 	uint32_t chunks;
 	unsigned int i;
@@ -689,9 +794,9 @@ static void decode_chunk_read(struct xcur *c, const uint8_t *expect,
 	chunks = gu32(c);
 	printf("READ-CHUNK-COUNT=%u\n", chunks);
 	for (i = 0; i < chunks && !c->bad; i++) {
-		const uint8_t *checksum, *payload;
-		size_t checksum_len, payload_len;
-		uint32_t algorithm, effective;
+		const uint8_t *checksum, *payload, *want;
+		size_t checksum_len, payload_len, want_len;
+		uint32_t algorithm, effective, claimed, computed;
 
 		algorithm = gu32(c);
 		checksum = gopaque(c, &checksum_len);
@@ -707,53 +812,87 @@ static void decode_chunk_read(struct xcur *c, const uint8_t *expect,
 		printf("READ-STATUS[%u]=%u\n", i, gu32(c));
 		payload = gopaque(c, &payload_len);
 		printf("READ-PAYLOAD-LEN[%u]=%zu\n", i, payload_len);
-		if (c->bad || !payload)
-			break;
+		if (c->bad || !payload) {
+			fail("truncated CHUNK_READ reply");
+			return;
+		}
 		hexdump("READ-PAYLOAD", payload,
 			payload_len < 64 ? payload_len : 64);
-		if (payload_len != effective)
-			die("payload of %zu bytes under a length of %u",
-			    payload_len, effective);
-		if (checksum_len == sizeof(uint32_t)) {
-			uint32_t claimed, computed;
 
-			memcpy(&claimed, checksum, sizeof(claimed));
-			claimed = ntohl(claimed);
-			computed = crc32_zlib(payload, payload_len);
-			printf("READ-CRC32-CLAIMED[%u]=%08x\n", i, claimed);
-			printf("READ-CRC32-COMPUTED[%u]=%08x\n", i, computed);
-			printf("READ-CRC32-MATCH[%u]=%s\n", i,
-			       claimed == computed ? "yes" : "NO");
+		if (algorithm != FFV2_CHECKSUM_ALG_CRC32) {
+			fail("chunk %u names checksum algorithm %u, not CRC32",
+			     i, algorithm);
+			continue;
 		}
-		if (expect && i == 0) {
-			size_t compare = payload_len < expect_len ?
-					 payload_len : expect_len;
+		if (checksum_len != FFV2_CHECKSUM_CRC32_LEN) {
+			fail("chunk %u carries a %zu-byte CRC32", i,
+			     checksum_len);
+			continue;
+		}
+		if (payload_len != effective) {
+			fail("chunk %u carries %zu bytes under a length of %u",
+			     i, payload_len, effective);
+			continue;
+		}
+		memcpy(&claimed, checksum, sizeof(claimed));
+		claimed = ntohl(claimed);
+		computed = crc32_zlib(payload, payload_len);
+		printf("READ-CRC32-CLAIMED[%u]=%08x\n", i, claimed);
+		printf("READ-CRC32-COMPUTED[%u]=%08x\n", i, computed);
+		if (claimed != computed) {
+			fail("chunk %u claims CRC32 %08x, its bytes give %08x",
+			     i, claimed, computed);
+			continue;
+		}
+		printf("READ-CRC32-MATCH[%u]=yes\n", i);
 
-			printf("READ-CONTENT-MATCH=%s\n",
-			       compare && !memcmp(payload, expect, compare) ?
-			       "yes" : "NO");
+		if (!probe_expect.requested)
+			continue;
+		if (i) {
+			/*
+			 * Only the first chunk's offset is known here, so a
+			 * multi-chunk reply is not compared rather than
+			 * compared against the wrong bytes.
+			 */
+			printf("READ-CONTENT-COMPARED[%u]=no\n", i);
+			continue;
 		}
+		want_len = expected_chunk(offset, &want);
+		if (payload_len != want_len) {
+			fail("chunk %u carries %zu bytes, not the %zu the object holds",
+			     i, payload_len, want_len);
+			continue;
+		}
+		if (!want || memcmp(payload, want, want_len)) {
+			fail("chunk %u carries bytes the object does not hold at offset %llu",
+			     i, (unsigned long long)offset);
+			continue;
+		}
+		printf("READ-CONTENT-MATCH=yes\n");
 	}
 	if (c->bad)
-		die("truncated CHUNK_READ reply");
+		fail("truncated CHUNK_READ reply");
 }
 
 /*
  * One FFv2 read against one filehandle.  Every case in the matrix is this
  * shape, so the failures and the successes are produced by the same code
  * path and differ only in what they are given.
+ *
+ * A case is complete only when the compound status agrees with its last
+ * operation, the reply carries exactly the results it announced, and the
+ * cursor has consumed the whole record.
  */
 static uint32_t chunk_case(struct nfs4_client *c, const char *label,
 			   uint32_t opnum, const uint8_t *fh, size_t fh_len,
 			   const uint8_t *stateid, uint64_t offset,
-			   uint32_t count, const uint8_t *expect,
-			   size_t expect_len, uint8_t *buf, size_t cap)
+			   uint32_t count, uint8_t *buf, size_t cap)
 {
 	struct xbuf x = { .b = buf, .cap = cap };
 	uint8_t reply[MAX_MSG];
 	struct xcur cur = { .b = reply };
+	uint32_t compound, nres, status, results = 0;
 	char name[64];
-	uint32_t nres, status;
 
 	rpc_start(&x, c, 3);
 	put_sequence(&x, c);
@@ -766,24 +905,45 @@ static uint32_t chunk_case(struct nfs4_client *c, const char *label,
 
 	snprintf(name, sizeof(name), "REP-%s", label);
 	cur.len = rpc_recv(c, reply, sizeof(reply), name);
-	rpc_reply_open(&cur, &nres);
+	compound = rpc_reply_open(&cur, &nres);
+	printf("%s-COMPOUND-STATUS=%u\n", label, compound);
+
 	status = get_sequence(&cur);
+	results++;
 	if (status) {
 		printf("%s-SEQUENCE-STATUS=%u\n", label, status);
-		return status;
+		goto out;
 	}
 	status = op_result(&cur, OP_PUTFH);
+	results++;
 	printf("%s-PUTFH-STATUS=%u\n", label, status);
 	if (status)
-		return status;
+		goto out;
 	status = op_result(&cur, opnum);
+	results++;
 	printf("%s-STATUS=%u\n", label, status);
 	if (status)
-		return status;
+		goto out;
 	if (opnum == OP_CHUNK_HEADER_READ)
 		decode_header_read(&cur);
 	else if (opnum == OP_CHUNK_READ)
-		decode_chunk_read(&cur, expect, expect_len);
+		decode_chunk_read(&cur, offset);
+out:
+	/*
+	 * A compound that stopped early announces only the results it
+	 * produced, and its status is that of the operation that stopped it.
+	 */
+	if (nres != results)
+		fail("%s announced %u results and carried %u", label, nres,
+		     results);
+	if (compound != status)
+		fail("%s compound status %u disagrees with its last operation's %u",
+		     label, compound, status);
+	if (cur.bad)
+		fail("%s reply is truncated", label);
+	else if (cur.off != cur.len)
+		fail("%s reply carries %zu bytes after its last result", label,
+		     cur.len - cur.off);
 	return status;
 }
 
@@ -852,18 +1012,28 @@ static bool registration_value(const char *dir, const char *key, char *out,
 	return found;
 }
 
+/*
+ * The object's bytes, for the content comparison.  A named file that
+ * cannot be read is a broken harness, not an absent comparison, so it is
+ * fatal; omitting --expect is the only way to say "do not compare".
+ */
 static size_t read_expect(const char *path, uint8_t *out, size_t max)
 {
 	size_t len;
 	FILE *f;
 
-	if (!path)
-		return 0;
 	f = fopen(path, "r");
 	if (!f)
-		return 0;
+		die("cannot read expected content %s: %s", path,
+		    strerror(errno));
 	len = fread(out, 1, max, f);
+	if (ferror(f))
+		die("error reading expected content %s", path);
+	if (!feof(f) && len == max)
+		die("expected content %s is larger than %zu bytes", path, max);
 	fclose(f);
+	if (!len)
+		die("expected content %s is empty", path);
 	return len;
 }
 
@@ -933,8 +1103,8 @@ int main(int argc, char **argv)
 	uint8_t wrong_stateid[NFS4_STATEID_SIZE];
 	uint8_t stateid[NFS4_STATEID_SIZE];
 	uint8_t mapped[NFS4_FHSIZE], wrong_fh[NFS4_FHSIZE];
-	uint8_t content[65536];
-	size_t mapped_len, content_len;
+	static uint8_t content[1024 * 1024];
+	size_t mapped_len;
 	char value[1024];
 	uint16_t port = 2049;
 	int i;
@@ -958,7 +1128,15 @@ int main(int argc, char **argv)
 	if (!server || !file)
 		usage();
 	setvbuf(stdout, NULL, _IOLBF, 0);
-	content_len = read_expect(expect, content, sizeof(content));
+	if (expect) {
+		probe_expect.data = content;
+		probe_expect.len = read_expect(expect, content,
+					       sizeof(content));
+		probe_expect.requested = true;
+		printf("PROBE-EXPECT-LEN=%zu\n", probe_expect.len);
+	} else {
+		printf("PROBE-EXPECT=not-requested\n");
+	}
 
 	connect_server(&c, server, port);
 	exchange_id(&c, request, sizeof(request));
@@ -971,7 +1149,7 @@ int main(int argc, char **argv)
 	 * clearest way to show that is to ask it to.
 	 */
 	chunk_case(&c, "CASE3-ORDINARY-BEFORE", OP_CHUNK_HEADER_READ, c.fh,
-		   c.fh_len, zero_stateid, 0, 1, NULL, 0, request,
+		   c.fh_len, zero_stateid, 0, 1, request,
 		   sizeof(request));
 
 	if (xchg) {
@@ -988,6 +1166,7 @@ int main(int argc, char **argv)
 		printf("PROBE-REGISTRATION=absent\n");
 		destroy_session(&c, request, sizeof(request));
 		close(c.fd);
+		printf("PROBE-FAILURES=%u\n", probe_failures + 1);
 		return 1;
 	}
 	if (!registration_value(xchg, "MAPPED_HANDLE", value, sizeof(value)))
@@ -997,37 +1176,49 @@ int main(int argc, char **argv)
 		die("registration published no stateid");
 	if (parse_hex(value, stateid, sizeof(stateid)) != sizeof(stateid))
 		die("stateid must be 16 bytes");
+	/*
+	 * A chunk is the slice of the object the registration's chunk size
+	 * names, so the payload comparison cannot be made without it.
+	 */
+	if (probe_expect.requested) {
+		if (!registration_value(xchg, "CHUNK_SIZE", value,
+					sizeof(value)))
+			die("registration published no chunk size");
+		probe_expect.chunk_size = (uint32_t)strtoul(value, NULL, 0);
+		if (!probe_expect.chunk_size)
+			die("registration published a zero chunk size");
+		printf("PROBE-CHUNK-SIZE=%u\n", probe_expect.chunk_size);
+	}
 	print_hex("PROBE-MAPPED-HANDLE", mapped, mapped_len);
 	print_hex("PROBE-STATEID", stateid, sizeof(stateid));
 
 	chunk_case(&c, "CASE1-HEADER-READ", OP_CHUNK_HEADER_READ, mapped,
-		   mapped_len, stateid, 0, 1, NULL, 0, request,
+		   mapped_len, stateid, 0, 1, request,
 		   sizeof(request));
 	chunk_case(&c, "CASE2-CHUNK-READ", OP_CHUNK_READ, mapped, mapped_len,
-		   stateid, 0, 1, content_len ? content : NULL, content_len,
-		   request, sizeof(request));
+		   stateid, 0, 1, request, sizeof(request));
 	chunk_case(&c, "CASE3-ORDINARY-AFTER", OP_CHUNK_READ, c.fh, c.fh_len,
-		   stateid, 0, 1, NULL, 0, request, sizeof(request));
+		   stateid, 0, 1, request, sizeof(request));
 	chunk_case(&c, "CASE4-EXCLUDED-COMMIT", OP_CHUNK_COMMIT, mapped,
-		   mapped_len, stateid, 0, 1, NULL, 0, request,
+		   mapped_len, stateid, 0, 1, request,
 		   sizeof(request));
 
 	memcpy(wrong_stateid, stateid, sizeof(wrong_stateid));
 	wrong_stateid[NFS4_STATEID_SIZE - 1] ^= 0xff;
 	chunk_case(&c, "CASE5-WRONG-STATEID", OP_CHUNK_READ, mapped,
-		   mapped_len, wrong_stateid, 0, 1, NULL, 0, request,
+		   mapped_len, wrong_stateid, 0, 1, request,
 		   sizeof(request));
 
 	memcpy(wrong_fh, mapped, mapped_len);
 	wrong_fh[mapped_len - 1] ^= 0xff;
 	chunk_case(&c, "CASE5-WRONG-HANDLE", OP_CHUNK_READ, wrong_fh,
-		   mapped_len, stateid, 0, 1, NULL, 0, request,
+		   mapped_len, stateid, 0, 1, request,
 		   sizeof(request));
 
 	publish(xchg, "client-cases-done", "done");
 	if (await(xchg, "server-retired", wait_seconds)) {
 		chunk_case(&c, "CASE6-AFTER-RETIREMENT", OP_CHUNK_READ, mapped,
-			   mapped_len, stateid, 0, 1, NULL, 0, request,
+			   mapped_len, stateid, 0, 1, request,
 			   sizeof(request));
 	} else {
 		printf("CASE6-AFTER-RETIREMENT=unavailable\n");
@@ -1035,6 +1226,7 @@ int main(int argc, char **argv)
 
 	destroy_session(&c, request, sizeof(request));
 	close(c.fd);
+	printf("PROBE-FAILURES=%u\n", probe_failures);
 	printf("PROBE-DONE\n");
-	return 0;
+	return probe_failures ? 1 : 0;
 }
