@@ -6143,6 +6143,44 @@ out:
 	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
+/*
+ * A read of no chunks is a success with an empty reply, and it must not be
+ * sized as though a chunk could come back: the boundary refuses a result
+ * longer than the request, so nothing can be encoded and the aggregate
+ * payload bound has nothing to bound.  Charged for one, a request a client
+ * is entitled to make would be refused on any ordinary session.
+ */
+static void nfsd_ffv2_encoder_read_zero_count_test(struct kunit *test)
+{
+	static const u32 fixed =
+		NFSD4_FFV2_READ_FIXED_WORDS * XDR_UNIT;
+	struct nfsd_ffv2_ro_fixture f;
+	union nfsd4_op_u u;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+
+	memset(&u, 0, sizeof(u));
+	u.chunk_read.cra_stateid = f.stateid;
+	u.chunk_read.cra_count = 0;
+	/*
+	 * A budget that holds the empty reply and nothing else.  One chunk
+	 * of this provider's size would not begin to fit in it, which is the
+	 * point: no chunk was asked for, so none is charged for.
+	 */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_ro_compound_op(test, &f, OP_CHUNK_READ,
+						 fixed, false, &u));
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_read.cra_nchunks);
+	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_chunks);
+	KUNIT_EXPECT_NULL(test, u.chunk_read.cra_payload);
+	KUNIT_EXPECT_EQ(test, 0U, u.chunk_read.cra_payload_len);
+	nfsd_ffv2_test_release_op(OP_CHUNK_READ, &u);
+
+out:
+	nfsd_ffv2_ro_fixture_exit(test, &f);
+}
+
 /* The service's own listener, so a client can find it. */
 static int nfsd_ffv2_ro_listener_port(struct nfsd_net *nn)
 {
@@ -12426,6 +12464,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_compound_header_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_compound_read_capacity_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_copy_failure_test),
+	KUNIT_CASE(nfsd_ffv2_encoder_read_zero_count_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
