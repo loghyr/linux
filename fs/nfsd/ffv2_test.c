@@ -6403,30 +6403,29 @@ static int nfsd_ffv2_ro_drain_thread(void *data)
 }
 
 /*
- * Retirement fences the copy, not merely the callback.
+ * A read held inside the provider, with that provider's drain waiting
+ * behind it.
  *
- * A read is held inside the provider, so its admission is live and the
+ * The read is stalled in the callback, so its admission is live and the
  * provider reference it took is held.  The provider is unpublished and its
  * drain started behind the read, and the drain announces that it has
- * reached its wait -- so what follows is measured against removal actually
- * waiting, not against a thread that may not have run.  It cannot get past
- * that wait: the reference is dropped only when the handler completes its
- * admission, which it does after the payload has been copied into storage
- * the operation owns.  The copy therefore runs entirely inside a drain
- * that is already waiting, and the reply encodes from the copy afterwards.
+ * reached the wait for the last holder -- after the RCU grace period and
+ * after the publication reference is dropped -- so what follows is
+ * measured against a drain that is actually waiting rather than a thread
+ * that may not have run.  It cannot get past that wait while the read
+ * holds the provider.  The read is then released, both finish, and the
+ * reply encodes from storage the operation owns, with the provider gone.
  *
- * Two things this does not assert, said plainly rather than implied.  It
- * does not start the removal during the copy: there is no hook inside the
- * copy to do that deterministically, and a sleep would prove nothing.  And
- * it cannot tell a handler that completes its admission after the copy
- * from one that completes it before: both finish the drain only once the
- * read thread is done, and nothing outside the handler can observe which
- * side of the copy the completion fell on.  What is asserted is that the
- * drain is provably waiting before the copy begins and gets past that wait
- * only after the handler has released, and that the reply is built from
- * storage the operation owns.
+ * What this does not observe, said plainly rather than implied: the order
+ * of the copy and the handler's admission completion.  The test waits for
+ * the handler to return before it looks at the drain, and the payload the
+ * encoder reads is the operation's own copy either way, so no schedule
+ * here distinguishes a handler that copies before completing its
+ * admission from one that copies after.  That ordering is a property of
+ * the handler's source -- the copy precedes nfsd_ffv2_complete() in
+ * nfsd4_ffv2_chunk_read_op() -- and not of this test.
  */
-static void nfsd_ffv2_encoder_copy_fence_test(struct kunit *test)
+static void nfsd_ffv2_encoder_drain_wait_test(struct kunit *test)
 {
 	/*
 	 * The handler context carries a whole operation union, which is too
@@ -6453,6 +6452,7 @@ static void nfsd_ffv2_encoder_copy_fence_test(struct kunit *test)
 	init_completion(&enter);
 	init_completion(&release);
 	init_completion(&entered);
+	init_completion(&drain.done);
 	f.provider->enter = &enter;
 	f.provider->release = &release;
 
@@ -6476,7 +6476,7 @@ static void nfsd_ffv2_encoder_copy_fence_test(struct kunit *test)
 	/*
 	 * Held inside the boundary: take the provider out of the registry
 	 * and start the wait behind it.  Unpublishing here rather than in
-	 * the drain thread is what gives the arming a provider to name.
+	 * the drain thread is what gives the arming a provider to name, and
 	 */
 	drain.handle = nfsd_ffv2_test_provider_unpublish(f.nn);
 	f.provider_installed = false;
@@ -6485,7 +6485,6 @@ static void nfsd_ffv2_encoder_copy_fence_test(struct kunit *test)
 		goto out_unstall;
 	}
 	nfsd_ffv2_test_provider_drain_hook(drain.handle, &entered);
-	init_completion(&drain.done);
 	drain_task = kthread_run(nfsd_ffv2_ro_drain_thread, &drain,
 				 "nfsd-ffv2-ro-drain");
 	if (IS_ERR(drain_task)) {
@@ -6495,9 +6494,9 @@ static void nfsd_ffv2_encoder_copy_fence_test(struct kunit *test)
 		nfsd_ffv2_test_provider_drain_hook(NULL, NULL);
 		goto out_unstall;
 	}
-	/* Removal is at its wait, rather than merely not scheduled yet. */
+	/* The drain is at its wait, rather than merely not scheduled yet. */
 	if (!wait_for_completion_timeout(&entered, 15 * HZ)) {
-		KUNIT_FAIL(test, "removal never reached its wait");
+		KUNIT_FAIL(test, "the drain never reached its wait");
 		goto out_unstall;
 	}
 	/* And it cannot get past it while a crossing holds the provider. */
@@ -6512,11 +6511,12 @@ out_unstall:
 							    30 * HZ));
 		KUNIT_EXPECT_EQ(test, nfs_ok, read->status);
 	}
-	if (drain_task)
+	if (drain_task) {
 		/* Released only once the handler completed its admission. */
 		KUNIT_EXPECT_NE(test, 0UL,
 				wait_for_completion_timeout(&drain.done,
 							    30 * HZ));
+	}
 	nfsd_ffv2_test_provider_drain_hook(NULL, NULL);
 	f.provider->enter = NULL;
 	f.provider->release = NULL;
@@ -13020,7 +13020,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_encoder_read_zero_count_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_header_cachethis_test),
 	KUNIT_CASE(nfsd_ffv2_encoder_retired_provider_test),
-	KUNIT_CASE_SLOW(nfsd_ffv2_encoder_copy_fence_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_encoder_drain_wait_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
