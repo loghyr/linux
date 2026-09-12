@@ -11680,10 +11680,25 @@ out:
  * aborting assertion would skip.
  */
 struct nfsd_ffv2_proto_access_ctx {
-	struct svc_export	*exp;
-	bool			held;
+	struct svc_export		*exp;
+	struct nfsd_ffv2_proto_register_ctx *ctx;
+	struct task_struct		*task;
+	bool				held;
 };
 
+/*
+ * Release everything the armed-access test may still be holding, and join
+ * the thread it started.  Registered as a KUnit action after the test's
+ * allocations, so it runs before they are freed: a registration thread
+ * still inside the transition reads this context, and returning from the
+ * test while it does would leave it reading memory KUnit has reclaimed.
+ *
+ * The join is unconditional.  Releasing the access is what a working
+ * registration is waiting for; cancelling the wait is what lets a wedged
+ * one -- the deliberately broken path -- return the error a caller that
+ * gave up would see.  Signalling follows, in case the thread is waiting
+ * somewhere else.
+ */
 static void nfsd_ffv2_proto_access_release(void *data)
 {
 	struct nfsd_ffv2_proto_access_ctx *held = data;
@@ -11693,6 +11708,17 @@ static void nfsd_ffv2_proto_access_release(void *data)
 		nfsd_ffv2_export_access_put(held->exp);
 		held->held = false;
 	}
+	if (!held->task)
+		return;
+	if (!wait_for_completion_timeout(&held->ctx->done, 5 * HZ)) {
+		nfsd_ffv2_export_test_cancel_wait(held->exp, true);
+		if (!wait_for_completion_timeout(&held->ctx->done, 30 * HZ))
+			send_sig(SIGKILL, held->task, 1);
+		wait_for_completion(&held->ctx->done);
+	}
+	kthread_stop(held->task);
+	held->task = NULL;
+	nfsd_ffv2_export_test_cancel_wait(held->exp, false);
 }
 
 static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
@@ -11748,6 +11774,12 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 		KUNIT_FAIL(test, "failed to start the registering thread");
 		goto out;
 	}
+	/*
+	 * Handed to the cleanup action before anything else can fail, so the
+	 * thread is joined however this test ends.
+	 */
+	held->ctx = ctx;
+	held->task = task;
 
 	/*
 	 * The transition records itself on the export before it waits, so
@@ -11769,6 +11801,14 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, joined);
 	if (!joined)
 		goto out;
+	/*
+	 * Joined here on the path that works; the cleanup action joins on
+	 * every other, and clearing the task is what keeps the two from both
+	 * stopping the same thread.
+	 */
+	kthread_stop(task);
+	held->task = NULL;
+	task = NULL;
 	KUNIT_EXPECT_EQ(test, 0, ctx->result);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_READY,
 			nfsd_ffv2_prototype_state_get(f->nn));
@@ -11780,30 +11820,11 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 	f->enabled = false;
 out:
 	/*
-	 * A registration that kept the access its own handle holds is still
-	 * inside that interruptible wait.  Signalling it is what a caller
-	 * that gave up would do, and it is what makes the broken path
-	 * bounded: the thread returns, is joined, and the fixture is never
-	 * torn down while it could still reach the export or the namespace.
+	 * The cleanup action releases the access, cancels a wedged wait and
+	 * joins the thread; it runs before the memory that thread reads is
+	 * freed.  Fixture teardown is therefore never reached with the
+	 * registration still running.
 	 */
-	if (task && !joined) {
-		if (held->held) {
-			nfsd_ffv2_export_access_put(held->exp);
-			held->held = false;
-		}
-		send_sig(SIGKILL, task, 1);
-		joined = wait_for_completion_timeout(&ctx->done, 30 * HZ);
-		KUNIT_EXPECT_TRUE(test, joined);
-	}
-	if (task && joined) {
-		kthread_stop(task);
-		task = NULL;
-	}
-	if (task) {
-		KUNIT_FAIL(test,
-			   "the registering thread could not be joined; the fixture is left standing");
-		return;
-	}
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 

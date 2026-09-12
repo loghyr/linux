@@ -123,6 +123,9 @@ void nfsd_ffv2_export_access_put(struct svc_export *exp);
 bool nfsd_ffv2_export_is_service(struct svc_export *exp);
 int nfsd_ffv2_export_transition_begin(struct svc_export *exp);
 int nfsd_ffv2_export_transition_wait(struct svc_export *exp);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_export_test_cancel_wait(struct svc_export *exp, bool cancel);
+#endif
 bool nfsd_ffv2_export_is_transitioning(struct svc_export *exp);
 void nfsd_ffv2_export_transition_abort(struct svc_export *exp);
 void nfsd_ffv2_export_transition_commit(struct svc_export *exp);
