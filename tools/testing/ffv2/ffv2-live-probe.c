@@ -1215,15 +1215,27 @@ static int bundle_key_index(const char *key, size_t len)
  * not written by a registration that finished, and is refused rather than
  * read.  No key is conditional; a field that ever becomes optional has to
  * say so here.
+ *
+ * The whole snapshot means all @len bytes of it.  Walking it as a C string
+ * would stop at the first NUL and never reach what followed, so a file
+ * carrying six good records, a NUL, and anything at all after it would
+ * pass a check it never applied to most of its contents.  A NUL is not
+ * part of this grammar, so it is refused outright, and the walk must
+ * arrive exactly at the end.
  */
 static bool bundle_well_formed(const struct bundle *b, const char **why)
 {
 	unsigned int seen[ARRAY_SIZE(bundle_keys)] = {};
 	const char *p = b->text;
+	const char *limit = b->text + b->len;
 	size_t i;
 
-	while (*p) {
-		const char *eol = strchr(p, '\n');
+	if (memchr(b->text, '\0', b->len)) {
+		*why = "the bundle carries a byte no record may contain";
+		return false;
+	}
+	while (p < limit) {
+		const char *eol = memchr(p, '\n', (size_t)(limit - p));
 		const char *eq;
 		size_t line, klen;
 		int key;
@@ -1258,6 +1270,10 @@ static bool bundle_well_formed(const struct bundle *b, const char **why)
 		}
 		p = eol + 1;
 	}
+	if (p != limit) {
+		*why = "the bundle carries bytes outside its records";
+		return false;
+	}
 	for (i = 0; i < ARRAY_SIZE(bundle_keys); i++)
 		if (!seen[i]) {
 			*why = "the bundle is missing a key this client requires";
@@ -1267,25 +1283,27 @@ static bool bundle_well_formed(const struct bundle *b, const char **why)
 }
 
 /*
- * One "KEY=value" line out of the snapshot.  Terminated records only, for
- * the same reason the grammar above requires them: this also runs before
- * the grammar has been checked, when a directory is being watched for this
- * run's registration to appear in it.
+ * One "KEY=value" record out of the snapshot.  Terminated records only,
+ * and bounded by the recorded length rather than by a NUL, for the same
+ * reasons the grammar above is: this also runs before the grammar has been
+ * checked, when a directory is being watched for this run's registration
+ * to appear in it.
  */
 static bool bundle_value(const struct bundle *b, const char *key, char *out,
 			 size_t out_size)
 {
-	const char *p = b->text;
+	const char *limit = b->text + b->len;
 	size_t klen = strlen(key);
+	const char *p = b->text;
 
-	while (*p) {
-		const char *eol = strchr(p, '\n');
+	while (p < limit) {
+		const char *eol = memchr(p, '\n', (size_t)(limit - p));
 		size_t line;
 
 		if (!eol)
 			break;
 		line = (size_t)(eol - p);
-		if (line > klen && !strncmp(p, key, klen) && p[klen] == '=') {
+		if (line > klen && !memcmp(p, key, klen) && p[klen] == '=') {
 			size_t vlen = line - klen - 1;
 
 			if (vlen >= out_size)
