@@ -60,19 +60,32 @@ static void print_hex(const char *name, const void *data, size_t len)
 	printf("\n");
 }
 
+/* One hex digit, or -1.  sscanf("%2x") would accept "0g" as a single 0. */
+static int hex_digit(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
 static size_t parse_hex(const char *text, uint8_t *out, size_t max)
 {
 	size_t len = strlen(text);
 	size_t i;
 
-	if (len % 2 || len / 2 > max)
+	if (!len || len % 2 || len / 2 > max)
 		die("bad hex string of %zu characters", len);
 	for (i = 0; i < len / 2; i++) {
-		unsigned int byte;
+		int hi = hex_digit(text[2 * i]);
+		int lo = hex_digit(text[2 * i + 1]);
 
-		if (sscanf(text + 2 * i, "%2x", &byte) != 1)
-			die("bad hex string");
-		out[i] = (uint8_t)byte;
+		if (hi < 0 || lo < 0)
+			die("bad hex digit in \"%s\"", text);
+		out[i] = (uint8_t)((hi << 4) | lo);
 	}
 	return len / 2;
 }
