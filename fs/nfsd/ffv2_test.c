@@ -11135,6 +11135,13 @@ struct nfsd_ffv2_proto_fixture {
 	/* The ordinary handle the substituted resolution hands back. */
 	u8				inner[8];
 	u16				inner_len;
+	/*
+	 * Which arming of the process-global object hook is this fixture's.
+	 * The hook points at @bytes below, so whoever takes it down has to
+	 * be able to say that the arming it is taking down is still this
+	 * one.
+	 */
+	u64				object_arming;
 	u8				bytes[NFSD_FFV2_PROTO_CHUNKS *
 					      NFSD_FFV2_PROTO_CHUNK_SIZE];
 	bool				enabled;
@@ -11146,6 +11153,7 @@ struct nfsd_ffv2_proto_fixture {
 static void nfsd_ffv2_proto_fixture_exit(struct nfsd_ffv2_proto_fixture *f)
 {
 	nfsd_ffv2_prototype_test_object_hook(NULL, NULL, NULL, 0, NULL, 0, 0);
+	f->object_arming = 0;
 	if (f->mapped && f->mapped->fh_dentry) {
 		fh_put(f->mapped);
 		f->binding = NULL;
@@ -11297,9 +11305,12 @@ static bool nfsd_ffv2_proto_fixture_init(struct kunit *test,
 	 */
 	memcpy(f->inner, inner, sizeof(inner));
 	f->inner_len = sizeof(inner);
-	nfsd_ffv2_prototype_test_object_hook(f->seeded, f->object_dentry,
-					     f->inner, f->inner_len, f->bytes,
-					     sizeof(f->bytes), 0);
+	f->object_arming =
+		nfsd_ffv2_prototype_test_object_hook(f->seeded,
+						     f->object_dentry,
+						     f->inner, f->inner_len,
+						     f->bytes,
+						     sizeof(f->bytes), 0);
 	return true;
 }
 
@@ -11669,31 +11680,39 @@ out:
  * complete, and the bounded wait below reports that rather than hanging.
  */
 /*
- * What the armed-access test hands its registration thread, and what owns
- * it.
+ * What a lifetime test hands the threads it starts, and what owns it.
  *
- * A registration that does not return goes on reading this after the test
- * that started it is over, so none of it can be KUnit's to free: the
- * fixture, the request and the bundle live in one arena, and the arena
- * lives until both the test and the thread have let go of it.  The
- * fixture's remaining scaffolding is KUnit's, and is the test's own -- the
- * thread reads the namespace and the substituted object's bytes, and both
- * are here or refcounted.
+ * A worker that does not return goes on reading this after the test that
+ * started it is over, so none of it can be KUnit's to free: the fixture,
+ * the registration context, the bundle, the closing call's context and the
+ * completions the publish hook is armed with all live in one arena, and
+ * the arena lives until the test and every worker in it have let go.  The
+ * fixture's remaining scaffolding is KUnit's and is the test body's alone;
+ * no worker and no process-global hook reads it.
  *
- * The process-global resolve hook and the export access the test itself
- * takes are separate ownership again, released by the settle below.
+ * The export access a test takes for itself and the two process-global
+ * hooks are separate ownership again, and the settle below is what gives
+ * each of them back.
  */
 struct nfsd_ffv2_proto_access_work {
 	struct nfsd_ffv2_proto_fixture		fixture;
 	struct nfsd_ffv2_proto_register_ctx	ctx;
 	struct nfsd_ffv2_prototype_bundle	bundle;
+	struct nfsd_ffv2_prototype_call_ctx	closer;
+	/* The publish hook's, so no worker completes a dead stack. */
+	struct completion			reached;
+	struct completion			proceed;
+	/* What a stand-in worker waits for, so a test can end it. */
+	struct completion			stall;
 	struct svc_export			*exp;
 	struct task_struct			*task;
-	/* What a stand-in thread waits for, so a test can end it. */
-	struct completion			stall;
+	struct task_struct			*close_task;
 	refcount_t				ref;
+	/* Workers started here and not yet seen out. */
+	atomic_t				workers;
 	unsigned long				wedge_bound;
 	unsigned long				join_bound;
+	bool					publish_hooked;
 	bool					stalls;
 	bool					held;
 	bool					released;
@@ -11702,9 +11721,9 @@ struct nfsd_ffv2_proto_access_work {
 };
 
 /*
- * Registration threads this suite has started and not seen end.  A test
- * that gives one up leaves it counted, which is how the give-up test below
- * can say that it ended rather than assume it.
+ * Workers this suite has started and not seen end, across every arena.  A
+ * test that gives one up leaves it counted, which is how the give-up tests
+ * below can say that it ended rather than assume it.
  */
 static atomic_t nfsd_ffv2_proto_access_workers = ATOMIC_INIT(0);
 
@@ -11720,15 +11739,36 @@ static void nfsd_ffv2_proto_access_put_action(void *data)
 }
 
 /*
- * The thread the armed-access test starts.
+ * How every worker in an arena ends.
  *
- * It ends in one of two ways.  Joined: the test saw the registration
- * return and stops it, which is every path this test expects to take.
- * Released: the test gave up waiting and said so, and a thread nobody will
- * join has to end by itself.  The reference it drops on the way out is
- * what frees the arena it has been reading, so the arena outlives it
- * either way.
+ * Joined: the test saw it return and stops it, and the fixture is torn
+ * down afterwards in the test's own context.  Released: the test gave up
+ * waiting, and a worker nobody will join has to end by itself.
+ *
+ * The last worker out of a released arena takes the object hook down
+ * before it drops the reference that can free the bytes the hook points
+ * at -- and takes down only the arming its own fixture made, so a hook a
+ * later fixture armed for itself is left alone.  Nothing is cleared
+ * blindly and nothing is left pointing into freed storage.
  */
+static void nfsd_ffv2_proto_worker_end(struct nfsd_ffv2_proto_access_work *work)
+{
+	bool last;
+
+	for (;;) {
+		set_current_state(TASK_IDLE);
+		if (kthread_should_stop() || READ_ONCE(work->released))
+			break;
+		schedule();
+	}
+	__set_current_state(TASK_RUNNING);
+	last = atomic_dec_and_test(&work->workers);
+	if (last && READ_ONCE(work->released))
+		nfsd_ffv2_prototype_test_object_hook_disarm(work->fixture.object_arming);
+	atomic_dec(&nfsd_ffv2_proto_access_workers);
+	nfsd_ffv2_proto_access_put(work);
+}
+
 static int nfsd_ffv2_proto_access_thread(void *data)
 {
 	struct nfsd_ffv2_proto_access_work *work = data;
@@ -11741,16 +11781,8 @@ static int nfsd_ffv2_proto_access_thread(void *data)
 						     work->fixture.net,
 						     &work->ctx.req,
 						     &work->bundle);
-	complete(&work->ctx.done);
-	for (;;) {
-		set_current_state(TASK_IDLE);
-		if (kthread_should_stop() || READ_ONCE(work->released))
-			break;
-		schedule();
-	}
-	__set_current_state(TASK_RUNNING);
-	atomic_dec(&nfsd_ffv2_proto_access_workers);
-	nfsd_ffv2_proto_access_put(work);
+	complete_all(&work->ctx.done);
+	nfsd_ffv2_proto_worker_end(work);
 	return 0;
 }
 
@@ -11762,7 +11794,11 @@ static struct nfsd_ffv2_proto_access_work *nfsd_ffv2_proto_access_alloc(void)
 	if (!work)
 		return NULL;
 	refcount_set(&work->ref, 1);
+	atomic_set(&work->workers, 0);
 	init_completion(&work->ctx.done);
+	init_completion(&work->closer.done);
+	init_completion(&work->reached);
+	init_completion(&work->proceed);
 	init_completion(&work->stall);
 	work->ctx.f = &work->fixture;
 	work->ctx.bundle = &work->bundle;
@@ -11772,29 +11808,33 @@ static struct nfsd_ffv2_proto_access_work *nfsd_ffv2_proto_access_alloc(void)
 }
 
 /*
- * Start the thread.
+ * Start a worker in an arena.
  *
- * Two references are taken and both are given back below: one on the arena,
- * which the thread drops when it ends, and one on the task itself, because
- * kthread_run() hands back a pointer rather than a reference and a thread
- * this may have to release instead of joining can end at any point after
- * it is told to.
+ * Two references are taken and both are given back below: one on the
+ * arena, which the worker drops when it ends, and one on the task itself,
+ * because kthread_run() hands back a pointer rather than a reference and a
+ * worker this may have to release instead of joining can end at any point
+ * after it is told to.
  */
-static bool nfsd_ffv2_proto_access_start(struct nfsd_ffv2_proto_access_work *work,
+static bool nfsd_ffv2_proto_worker_start(struct nfsd_ffv2_proto_access_work *work,
+					 int (*fn)(void *),
+					 struct task_struct **slot,
 					 const char *name)
 {
 	struct task_struct *task;
 
 	refcount_inc(&work->ref);
+	atomic_inc(&work->workers);
 	atomic_inc(&nfsd_ffv2_proto_access_workers);
-	task = kthread_run(nfsd_ffv2_proto_access_thread, work, "%s", name);
+	task = kthread_run(fn, work, "%s", name);
 	if (IS_ERR(task)) {
 		atomic_dec(&nfsd_ffv2_proto_access_workers);
+		atomic_dec(&work->workers);
 		nfsd_ffv2_proto_access_put(work);
 		return false;
 	}
 	get_task_struct(task);
-	work->task = task;
+	*slot = task;
 	return true;
 }
 
@@ -11814,84 +11854,136 @@ static unsigned int nfsd_ffv2_proto_access_count(struct svc_export *exp)
 }
 
 /*
+ * Put the access a wedged registration is holding, and only if it is
+ * provably the one outstanding.
+ *
+ * Ownership is established by the export's own state, not inferred from a
+ * count.  A registration reaches TRANSITIONING only after its handle has
+ * been put -- nfsd_ffv2_object_register_fh() puts the handle before it
+ * publishes -- so an export that is transitioning while one ordinary
+ * access is outstanding is an export whose registration kept the access it
+ * should have released.  Nothing else in this fixture holds one: the
+ * test's own reader has already gone, and a transitioning export refuses
+ * new ones.
+ *
+ * The state, the count and the decrement are one acquisition of the lock
+ * all three live under, which is what the two of them being separate
+ * acquisitions could not promise: a registration about to put its own
+ * access cannot slip between the decision and the act.  A registration
+ * that has not reached the transition leaves the export open, and then
+ * this puts nothing -- an access cleanup cannot prove it owns is an access
+ * cleanup does not touch.
+ *
+ * This mirrors the last put in nfsd_ffv2_export_access_put(), including
+ * the wake outside the lock, because that is the operation being performed.
+ */
+static bool nfsd_ffv2_proto_access_put_wedged(struct svc_export *exp)
+{
+	bool put = false;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	if (exp->ex_ffv2_access_state == NFSD_FFV2_EXPORT_TRANSITIONING &&
+	    exp->ex_ffv2_access_count == 1) {
+		exp->ex_ffv2_access_count = 0;
+		put = true;
+	}
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	if (put)
+		wake_up_all(&exp->ex_ffv2_access_wait);
+	return put;
+}
+
+/*
  * Wait for the registration to return, ending on the way the one wait a
- * test is able to end.
- *
- * The test's own reader access is gone by the time this runs, so the only
- * ordinary access this export can still be carrying is the one the
- * substituted resolve claimed for the registration's handle and the handle
- * should have released before publication.  A registration that released
- * it is not waiting on the count, and the first bound is all it needs.
- * One that kept it is waiting for itself, and putting that access is what
- * ends the wait.
- *
- * It is put only when it is there to put.  The count is read first, and
- * the two orderings that reach here are the only two there are: a
- * registration that has already put its access cannot put again, and one
- * blocked inside the wait puts nothing until it returns from the wait,
- * which is after this.  So this never puts an access it does not hold, and
- * never leaves the deliberately broken build's one imbalance unattributed.
- *
- * Both waits are bounded.  A registration that returns from neither is a
- * thread this cannot join, and the caller disposes of it rather than
- * waiting on it.
+ * test is able to end.  Both waits are bounded; a registration that
+ * returns from neither is a worker the caller has to dispose of rather
+ * than wait on.
  */
 static bool nfsd_ffv2_proto_access_join(struct nfsd_ffv2_proto_access_work *work)
 {
 	if (wait_for_completion_timeout(&work->ctx.done, work->wedge_bound))
 		return true;
-	if (work->exp && nfsd_ffv2_proto_access_count(work->exp) == 1)
-		nfsd_ffv2_export_access_put(work->exp);
+	if (work->exp)
+		nfsd_ffv2_proto_access_put_wedged(work->exp);
 	return wait_for_completion_timeout(&work->ctx.done,
 					   work->join_bound) != 0;
 }
 
 /*
- * Everything the armed-access test must undo, in the only order it is safe
- * to undo it in, and idempotent so that the test body and a KUnit action
- * can both ask for it.
+ * Everything a lifetime test must undo, in the only order it is safe to
+ * undo it in, and idempotent so that the test body and a KUnit action can
+ * both ask for it.
  *
- * The resolve hook is process-global and every other fixture expects it
- * clear; the reader access this test holds would keep a later transition
- * waiting.  Both go first, because the second is what a wedged
- * registration is waiting on.  The fixture is torn down last and only once
- * the thread has been joined: tearing it down would stop the service the
- * registration is still inside and put the namespace it is still reading.
+ * The publish hook goes first, and from here rather than from a worker:
+ * this runs while the test still owns the suite, so taking the arming down
+ * now is what keeps a later registration from completing completions in an
+ * arena a released worker may free.  Only this test's own arming is taken
+ * down; a worker already inside the pause took its own copy and cleared
+ * the hook itself, and the completions it holds are in the arena, which
+ * outlives every worker in it.
  *
- * Returns whether the thread was joined.  It is not joined only when the
- * registration returned from neither bound, and then this releases the
- * thread instead: the arena stays allocated until the thread ends by
- * itself, the fixture stays up, and the test says so.  That retains a
- * namespace, an nfsd service and an export access, and a later fixture in
- * the same run may fail to start because of it -- but every one of those
- * is a reported failure, which neither a freed context nor a suite that
- * never returns would be.
+ * Then whatever a paused worker is waiting for is released, the resolve
+ * hook is cleared, and the reader access the test took is put -- that
+ * access is what a wedged registration is waiting on, so it goes before
+ * anything waits for that registration.
+ *
+ * The fixture is torn down last and only once every worker has been
+ * joined: tearing it down would stop the service a registration is still
+ * inside and put the namespace it is still reading.
+ *
+ * Returns whether every worker was joined.  When one was not, this
+ * releases them instead: the arena stays allocated until the last of them
+ * ends by itself, the object hook comes down with it, the fixture is left
+ * standing, and the test says so.  That retains a namespace, an nfsd
+ * service and an export access, and a later fixture in the same run may
+ * fail to start because of them -- but each of those is a reported
+ * failure, which neither a freed context nor a suite that never returns
+ * would be.
  */
 static bool nfsd_ffv2_proto_access_settle(struct nfsd_ffv2_proto_access_work *work)
 {
+	struct task_struct *close_task = work->close_task;
 	struct task_struct *task = work->task;
+	bool closed, returned;
 
 	if (work->settled)
 		return work->joined;
 	work->settled = true;
-	work->joined = true;
+	if (work->publish_hooked) {
+		nfsd_ffv2_prototype_test_publish_hook_disarm(&work->reached);
+		work->publish_hooked = false;
+	}
+	complete_all(&work->proceed);
 	nfsd_ffv2_prototype_test_access_hook(false);
 	if (work->held) {
 		nfsd_ffv2_export_access_put(work->exp);
 		work->held = false;
 	}
-	if (task) {
-		work->task = NULL;
-		work->joined = nfsd_ffv2_proto_access_join(work);
-		if (!work->joined) {
-			WRITE_ONCE(work->released, true);
+
+	returned = !task || nfsd_ffv2_proto_access_join(work);
+	closed = !close_task ||
+		 wait_for_completion_timeout(&work->closer.done,
+					     work->join_bound) != 0;
+	work->task = NULL;
+	work->close_task = NULL;
+	work->joined = returned && closed;
+	if (!work->joined) {
+		WRITE_ONCE(work->released, true);
+		if (task) {
 			wake_up_process(task);
 			put_task_struct(task);
-			pr_err("nfsd ffv2 test: a registration thread did not return within its bound; its context and fixture are retained\n");
-			return false;
 		}
-		kthread_stop_put(task);
+		if (close_task) {
+			wake_up_process(close_task);
+			put_task_struct(close_task);
+		}
+		pr_err("nfsd ffv2 test: a worker did not return within its bound; its context and fixture are retained\n");
+		return false;
 	}
+	if (task)
+		kthread_stop_put(task);
+	if (close_task)
+		kthread_stop_put(close_task);
 	nfsd_ffv2_proto_fixture_exit(&work->fixture);
 	return true;
 }
@@ -11902,45 +11994,95 @@ static void nfsd_ffv2_proto_access_release(void *data)
 }
 
 /*
- * What is left behind when a registration thread does not return.
+ * Set an arena up for a test, with both KUnit actions in the order they
+ * must run in reverse: the settle runs first and the arena is released
+ * after it, so an aborting assertion cannot free the arena before the
+ * workers that read it have been joined or let go.
+ */
+static struct nfsd_ffv2_proto_access_work *
+nfsd_ffv2_proto_access_begin(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_access_work *work;
+
+	work = nfsd_ffv2_proto_access_alloc();
+	if (!work) {
+		KUNIT_FAIL(test, "failed to allocate the worker arena");
+		return NULL;
+	}
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_access_put_action,
+				      work)) {
+		KUNIT_FAIL(test, "failed to register the arena release");
+		return NULL;
+	}
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_access_release,
+				      work)) {
+		KUNIT_FAIL(test, "failed to register the settle action");
+		return NULL;
+	}
+	return work;
+}
+
+/*
+ * Settle from the test body, so that what the settle could not do is a
+ * failure this test reports rather than one only the log carries.  The
+ * action is removed first because it would otherwise repeat a settle that
+ * has already happened; the arena release stays registered and runs last.
+ */
+static bool nfsd_ffv2_proto_access_finish(struct kunit *test,
+					  struct nfsd_ffv2_proto_access_work *work)
+{
+	kunit_remove_action(test, nfsd_ffv2_proto_access_release, work);
+	return nfsd_ffv2_proto_access_settle(work);
+}
+
+/* Wait, bounded, for every worker this suite started to have ended. */
+static bool nfsd_ffv2_proto_workers_quiesced(void)
+{
+	unsigned long deadline = jiffies + 30 * HZ;
+
+	while (atomic_read(&nfsd_ffv2_proto_access_workers) &&
+	       time_before(jiffies, deadline))
+		schedule_timeout_uninterruptible(1);
+	return !atomic_read(&nfsd_ffv2_proto_access_workers);
+}
+
+/*
+ * What is left behind when a worker does not return.
  *
- * The cleanup above is bounded, which means it can reach its bound with
- * the thread still inside the registration.  What it does then is the part
- * worth a test of its own: it must not free what the thread is reading,
- * must not wait for it without end, and must not leave it running with
- * nothing that will ever end it.  A thread that waits for this test and
- * for nothing else stands in for a registration that never returns.
+ * The settle is bounded, which means it can reach its bound with a worker
+ * still inside whatever it is doing.  What it does then is the part worth
+ * a test of its own: it must not free what the worker is reading, must not
+ * wait for it without end, and must not leave it running with nothing that
+ * will ever end it.  A worker that waits for this test and for nothing
+ * else stands in for a registration that never returns.
  *
  * The bounds are shortened so that this costs seconds instead of the
- * minute the real ones would; the path through the cleanup is the same
- * one.  Afterwards the thread is let go and does end, and the suite is
- * left with none running -- which is what giving one up has to mean if
- * what runs after it is to be worth anything.
+ * minute the real ones would; the path through the settle is the same one.
+ * Afterwards the worker is let go and does end, and the suite is left with
+ * none running -- which is what giving one up has to mean if what runs
+ * after it is to be worth anything.
  */
 static void nfsd_ffv2_prototype_worker_giveup_test(struct kunit *test)
 {
 	struct nfsd_ffv2_proto_access_work *work;
-	unsigned long elapsed, deadline;
+	unsigned long elapsed;
 
 	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_access_workers));
-	work = nfsd_ffv2_proto_access_alloc();
-	KUNIT_ASSERT_NOT_NULL(test, work);
-	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_access_put_action,
-				      work)) {
-		KUNIT_FAIL(test, "failed to register the arena release");
+	work = nfsd_ffv2_proto_access_begin(test);
+	if (!work)
 		return;
-	}
 	work->stalls = true;
 	work->wedge_bound = HZ;
 	work->join_bound = HZ;
-	if (!nfsd_ffv2_proto_access_start(work, "ffv2-proto-stall")) {
-		KUNIT_FAIL(test, "failed to start the stalled thread");
+	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
+					  &work->task, "ffv2-proto-stall")) {
+		KUNIT_FAIL(test, "failed to start the stalled worker");
 		return;
 	}
 
 	elapsed = jiffies;
-	/* The cleanup gives the thread up rather than waiting for it. */
-	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_access_settle(work));
+	/* The settle gives the worker up rather than waiting for it. */
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_access_finish(test, work));
 	elapsed = jiffies - elapsed;
 	KUNIT_EXPECT_TRUE(test,
 			  elapsed < 4 * (work->wedge_bound + work->join_bound));
@@ -11951,16 +12093,174 @@ static void nfsd_ffv2_prototype_worker_giveup_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, refcount_read(&work->ref) >= 2);
 
 	/*
-	 * What the thread was waiting for ends, and the thread ends with it:
-	 * a released thread returns without being stopped, drops the last
+	 * What the worker was waiting for ends, and the worker ends with it:
+	 * a released worker returns without being stopped, drops the last
 	 * reference it holds, and leaves the suite with nothing running.
 	 */
-	complete(&work->stall);
-	deadline = jiffies + 30 * HZ;
-	while (atomic_read(&nfsd_ffv2_proto_access_workers) &&
-	       time_before(jiffies, deadline))
-		schedule_timeout_uninterruptible(1);
-	KUNIT_EXPECT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_access_workers));
+	complete_all(&work->stall);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_workers_quiesced());
+}
+
+/*
+ * The object hook a released worker leaves behind.
+ *
+ * The hook is process-global and points at bytes inside the arena, which
+ * a released worker frees when it finally ends.  So the worker has to take
+ * the hook down on its way out -- before the reference that frees those
+ * bytes, and after the test that gave it up has stopped being able to do
+ * it itself.
+ */
+static void nfsd_ffv2_prototype_worker_hook_release_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_access_work *work;
+
+	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_access_workers));
+	work = nfsd_ffv2_proto_access_begin(test);
+	if (!work)
+		return;
+	if (!nfsd_ffv2_proto_fixture_init(test, &work->fixture))
+		return;
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+	work->stalls = true;
+	work->wedge_bound = HZ;
+	work->join_bound = HZ;
+	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
+					  &work->task, "ffv2-proto-stall")) {
+		KUNIT_FAIL(test, "failed to start the stalled worker");
+		return;
+	}
+
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_access_finish(test, work));
+	/*
+	 * Still armed, and still pointing at bytes that are still there:
+	 * the worker holds the arena up until it ends.
+	 */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+
+	complete_all(&work->stall);
+	if (!nfsd_ffv2_proto_workers_quiesced()) {
+		KUNIT_FAIL(test, "the released worker never ended");
+		return;
+	}
+	/* Down with the worker, before the bytes it pointed at could go. */
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+	/* Safe now: there is no worker left to tear the fixture out from. */
+	nfsd_ffv2_proto_fixture_exit(&work->fixture);
+}
+
+/*
+ * And the hook a released worker must leave alone.
+ *
+ * A worker can end long after the test that gave it up, by which time
+ * another fixture may have armed the hook for itself.  Clearing it then
+ * would take a live fixture's hook down, so the worker names the arming it
+ * is taking down and finds that it is no longer the current one.
+ */
+static void nfsd_ffv2_prototype_worker_hook_replace_test(struct kunit *test)
+{
+	static const u8 inner[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
+	struct nfsd_ffv2_proto_access_work *work;
+	u64 replacement;
+	u8 *bytes;
+
+	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_access_workers));
+	bytes = kunit_kzalloc(test, NFSD_FFV2_PROTO_CHUNK_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	work = nfsd_ffv2_proto_access_begin(test);
+	if (!work)
+		return;
+	if (!nfsd_ffv2_proto_fixture_init(test, &work->fixture))
+		return;
+	work->stalls = true;
+	work->wedge_bound = HZ;
+	work->join_bound = HZ;
+	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
+					  &work->task, "ffv2-proto-stall")) {
+		KUNIT_FAIL(test, "failed to start the stalled worker");
+		return;
+	}
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_access_finish(test, work));
+
+	/* A later fixture arms the hook for itself, over this one's. */
+	replacement =
+		nfsd_ffv2_prototype_test_object_hook(work->fixture.seeded,
+						     work->fixture.object_dentry,
+						     inner, sizeof(inner),
+						     bytes,
+						     NFSD_FFV2_PROTO_CHUNK_SIZE,
+						     0);
+	KUNIT_EXPECT_NE(test, 0ULL, replacement);
+	KUNIT_EXPECT_NE(test, work->fixture.object_arming, replacement);
+
+	complete_all(&work->stall);
+	if (!nfsd_ffv2_proto_workers_quiesced()) {
+		KUNIT_FAIL(test, "the released worker never ended");
+		return;
+	}
+	/* The arming it named was not this one, so this one still stands. */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_prototype_test_object_hook_disarm(replacement));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+	nfsd_ffv2_proto_fixture_exit(&work->fixture);
+}
+
+/*
+ * The access the settle must not put.
+ *
+ * A registration that has resolved its handle but has not reached the
+ * transition holds an ordinary access on an export that is still open.
+ * The count then says one, and one is what a wedged registration would
+ * also leave -- but this access is not the settle's to release: the
+ * registration is going to put it itself, and a put from here would either
+ * take it from under that put or double it.  The settle asks the export's
+ * state, not its count, so it puts nothing here.
+ */
+static void nfsd_ffv2_prototype_access_pretransition_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_access_work *work;
+	struct nfsd_ffv2_proto_fixture *f;
+
+	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_access_workers));
+	work = nfsd_ffv2_proto_access_begin(test);
+	if (!work)
+		return;
+	f = &work->fixture;
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		return;
+	work->exp = f->seeded;
+	work->stalls = true;
+	work->wedge_bound = HZ;
+	work->join_bound = HZ;
+	/*
+	 * Standing in for the access a registration's resolved handle holds
+	 * before it publishes.  It is deliberately not recorded as the
+	 * test's own, because the settle releases that one and the question
+	 * here is what it does with one that is not.
+	 */
+	if (nfsd_ffv2_export_access_get(f->seeded)) {
+		KUNIT_FAIL(test, "the fixture export refused an access");
+		return;
+	}
+	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
+					  &work->task, "ffv2-proto-stall")) {
+		nfsd_ffv2_export_access_put(f->seeded);
+		KUNIT_FAIL(test, "failed to start the stalled worker");
+		return;
+	}
+
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_access_finish(test, work));
+	/* Open, not transitioning, and the access is still where it was. */
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_is_transitioning(f->seeded));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_proto_access_count(f->seeded));
+
+	nfsd_ffv2_export_access_put(f->seeded);
+	complete_all(&work->stall);
+	if (!nfsd_ffv2_proto_workers_quiesced()) {
+		KUNIT_FAIL(test, "the released worker never ended");
+		return;
+	}
+	nfsd_ffv2_proto_fixture_exit(&work->fixture);
 }
 
 static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
@@ -11973,24 +12273,9 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 	bool joined = false;
 	u64 expires = 0;
 
-	work = nfsd_ffv2_proto_access_alloc();
-	KUNIT_ASSERT_NOT_NULL(test, work);
-	/*
-	 * Two actions, registered in the order they must run in reverse:
-	 * the settle runs first and the arena is released after it, so an
-	 * aborting assertion cannot free the arena before the thread that
-	 * reads it has been joined or let go.
-	 */
-	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_access_put_action,
-				      work)) {
-		KUNIT_FAIL(test, "failed to register the arena release");
+	work = nfsd_ffv2_proto_access_begin(test);
+	if (!work)
 		return;
-	}
-	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_access_release,
-				      work)) {
-		KUNIT_FAIL(test, "failed to register the release action");
-		return;
-	}
 	f = &work->fixture;
 	ctx = &work->ctx;
 	if (!nfsd_ffv2_proto_fixture_init(test, f))
@@ -12013,7 +12298,8 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 	}
 	work->held = true;
 
-	if (!nfsd_ffv2_proto_access_start(work, "ffv2-proto-access")) {
+	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
+					  &work->task, "ffv2-proto-access")) {
 		KUNIT_FAIL(test, "failed to start the registering thread");
 		goto out;
 	}
@@ -12041,7 +12327,7 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 	/*
 	 * Joined here on the path that works; the settle joins on every
 	 * other, and clearing the task is what keeps the two from both
-	 * stopping the same thread.
+	 * stopping the same worker.
 	 */
 	kthread_stop_put(work->task);
 	work->task = NULL;
@@ -12055,15 +12341,7 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 							       work->bundle.generation));
 	f->enabled = false;
 out:
-	/*
-	 * Settled here, so that what it could not do is a failure this test
-	 * reports rather than one only the log carries.  The action is
-	 * removed first because it would otherwise repeat a settle that has
-	 * already happened; the arena release stays registered and runs
-	 * last.
-	 */
-	kunit_remove_action(test, nfsd_ffv2_proto_access_release, work);
-	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_access_settle(work));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_access_finish(test, work));
 }
 
 /*
@@ -13492,6 +13770,9 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_giveup_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_hook_release_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_hook_replace_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_access_pretransition_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_resolve_access_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_close_race_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_short_read_test),
