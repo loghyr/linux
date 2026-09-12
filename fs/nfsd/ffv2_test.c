@@ -11541,16 +11541,7 @@ out:
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
-/*
- * The interval between a registration publishing its generation and the
- * gate reaching READY.
- *
- * The generation is active inside it -- publication is what makes it
- * active -- so the only thing keeping an operation out is the gate's own
- * final transition.  This holds a registration open in exactly that
- * interval and asks the production admission predicate what it would say
- * about a mapping arriving there.
- */
+/* What a registration running on a worker is given, and leaves behind. */
 struct nfsd_ffv2_proto_register_ctx {
 	struct nfsd_ffv2_proto_fixture		*f;
 	struct nfsd_ffv2_prototype_request	req;
@@ -11559,108 +11550,6 @@ struct nfsd_ffv2_proto_register_ctx {
 	struct completion			done;
 };
 
-static int nfsd_ffv2_proto_register_thread(void *data)
-{
-	struct nfsd_ffv2_proto_register_ctx *ctx = data;
-
-	ctx->result = nfsd_ffv2_prototype_register(ctx->f->nn, ctx->f->net,
-						   &ctx->req, ctx->bundle);
-	complete(&ctx->done);
-	/*
-	 * Parked rather than returned from, so that the test joins this
-	 * thread with kthread_stop() and nothing the thread read is freed
-	 * before it has.  Nothing signals this thread; the join is what ends
-	 * it.
-	 */
-	nfsd_ffv2_test_thread_park();
-	return 0;
-}
-
-static void nfsd_ffv2_prototype_publish_window_test(struct kunit *test)
-{
-	struct nfsd_ffv2_proto_register_ctx *ctx;
-	struct nfsd_ffv2_generation *generation;
-	static const u8 unpublished[16] = { 0 };
-	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
-	struct nfsd_ffv2_proto_fixture *f;
-	struct completion reached, proceed;
-	struct task_struct *task;
-	bool counted = false;
-	u64 expires = 0;
-
-	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
-	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, ctx);
-	KUNIT_ASSERT_NOT_NULL(test, f);
-	ctx->bundle = kunit_kzalloc(test, sizeof(*ctx->bundle), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, ctx->bundle);
-	if (!nfsd_ffv2_proto_fixture_init(test, f))
-		goto out;
-
-	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
-	f->enabled = true;
-	KUNIT_ASSERT_EQ(test, 0,
-			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
-						      &expires));
-	nfsd_ffv2_proto_request(&ctx->req, nonce);
-	ctx->f = f;
-	init_completion(&ctx->done);
-	init_completion(&reached);
-	init_completion(&proceed);
-	nfsd_ffv2_prototype_test_publish_hook(&reached, &proceed);
-
-	task = kthread_run(nfsd_ffv2_proto_register_thread, ctx,
-			   "ffv2-proto-reg");
-	if (IS_ERR(task)) {
-		KUNIT_FAIL(test, "failed to start the registering thread");
-		goto out;
-	}
-	if (!wait_for_completion_timeout(&reached, 30 * HZ)) {
-		KUNIT_FAIL(test, "the registration never reached publication");
-		goto join;
-	}
-
-	/* The generation is already active... */
-	generation = nfsd_ffv2_test_active_generation_get(f->nn);
-	KUNIT_EXPECT_NOT_NULL(test, generation);
-	if (generation)
-		nfsd_ffv2_test_generation_put(generation);
-	/* ...and the gate still refuses every mapping into it. */
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OPEN,
-			nfsd_ffv2_prototype_state_get(f->nn));
-	KUNIT_EXPECT_EQ(test, -ESTALE,
-			nfsd_ffv2_prototype_op_admit(f->nn, &counted));
-	KUNIT_EXPECT_FALSE(test, counted);
-	/*
-	 * An unregister cannot claim the gate here either.  It names the
-	 * registration it expects to find, and this one has not published
-	 * yet, so there is nothing for it to retire and nothing for it to
-	 * take the close role over.
-	 */
-	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
-			nfsd_ffv2_prototype_unregister(f->nn, f->net,
-						       unpublished, 1));
-
-join:
-	complete(&proceed);
-	if (!wait_for_completion_timeout(&ctx->done, 30 * HZ)) {
-		KUNIT_FAIL(test, "the registering thread never returned");
-		wait_for_completion(&ctx->done);
-	}
-	kthread_stop(task);
-
-	KUNIT_EXPECT_EQ(test, 0, ctx->result);
-	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_READY,
-			nfsd_ffv2_prototype_state_get(f->nn));
-	/* And admits one once the registration has finished. */
-	KUNIT_EXPECT_EQ(test, 0,
-			nfsd_ffv2_prototype_op_admit(f->nn, &counted));
-	KUNIT_EXPECT_TRUE(test, counted);
-	if (counted)
-		nfsd_ffv2_prototype_op_release(f->nn);
-out:
-	nfsd_ffv2_proto_fixture_exit(f);
-}
 
 /*
  * A registration must not wait for the access its own handle holds.
@@ -11782,6 +11671,17 @@ static int nfsd_ffv2_proto_access_thread(void *data)
 						     &work->ctx.req,
 						     &work->bundle);
 	complete_all(&work->ctx.done);
+	nfsd_ffv2_proto_worker_end(work);
+	return 0;
+}
+
+static int nfsd_ffv2_proto_close_thread(void *data)
+{
+	struct nfsd_ffv2_proto_access_work *work = data;
+
+	work->closer.result = nfsd_ffv2_prototype_disable(work->closer.nn,
+							  work->closer.net);
+	complete_all(&work->closer.done);
 	nfsd_ffv2_proto_worker_end(work);
 	return 0;
 }
@@ -12345,6 +12245,100 @@ out:
 }
 
 /*
+ * The interval between a registration publishing its generation and the
+ * gate reaching READY.
+ *
+ * The generation is active inside it -- publication is what makes it
+ * active -- so the only thing keeping an operation out is the gate's own
+ * final transition.  This holds a registration open in exactly that
+ * interval and asks the production admission predicate what it would say
+ * about a mapping arriving there.
+ *
+ * The registration is held there by a process-global publish hook armed
+ * with completions, so both of them live in the arena: a worker this test
+ * could not join would otherwise be left completing a dead stack.
+ */
+static void nfsd_ffv2_prototype_publish_window_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_access_work *work;
+	struct nfsd_ffv2_proto_register_ctx *ctx;
+	struct nfsd_ffv2_generation *generation;
+	static const u8 unpublished[16] = { 0 };
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct nfsd_ffv2_proto_fixture *f;
+	bool counted = false;
+	u64 expires = 0;
+
+	work = nfsd_ffv2_proto_access_begin(test);
+	if (!work)
+		return;
+	f = &work->fixture;
+	ctx = &work->ctx;
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	nfsd_ffv2_proto_request(&ctx->req, nonce);
+	nfsd_ffv2_prototype_test_publish_hook(&work->reached, &work->proceed);
+	work->publish_hooked = true;
+
+	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
+					  &work->task, "ffv2-proto-reg")) {
+		KUNIT_FAIL(test, "failed to start the registering thread");
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&work->reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the registration never reached publication");
+		goto out;
+	}
+
+	/* The generation is already active... */
+	generation = nfsd_ffv2_test_active_generation_get(f->nn);
+	KUNIT_EXPECT_NOT_NULL(test, generation);
+	if (generation)
+		nfsd_ffv2_test_generation_put(generation);
+	/* ...and the gate still refuses every mapping into it. */
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OPEN,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	KUNIT_EXPECT_EQ(test, -ESTALE,
+			nfsd_ffv2_prototype_op_admit(f->nn, &counted));
+	KUNIT_EXPECT_FALSE(test, counted);
+	/*
+	 * An unregister cannot claim the gate here either.  It names the
+	 * registration it expects to find, and this one has not published
+	 * yet, so there is nothing for it to retire and nothing for it to
+	 * take the close role over.
+	 */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_prototype_unregister(f->nn, f->net,
+						       unpublished, 1));
+
+	complete_all(&work->proceed);
+	if (!wait_for_completion_timeout(&ctx->done, 30 * HZ)) {
+		KUNIT_FAIL(test, "the registering thread never returned");
+		goto out;
+	}
+	kthread_stop_put(work->task);
+	work->task = NULL;
+
+	KUNIT_EXPECT_EQ(test, 0, ctx->result);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_READY,
+			nfsd_ffv2_prototype_state_get(f->nn));
+	/* And admits one once the registration has finished. */
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_op_admit(f->nn, &counted));
+	KUNIT_EXPECT_TRUE(test, counted);
+	if (counted)
+		nfsd_ffv2_prototype_op_release(f->nn);
+out:
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_access_finish(test, work));
+}
+
+/*
  * Two challenges reaping the same expired records at once.
  *
  * The reaper walks a table another challenge may be erasing from, and what
@@ -12477,28 +12471,23 @@ out:
  */
 static void nfsd_ffv2_prototype_publish_close_race_test(struct kunit *test)
 {
+	struct nfsd_ffv2_proto_access_work *work;
 	struct nfsd_ffv2_proto_register_ctx *ctx;
-	struct nfsd_ffv2_prototype_call_ctx *closer;
 	struct nfsd_ffv2_generation *generation;
 	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
-	struct task_struct *task, *close_task;
 	struct nfsd_ffv2_ro_provider *spare;
 	struct nfsd_ffv2_proto_fixture *f;
-	struct completion reached, proceed;
 	u64 expires = 0;
 	bool closing;
 
-	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
-	closer = kunit_kzalloc(test, sizeof(*closer), GFP_KERNEL);
-	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, ctx);
-	KUNIT_ASSERT_NOT_NULL(test, closer);
-	KUNIT_ASSERT_NOT_NULL(test, f);
-	ctx->bundle = kunit_kzalloc(test, sizeof(*ctx->bundle), GFP_KERNEL);
 	spare = kunit_kzalloc(test, sizeof(*spare), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, ctx->bundle);
 	KUNIT_ASSERT_NOT_NULL(test, spare);
 	nfsd_ffv2_ro_provider_init(spare);
+	work = nfsd_ffv2_proto_access_begin(test);
+	if (!work)
+		return;
+	f = &work->fixture;
+	ctx = &work->ctx;
 	if (!nfsd_ffv2_proto_fixture_init(test, f))
 		goto out;
 
@@ -12508,52 +12497,52 @@ static void nfsd_ffv2_prototype_publish_close_race_test(struct kunit *test)
 			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
 						      &expires));
 	/* A bundle the registration must not fill in. */
-	memset(ctx->bundle, 0xa5, sizeof(*ctx->bundle));
+	memset(&work->bundle, 0xa5, sizeof(work->bundle));
 	nfsd_ffv2_proto_request(&ctx->req, nonce);
-	ctx->f = f;
-	init_completion(&ctx->done);
-	init_completion(&closer->done);
-	init_completion(&reached);
-	init_completion(&proceed);
-	closer->nn = f->nn;
-	closer->net = f->net;
-	nfsd_ffv2_prototype_test_publish_hook(&reached, &proceed);
+	work->closer.nn = f->nn;
+	work->closer.net = f->net;
+	nfsd_ffv2_prototype_test_publish_hook(&work->reached, &work->proceed);
+	work->publish_hooked = true;
 
-	task = kthread_run(nfsd_ffv2_proto_register_thread, ctx,
-			   "ffv2-proto-reg");
-	if (IS_ERR(task)) {
+	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
+					  &work->task, "ffv2-proto-reg")) {
 		KUNIT_FAIL(test, "failed to start the registering thread");
 		goto out;
 	}
-	if (!wait_for_completion_timeout(&reached, 30 * HZ)) {
+	if (!wait_for_completion_timeout(&work->reached, 30 * HZ)) {
 		KUNIT_FAIL(test, "the registration never reached publication");
-		goto join;
+		goto out;
 	}
-	close_task = kthread_run(nfsd_ffv2_prototype_disable_thread, closer,
-				 "ffv2-proto-close");
-	if (IS_ERR(close_task)) {
+	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_close_thread,
+					  &work->close_task,
+					  "ffv2-proto-close")) {
 		KUNIT_FAIL(test, "failed to start the closing thread");
-		goto join;
+		goto out;
 	}
 	/* The close role is claimed while the registration is still inside. */
 	closing = nfsd_ffv2_prototype_wait_state(f->nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
 
-	complete(&proceed);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&ctx->done, 60 * HZ) != 0);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&closer->done,
-						      60 * HZ) != 0);
-	kthread_stop(task);
-	kthread_stop(close_task);
+	complete_all(&work->proceed);
+	if (!wait_for_completion_timeout(&ctx->done, 60 * HZ)) {
+		KUNIT_FAIL(test, "the registering thread never returned");
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&work->closer.done, 60 * HZ)) {
+		KUNIT_FAIL(test, "the closing thread never returned");
+		goto out;
+	}
+	kthread_stop_put(work->task);
+	work->task = NULL;
+	kthread_stop_put(work->close_task);
+	work->close_task = NULL;
 
 	/* The registration published nothing and said so. */
 	KUNIT_EXPECT_EQ(test, -EBUSY, ctx->result);
-	KUNIT_EXPECT_EQ(test, 0, closer->result);
-	KUNIT_EXPECT_EQ(test, 0xa5, ctx->bundle->handle[0]);
-	KUNIT_EXPECT_EQ(test, 0xa5a5a5a5u, ctx->bundle->handle_len);
+	KUNIT_EXPECT_EQ(test, 0, work->closer.result);
+	KUNIT_EXPECT_EQ(test, 0xa5, work->bundle.handle[0]);
+	KUNIT_EXPECT_EQ(test, 0xa5a5a5a5u, work->bundle.handle_len);
 	/* The close owner finished, and took the generation with it. */
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(f->nn));
@@ -12577,14 +12566,8 @@ static void nfsd_ffv2_prototype_publish_close_race_test(struct kunit *test)
 							spare,
 							NFSD_FFV2_RO_CHUNK_SIZE));
 	nfsd_ffv2_test_provider_remove(f->nn);
-	goto out;
-
-join:
-	complete(&proceed);
-	wait_for_completion(&ctx->done);
-	kthread_stop(task);
 out:
-	nfsd_ffv2_proto_fixture_exit(f);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_access_finish(test, work));
 }
 
 /*
