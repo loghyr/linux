@@ -1174,63 +1174,91 @@ static const char * const bundle_keys[] = {
 	"CHUNK_SIZE",
 };
 
-static bool bundle_key_known(const char *key, size_t len)
+/*
+ * Which key a line names, or -1 for none of them.  The length is compared
+ * before the bytes, so a key longer than any this client knows is refused
+ * by its length and nothing is read past the end of a literal to find that
+ * out.
+ */
+static int bundle_key_index(const char *key, size_t len)
 {
 	size_t i;
 
 	for (i = 0; i < ARRAY_SIZE(bundle_keys); i++)
-		if (!strncmp(key, bundle_keys[i], len) &&
-		    !bundle_keys[i][len])
-			return true;
-	return false;
+		if (strlen(bundle_keys[i]) == len &&
+		    !memcmp(key, bundle_keys[i], len))
+			return (int)i;
+	return -1;
 }
 
 /*
- * Check the snapshot before anything reads a value out of it: every line
- * is "KNOWN_KEY=value", no key appears twice, and no value is empty.
+ * Check the snapshot before anything reads a value out of it.
+ *
+ * The grammar is the one the control tool writes and nothing wider: a
+ * whole number of "KNOWN_KEY=value\n" records, each key known, each key
+ * once, each value non-empty, and every key this client knows present.
+ * The writer emits all of them and renames the file into place afterwards,
+ * so a snapshot missing a record or a final newline is a snapshot that was
+ * not written by a registration that finished, and is refused rather than
+ * read.  No key is conditional; a field that ever becomes optional has to
+ * say so here.
  */
 static bool bundle_well_formed(const struct bundle *b, const char **why)
 {
 	unsigned int seen[ARRAY_SIZE(bundle_keys)] = {};
 	const char *p = b->text;
+	size_t i;
 
 	while (*p) {
 		const char *eol = strchr(p, '\n');
-		size_t line = eol ? (size_t)(eol - p) : strlen(p);
-		const char *eq = memchr(p, '=', line);
-		size_t klen, i;
+		const char *eq;
+		size_t line, klen;
+		int key;
 
+		if (!eol) {
+			*why = "the bundle's last line is not terminated";
+			return false;
+		}
+		line = (size_t)(eol - p);
 		if (!line) {
 			*why = "a bundle line is empty";
 			return false;
 		}
+		eq = memchr(p, '=', line);
 		if (!eq) {
 			*why = "a bundle line has no value";
 			return false;
 		}
 		klen = (size_t)(eq - p);
-		if (!klen || (eol ? (size_t)(eol - eq) : strlen(eq)) < 2) {
+		if (!klen || (size_t)(eol - eq) < 2) {
 			*why = "a bundle line has an empty key or value";
 			return false;
 		}
-		if (!bundle_key_known(p, klen)) {
+		key = bundle_key_index(p, klen);
+		if (key < 0) {
 			*why = "the bundle carries a key this client does not know";
 			return false;
 		}
-		for (i = 0; i < ARRAY_SIZE(bundle_keys); i++)
-			if (!strncmp(p, bundle_keys[i], klen) &&
-			    !bundle_keys[i][klen] && seen[i]++) {
-				*why = "the bundle carries a key twice";
-				return false;
-			}
-		if (!eol)
-			break;
+		if (seen[key]++) {
+			*why = "the bundle carries a key twice";
+			return false;
+		}
 		p = eol + 1;
 	}
+	for (i = 0; i < ARRAY_SIZE(bundle_keys); i++)
+		if (!seen[i]) {
+			*why = "the bundle is missing a key this client requires";
+			return false;
+		}
 	return true;
 }
 
-/* One "KEY=value" line out of the snapshot. */
+/*
+ * One "KEY=value" line out of the snapshot.  Terminated records only, for
+ * the same reason the grammar above requires them: this also runs before
+ * the grammar has been checked, when a directory is being watched for this
+ * run's registration to appear in it.
+ */
 static bool bundle_value(const struct bundle *b, const char *key, char *out,
 			 size_t out_size)
 {
@@ -1239,8 +1267,11 @@ static bool bundle_value(const struct bundle *b, const char *key, char *out,
 
 	while (*p) {
 		const char *eol = strchr(p, '\n');
-		size_t line = eol ? (size_t)(eol - p) : strlen(p);
+		size_t line;
 
+		if (!eol)
+			break;
+		line = (size_t)(eol - p);
 		if (line > klen && !strncmp(p, key, klen) && p[klen] == '=') {
 			size_t vlen = line - klen - 1;
 
@@ -1251,8 +1282,6 @@ static bool bundle_value(const struct bundle *b, const char *key, char *out,
 			out[strcspn(out, "\r")] = '\0';
 			return true;
 		}
-		if (!eol)
-			break;
 		p = eol + 1;
 	}
 	return false;
