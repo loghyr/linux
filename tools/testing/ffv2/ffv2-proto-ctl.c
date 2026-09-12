@@ -25,6 +25,7 @@
 #include <linux/genetlink.h>
 #include <linux/netlink.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #include <linux/nfsd_netlink.h>
 
@@ -204,7 +205,14 @@ static void nl_open(struct ffv2_nl *nl)
 	if (!nla)
 		die("no %s generic-netlink family; is nfsd loaded?",
 		    NFSD_FAMILY_NAME);
-	nl->family = *(const uint16_t *)nl_data(nla, &attrlen);
+	{
+		const void *value = nl_data(nla, &attrlen);
+
+		if (attrlen != sizeof(nl->family))
+			die("family id is %zu bytes, not %zu", attrlen,
+			    sizeof(nl->family));
+		memcpy(&nl->family, value, sizeof(nl->family));
+	}
 }
 
 static void cmd_enable(struct ffv2_nl *nl)
@@ -356,19 +364,27 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 
 	if (bundle_path) {
 		char staged[512];
+		int fd;
 
 		/*
 		 * Written beside the bundle and renamed onto it, so a reader
 		 * sees either the previous registration or this complete one
-		 * and never a half-written file.  The run token is what tells
-		 * the reader which of the two it has.
+		 * and never a half-written file.  The staging name is unique,
+		 * so two writers cannot stage over each other, and the run
+		 * token is what tells a reader which registration it has.
 		 */
-		if ((size_t)snprintf(staged, sizeof(staged), "%s.staged",
+		if ((size_t)snprintf(staged, sizeof(staged), "%s.XXXXXX",
 				     bundle_path) >= sizeof(staged))
 			die("bundle path is too long");
-		bundle = fopen(staged, "w");
-		if (!bundle)
+		fd = mkstemp(staged);
+		if (fd < 0)
+			die("cannot stage %s: %s", staged, strerror(errno));
+		bundle = fdopen(fd, "w");
+		if (!bundle) {
+			close(fd);
+			unlink(staged);
 			die("cannot write %s: %s", staged, strerror(errno));
+		}
 		fprintf(bundle, "RUN=%s\n", run ? run : "");
 		bundle_hex(bundle, "MAPPED_HANDLE", mapped, mapped_len);
 		bundle_hex(bundle, "STATEID", wire, sizeof(wire));
@@ -376,13 +392,24 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 		fprintf(bundle, "GENERATION=%llu\n",
 			(unsigned long long)generation);
 		fprintf(bundle, "CHUNK_SIZE=%u\n", chunk_size);
-		if (fflush(bundle) || fsync(fileno(bundle)))
+		if (fflush(bundle) || fsync(fileno(bundle))) {
+			unlink(staged);
 			die("cannot flush %s: %s", staged, strerror(errno));
-		if (fclose(bundle))
+		}
+		if (fchmod(fileno(bundle), 0644)) {
+			unlink(staged);
+			die("cannot set the mode of %s: %s", staged,
+			    strerror(errno));
+		}
+		if (fclose(bundle)) {
+			unlink(staged);
 			die("cannot complete %s: %s", staged, strerror(errno));
-		if (rename(staged, bundle_path))
+		}
+		if (rename(staged, bundle_path)) {
+			unlink(staged);
 			die("cannot publish %s: %s", bundle_path,
 			    strerror(errno));
+		}
 		printf("PROTO-BUNDLE=%s\n", bundle_path);
 	}
 	printf("PROTO-REGISTER=ok\n");
