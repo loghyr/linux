@@ -11661,20 +11661,46 @@ out:
  * is released.  If the registration kept its own access it would never
  * complete, and the bounded wait below reports that rather than hanging.
  */
+/*
+ * What the armed-access test must undo however it ends.  The hook is
+ * process-global and every other fixture expects it clear, and an export
+ * access this test is holding would keep a later transition waiting, so
+ * both are released from a KUnit action rather than from a label an
+ * aborting assertion would skip.
+ */
+struct nfsd_ffv2_proto_access_ctx {
+	struct svc_export	*exp;
+	bool			held;
+};
+
+static void nfsd_ffv2_proto_access_release(void *data)
+{
+	struct nfsd_ffv2_proto_access_ctx *held = data;
+
+	nfsd_ffv2_prototype_test_access_hook(false);
+	if (held->held) {
+		nfsd_ffv2_export_access_put(held->exp);
+		held->held = false;
+	}
+}
+
 static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 {
+	struct nfsd_ffv2_proto_access_ctx *held;
 	struct nfsd_ffv2_proto_register_ctx *ctx;
 	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
 	struct nfsd_ffv2_proto_fixture *f;
 	struct task_struct *task = NULL;
-	bool reader = false, joined = false;
 	unsigned long deadline;
+	bool joined = false;
 	u64 expires = 0;
 
 	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	held = kunit_kzalloc(test, sizeof(*held), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ctx);
 	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, held);
 	ctx->bundle = kunit_kzalloc(test, sizeof(*ctx->bundle), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, ctx->bundle);
 	if (!nfsd_ffv2_proto_fixture_init(test, f))
@@ -11690,10 +11716,19 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 	init_completion(&ctx->done);
 
 	/* The resolve now claims an access, as the production one does. */
+	held->exp = f->seeded;
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_access_release,
+				      held)) {
+		KUNIT_FAIL(test, "failed to register the release action");
+		goto out;
+	}
 	nfsd_ffv2_prototype_test_access_hook(true);
 	/* And one more, standing in for a reader the registration must wait for. */
-	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_export_access_get(f->seeded));
-	reader = true;
+	if (nfsd_ffv2_export_access_get(f->seeded)) {
+		KUNIT_FAIL(test, "the fixture export refused an access");
+		goto out;
+	}
+	held->held = true;
 
 	task = kthread_run(nfsd_ffv2_proto_register_thread, ctx,
 			   "ffv2-proto-access");
@@ -11718,7 +11753,7 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 			wait_for_completion_timeout(&ctx->done, HZ / 4));
 
 	nfsd_ffv2_export_access_put(f->seeded);
-	reader = false;
+	held->held = false;
 	joined = wait_for_completion_timeout(&ctx->done, 30 * HZ);
 	KUNIT_EXPECT_TRUE(test, joined);
 	if (!joined)
@@ -11733,9 +11768,6 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 							       ctx->bundle->generation));
 	f->enabled = false;
 out:
-	if (reader)
-		nfsd_ffv2_export_access_put(f->seeded);
-	nfsd_ffv2_prototype_test_access_hook(false);
 	/*
 	 * The thread is joined only when its completion was observed: a
 	 * registration that kept its own access would never return, and this
