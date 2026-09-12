@@ -203,6 +203,24 @@ void nfsd_ffv2_prototype_test_publish_hook(struct completion *reached,
 }
 
 /*
+ * Take the hook down, but only the arming @reached names.
+ *
+ * The hook is process-global and the completions it points at belong to
+ * whichever test armed it.  A test taking its own arming down may be doing
+ * so after the registration consumed it, or after another fixture replaced
+ * it; in both of those the current arming is not this one and is left
+ * alone.  Returns whether this arming was the one cleared.
+ */
+bool nfsd_ffv2_prototype_test_publish_hook_disarm(struct completion *reached)
+{
+	if (!reached || READ_ONCE(nfsd_ffv2_prototype_publish_reached) != reached)
+		return false;
+	WRITE_ONCE(nfsd_ffv2_prototype_publish_reached, NULL);
+	WRITE_ONCE(nfsd_ffv2_prototype_publish_proceed, NULL);
+	return true;
+}
+
+/*
  * The gap between a superseded enable registering its wait and consuming
  * it.  A test stops there to ask whether a new enable can start a cycle
  * this caller would then be carried into.
@@ -1036,15 +1054,23 @@ static size_t nfsd_ffv2_prototype_test_sampled;
  * is how a test reproduces a file that shrank between the two, which is
  * the one case a real read can hit and this environment otherwise cannot.
  * Zero means the two agree.
+ *
+ * Returns a number naming this arming of the hook, so that a caller which
+ * has to take its own arming down later can say which one it means.  Zero
+ * is never a live arming.
  */
-void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
-					  struct dentry *dentry,
-					  const u8 *inner, u16 inner_len,
-					  const void *bytes, size_t len,
-					  size_t sampled)
+static u64 nfsd_ffv2_prototype_test_object_arming;
+
+u64 nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
+					 struct dentry *dentry,
+					 const u8 *inner, u16 inner_len,
+					 const void *bytes, size_t len,
+					 size_t sampled)
 {
+	u64 arming;
+
 	if (inner_len > sizeof(nfsd_ffv2_prototype_test_inner))
-		return;
+		return 0;
 	if (inner_len)
 		memcpy(nfsd_ffv2_prototype_test_inner, inner, inner_len);
 	nfsd_ffv2_prototype_test_inner_len = inner_len;
@@ -1052,8 +1078,35 @@ void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
 	nfsd_ffv2_prototype_test_len = len;
 	nfsd_ffv2_prototype_test_sampled = sampled ?: len;
 	nfsd_ffv2_prototype_test_dentry = dentry;
+	arming = READ_ONCE(nfsd_ffv2_prototype_test_object_arming) + 1;
+	WRITE_ONCE(nfsd_ffv2_prototype_test_object_arming, arming);
 	/* Last: the others are read only once this one is set. */
 	WRITE_ONCE(nfsd_ffv2_prototype_test_exp, exp);
+	return arming;
+}
+
+/*
+ * Take the object hook down, but only the arming @arming names.
+ *
+ * The bytes the hook points at belong to whoever armed it, and a test that
+ * has to disarm after its own fixture is beyond its reach may be doing so
+ * after another fixture armed the hook for itself.  Naming the arming is
+ * what keeps this from taking that one down.  Returns whether this arming
+ * was the one cleared.
+ */
+bool nfsd_ffv2_prototype_test_object_hook_disarm(u64 arming)
+{
+	if (!arming ||
+	    READ_ONCE(nfsd_ffv2_prototype_test_object_arming) != arming)
+		return false;
+	nfsd_ffv2_prototype_test_object_hook(NULL, NULL, NULL, 0, NULL, 0, 0);
+	return true;
+}
+
+/* Whether any arming of the object hook is in force. */
+bool nfsd_ffv2_prototype_test_object_hook_armed(void)
+{
+	return READ_ONCE(nfsd_ffv2_prototype_test_exp);
 }
 
 /*

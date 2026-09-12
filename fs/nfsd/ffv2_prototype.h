@@ -188,6 +188,7 @@ void nfsd_ffv2_prototype_test_setup_hook(struct completion *reached,
 					 struct completion *proceed);
 void nfsd_ffv2_prototype_test_publish_hook(struct completion *reached,
 					   struct completion *proceed);
+bool nfsd_ffv2_prototype_test_publish_hook_disarm(struct completion *reached);
 void nfsd_ffv2_prototype_test_supersede_hook(struct completion *reached,
 					     struct completion *proceed);
 void nfsd_ffv2_prototype_test_close_hooks(struct completion *entered_reached,
@@ -195,11 +196,13 @@ void nfsd_ffv2_prototype_test_close_hooks(struct completion *entered_reached,
 					  struct completion *published_reached,
 					  struct completion *published_proceed);
 void nfsd_ffv2_prototype_test_access_hook(bool claim);
-void nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
-					  struct dentry *dentry,
-					  const u8 *inner, u16 inner_len,
-					  const void *bytes, size_t len,
-					  size_t sampled);
+u64 nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
+					 struct dentry *dentry,
+					 const u8 *inner, u16 inner_len,
+					 const void *bytes, size_t len,
+					 size_t sampled);
+bool nfsd_ffv2_prototype_test_object_hook_disarm(u64 arming);
+bool nfsd_ffv2_prototype_test_object_hook_armed(void);
 int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 					 const struct net *net,
 					 const u8 *nonce);
