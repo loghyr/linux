@@ -3,6 +3,7 @@
 #define _NFSD_FFV2_PROTOTYPE_H
 
 #include <linux/completion.h>
+#include <linux/refcount.h>
 #include <linux/nfs4.h>
 #include <linux/time64.h>
 #include <linux/uidgid.h>
@@ -184,25 +185,61 @@ int nfsd_ffv2_prototype_disable(struct nfsd_net *nn, const struct net *net);
 enum nfsd_ffv2_prototype_state
 nfsd_ffv2_prototype_state_get(struct nfsd_net *nn);
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
-void nfsd_ffv2_prototype_test_setup_hook(struct completion *reached,
-					 struct completion *proceed);
-void nfsd_ffv2_prototype_test_publish_hook(struct completion *reached,
-					   struct completion *proceed);
-bool nfsd_ffv2_prototype_test_publish_hook_disarm(struct completion *reached);
-void nfsd_ffv2_prototype_test_supersede_hook(struct completion *reached,
-					     struct completion *proceed);
-void nfsd_ffv2_prototype_test_close_hooks(struct completion *entered_reached,
-					  struct completion *entered_proceed,
-					  struct completion *published_reached,
-					  struct completion *published_proceed);
-void nfsd_ffv2_prototype_test_access_hook(bool claim);
-u64 nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
-					 struct dentry *dentry,
-					 const u8 *inner, u16 inner_len,
-					 const void *bytes, size_t len,
-					 size_t sampled);
-bool nfsd_ffv2_prototype_test_object_hook_disarm(u64 arming);
-bool nfsd_ffv2_prototype_test_object_hook_armed(void);
+/*
+ * The intervals a test can hold a caller at.  Each slot holds at most one
+ * arming, and an arming is a record rather than a pair of pointers so that
+ * arming it, taking it back down and consuming it can be one protocol.
+ */
+enum nfsd_ffv2_prototype_test_pause_site {
+	NFSD_FFV2_PAUSE_SETUP,
+	NFSD_FFV2_PAUSE_PUBLISH,
+	NFSD_FFV2_PAUSE_SUPERSEDE,
+	NFSD_FFV2_PAUSE_ENTERED,
+	NFSD_FFV2_PAUSE_PUBLISHED,
+	NFSD_FFV2_PAUSE_SITES,
+};
+
+struct nfsd_ffv2_prototype_test_pause {
+	refcount_t		ref;
+	struct completion	reached;
+	struct completion	proceed;
+};
+
+struct nfsd_ffv2_prototype_test_pause *
+nfsd_ffv2_prototype_test_pause_arm(enum nfsd_ffv2_prototype_test_pause_site site);
+bool nfsd_ffv2_prototype_test_pause_disarm(enum nfsd_ffv2_prototype_test_pause_site site,
+					   struct nfsd_ffv2_prototype_test_pause *pause);
+void nfsd_ffv2_prototype_test_pause_put(struct nfsd_ffv2_prototype_test_pause *pause);
+
+/*
+ * The substituted object, as one immutable record.  A consumer takes a
+ * reference before it reads any of it and holds that reference past its
+ * last use, so what it reads is one arming's and the storage it is in
+ * cannot go underneath it.
+ */
+struct nfsd_ffv2_prototype_test_object {
+	refcount_t		ref;
+	struct svc_export	*exp;
+	struct dentry		*dentry;
+	size_t			len;
+	size_t			sampled;
+	u16			inner_len;
+	bool			claim;
+	u8			inner[NFS4_FHSIZE];
+	u8			bytes[];
+};
+
+struct nfsd_ffv2_prototype_test_object *
+nfsd_ffv2_prototype_test_object_arm(struct svc_export *exp,
+				    struct dentry *dentry,
+				    const u8 *inner, u16 inner_len,
+				    const void *bytes, size_t len,
+				    size_t sampled, bool claim);
+bool nfsd_ffv2_prototype_test_object_disarm(struct nfsd_ffv2_prototype_test_object *obj);
+void nfsd_ffv2_prototype_test_object_put(struct nfsd_ffv2_prototype_test_object *obj);
+struct nfsd_ffv2_prototype_test_object *
+nfsd_ffv2_prototype_test_object_acquire(void);
+bool nfsd_ffv2_prototype_test_object_armed(void);
 int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 					 const struct net *net,
 					 const u8 *nonce);

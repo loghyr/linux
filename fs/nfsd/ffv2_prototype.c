@@ -153,175 +153,141 @@ static struct nfsd_ffv2_prototype *nfsd_ffv2_prototype_of(struct nfsd_net *nn)
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 /*
- * A one-shot pause inside the enabling caller's sleepable setup.  The
- * ENABLING interval is the whole point of the state, and it is otherwise
- * too short to race against deterministically: this lets a test hold an
- * enable there while another thread closes the gate or exits the
- * namespace.  Armed by the test that uses it and consumed once.
+ * The one-shot pauses a test can hold a caller at.
+ *
+ * Each names an interval the design turns on and which is otherwise far
+ * too short to enter deliberately: the enabling caller's sleepable setup,
+ * the gap between a registration publishing its generation and reaching
+ * READY, the gap between a superseded enable registering its wait and
+ * consuming it, and two points inside a close -- before the owner drains
+ * anything, where a second closer can still arrive, and after the gate
+ * reads off but before the completion that says so is signalled.
+ *
+ * Every slot below is process-global, and what a pause completes belongs
+ * to whichever test armed it.  Arming, taking an arming down and consuming
+ * one are therefore a single protocol rather than three sets of stores:
+ * the record is immutable and refcounted, a consumer takes a reference
+ * before it reads anything and holds it past its last use, and a test
+ * taking its own arming down does so under the lock that decides which
+ * arming is current -- so it cannot take down one that replaced it, and a
+ * consumer cannot be left reading a record that has gone.
  */
-static struct completion *nfsd_ffv2_prototype_setup_reached;
-static struct completion *nfsd_ffv2_prototype_setup_proceed;
+static DEFINE_SPINLOCK(nfsd_ffv2_prototype_test_hook_lock);
+static struct nfsd_ffv2_prototype_test_pause
+	*nfsd_ffv2_prototype_test_pauses[NFSD_FFV2_PAUSE_SITES];
 
-void nfsd_ffv2_prototype_test_setup_hook(struct completion *reached,
-					 struct completion *proceed)
+void nfsd_ffv2_prototype_test_pause_put(struct nfsd_ffv2_prototype_test_pause *pause)
 {
-	WRITE_ONCE(nfsd_ffv2_prototype_setup_proceed, proceed);
-	WRITE_ONCE(nfsd_ffv2_prototype_setup_reached, reached);
+	if (pause && refcount_dec_and_test(&pause->ref))
+		kfree(pause);
+}
+
+/*
+ * Arm @site, and hand back the arming with a reference of the caller's
+ * own: it is what the caller waits on, and it is what the caller names to
+ * take this arming and no other back down.
+ */
+struct nfsd_ffv2_prototype_test_pause *
+nfsd_ffv2_prototype_test_pause_arm(enum nfsd_ffv2_prototype_test_pause_site site)
+{
+	struct nfsd_ffv2_prototype_test_pause *pause, *old;
+
+	if (site >= NFSD_FFV2_PAUSE_SITES)
+		return NULL;
+	pause = kzalloc_obj(*pause, GFP_KERNEL);
+	if (!pause)
+		return NULL;
+	/* One for the caller and one for the slot. */
+	refcount_set(&pause->ref, 2);
+	init_completion(&pause->reached);
+	init_completion(&pause->proceed);
+
+	spin_lock(&nfsd_ffv2_prototype_test_hook_lock);
+	old = nfsd_ffv2_prototype_test_pauses[site];
+	nfsd_ffv2_prototype_test_pauses[site] = pause;
+	spin_unlock(&nfsd_ffv2_prototype_test_hook_lock);
+	nfsd_ffv2_prototype_test_pause_put(old);
+	return pause;
+}
+
+/*
+ * Take @pause out of @site, and only if it is still what @site holds.  The
+ * comparison and the store are the same critical section, so an arming
+ * that replaced it between the two is not the one taken out.  Returns
+ * whether this arming was the one removed; the caller's own reference is
+ * its to put either way.
+ */
+bool nfsd_ffv2_prototype_test_pause_disarm(enum nfsd_ffv2_prototype_test_pause_site site,
+					   struct nfsd_ffv2_prototype_test_pause *pause)
+{
+	bool taken = false;
+
+	if (!pause || site >= NFSD_FFV2_PAUSE_SITES)
+		return false;
+	spin_lock(&nfsd_ffv2_prototype_test_hook_lock);
+	if (nfsd_ffv2_prototype_test_pauses[site] == pause) {
+		nfsd_ffv2_prototype_test_pauses[site] = NULL;
+		taken = true;
+	}
+	spin_unlock(&nfsd_ffv2_prototype_test_hook_lock);
+	if (taken)
+		nfsd_ffv2_prototype_test_pause_put(pause);
+	return taken;
+}
+
+/*
+ * Consume one arming of @site, once.
+ *
+ * Whoever takes the arming out of the slot is the one that runs it, so a
+ * second caller arriving here finds nothing, and a test taking its own
+ * arming down concurrently either wins -- and this runs nothing -- or
+ * loses, and this runs an arming the test still holds a reference to.  The
+ * wait is what the pause is for; the test that armed it completes
+ * @proceed on every path it can end on.
+ */
+static void nfsd_ffv2_prototype_test_pause_run(enum nfsd_ffv2_prototype_test_pause_site site)
+{
+	struct nfsd_ffv2_prototype_test_pause *pause;
+
+	spin_lock(&nfsd_ffv2_prototype_test_hook_lock);
+	pause = nfsd_ffv2_prototype_test_pauses[site];
+	if (pause)
+		refcount_inc(&pause->ref);
+	spin_unlock(&nfsd_ffv2_prototype_test_hook_lock);
+	if (!pause)
+		return;
+	if (!nfsd_ffv2_prototype_test_pause_disarm(site, pause)) {
+		nfsd_ffv2_prototype_test_pause_put(pause);
+		return;
+	}
+	complete(&pause->reached);
+	wait_for_completion(&pause->proceed);
+	nfsd_ffv2_prototype_test_pause_put(pause);
 }
 
 static void nfsd_ffv2_prototype_setup_pause(void)
 {
-	struct completion *reached =
-		READ_ONCE(nfsd_ffv2_prototype_setup_reached);
-	struct completion *proceed =
-		READ_ONCE(nfsd_ffv2_prototype_setup_proceed);
-
-	if (!reached)
-		return;
-	WRITE_ONCE(nfsd_ffv2_prototype_setup_reached, NULL);
-	WRITE_ONCE(nfsd_ffv2_prototype_setup_proceed, NULL);
-	complete(reached);
-	if (proceed)
-		wait_for_completion(proceed);
-}
-
-/*
- * The same, for the interval a registration opens between publishing its
- * generation and reaching READY.  That interval is the one thing the
- * design turns on -- a mapping must be refused inside it even though the
- * generation is already active -- and it is otherwise far too short to
- * enter deliberately.
- */
-static struct completion *nfsd_ffv2_prototype_publish_reached;
-static struct completion *nfsd_ffv2_prototype_publish_proceed;
-
-void nfsd_ffv2_prototype_test_publish_hook(struct completion *reached,
-					   struct completion *proceed)
-{
-	WRITE_ONCE(nfsd_ffv2_prototype_publish_proceed, proceed);
-	WRITE_ONCE(nfsd_ffv2_prototype_publish_reached, reached);
-}
-
-/*
- * Take the hook down, but only the arming @reached names.
- *
- * The hook is process-global and the completions it points at belong to
- * whichever test armed it.  A test taking its own arming down may be doing
- * so after the registration consumed it, or after another fixture replaced
- * it; in both of those the current arming is not this one and is left
- * alone.  Returns whether this arming was the one cleared.
- */
-bool nfsd_ffv2_prototype_test_publish_hook_disarm(struct completion *reached)
-{
-	if (!reached || READ_ONCE(nfsd_ffv2_prototype_publish_reached) != reached)
-		return false;
-	WRITE_ONCE(nfsd_ffv2_prototype_publish_reached, NULL);
-	WRITE_ONCE(nfsd_ffv2_prototype_publish_proceed, NULL);
-	return true;
-}
-
-/*
- * The gap between a superseded enable registering its wait and consuming
- * it.  A test stops there to ask whether a new enable can start a cycle
- * this caller would then be carried into.
- */
-static struct completion *nfsd_ffv2_prototype_supersede_reached;
-static struct completion *nfsd_ffv2_prototype_supersede_proceed;
-
-void nfsd_ffv2_prototype_test_supersede_hook(struct completion *reached,
-					     struct completion *proceed)
-{
-	WRITE_ONCE(nfsd_ffv2_prototype_supersede_proceed, proceed);
-	WRITE_ONCE(nfsd_ffv2_prototype_supersede_reached, reached);
-}
-
-/*
- * Two points inside a close, for a test that has to be somewhere specific
- * while another caller acts.  The first is before the owner drains
- * anything, which is where a second closer can still arrive and become a
- * waiter; the second is after the gate reads off and before the completion
- * that says so is signalled, which is the interval a new cycle must not be
- * able to start in.
- */
-static struct completion *nfsd_ffv2_prototype_entered_reached;
-static struct completion *nfsd_ffv2_prototype_entered_proceed;
-static struct completion *nfsd_ffv2_prototype_published_reached;
-static struct completion *nfsd_ffv2_prototype_published_proceed;
-
-void nfsd_ffv2_prototype_test_close_hooks(struct completion *entered_reached,
-					  struct completion *entered_proceed,
-					  struct completion *published_reached,
-					  struct completion *published_proceed)
-{
-	WRITE_ONCE(nfsd_ffv2_prototype_entered_proceed, entered_proceed);
-	WRITE_ONCE(nfsd_ffv2_prototype_published_proceed, published_proceed);
-	WRITE_ONCE(nfsd_ffv2_prototype_published_reached, published_reached);
-	/* Last: the close reaches this one first. */
-	WRITE_ONCE(nfsd_ffv2_prototype_entered_reached, entered_reached);
+	nfsd_ffv2_prototype_test_pause_run(NFSD_FFV2_PAUSE_SETUP);
 }
 
 static void nfsd_ffv2_prototype_entered_pause(void)
 {
-	struct completion *reached =
-		READ_ONCE(nfsd_ffv2_prototype_entered_reached);
-	struct completion *proceed =
-		READ_ONCE(nfsd_ffv2_prototype_entered_proceed);
-
-	if (!reached)
-		return;
-	WRITE_ONCE(nfsd_ffv2_prototype_entered_reached, NULL);
-	WRITE_ONCE(nfsd_ffv2_prototype_entered_proceed, NULL);
-	complete(reached);
-	if (proceed)
-		wait_for_completion(proceed);
+	nfsd_ffv2_prototype_test_pause_run(NFSD_FFV2_PAUSE_ENTERED);
 }
 
 static void nfsd_ffv2_prototype_published_pause(void)
 {
-	struct completion *reached =
-		READ_ONCE(nfsd_ffv2_prototype_published_reached);
-	struct completion *proceed =
-		READ_ONCE(nfsd_ffv2_prototype_published_proceed);
-
-	if (!reached)
-		return;
-	WRITE_ONCE(nfsd_ffv2_prototype_published_reached, NULL);
-	WRITE_ONCE(nfsd_ffv2_prototype_published_proceed, NULL);
-	complete(reached);
-	if (proceed)
-		wait_for_completion(proceed);
+	nfsd_ffv2_prototype_test_pause_run(NFSD_FFV2_PAUSE_PUBLISHED);
 }
 
 static void nfsd_ffv2_prototype_supersede_pause(void)
 {
-	struct completion *reached =
-		READ_ONCE(nfsd_ffv2_prototype_supersede_reached);
-	struct completion *proceed =
-		READ_ONCE(nfsd_ffv2_prototype_supersede_proceed);
-
-	if (!reached)
-		return;
-	WRITE_ONCE(nfsd_ffv2_prototype_supersede_reached, NULL);
-	WRITE_ONCE(nfsd_ffv2_prototype_supersede_proceed, NULL);
-	complete(reached);
-	if (proceed)
-		wait_for_completion(proceed);
+	nfsd_ffv2_prototype_test_pause_run(NFSD_FFV2_PAUSE_SUPERSEDE);
 }
 
 static void nfsd_ffv2_prototype_publish_pause(void)
 {
-	struct completion *reached =
-		READ_ONCE(nfsd_ffv2_prototype_publish_reached);
-	struct completion *proceed =
-		READ_ONCE(nfsd_ffv2_prototype_publish_proceed);
-
-	if (!reached)
-		return;
-	WRITE_ONCE(nfsd_ffv2_prototype_publish_reached, NULL);
-	WRITE_ONCE(nfsd_ffv2_prototype_publish_proceed, NULL);
-	complete(reached);
-	if (proceed)
-		wait_for_completion(proceed);
+	nfsd_ffv2_prototype_test_pause_run(NFSD_FFV2_PAUSE_PUBLISH);
 }
 #else
 static inline void nfsd_ffv2_prototype_setup_pause(void) { }
@@ -1040,116 +1006,159 @@ out_put:
  * it.  Everything on either side of these two steps is the production
  * path; this is the only way to reach it here.
  */
-static struct svc_export *nfsd_ffv2_prototype_test_exp;
-static struct dentry *nfsd_ffv2_prototype_test_dentry;
-static u8 nfsd_ffv2_prototype_test_inner[NFSD_FFV2_FH_INNER_MAX];
-static u16 nfsd_ffv2_prototype_test_inner_len;
-static const void *nfsd_ffv2_prototype_test_bytes;
-static size_t nfsd_ffv2_prototype_test_len;
-static size_t nfsd_ffv2_prototype_test_sampled;
+static struct nfsd_ffv2_prototype_test_object *nfsd_ffv2_prototype_test_object;
+
+void nfsd_ffv2_prototype_test_object_put(struct nfsd_ffv2_prototype_test_object *obj)
+{
+	if (!obj || !refcount_dec_and_test(&obj->ref))
+		return;
+	if (obj->dentry)
+		dput(obj->dentry);
+	if (obj->exp)
+		exp_put(obj->exp);
+	kfree(obj);
+}
 
 /*
+ * Substitute the object, and hand the arming back with a reference of the
+ * caller's own.
+ *
  * @len is what the substituted object can supply and @sampled is what its
  * size looks like when it is measured; passing a @sampled larger than @len
  * is how a test reproduces a file that shrank between the two, which is
  * the one case a real read can hit and this environment otherwise cannot.
- * Zero means the two agree.
+ * Zero means the two agree.  @claim asks the substituted resolve to take
+ * the ordinary export access fh_verify_local() would take, which is off by
+ * default because most fixtures have no use for it.
  *
- * Returns a number naming this arming of the hook, so that a caller which
- * has to take its own arming down later can say which one it means.  Zero
- * is never a live arming.
+ * The arming is immutable and carries everything a consumer reads: copies
+ * of the handle and of the bytes, and references of its own on the export
+ * and the dentry.  So a consumer that has taken a reference on it is
+ * reading one fixture's object and not a mixture of two, and is reading
+ * storage that cannot go while it holds that reference -- including when
+ * the test that armed it has been over for some time.
  */
-static u64 nfsd_ffv2_prototype_test_object_arming;
-
-u64 nfsd_ffv2_prototype_test_object_hook(struct svc_export *exp,
-					 struct dentry *dentry,
-					 const u8 *inner, u16 inner_len,
-					 const void *bytes, size_t len,
-					 size_t sampled)
+struct nfsd_ffv2_prototype_test_object *
+nfsd_ffv2_prototype_test_object_arm(struct svc_export *exp,
+				    struct dentry *dentry,
+				    const u8 *inner, u16 inner_len,
+				    const void *bytes, size_t len,
+				    size_t sampled, bool claim)
 {
-	u64 arming;
+	struct nfsd_ffv2_prototype_test_object *obj, *old;
 
-	if (inner_len > sizeof(nfsd_ffv2_prototype_test_inner))
-		return 0;
+	if (inner_len > sizeof(obj->inner))
+		return NULL;
+	obj = kzalloc(struct_size(obj, bytes, len), GFP_KERNEL);
+	if (!obj)
+		return NULL;
+	/* One for the caller and one for the slot. */
+	refcount_set(&obj->ref, 2);
+	obj->exp = exp ? exp_get(exp) : NULL;
+	obj->dentry = dentry ? dget(dentry) : NULL;
 	if (inner_len)
-		memcpy(nfsd_ffv2_prototype_test_inner, inner, inner_len);
-	nfsd_ffv2_prototype_test_inner_len = inner_len;
-	nfsd_ffv2_prototype_test_bytes = bytes;
-	nfsd_ffv2_prototype_test_len = len;
-	nfsd_ffv2_prototype_test_sampled = sampled ?: len;
-	nfsd_ffv2_prototype_test_dentry = dentry;
-	arming = READ_ONCE(nfsd_ffv2_prototype_test_object_arming) + 1;
-	WRITE_ONCE(nfsd_ffv2_prototype_test_object_arming, arming);
-	/* Last: the others are read only once this one is set. */
-	WRITE_ONCE(nfsd_ffv2_prototype_test_exp, exp);
-	return arming;
+		memcpy(obj->inner, inner, inner_len);
+	obj->inner_len = inner_len;
+	if (len)
+		memcpy(obj->bytes, bytes, len);
+	obj->len = len;
+	obj->sampled = sampled ?: len;
+	obj->claim = claim;
+
+	spin_lock(&nfsd_ffv2_prototype_test_hook_lock);
+	old = nfsd_ffv2_prototype_test_object;
+	nfsd_ffv2_prototype_test_object = obj;
+	spin_unlock(&nfsd_ffv2_prototype_test_hook_lock);
+	nfsd_ffv2_prototype_test_object_put(old);
+	return obj;
 }
 
 /*
- * Take the object hook down, but only the arming @arming names.
- *
- * The bytes the hook points at belong to whoever armed it, and a test that
- * has to disarm after its own fixture is beyond its reach may be doing so
- * after another fixture armed the hook for itself.  Naming the arming is
- * what keeps this from taking that one down.  Returns whether this arming
- * was the one cleared.
+ * Take @obj out of the slot, and only if it is still what the slot holds.
+ * Comparison and store are one critical section, so an arming that
+ * replaced it is not the one taken out.
  */
-bool nfsd_ffv2_prototype_test_object_hook_disarm(u64 arming)
+bool nfsd_ffv2_prototype_test_object_disarm(struct nfsd_ffv2_prototype_test_object *obj)
 {
-	if (!arming ||
-	    READ_ONCE(nfsd_ffv2_prototype_test_object_arming) != arming)
+	bool taken = false;
+
+	if (!obj)
 		return false;
-	nfsd_ffv2_prototype_test_object_hook(NULL, NULL, NULL, 0, NULL, 0, 0);
-	return true;
-}
-
-/* Whether any arming of the object hook is in force. */
-bool nfsd_ffv2_prototype_test_object_hook_armed(void)
-{
-	return READ_ONCE(nfsd_ffv2_prototype_test_exp);
+	spin_lock(&nfsd_ffv2_prototype_test_hook_lock);
+	if (nfsd_ffv2_prototype_test_object == obj) {
+		nfsd_ffv2_prototype_test_object = NULL;
+		taken = true;
+	}
+	spin_unlock(&nfsd_ffv2_prototype_test_hook_lock);
+	if (taken)
+		nfsd_ffv2_prototype_test_object_put(obj);
+	return taken;
 }
 
 /*
- * Whether the substituted resolve should claim an ordinary export access
- * the way fh_verify_local() does for a real filehandle.  It is off by
- * default because most fixtures have no use for it; a test that wants to
- * prove the registration releases that access before publication turns it
- * on, because without it there is no access to release.
+ * The arming in force, with a reference of the caller's own, or NULL.
+ * This is how every consumer starts: what it reads afterwards is that
+ * arming's and stays readable until it puts the reference back.
  */
-static bool nfsd_ffv2_prototype_test_access;
-
-void nfsd_ffv2_prototype_test_access_hook(bool claim)
+struct nfsd_ffv2_prototype_test_object *
+nfsd_ffv2_prototype_test_object_acquire(void)
 {
-	WRITE_ONCE(nfsd_ffv2_prototype_test_access, claim);
+	struct nfsd_ffv2_prototype_test_object *obj;
+
+	spin_lock(&nfsd_ffv2_prototype_test_hook_lock);
+	obj = nfsd_ffv2_prototype_test_object;
+	if (obj)
+		refcount_inc(&obj->ref);
+	spin_unlock(&nfsd_ffv2_prototype_test_hook_lock);
+	return obj;
 }
 
-/* Whether a test has substituted the object; see the hook above. */
+/* Whether any arming of the object is in force. */
+bool nfsd_ffv2_prototype_test_object_armed(void)
+{
+	struct nfsd_ffv2_prototype_test_object *obj;
+
+	obj = nfsd_ffv2_prototype_test_object_acquire();
+	nfsd_ffv2_prototype_test_object_put(obj);
+	return obj;
+}
+
+/* Whether a test has substituted the object; see the arming above. */
 static bool nfsd_ffv2_prototype_test_armed(void)
 {
-	const struct svc_export *exp = READ_ONCE(nfsd_ffv2_prototype_test_exp);
-
-	return exp;
+	return nfsd_ffv2_prototype_test_object_armed();
 }
 
 static bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp)
 {
-	struct svc_export *exp = READ_ONCE(nfsd_ffv2_prototype_test_exp);
+	struct nfsd_ffv2_prototype_test_object *obj;
 
-	if (!exp)
+	obj = nfsd_ffv2_prototype_test_object_acquire();
+	if (!obj)
 		return false;
+	/*
+	 * An arming with no export resolves nothing: a test that is asking
+	 * about the arming protocol itself has no fixture behind it, and
+	 * substituting one would hand back a handle with no export.
+	 */
+	if (!obj->exp) {
+		nfsd_ffv2_prototype_test_object_put(obj);
+		return false;
+	}
 	fh_init(fhp, NFS4_FHSIZE);
-	fhp->fh_export = exp_get(exp);
-	fhp->fh_dentry = dget(nfsd_ffv2_prototype_test_dentry);
-	fhp->fh_handle.fh_size = nfsd_ffv2_prototype_test_inner_len;
-	memcpy(fhp->fh_handle.fh_raw, nfsd_ffv2_prototype_test_inner,
-	       nfsd_ffv2_prototype_test_inner_len);
-	if (READ_ONCE(nfsd_ffv2_prototype_test_access)) {
-		if (nfsd_ffv2_export_access_get(exp)) {
+	fhp->fh_export = exp_get(obj->exp);
+	fhp->fh_dentry = dget(obj->dentry);
+	fhp->fh_handle.fh_size = obj->inner_len;
+	memcpy(fhp->fh_handle.fh_raw, obj->inner, obj->inner_len);
+	if (obj->claim) {
+		if (nfsd_ffv2_export_access_get(obj->exp)) {
 			fh_put(fhp);
+			nfsd_ffv2_prototype_test_object_put(obj);
 			return false;
 		}
 		fhp->fh_ffv2_admitted = true;
 	}
+	nfsd_ffv2_prototype_test_object_put(obj);
 	return true;
 }
 #else
@@ -1282,6 +1291,9 @@ nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
 				   struct nfsd_ffv2_prototype_provider **result)
 {
 	struct nfsd_ffv2_prototype_provider *provider;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	struct nfsd_ffv2_prototype_test_object *obj;
+#endif
 	struct file *file;
 	loff_t pos = 0;
 	size_t total;
@@ -1295,13 +1307,23 @@ nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
 	file = NULL;
 	size = 0;
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
-	if (nfsd_ffv2_prototype_test_bytes)
-		size = nfsd_ffv2_prototype_test_sampled;
+	/*
+	 * Taken once and held to the end: the substituted object's measured
+	 * size and its bytes are read at two points, and a reference across
+	 * both is what makes them the same object's -- and keeps the storage
+	 * they are in from going in between.
+	 */
+	obj = nfsd_ffv2_prototype_test_object_acquire();
+	if (obj && obj->exp && obj->len)
+		size = obj->sampled;
 #endif
 	if (!size) {
 		file = dentry_open(path, O_RDONLY | O_LARGEFILE, cred);
-		if (IS_ERR(file))
-			return PTR_ERR(file);
+		if (IS_ERR(file)) {
+			error = PTR_ERR(file);
+			file = NULL;
+			goto out_close;
+		}
 		size = i_size_read(file_inode(file));
 	}
 	/*
@@ -1358,8 +1380,9 @@ nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
 	} else {
 		got = -EIO;
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
-		got = min_t(size_t, total, nfsd_ffv2_prototype_test_len);
-		memcpy(provider->bytes, nfsd_ffv2_prototype_test_bytes, got);
+		/* The same arming the size came from, still referenced. */
+		got = min_t(size_t, total, obj->len);
+		memcpy(provider->bytes, obj->bytes, got);
 #endif
 	}
 	if (got < 0) {
@@ -1408,16 +1431,18 @@ nfsd_ffv2_prototype_provider_build(struct path *path, const struct cred *cred,
 		provider->guards[i] = provider->read[i].cr_guard;
 		provider->predecessors[i].disposition = NFSD_FFV2_RETAINED_ABSENT;
 	}
-	if (file)
-		fput(file);
 	*result = provider;
-	return 0;
+	error = 0;
+	goto out_close;
 
 out_free:
 	nfsd_ffv2_prototype_provider_free(provider);
 out_close:
 	if (file)
 		fput(file);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	nfsd_ffv2_prototype_test_object_put(obj);
+#endif
 	return error;
 }
 

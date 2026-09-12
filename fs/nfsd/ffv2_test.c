@@ -10645,6 +10645,53 @@ out:
 }
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+
+/*
+ * One arming of one of the prototype's pauses, held for a test.
+ *
+ * The arming is a refcounted record rather than a pair of pointers into
+ * this test's frame, so a caller that consumed it is reading storage the
+ * record owns and not a stack that has since gone.  The action below runs
+ * however the test ends: it releases anything still waiting, takes the
+ * arming down if it is still the current one -- and leaves a later
+ * arming alone if it is not -- and drops the test's reference.
+ */
+struct nfsd_ffv2_proto_pause {
+	struct nfsd_ffv2_prototype_test_pause	*pause;
+	enum nfsd_ffv2_prototype_test_pause_site site;
+};
+
+static void nfsd_ffv2_proto_pause_release(void *data)
+{
+	struct nfsd_ffv2_proto_pause *held = data;
+
+	if (!held->pause)
+		return;
+	complete_all(&held->pause->proceed);
+	nfsd_ffv2_prototype_test_pause_disarm(held->site, held->pause);
+	nfsd_ffv2_prototype_test_pause_put(held->pause);
+	held->pause = NULL;
+}
+
+static struct nfsd_ffv2_prototype_test_pause *
+nfsd_ffv2_proto_pause_arm(struct kunit *test,
+			  enum nfsd_ffv2_prototype_test_pause_site site)
+{
+	struct nfsd_ffv2_proto_pause *held;
+
+	held = kunit_kzalloc(test, sizeof(*held), GFP_KERNEL);
+	if (!held)
+		return NULL;
+	held->site = site;
+	held->pause = nfsd_ffv2_prototype_test_pause_arm(site);
+	if (!held->pause)
+		return NULL;
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_pause_release,
+				      held))
+		return NULL;
+	return held->pause;
+}
+
 /*
  * Prototype authority gate.
  *
@@ -10874,7 +10921,7 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 {
 	struct nfsd_ffv2_prototype_call_ctx enable = {}, first = {}, second = {};
 	struct task_struct *enable_task, *first_task, *second_task;
-	struct completion reached, proceed;
+	struct nfsd_ffv2_prototype_test_pause *setup;
 	struct nfsd_net *nn;
 	bool closing, waited;
 	int error;
@@ -10884,8 +10931,6 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 
-	init_completion(&reached);
-	init_completion(&proceed);
 	init_completion(&enable.done);
 	init_completion(&first.done);
 	init_completion(&second.done);
@@ -10895,13 +10940,14 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 	enable.net = &init_net;
 	first.net = &init_net;
 	second.net = &init_net;
-	nfsd_ffv2_prototype_test_setup_hook(&reached, &proceed);
+	setup = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_SETUP);
+	KUNIT_ASSERT_NOT_NULL(test, setup);
 
 	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
 				  "ffv2-proto-enable");
 	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&reached, 15 * HZ) != 0);
+			  wait_for_completion_timeout(&setup->reached, 15 * HZ) != 0);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_ENABLING,
 			nfsd_ffv2_prototype_state_get(nn));
 
@@ -10927,7 +10973,7 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 	waited = nfsd_ffv2_prototype_wait_waiters(nn, 1);
 	KUNIT_EXPECT_TRUE(test, waited);
 
-	complete(&proceed);
+	complete(&setup->proceed);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&enable.done, 30 * HZ) != 0);
 	KUNIT_EXPECT_TRUE(test,
@@ -10956,7 +11002,7 @@ static void nfsd_ffv2_prototype_enabling_pre_exit_test(struct kunit *test)
 {
 	struct nfsd_ffv2_prototype_call_ctx enable = {}, exiting = {};
 	struct task_struct *enable_task, *exit_task;
-	struct completion reached, proceed;
+	struct nfsd_ffv2_prototype_test_pause *setup;
 	struct nfsd_net *nn;
 	bool closing;
 	int error;
@@ -10966,20 +11012,19 @@ static void nfsd_ffv2_prototype_enabling_pre_exit_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 
-	init_completion(&reached);
-	init_completion(&proceed);
 	init_completion(&enable.done);
 	init_completion(&exiting.done);
 	enable.nn = nn;
 	exiting.nn = nn;
 	enable.net = &init_net;
-	nfsd_ffv2_prototype_test_setup_hook(&reached, &proceed);
+	setup = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_SETUP);
+	KUNIT_ASSERT_NOT_NULL(test, setup);
 
 	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
 				  "ffv2-proto-enable");
 	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&reached, 15 * HZ) != 0);
+			  wait_for_completion_timeout(&setup->reached, 15 * HZ) != 0);
 
 	exit_task = kthread_run(nfsd_ffv2_prototype_pre_exit_thread, &exiting,
 				"ffv2-proto-exit");
@@ -10990,7 +11035,7 @@ static void nfsd_ffv2_prototype_enabling_pre_exit_test(struct kunit *test)
 	/* Exit is still inside the gate, not past it. */
 	KUNIT_EXPECT_EQ(test, 0, exiting.result);
 
-	complete(&proceed);
+	complete(&setup->proceed);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&enable.done, 30 * HZ) != 0);
 	KUNIT_EXPECT_TRUE(test,
@@ -11136,12 +11181,11 @@ struct nfsd_ffv2_proto_fixture {
 	u8				inner[8];
 	u16				inner_len;
 	/*
-	 * Which arming of the process-global object hook is this fixture's.
-	 * The hook points at @bytes below, so whoever takes it down has to
-	 * be able to say that the arming it is taking down is still this
-	 * one.
+	 * The arming of the substituted object this fixture made, held with
+	 * a reference of its own.  Naming it is what lets whoever takes it
+	 * down leave a later fixture's arming alone.
 	 */
-	u64				object_arming;
+	struct nfsd_ffv2_prototype_test_object *object;
 	u8				bytes[NFSD_FFV2_PROTO_CHUNKS *
 					      NFSD_FFV2_PROTO_CHUNK_SIZE];
 	bool				enabled;
@@ -11152,8 +11196,17 @@ struct nfsd_ffv2_proto_fixture {
 
 static void nfsd_ffv2_proto_fixture_exit(struct nfsd_ffv2_proto_fixture *f)
 {
-	nfsd_ffv2_prototype_test_object_hook(NULL, NULL, NULL, 0, NULL, 0, 0);
-	f->object_arming = 0;
+	/*
+	 * The arming goes first, and the fixture is only ever torn down on
+	 * the path where every worker returned -- so nothing is holding the
+	 * arming here, and the export and dentry it references go with it.
+	 * A teardown underneath a consumer would block on the namespace it
+	 * is still pinning, which is why the released path retains the
+	 * fixture instead of tearing it down.
+	 */
+	nfsd_ffv2_prototype_test_object_disarm(f->object);
+	nfsd_ffv2_prototype_test_object_put(f->object);
+	f->object = NULL;
 	if (f->mapped && f->mapped->fh_dentry) {
 		fh_put(f->mapped);
 		f->binding = NULL;
@@ -11305,12 +11358,45 @@ static bool nfsd_ffv2_proto_fixture_init(struct kunit *test,
 	 */
 	memcpy(f->inner, inner, sizeof(inner));
 	f->inner_len = sizeof(inner);
-	f->object_arming =
-		nfsd_ffv2_prototype_test_object_hook(f->seeded,
-						     f->object_dentry,
-						     f->inner, f->inner_len,
-						     f->bytes,
-						     sizeof(f->bytes), 0);
+	f->object = nfsd_ffv2_prototype_test_object_arm(f->seeded,
+							f->object_dentry,
+							f->inner,
+							f->inner_len,
+							f->bytes,
+							sizeof(f->bytes), 0,
+							false);
+	if (!f->object) {
+		KUNIT_FAIL(test, "failed to substitute the fixture object");
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Substitute the fixture's object again, with a different suppliable or
+ * measured size, or asking the resolve to claim the ordinary export access
+ * a real one would.
+ *
+ * The new arming replaces the old in the slot, so taking the old one down
+ * afterwards finds it is no longer current and leaves the new one alone --
+ * which is the same rule every other caller of the disarm relies on.  The
+ * fixture ends up holding exactly the arming that is in force.
+ */
+static bool nfsd_ffv2_proto_fixture_rearm(struct nfsd_ffv2_proto_fixture *f,
+					  size_t len, size_t sampled,
+					  bool claim)
+{
+	struct nfsd_ffv2_prototype_test_object *obj;
+
+	obj = nfsd_ffv2_prototype_test_object_arm(f->seeded, f->object_dentry,
+						  f->inner, f->inner_len,
+						  f->bytes, len, sampled,
+						  claim);
+	if (!obj)
+		return false;
+	nfsd_ffv2_prototype_test_object_disarm(f->object);
+	nfsd_ffv2_prototype_test_object_put(f->object);
+	f->object = obj;
 	return true;
 }
 
@@ -11550,7 +11636,6 @@ struct nfsd_ffv2_proto_register_ctx {
 	struct completion			done;
 };
 
-
 /*
  * A registration must not wait for the access its own handle holds.
  *
@@ -11588,9 +11673,8 @@ struct nfsd_ffv2_proto_access_work {
 	struct nfsd_ffv2_proto_register_ctx	ctx;
 	struct nfsd_ffv2_prototype_bundle	bundle;
 	struct nfsd_ffv2_prototype_call_ctx	closer;
-	/* The publish hook's, so no worker completes a dead stack. */
-	struct completion			reached;
-	struct completion			proceed;
+	/* The publish arming this test made, if it made one. */
+	struct nfsd_ffv2_prototype_test_pause	*publish;
 	/* What a stand-in worker waits for, so a test can end it. */
 	struct completion			stall;
 	struct svc_export			*exp;
@@ -11599,9 +11683,7 @@ struct nfsd_ffv2_proto_access_work {
 	refcount_t				ref;
 	/* Workers started here and not yet seen out. */
 	atomic_t				workers;
-	unsigned long				wedge_bound;
 	unsigned long				join_bound;
-	bool					publish_hooked;
 	bool					stalls;
 	bool					held;
 	bool					released;
@@ -11652,8 +11734,22 @@ static void nfsd_ffv2_proto_worker_end(struct nfsd_ffv2_proto_access_work *work)
 	}
 	__set_current_state(TASK_RUNNING);
 	last = atomic_dec_and_test(&work->workers);
-	if (last && READ_ONCE(work->released))
-		nfsd_ffv2_prototype_test_object_hook_disarm(work->fixture.object_arming);
+	if (last && READ_ONCE(work->released)) {
+		struct nfsd_ffv2_prototype_test_object *obj;
+
+		/*
+		 * The fixture is retained, so nothing else will ever use the
+		 * arming it made.  Taking it down names it, so a fixture
+		 * that armed the object for itself since is left alone, and
+		 * anything still reading this arming holds a reference to it
+		 * and is reading the arming's own copies rather than
+		 * anything of the fixture's.
+		 */
+		obj = work->fixture.object;
+		work->fixture.object = NULL;
+		nfsd_ffv2_prototype_test_object_disarm(obj);
+		nfsd_ffv2_prototype_test_object_put(obj);
+	}
 	atomic_dec(&nfsd_ffv2_proto_access_workers);
 	nfsd_ffv2_proto_access_put(work);
 }
@@ -11697,12 +11793,9 @@ static struct nfsd_ffv2_proto_access_work *nfsd_ffv2_proto_access_alloc(void)
 	atomic_set(&work->workers, 0);
 	init_completion(&work->ctx.done);
 	init_completion(&work->closer.done);
-	init_completion(&work->reached);
-	init_completion(&work->proceed);
 	init_completion(&work->stall);
 	work->ctx.f = &work->fixture;
 	work->ctx.bundle = &work->bundle;
-	work->wedge_bound = 5 * HZ;
 	work->join_bound = 30 * HZ;
 	return work;
 }
@@ -11754,57 +11847,24 @@ static unsigned int nfsd_ffv2_proto_access_count(struct svc_export *exp)
 }
 
 /*
- * Put the access a wedged registration is holding, and only if it is
- * provably the one outstanding.
+ * Wait for the registration to return, once and bounded.
  *
- * Ownership is established by the export's own state, not inferred from a
- * count.  A registration reaches TRANSITIONING only after its handle has
- * been put -- nfsd_ffv2_object_register_fh() puts the handle before it
- * publishes -- so an export that is transitioning while one ordinary
- * access is outstanding is an export whose registration kept the access it
- * should have released.  Nothing else in this fixture holds one: the
- * test's own reader has already gone, and a transitioning export refuses
- * new ones.
+ * Nothing is released on its behalf.  A registration that is waiting for
+ * an export access to drain is waiting for an access this cleanup cannot
+ * prove it owns: the count says how many are outstanding and never says
+ * whose, and an export's state says where a registration has got to and
+ * not which acquisition is still held.  Releasing on a guess would either
+ * take an access from under the caller that owns it or double-release the
+ * one this test does, and both of those corrupt accounting the rest of
+ * the run depends on.
  *
- * The state, the count and the decrement are one acquisition of the lock
- * all three live under, which is what the two of them being separate
- * acquisitions could not promise: a registration about to put its own
- * access cannot slip between the decision and the act.  A registration
- * that has not reached the transition leaves the export open, and then
- * this puts nothing -- an access cleanup cannot prove it owns is an access
- * cleanup does not touch.
- *
- * This mirrors the last put in nfsd_ffv2_export_access_put(), including
- * the wake outside the lock, because that is the operation being performed.
- */
-static bool nfsd_ffv2_proto_access_put_wedged(struct svc_export *exp)
-{
-	bool put = false;
-
-	spin_lock(&exp->ex_ffv2_access_lock);
-	if (exp->ex_ffv2_access_state == NFSD_FFV2_EXPORT_TRANSITIONING &&
-	    exp->ex_ffv2_access_count == 1) {
-		exp->ex_ffv2_access_count = 0;
-		put = true;
-	}
-	spin_unlock(&exp->ex_ffv2_access_lock);
-	if (put)
-		wake_up_all(&exp->ex_ffv2_access_wait);
-	return put;
-}
-
-/*
- * Wait for the registration to return, ending on the way the one wait a
- * test is able to end.  Both waits are bounded; a registration that
- * returns from neither is a worker the caller has to dispose of rather
- * than wait on.
+ * So a registration that does not return within the bound is a worker to
+ * be disposed of rather than unwedged, and the disposition below is what
+ * happens to it.  The deliberately broken build reaches exactly that: the
+ * test fails, says what it left behind, and the suite goes on.
  */
 static bool nfsd_ffv2_proto_access_join(struct nfsd_ffv2_proto_access_work *work)
 {
-	if (wait_for_completion_timeout(&work->ctx.done, work->wedge_bound))
-		return true;
-	if (work->exp)
-		nfsd_ffv2_proto_access_put_wedged(work->exp);
 	return wait_for_completion_timeout(&work->ctx.done,
 					   work->join_bound) != 0;
 }
@@ -11849,12 +11909,13 @@ static bool nfsd_ffv2_proto_access_settle(struct nfsd_ffv2_proto_access_work *wo
 	if (work->settled)
 		return work->joined;
 	work->settled = true;
-	if (work->publish_hooked) {
-		nfsd_ffv2_prototype_test_publish_hook_disarm(&work->reached);
-		work->publish_hooked = false;
+	if (work->publish) {
+		complete_all(&work->publish->proceed);
+		nfsd_ffv2_prototype_test_pause_disarm(NFSD_FFV2_PAUSE_PUBLISH,
+						      work->publish);
+		nfsd_ffv2_prototype_test_pause_put(work->publish);
+		work->publish = NULL;
 	}
-	complete_all(&work->proceed);
-	nfsd_ffv2_prototype_test_access_hook(false);
 	if (work->held) {
 		nfsd_ffv2_export_access_put(work->exp);
 		work->held = false;
@@ -11972,7 +12033,6 @@ static void nfsd_ffv2_prototype_worker_giveup_test(struct kunit *test)
 	if (!work)
 		return;
 	work->stalls = true;
-	work->wedge_bound = HZ;
 	work->join_bound = HZ;
 	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
 					  &work->task, "ffv2-proto-stall")) {
@@ -11984,8 +12044,7 @@ static void nfsd_ffv2_prototype_worker_giveup_test(struct kunit *test)
 	/* The settle gives the worker up rather than waiting for it. */
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_access_finish(test, work));
 	elapsed = jiffies - elapsed;
-	KUNIT_EXPECT_TRUE(test,
-			  elapsed < 4 * (work->wedge_bound + work->join_bound));
+	KUNIT_EXPECT_TRUE(test, elapsed < 4 * work->join_bound);
 	/* Released, not abandoned: something will end it. */
 	KUNIT_EXPECT_TRUE(test, READ_ONCE(work->released));
 	KUNIT_EXPECT_NULL(test, work->task);
@@ -12020,9 +12079,8 @@ static void nfsd_ffv2_prototype_worker_hook_release_test(struct kunit *test)
 		return;
 	if (!nfsd_ffv2_proto_fixture_init(test, &work->fixture))
 		return;
-	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_armed());
 	work->stalls = true;
-	work->wedge_bound = HZ;
 	work->join_bound = HZ;
 	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
 					  &work->task, "ffv2-proto-stall")) {
@@ -12035,7 +12093,7 @@ static void nfsd_ffv2_prototype_worker_hook_release_test(struct kunit *test)
 	 * Still armed, and still pointing at bytes that are still there:
 	 * the worker holds the arena up until it ends.
 	 */
-	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_armed());
 
 	complete_all(&work->stall);
 	if (!nfsd_ffv2_proto_workers_quiesced()) {
@@ -12043,7 +12101,7 @@ static void nfsd_ffv2_prototype_worker_hook_release_test(struct kunit *test)
 		return;
 	}
 	/* Down with the worker, before the bytes it pointed at could go. */
-	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_armed());
 	/* Safe now: there is no worker left to tear the fixture out from. */
 	nfsd_ffv2_proto_fixture_exit(&work->fixture);
 }
@@ -12059,8 +12117,8 @@ static void nfsd_ffv2_prototype_worker_hook_release_test(struct kunit *test)
 static void nfsd_ffv2_prototype_worker_hook_replace_test(struct kunit *test)
 {
 	static const u8 inner[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
+	struct nfsd_ffv2_prototype_test_object *replacement;
 	struct nfsd_ffv2_proto_access_work *work;
-	u64 replacement;
 	u8 *bytes;
 
 	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_access_workers));
@@ -12072,7 +12130,6 @@ static void nfsd_ffv2_prototype_worker_hook_replace_test(struct kunit *test)
 	if (!nfsd_ffv2_proto_fixture_init(test, &work->fixture))
 		return;
 	work->stalls = true;
-	work->wedge_bound = HZ;
 	work->join_bound = HZ;
 	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
 					  &work->task, "ffv2-proto-stall")) {
@@ -12081,16 +12138,16 @@ static void nfsd_ffv2_prototype_worker_hook_replace_test(struct kunit *test)
 	}
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_access_finish(test, work));
 
-	/* A later fixture arms the hook for itself, over this one's. */
+	/* A later fixture arms the object for itself, over this one's. */
 	replacement =
-		nfsd_ffv2_prototype_test_object_hook(work->fixture.seeded,
-						     work->fixture.object_dentry,
-						     inner, sizeof(inner),
-						     bytes,
-						     NFSD_FFV2_PROTO_CHUNK_SIZE,
-						     0);
-	KUNIT_EXPECT_NE(test, 0ULL, replacement);
-	KUNIT_EXPECT_NE(test, work->fixture.object_arming, replacement);
+		nfsd_ffv2_prototype_test_object_arm(work->fixture.seeded,
+						    work->fixture.object_dentry,
+						    inner, sizeof(inner),
+						    bytes,
+						    NFSD_FFV2_PROTO_CHUNK_SIZE,
+						    0, false);
+	KUNIT_ASSERT_NOT_NULL(test, replacement);
+	KUNIT_EXPECT_PTR_NE(test, work->fixture.object, replacement);
 
 	complete_all(&work->stall);
 	if (!nfsd_ffv2_proto_workers_quiesced()) {
@@ -12098,28 +12155,31 @@ static void nfsd_ffv2_prototype_worker_hook_replace_test(struct kunit *test)
 		return;
 	}
 	/* The arming it named was not this one, so this one still stands. */
-	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_armed());
 	KUNIT_EXPECT_TRUE(test,
-			  nfsd_ffv2_prototype_test_object_hook_disarm(replacement));
-	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_hook_armed());
+			  nfsd_ffv2_prototype_test_object_disarm(replacement));
+	nfsd_ffv2_prototype_test_object_put(replacement);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_armed());
 	nfsd_ffv2_proto_fixture_exit(&work->fixture);
 }
 
 /*
- * The access the settle must not put.
+ * The access the settle must not put, in either state it can find it in.
  *
- * A registration that has resolved its handle but has not reached the
- * transition holds an ordinary access on an export that is still open.
- * The count then says one, and one is what a wedged registration would
- * also leave -- but this access is not the settle's to release: the
- * registration is going to put it itself, and a put from here would either
- * take it from under that put or double it.  The settle asks the export's
- * state, not its count, so it puts nothing here.
+ * An ordinary access outstanding on the fixture export says that one is
+ * held and never says by whom.  A registration that has resolved its
+ * handle and not yet published holds one on an open export; one wedged
+ * inside the transition holds one on a transitioning export.  The count is
+ * one in both, and in neither is it the settle's to release: the first
+ * will be put by the registration itself, and the second cannot be proved
+ * to be the registration's rather than some other caller's.  So the settle
+ * puts neither, and gives the worker up instead.
  */
-static void nfsd_ffv2_prototype_access_pretransition_test(struct kunit *test)
+static void nfsd_ffv2_prototype_access_untouched_test(struct kunit *test)
 {
 	struct nfsd_ffv2_proto_access_work *work;
 	struct nfsd_ffv2_proto_fixture *f;
+	bool transitioning;
 
 	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_access_workers));
 	work = nfsd_ffv2_proto_access_begin(test);
@@ -12130,27 +12190,40 @@ static void nfsd_ffv2_prototype_access_pretransition_test(struct kunit *test)
 		return;
 	work->exp = f->seeded;
 	work->stalls = true;
-	work->wedge_bound = HZ;
 	work->join_bound = HZ;
 	/*
-	 * Standing in for the access a registration's resolved handle holds
-	 * before it publishes.  It is deliberately not recorded as the
-	 * test's own, because the settle releases that one and the question
-	 * here is what it does with one that is not.
+	 * Standing in for the access a registration holds.  It is
+	 * deliberately not recorded as the test's own, because the settle
+	 * releases that one and the question here is what it does with one
+	 * that is not.
 	 */
 	if (nfsd_ffv2_export_access_get(f->seeded)) {
 		KUNIT_FAIL(test, "the fixture export refused an access");
 		return;
 	}
+	/*
+	 * The second ordering: the same access, but with the export already
+	 * in the state a wedged registration would have left it in.
+	 */
+	transitioning = !nfsd_ffv2_export_transition_begin(f->seeded);
+	KUNIT_EXPECT_TRUE(test, transitioning);
 	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
 					  &work->task, "ffv2-proto-stall")) {
+		if (transitioning)
+			nfsd_ffv2_export_transition_abort(f->seeded);
 		nfsd_ffv2_export_access_put(f->seeded);
 		KUNIT_FAIL(test, "failed to start the stalled worker");
 		return;
 	}
 
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_access_finish(test, work));
-	/* Open, not transitioning, and the access is still where it was. */
+	/* Transitioning, and the access is still exactly where it was. */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_transitioning(f->seeded));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_proto_access_count(f->seeded));
+
+	if (transitioning)
+		nfsd_ffv2_export_transition_abort(f->seeded);
+	/* And open, which is the other state a registration can be in. */
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_is_transitioning(f->seeded));
 	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_proto_access_count(f->seeded));
 
@@ -12161,6 +12234,228 @@ static void nfsd_ffv2_prototype_access_pretransition_test(struct kunit *test)
 		return;
 	}
 	nfsd_ffv2_proto_fixture_exit(&work->fixture);
+}
+
+/*
+ * Taking one arming down never takes another's place.
+ *
+ * Both slots hold at most one arming, and the only ordering that can lose
+ * a live one is a disarm that decided it was current and stored after
+ * something else had replaced it.  There is no such state here: deciding
+ * and storing are one critical section, so a disarm either names what the
+ * slot holds and takes it, or names something else and does nothing.  That
+ * is what this asks of both slots, in the order that would have lost the
+ * replacement.
+ */
+static void nfsd_ffv2_prototype_hook_replace_test(struct kunit *test)
+{
+	static const u8 inner[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
+	struct nfsd_ffv2_prototype_test_object *first, *second;
+	struct nfsd_ffv2_prototype_test_pause *early, *late;
+	u8 bytes[4] = { 1, 2, 3, 4 };
+
+	first = nfsd_ffv2_prototype_test_object_arm(NULL, NULL, inner,
+						    sizeof(inner), bytes,
+						    sizeof(bytes), 0, false);
+	KUNIT_ASSERT_NOT_NULL(test, first);
+	second = nfsd_ffv2_prototype_test_object_arm(NULL, NULL, inner,
+						     sizeof(inner), bytes,
+						     sizeof(bytes), 0, false);
+	KUNIT_ASSERT_NOT_NULL(test, second);
+	/* The earlier arming is no longer current, and says so. */
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_disarm(first));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_armed());
+	/* And the later one is still there to be taken down by its owner. */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_disarm(second));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_armed());
+	nfsd_ffv2_prototype_test_object_put(first);
+	nfsd_ffv2_prototype_test_object_put(second);
+
+	early = nfsd_ffv2_prototype_test_pause_arm(NFSD_FFV2_PAUSE_PUBLISH);
+	KUNIT_ASSERT_NOT_NULL(test, early);
+	late = nfsd_ffv2_prototype_test_pause_arm(NFSD_FFV2_PAUSE_PUBLISH);
+	KUNIT_ASSERT_NOT_NULL(test, late);
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd_ffv2_prototype_test_pause_disarm(NFSD_FFV2_PAUSE_PUBLISH,
+								 early));
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_prototype_test_pause_disarm(NFSD_FFV2_PAUSE_PUBLISH,
+								late));
+	nfsd_ffv2_prototype_test_pause_put(early);
+	nfsd_ffv2_prototype_test_pause_put(late);
+}
+
+/*
+ * How many rounds the replacement race below runs.  Each is two thread
+ * wake-ups, which this environment is not quick at, so the number is what
+ * buys a spread of interleavings without the case costing a minute.
+ */
+#define NFSD_FFV2_PROTO_RACE_ROUNDS	16
+
+/* One half of the replacement race: a disarm, started on its own thread. */
+struct nfsd_ffv2_proto_disarm_ctx {
+	struct nfsd_ffv2_prototype_test_object	*obj;
+	struct completion			start;
+	struct completion			done;
+	bool					stop;
+};
+
+/*
+ * Woken once per round, and once more to end.  The flag is what ends it
+ * rather than kthread_should_stop(): this thread sleeps in an
+ * uninterruptible wait that stopping it would not wake, so the last
+ * wake-up has to carry the reason with it.
+ */
+static int nfsd_ffv2_proto_disarm_thread(void *data)
+{
+	struct nfsd_ffv2_proto_disarm_ctx *ctx = data;
+
+	for (;;) {
+		wait_for_completion(&ctx->start);
+		if (READ_ONCE(ctx->stop))
+			break;
+		nfsd_ffv2_prototype_test_object_disarm(ctx->obj);
+		complete(&ctx->done);
+	}
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+/*
+ * The same question asked against the clock instead of against an order.
+ *
+ * The ordering above is the one the protocol has to get right; this runs
+ * the two halves at each other repeatedly, so that whichever interleaving
+ * the machine picks, the arming left in the slot is the later one.  A
+ * disarm that decided and stored separately would sooner or later store
+ * over the replacement, and the slot would be empty.
+ */
+static void nfsd_ffv2_prototype_hook_replace_race_test(struct kunit *test)
+{
+	static const u8 inner[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
+	struct nfsd_ffv2_prototype_test_object *first, *second;
+	struct nfsd_ffv2_proto_disarm_ctx *ctx;
+	u8 bytes[4] = { 1, 2, 3, 4 };
+	struct task_struct *task;
+	unsigned int i;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	init_completion(&ctx->start);
+	init_completion(&ctx->done);
+	task = kthread_run(nfsd_ffv2_proto_disarm_thread, ctx,
+			   "ffv2-proto-disarm");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "failed to start the disarming thread");
+		return;
+	}
+
+	for (i = 0; i < NFSD_FFV2_PROTO_RACE_ROUNDS; i++) {
+		first = nfsd_ffv2_prototype_test_object_arm(NULL, NULL, inner,
+							    sizeof(inner),
+							    bytes,
+							    sizeof(bytes), 0,
+							    false);
+		if (!first) {
+			KUNIT_FAIL(test, "failed to arm the object");
+			break;
+		}
+		ctx->obj = first;
+		complete(&ctx->start);
+		second = nfsd_ffv2_prototype_test_object_arm(NULL, NULL, inner,
+							     sizeof(inner),
+							     bytes,
+							     sizeof(bytes), 0,
+							     false);
+		wait_for_completion(&ctx->done);
+		if (!second) {
+			KUNIT_FAIL(test, "failed to arm the replacement");
+			nfsd_ffv2_prototype_test_object_put(first);
+			break;
+		}
+		/*
+		 * Either order leaves the later arming in the slot: a disarm
+		 * that ran first found it and took it, and the arm that
+		 * followed put the later one in; a disarm that ran second
+		 * found the later one and left it alone.
+		 */
+		KUNIT_ASSERT_TRUE(test,
+				  nfsd_ffv2_prototype_test_object_disarm(second));
+		nfsd_ffv2_prototype_test_object_put(first);
+		nfsd_ffv2_prototype_test_object_put(second);
+	}
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_armed());
+	WRITE_ONCE(ctx->stop, true);
+	complete(&ctx->start);
+	kthread_stop(task);
+}
+
+/*
+ * What a consumer reads, it reads to the end.
+ *
+ * A consumer takes a reference on the arming before it reads anything of
+ * it, and everything it reads is that arming's own copy: the handle, the
+ * bytes, the measured size, and references of its own on the export and
+ * the dentry.  So the arming can be replaced and every other reference to
+ * it dropped -- the fixture's included -- and the consumer still reads
+ * what it acquired rather than what replaced it.  This stands in for a
+ * registration that was still inside the server when the test that armed
+ * the object gave up on it and another fixture armed its own.
+ *
+ * The fixture is torn down only after the consumer has let go, which is
+ * the invariant the suite holds to everywhere else: a fixture is torn down
+ * on the path where every worker returned, and retained on the path where
+ * one did not.
+ */
+static void nfsd_ffv2_prototype_hook_consumer_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_test_object *taken, *replacement;
+	static const u8 inner[] = { 2, 0, 2, 2, 0xa8, 0xb8, 0xc8, 0xd8 };
+	struct nfsd_ffv2_proto_fixture *f;
+	u8 other[4] = { 9, 9, 9, 9 };
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+
+	/* A consumer arriving while this fixture's arming is in force. */
+	taken = nfsd_ffv2_prototype_test_object_acquire();
+	KUNIT_ASSERT_NOT_NULL(test, taken);
+	KUNIT_EXPECT_PTR_EQ(test, f->object, taken);
+	KUNIT_EXPECT_PTR_EQ(test, taken->exp, f->seeded);
+	KUNIT_EXPECT_PTR_EQ(test, taken->dentry, f->object_dentry);
+
+	/* Another fixture arms its own, over this one's. */
+	replacement = nfsd_ffv2_prototype_test_object_arm(NULL, NULL, inner,
+							  sizeof(inner),
+							  other,
+							  sizeof(other), 0,
+							  false);
+	KUNIT_ASSERT_NOT_NULL(test, replacement);
+	/* And this one lets go of everything but the consumer's reference. */
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd_ffv2_prototype_test_object_disarm(f->object));
+	nfsd_ffv2_prototype_test_object_put(f->object);
+	f->object = NULL;
+
+	/* The consumer still reads the object it acquired, whole. */
+	KUNIT_EXPECT_EQ(test, sizeof(f->bytes), taken->len);
+	KUNIT_EXPECT_EQ(test, taken->len, taken->sampled);
+	KUNIT_EXPECT_EQ(test, (size_t)f->inner_len, (size_t)taken->inner_len);
+	KUNIT_EXPECT_MEMEQ(test, taken->inner, f->inner, taken->inner_len);
+	KUNIT_EXPECT_MEMEQ(test, taken->bytes, f->bytes, taken->len);
+	KUNIT_EXPECT_PTR_EQ(test, taken->exp, f->seeded);
+	KUNIT_EXPECT_PTR_EQ(test, taken->dentry, f->object_dentry);
+	/* Not the replacement's, which says nothing of it leaked across. */
+	KUNIT_EXPECT_NE(test, taken->bytes[0], other[0]);
+	nfsd_ffv2_prototype_test_object_put(taken);
+
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_prototype_test_object_disarm(replacement));
+	nfsd_ffv2_prototype_test_object_put(replacement);
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
 }
 
 static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
@@ -12190,7 +12485,10 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 
 	/* The resolve now claims an access, as the production one does. */
 	work->exp = f->seeded;
-	nfsd_ffv2_prototype_test_access_hook(true);
+	if (!nfsd_ffv2_proto_fixture_rearm(f, sizeof(f->bytes), 0, true)) {
+		KUNIT_FAIL(test, "failed to arm the claiming resolve");
+		goto out;
+	}
 	/* And one more, standing in for a reader the registration must wait for. */
 	if (nfsd_ffv2_export_access_get(f->seeded)) {
 		KUNIT_FAIL(test, "the fixture export refused an access");
@@ -12283,15 +12581,18 @@ static void nfsd_ffv2_prototype_publish_window_test(struct kunit *test)
 			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
 						      &expires));
 	nfsd_ffv2_proto_request(&ctx->req, nonce);
-	nfsd_ffv2_prototype_test_publish_hook(&work->reached, &work->proceed);
-	work->publish_hooked = true;
+	work->publish = nfsd_ffv2_prototype_test_pause_arm(NFSD_FFV2_PAUSE_PUBLISH);
+	if (!work->publish) {
+		KUNIT_FAIL(test, "failed to arm the publication pause");
+		goto out;
+	}
 
 	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
 					  &work->task, "ffv2-proto-reg")) {
 		KUNIT_FAIL(test, "failed to start the registering thread");
 		goto out;
 	}
-	if (!wait_for_completion_timeout(&work->reached, 30 * HZ)) {
+	if (!wait_for_completion_timeout(&work->publish->reached, 30 * HZ)) {
 		KUNIT_FAIL(test, "the registration never reached publication");
 		goto out;
 	}
@@ -12317,7 +12618,7 @@ static void nfsd_ffv2_prototype_publish_window_test(struct kunit *test)
 			nfsd_ffv2_prototype_unregister(f->nn, f->net,
 						       unpublished, 1));
 
-	complete_all(&work->proceed);
+	complete_all(&work->publish->proceed);
 	if (!wait_for_completion_timeout(&ctx->done, 30 * HZ)) {
 		KUNIT_FAIL(test, "the registering thread never returned");
 		goto out;
@@ -12501,15 +12802,18 @@ static void nfsd_ffv2_prototype_publish_close_race_test(struct kunit *test)
 	nfsd_ffv2_proto_request(&ctx->req, nonce);
 	work->closer.nn = f->nn;
 	work->closer.net = f->net;
-	nfsd_ffv2_prototype_test_publish_hook(&work->reached, &work->proceed);
-	work->publish_hooked = true;
+	work->publish = nfsd_ffv2_prototype_test_pause_arm(NFSD_FFV2_PAUSE_PUBLISH);
+	if (!work->publish) {
+		KUNIT_FAIL(test, "failed to arm the publication pause");
+		goto out;
+	}
 
 	if (!nfsd_ffv2_proto_worker_start(work, nfsd_ffv2_proto_access_thread,
 					  &work->task, "ffv2-proto-reg")) {
 		KUNIT_FAIL(test, "failed to start the registering thread");
 		goto out;
 	}
-	if (!wait_for_completion_timeout(&work->reached, 30 * HZ)) {
+	if (!wait_for_completion_timeout(&work->publish->reached, 30 * HZ)) {
 		KUNIT_FAIL(test, "the registration never reached publication");
 		goto out;
 	}
@@ -12524,7 +12828,7 @@ static void nfsd_ffv2_prototype_publish_close_race_test(struct kunit *test)
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
 
-	complete_all(&work->proceed);
+	complete_all(&work->publish->proceed);
 	if (!wait_for_completion_timeout(&ctx->done, 60 * HZ)) {
 		KUNIT_FAIL(test, "the registering thread never returned");
 		goto out;
@@ -12606,11 +12910,12 @@ static void nfsd_ffv2_prototype_short_read_test(struct kunit *test)
 			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
 						      &expires));
 	/* Measured whole, able to supply one chunk less. */
-	nfsd_ffv2_prototype_test_object_hook(f->seeded, f->object_dentry,
-					     f->inner, f->inner_len, f->bytes,
-					     sizeof(f->bytes) -
-						NFSD_FFV2_PROTO_CHUNK_SIZE,
-					     sizeof(f->bytes));
+	if (!nfsd_ffv2_proto_fixture_rearm(f, sizeof(f->bytes) -
+					      NFSD_FFV2_PROTO_CHUNK_SIZE,
+					   sizeof(f->bytes), false)) {
+		KUNIT_FAIL(test, "failed to substitute the short object");
+		goto out;
+	}
 	nfsd_ffv2_proto_request(&req, nonce);
 	memset(bundle, 0x5a, sizeof(*bundle));
 	KUNIT_EXPECT_EQ(test, -EIO,
@@ -12651,7 +12956,7 @@ out:
 static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
 {
 	struct nfsd_ffv2_prototype_call_ctx enable = {}, closer = {};
-	struct completion reached, proceed, parked, resume;
+	struct nfsd_ffv2_prototype_test_pause *setup, *sup;
 	struct task_struct *enable_task, *close_task;
 	struct nfsd_net *nn;
 	bool closing;
@@ -12662,23 +12967,20 @@ static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 
-	init_completion(&reached);
-	init_completion(&proceed);
-	init_completion(&parked);
-	init_completion(&resume);
 	init_completion(&enable.done);
 	init_completion(&closer.done);
 	enable.nn = nn;
 	closer.nn = nn;
 	enable.net = &init_net;
 	closer.net = &init_net;
-	nfsd_ffv2_prototype_test_setup_hook(&reached, &proceed);
+	setup = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_SETUP);
+	KUNIT_ASSERT_NOT_NULL(test, setup);
 
 	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
 				  "ffv2-proto-enable");
 	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&reached, 15 * HZ) != 0);
+			  wait_for_completion_timeout(&setup->reached, 15 * HZ) != 0);
 
 	close_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &closer,
 				 "ffv2-proto-close");
@@ -12688,10 +12990,11 @@ static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, closing);
 
 	/* Stop the loser between registering its wait and consuming it. */
-	nfsd_ffv2_prototype_test_supersede_hook(&parked, &resume);
-	complete(&proceed);
+	sup = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_SUPERSEDE);
+	KUNIT_ASSERT_NOT_NULL(test, sup);
+	complete(&setup->proceed);
 	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&parked, 30 * HZ) != 0);
+			  wait_for_completion_timeout(&sup->reached, 30 * HZ) != 0);
 
 	/* The close owner may finish; the loser has not returned yet. */
 	KUNIT_EXPECT_TRUE(test,
@@ -12709,7 +13012,7 @@ static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, -EBUSY,
 			nfsd_ffv2_prototype_enable(nn, &init_net));
 
-	complete(&resume);
+	complete(&sup->proceed);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&enable.done,
 						      30 * HZ) != 0);
@@ -12904,9 +13207,11 @@ static void nfsd_ffv2_prototype_growth_test(struct kunit *test)
 			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
 						      &expires));
 	/* Measured at @sampled, able to supply every byte the fixture holds. */
-	nfsd_ffv2_prototype_test_object_hook(f->seeded, f->object_dentry,
-					     f->inner, f->inner_len, f->bytes,
-					     sizeof(f->bytes), sampled);
+	if (!nfsd_ffv2_proto_fixture_rearm(f, sizeof(f->bytes), sampled,
+					   false)) {
+		KUNIT_FAIL(test, "failed to substitute the grown object");
+		goto out;
+	}
 	nfsd_ffv2_proto_request(&req, nonce);
 	KUNIT_ASSERT_EQ(test, 0,
 			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
@@ -12986,7 +13291,7 @@ out:
 static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 {
 	struct nfsd_ffv2_prototype_call_ctx owner = {}, waiter = {};
-	struct completion entered, proceed, published, resume;
+	struct nfsd_ffv2_prototype_test_pause *enter, *pub;
 	struct task_struct *owner_task, *waiter_task;
 	struct nfsd_net *nn;
 	bool closing;
@@ -13002,16 +13307,15 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	waiter.net = &init_net;
 
 	/* One: nothing else is closing, so nothing else can refuse. */
-	init_completion(&published);
-	init_completion(&resume);
 	init_completion(&owner.done);
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
-	nfsd_ffv2_prototype_test_close_hooks(NULL, NULL, &published, &resume);
+	pub = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_PUBLISHED);
+	KUNIT_ASSERT_NOT_NULL(test, pub);
 	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
 				 "ffv2-proto-owner");
 	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&published, 30 * HZ) != 0);
+			  wait_for_completion_timeout(&pub->reached, 30 * HZ) != 0);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	KUNIT_EXPECT_EQ(test, 0u,
@@ -13024,27 +13328,26 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	 */
 	KUNIT_EXPECT_EQ(test, -EBUSY,
 			nfsd_ffv2_prototype_enable(nn, &init_net));
-	complete(&resume);
+	complete(&pub->proceed);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
 	kthread_stop(owner_task);
 	KUNIT_EXPECT_EQ(test, 0, owner.result);
 
 	/* Two: a closer parked on the completion, and the signal withheld. */
-	init_completion(&entered);
-	init_completion(&proceed);
-	init_completion(&published);
-	init_completion(&resume);
 	init_completion(&owner.done);
 	init_completion(&waiter.done);
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
-	nfsd_ffv2_prototype_test_close_hooks(&entered, &proceed, &published,
-					     &resume);
+	/* Published first: the close reaches the entered one before it. */
+	pub = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_PUBLISHED);
+	enter = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_ENTERED);
+	KUNIT_ASSERT_NOT_NULL(test, pub);
+	KUNIT_ASSERT_NOT_NULL(test, enter);
 	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
 				 "ffv2-proto-owner2");
 	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&entered, 15 * HZ) != 0);
+			  wait_for_completion_timeout(&enter->reached, 15 * HZ) != 0);
 	closing = nfsd_ffv2_prototype_wait_state(nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
@@ -13055,16 +13358,16 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0,
 			wait_for_completion_timeout(&waiter.done, HZ / 5));
 
-	complete(&proceed);
+	complete(&enter->proceed);
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&published, 30 * HZ) != 0);
+			  wait_for_completion_timeout(&pub->reached, 30 * HZ) != 0);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	/* The gate reads off, and the waiter is still not satisfied. */
 	KUNIT_EXPECT_EQ(test, 0,
 			wait_for_completion_timeout(&waiter.done, HZ / 5));
 
-	complete(&resume);
+	complete(&pub->proceed);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
 	KUNIT_EXPECT_TRUE(test,
@@ -13082,20 +13385,19 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	 * parked on a reinitialised completion; if it were not, the old
 	 * signal would satisfy it the moment it arrived.
 	 */
-	init_completion(&entered);
-	init_completion(&proceed);
-	init_completion(&published);
-	init_completion(&resume);
 	init_completion(&owner.done);
 	init_completion(&waiter.done);
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
-	nfsd_ffv2_prototype_test_close_hooks(&entered, &proceed, &published,
-					     &resume);
+	/* Published first: the close reaches the entered one before it. */
+	pub = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_PUBLISHED);
+	enter = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_ENTERED);
+	KUNIT_ASSERT_NOT_NULL(test, pub);
+	KUNIT_ASSERT_NOT_NULL(test, enter);
 	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
 				 "ffv2-proto-owner3");
 	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&entered, 15 * HZ) != 0);
+			  wait_for_completion_timeout(&enter->reached, 15 * HZ) != 0);
 	closing = nfsd_ffv2_prototype_wait_state(nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
@@ -13106,9 +13408,9 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0,
 			wait_for_completion_timeout(&waiter.done, HZ / 5));
 
-	complete(&proceed);
+	complete(&enter->proceed);
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&published, 30 * HZ) != 0);
+			  wait_for_completion_timeout(&pub->reached, 30 * HZ) != 0);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	/* Still parked: this cycle's owner has not signalled either. */
@@ -13117,7 +13419,7 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 1u,
 			nfsd_ffv2_prototype_test_close_waiters(nn));
 
-	complete(&resume);
+	complete(&pub->proceed);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
 	KUNIT_EXPECT_TRUE(test,
@@ -13155,7 +13457,8 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	struct nfsd_ffv2_prototype_call_ctx owner = {}, exiting = {};
 	struct nfsd_ffv2_prototype_call_ctx destroying = {};
 	struct task_struct *owner_task, *exit_task, *destroy_task;
-	struct completion published, resume, entered;
+	struct nfsd_ffv2_prototype_test_pause *pub;
+	struct completion entered;
 	struct nfsd_net *nn, *stranger;
 	unsigned int parked_ref;
 	int error;
@@ -13165,8 +13468,6 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 
-	init_completion(&published);
-	init_completion(&resume);
 	init_completion(&entered);
 	init_completion(&owner.done);
 	init_completion(&exiting.done);
@@ -13177,12 +13478,13 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	owner.net = &init_net;
 
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
-	nfsd_ffv2_prototype_test_close_hooks(NULL, NULL, &published, &resume);
+	pub = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_PUBLISHED);
+	KUNIT_ASSERT_NOT_NULL(test, pub);
 	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
 				 "ffv2-proto-owner");
 	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
 	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&published, 30 * HZ) != 0);
+			  wait_for_completion_timeout(&pub->reached, 30 * HZ) != 0);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 
@@ -13194,7 +13496,7 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 				"ffv2-proto-exit");
 	if (IS_ERR(exit_task)) {
 		KUNIT_FAIL(test, "failed to start the exiting thread");
-		complete(&resume);
+		complete(&pub->proceed);
 		wait_for_completion(&owner.done);
 		kthread_stop(owner_task);
 		return;
@@ -13241,7 +13543,7 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	if (IS_ERR(destroy_task)) {
 		KUNIT_FAIL(test, "failed to start the destroying thread");
 		nfsd_ffv2_test_destroy_entry_hook(NULL, NULL);
-		complete(&resume);
+		complete(&pub->proceed);
 		wait_for_completion(&owner.done);
 		kthread_stop(owner_task);
 		kthread_stop(exit_task);
@@ -13263,7 +13565,7 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 1u, nfsd_ffv2_test_anchor_refcount(nn));
 
 	/* The owner signals, gives up the role, and lets the anchor go. */
-	complete(&resume);
+	complete(&pub->proceed);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
 	/* Only then does destruction get past its wait. */
@@ -13755,7 +14057,10 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_giveup_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_hook_release_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_hook_replace_test),
-	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_access_pretransition_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_access_untouched_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_hook_replace_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_hook_replace_race_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_hook_consumer_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_resolve_access_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_close_race_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_short_read_test),
