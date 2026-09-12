@@ -971,6 +971,19 @@ static void decode_chunk_read(struct xcur *c, uint64_t offset, uint32_t count)
 
 		if (!probe_expect.requested)
 			continue;
+		/*
+		 * The index of this element is the requested index plus its
+		 * position, and that addition is checked before it is made:
+		 * a sum that wrapped would name a low index and could be
+		 * compared successfully against a chunk the reply is not
+		 * carrying.  expected_chunk() checks the index it is given,
+		 * which is too late to catch a wrap that has happened.
+		 */
+		if ((uint64_t)i > UINT64_MAX - offset) {
+			fail("chunk %u is at index %llu + %u, past the end of the index space",
+			     i, (unsigned long long)offset, i);
+			continue;
+		}
 		want_len = expected_chunk(offset + i, &want);
 		if (payload_len != want_len) {
 			fail("chunk %u carries %zu bytes, not the %zu the object holds",
@@ -1416,7 +1429,8 @@ static void usage(void)
 		"usage: ffv2-live-probe --server <addr> --file <path>\n"
 		"                       [--port <port>] [--xchg <dir>]\n"
 		"                       [--expect <file>] [--wait <seconds>]\n"
-		"                       [--read-count <chunks>] [--interleave]\n"
+		"                       [--read-count <chunks>]\n"
+		"                       [--read-index <index>] [--interleave]\n"
 		"                       [--no-retirement] [--mutate-ordinary]\n"
 		"                       [--mutate-sequence]\n");
 	exit(2);
@@ -1441,6 +1455,7 @@ int main(int argc, char **argv)
 	bool interleave = false, retirement = true, mutate_ordinary = false;
 	bool mutate_sequence = false;
 	uint32_t read_count = 1;
+	uint64_t read_index = 0;
 	uint16_t port = 2049;
 	int i;
 
@@ -1459,6 +1474,8 @@ int main(int argc, char **argv)
 			wait_seconds = (unsigned int)strtoul(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--read-count") && i + 1 < argc)
 			read_count = (uint32_t)strtoul(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--read-index") && i + 1 < argc)
+			read_index = (uint64_t)strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--interleave"))
 			interleave = true;
 		else if (!strcmp(argv[i], "--no-retirement"))
@@ -1484,6 +1501,7 @@ int main(int argc, char **argv)
 	} else {
 		printf("PROBE-EXPECT=not-requested\n");
 	}
+	printf("PROBE-READ-INDEX=%llu\n", (unsigned long long)read_index);
 
 	connect_server(&c, server, port);
 	exchange_id(&c, request, sizeof(request));
@@ -1588,9 +1606,15 @@ int main(int argc, char **argv)
 	print_hex("PROBE-MAPPED-HANDLE", mapped, mapped_len);
 	print_hex("PROBE-STATEID", stateid, sizeof(stateid));
 
+	/*
+	 * The index is a knob for the same reason the count is: a control
+	 * run asks for a chunk index the object cannot have, and a reply
+	 * that satisfied such a request would be a reply this client must
+	 * refuse rather than compare.  The matrix leaves it at zero.
+	 */
 	chunk_case(&c, "CASE1-HEADER-READ", OP_CHUNK_HEADER_READ, mapped,
-		   mapped_len, stateid, 0, read_count, TERM_FFV2, NFS4_OK,
-		   request, sizeof(request));
+		   mapped_len, stateid, read_index, read_count, TERM_FFV2,
+		   NFS4_OK, request, sizeof(request));
 	/*
 	 * The interleaving harness retires the registration while that read
 	 * is held inside the server, so every later case would meet a
@@ -1606,8 +1630,8 @@ int main(int argc, char **argv)
 	 * "every requested chunk was compared" rule refuse the reply.
 	 */
 	chunk_case(&c, "CASE2-CHUNK-READ", OP_CHUNK_READ, mapped, mapped_len,
-		   stateid, 0, read_count, TERM_FFV2, NFS4_OK, request,
-		   sizeof(request));
+		   stateid, read_index, read_count, TERM_FFV2, NFS4_OK,
+		   request, sizeof(request));
 	chunk_case(&c, "CASE3-ORDINARY-AFTER-PUTFH", OP_CHUNK_READ, c.fh,
 		   c.fh_len, stateid, 0, 1, TERM_PUTFH, NFS4ERR_STALE,
 		   request, sizeof(request));
