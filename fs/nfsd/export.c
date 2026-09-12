@@ -1603,49 +1603,17 @@ int nfsd_ffv2_export_transition_begin(struct svc_export *exp)
 	return error;
 }
 
-#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
-/*
- * A test that has deliberately wedged a transition needs a way to let the
- * waiter go, so that the thread it runs on can be joined rather than left
- * over the memory the test is about to free.  Signals are not enough on
- * their own: a test must be able to unblock a wait whose predicate no
- * event will ever satisfy.  The wait still refuses to publish -- it
- * returns the error a caller that gave up would see -- so arming this
- * cannot make a registration succeed against an access it should have
- * waited for.
- */
-static bool nfsd_ffv2_export_wait_cancelled;
-
-void nfsd_ffv2_export_test_cancel_wait(struct svc_export *exp, bool cancel)
-{
-	WRITE_ONCE(nfsd_ffv2_export_wait_cancelled, cancel);
-	if (cancel && exp)
-		wake_up_all(&exp->ex_ffv2_access_wait);
-}
-
-static bool nfsd_ffv2_export_wait_cancel(void)
-{
-	return READ_ONCE(nfsd_ffv2_export_wait_cancelled);
-}
-#else
-static inline bool nfsd_ffv2_export_wait_cancel(void)
-{
-	return false;
-}
-#endif
-
 int nfsd_ffv2_export_transition_wait(struct svc_export *exp)
 {
 	int error;
 
 	error = wait_event_interruptible(exp->ex_ffv2_access_wait,
-					 !READ_ONCE(exp->ex_ffv2_access_count) ||
-					 nfsd_ffv2_export_wait_cancel());
+					 !READ_ONCE(exp->ex_ffv2_access_count));
 	if (error)
 		return error;
 	/*
-	 * Woken with the access still outstanding means the wait was
-	 * cancelled, never that it drained: the transition must not proceed.
+	 * Woken with the access still outstanding is not a drain, whatever
+	 * woke it: the transition must not proceed.
 	 */
 	if (READ_ONCE(exp->ex_ffv2_access_count))
 		return -ERESTARTSYS;

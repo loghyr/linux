@@ -11693,32 +11693,39 @@ struct nfsd_ffv2_proto_access_ctx {
  * still inside the transition reads this context, and returning from the
  * test while it does would leave it reading memory KUnit has reclaimed.
  *
- * The join is unconditional.  Releasing the access is what a working
- * registration is waiting for; cancelling the wait is what lets a wedged
- * one -- the deliberately broken path -- return the error a caller that
- * gave up would see.  Signalling follows, in case the thread is waiting
- * somewhere else.
+ * The join is unconditional and bounded without interrupting anything.
+ * The transition waits on a count, so putting the access it is waiting
+ * for is what ends the wait, and a registration that let go of its own
+ * access has already finished by the time this runs.
  */
 static void nfsd_ffv2_proto_access_release(void *data)
 {
 	struct nfsd_ffv2_proto_access_ctx *held = data;
+	struct task_struct *task = held->task;
 
 	nfsd_ffv2_prototype_test_access_hook(false);
 	if (held->held) {
 		nfsd_ffv2_export_access_put(held->exp);
 		held->held = false;
 	}
-	if (!held->task)
+	if (!task)
 		return;
+	held->task = NULL;
+	/*
+	 * The registration has not returned.  What it is waiting for is the
+	 * export's ordinary access to drain, and in the broken case the
+	 * access it is waiting on is the one its own handle took and should
+	 * have released.  The test has already failed; dropping that access
+	 * is what lets the thread finish, so it can be joined before
+	 * anything it reads is freed.  The broken registration will put the
+	 * same access again on its way out and warn about it, which is the
+	 * defect the test exists to catch saying so a second time.
+	 */
 	if (!wait_for_completion_timeout(&held->ctx->done, 5 * HZ)) {
-		nfsd_ffv2_export_test_cancel_wait(held->exp, true);
-		if (!wait_for_completion_timeout(&held->ctx->done, 30 * HZ))
-			send_sig(SIGKILL, held->task, 1);
+		nfsd_ffv2_export_access_put(held->exp);
 		wait_for_completion(&held->ctx->done);
 	}
-	kthread_stop(held->task);
-	held->task = NULL;
-	nfsd_ffv2_export_test_cancel_wait(held->exp, false);
+	kthread_stop(task);
 }
 
 static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
@@ -11820,11 +11827,13 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 	f->enabled = false;
 out:
 	/*
-	 * The cleanup action releases the access, cancels a wedged wait and
-	 * joins the thread; it runs before the memory that thread reads is
-	 * freed.  Fixture teardown is therefore never reached with the
-	 * registration still running.
+	 * Joined here, before the fixture is torn down: tearing it down
+	 * first would wait on the service the wedged registration is still
+	 * inside.  The same helper is registered as a KUnit action, which
+	 * covers an aborting assertion and is a no-op once this call has
+	 * cleared the task.
 	 */
+	nfsd_ffv2_proto_access_release(held);
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
