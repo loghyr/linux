@@ -53,6 +53,8 @@
 #define NFS4_SESSIONID_SIZE	16
 #define NFS4_VERIFIER_SIZE	8
 
+#define ARRAY_SIZE(a)		(sizeof(a) / sizeof((a)[0]))
+
 #define XDR_UNIT		4
 #define MAX_MSG			(1024 * 1024)
 
@@ -81,6 +83,7 @@ enum terminal_op {
 #define NFS4ERR_STALE		70
 #define NFS4ERR_NOTSUPP		10004
 #define NFS4ERR_BAD_STATEID	10025
+#define NFS4ERR_SEQ_MISORDERED	10063
 
 /* An encoded message under construction. */
 struct xbuf {
@@ -179,19 +182,32 @@ static void print_hex(const char *name, const void *data, size_t len)
 	printf("\n");
 }
 
+/* One hex digit, or -1.  sscanf("%2x") would accept "0g" as a single 0. */
+static int hex_digit(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+	return -1;
+}
+
 static size_t parse_hex(const char *text, uint8_t *out, size_t max)
 {
 	size_t len = strlen(text);
 	size_t i;
 
-	if (len % 2 || len / 2 > max)
+	if (!len || len % 2 || len / 2 > max)
 		die("bad hex string of %zu characters", len);
 	for (i = 0; i < len / 2; i++) {
-		unsigned int byte;
+		int hi = hex_digit(text[2 * i]);
+		int lo = hex_digit(text[2 * i + 1]);
 
-		if (sscanf(text + 2 * i, "%2x", &byte) != 1)
-			die("bad hex string");
-		out[i] = (uint8_t)byte;
+		if (hi < 0 || lo < 0)
+			die("bad hex digit in \"%s\"", text);
+		out[i] = (uint8_t)((hi << 4) | lo);
 	}
 	return len / 2;
 }
@@ -1024,7 +1040,15 @@ static void chunk_case(struct nfs4_client *c, const char *label,
 	status = get_sequence(&cur);
 	results++;
 	if (status) {
+		/*
+		 * The session failed the request, so no case's subject ever
+		 * ran.  A SEQUENCE error that happens to carry the number the
+		 * case expected is still not the refusal the case is about.
+		 */
 		printf("%s-SEQUENCE-STATUS=%u\n", label, status);
+		fail("%s stopped at SEQUENCE with NFS4ERR %u; nothing it names ran",
+		     label, status);
+		misterminated = true;
 		goto out;
 	}
 	status = op_result(&cur, OP_PUTFH);
@@ -1069,6 +1093,20 @@ out:
 	 * produced, and its status is that of the operation that stopped it.
 	 */
 	reply_complete(&cur, label, nres, results, compound, status);
+	/*
+	 * A case ends at the operation it names, and carries the results
+	 * that reaching it requires: three for one the FFv2 operation
+	 * decides, two for one PUTFH refuses.
+	 */
+	if (!misterminated) {
+		uint32_t expected = terminal == TERM_PUTFH ? 2 : 3;
+
+		if (results != expected)
+			fail("%s carried %u results, expected %u for a case ending at %s",
+			     label, results, expected,
+			     terminal == TERM_PUTFH ? "PUTFH" :
+						      "its FFv2 operation");
+	}
 	/*
 	 * The status the case exists to produce.  A refusal that stopped
 	 * refusing, or a read that stopped succeeding, is a failed case even
@@ -1124,6 +1162,72 @@ static bool bundle_read(const char *dir, struct bundle *b)
 	fclose(f);
 	b->text[b->len] = '\0';
 	return b->len != 0;
+}
+
+/*
+ * The keys a bundle may carry.  An unknown key is a bundle this probe does
+ * not understand, and a repeated one is a bundle that says two things; both
+ * are refused rather than resolved by taking the first.
+ */
+static const char * const bundle_keys[] = {
+	"RUN", "MAPPED_HANDLE", "STATEID", "SOURCE_UUID", "GENERATION",
+	"CHUNK_SIZE",
+};
+
+static bool bundle_key_known(const char *key, size_t len)
+{
+	size_t i;
+
+	for (i = 0; i < ARRAY_SIZE(bundle_keys); i++)
+		if (!strncmp(key, bundle_keys[i], len) &&
+		    !bundle_keys[i][len])
+			return true;
+	return false;
+}
+
+/*
+ * Check the snapshot before anything reads a value out of it: every line
+ * is "KNOWN_KEY=value", no key appears twice, and no value is empty.
+ */
+static bool bundle_well_formed(const struct bundle *b, const char **why)
+{
+	unsigned int seen[ARRAY_SIZE(bundle_keys)] = {};
+	const char *p = b->text;
+
+	while (*p) {
+		const char *eol = strchr(p, '\n');
+		size_t line = eol ? (size_t)(eol - p) : strlen(p);
+		const char *eq = memchr(p, '=', line);
+		size_t klen, i;
+
+		if (!line) {
+			*why = "a bundle line is empty";
+			return false;
+		}
+		if (!eq) {
+			*why = "a bundle line has no value";
+			return false;
+		}
+		klen = (size_t)(eq - p);
+		if (!klen || (eol ? (size_t)(eol - eq) : strlen(eq)) < 2) {
+			*why = "a bundle line has an empty key or value";
+			return false;
+		}
+		if (!bundle_key_known(p, klen)) {
+			*why = "the bundle carries a key this client does not know";
+			return false;
+		}
+		for (i = 0; i < ARRAY_SIZE(bundle_keys); i++)
+			if (!strncmp(p, bundle_keys[i], klen) &&
+			    !bundle_keys[i][klen] && seen[i]++) {
+				*why = "the bundle carries a key twice";
+				return false;
+			}
+		if (!eol)
+			break;
+		p = eol + 1;
+	}
+	return true;
 }
 
 /* One "KEY=value" line out of the snapshot. */
@@ -1284,7 +1388,8 @@ static void usage(void)
 		"                       [--port <port>] [--xchg <dir>]\n"
 		"                       [--expect <file>] [--wait <seconds>]\n"
 		"                       [--read-count <chunks>] [--interleave]\n"
-		"                       [--no-retirement] [--mutate-ordinary]\n");
+		"                       [--no-retirement] [--mutate-ordinary]\n"
+		"                       [--mutate-sequence]\n");
 	exit(2);
 }
 
@@ -1293,6 +1398,7 @@ int main(int argc, char **argv)
 	static uint8_t request[MAX_MSG];
 	static struct bundle bundle;
 	struct nfs4_client c = {};
+	const char *why = NULL;
 	const char *server = NULL, *file = NULL, *xchg = NULL, *expect = NULL;
 	unsigned int wait_seconds = 300;
 	uint8_t zero_stateid[NFS4_STATEID_SIZE] = {};
@@ -1304,6 +1410,7 @@ int main(int argc, char **argv)
 	char value[1024];
 	char run[64];
 	bool interleave = false, retirement = true, mutate_ordinary = false;
+	bool mutate_sequence = false;
 	uint32_t read_count = 1;
 	uint16_t port = 2049;
 	int i;
@@ -1329,6 +1436,8 @@ int main(int argc, char **argv)
 			retirement = false;
 		else if (!strcmp(argv[i], "--mutate-ordinary"))
 			mutate_ordinary = true;
+		else if (!strcmp(argv[i], "--mutate-sequence"))
+			mutate_sequence = true;
 		else
 			usage();
 	}
@@ -1379,7 +1488,22 @@ int main(int argc, char **argv)
 	 * Case 3 runs before any registration exists as well as after it:
 	 * an ordinary filehandle must never reach the provider, and the
 	 * clearest way to show that is to ask it to.
+	 *
+	 * A control run skips the slot's sequence id so the session refuses
+	 * the request, and asks this case to expect that refusal's number.
+	 * The case must still fail: an error from SEQUENCE means nothing the
+	 * case names ever ran, whatever number it carries.
 	 */
+	if (mutate_sequence) {
+		c.seq_seqid += 7;
+		printf("PROBE-SEQUENCE-MUTATED=yes\n");
+		chunk_case(&c, "CASE3-ORDINARY-BEFORE", OP_CHUNK_HEADER_READ,
+			   c.fh, c.fh_len, zero_stateid, 0, 1, TERM_FFV2,
+			   NFS4ERR_SEQ_MISORDERED, request, sizeof(request));
+		printf("PROBE-FAILURES=%u\n", probe_failures);
+		printf("PROBE-DONE\n");
+		return probe_failures ? 1 : 0;
+	}
 	chunk_case(&c, "CASE3-ORDINARY-BEFORE", OP_CHUNK_HEADER_READ, c.fh,
 		   c.fh_len, zero_stateid, 0, 1, TERM_FFV2, NFS4ERR_STALE,
 		   request, sizeof(request));
@@ -1391,6 +1515,8 @@ int main(int argc, char **argv)
 		printf("PROBE-FAILURES=%u\n", probe_failures + 1);
 		return 1;
 	}
+	if (!bundle_well_formed(&bundle, &why))
+		die("registration is malformed: %s", why);
 	if (!bundle_value(&bundle, "MAPPED_HANDLE", value, sizeof(value)))
 		die("registration published no mapped handle");
 	mapped_len = parse_hex(value, mapped, sizeof(mapped));
