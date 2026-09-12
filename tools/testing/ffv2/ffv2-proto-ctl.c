@@ -256,7 +256,8 @@ static void bundle_hex(FILE *f, const char *key, const void *data, size_t len)
  */
 static void cmd_register(struct ffv2_nl *nl, const char *domain,
 			 const char *handle_hex, uint32_t chunk_size,
-			 uint32_t data_count, const char *bundle_path)
+			 uint32_t data_count, const char *bundle_path,
+			 const char *run)
 {
 	uint8_t reply[NLMSG_BUF_SIZE];
 	uint8_t handle[128];
@@ -283,6 +284,8 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	print_hex("PROTO-NONCE", nonce, sizeof(nonce));
 
 	handle_len = parse_hex(handle_hex, handle, sizeof(handle));
+	if (!handle_len)
+		die("the ordinary filehandle is empty");
 	nl_start(nl, nl->family, NFSD_CMD_FFV2_PROTOTYPE_REGISTER);
 	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_NONCE, nonce, sizeof(nonce));
 	nl_put_str(nl, NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN, domain);
@@ -340,25 +343,45 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	if (!nla)
 		die("registration returned no mapped handle");
 	value = nl_data(nla, &attrlen);
-	if (attrlen > sizeof(mapped))
+	/*
+	 * A filehandle of no bytes is not one a client can present, and
+	 * publishing it would hand the harness something it would have to
+	 * index into.  Refuse it here rather than downstream.
+	 */
+	if (!attrlen || attrlen > sizeof(mapped))
 		die("mapped handle is %zu bytes", attrlen);
 	memcpy(mapped, value, attrlen);
 	mapped_len = attrlen;
 	print_hex("PROTO-MAPPED-HANDLE", mapped, mapped_len);
 
 	if (bundle_path) {
-		bundle = fopen(bundle_path, "w");
+		char staged[512];
+
+		/*
+		 * Written beside the bundle and renamed onto it, so a reader
+		 * sees either the previous registration or this complete one
+		 * and never a half-written file.  The run token is what tells
+		 * the reader which of the two it has.
+		 */
+		if ((size_t)snprintf(staged, sizeof(staged), "%s.staged",
+				     bundle_path) >= sizeof(staged))
+			die("bundle path is too long");
+		bundle = fopen(staged, "w");
 		if (!bundle)
-			die("cannot write %s: %s", bundle_path,
-			    strerror(errno));
+			die("cannot write %s: %s", staged, strerror(errno));
+		fprintf(bundle, "RUN=%s\n", run ? run : "");
 		bundle_hex(bundle, "MAPPED_HANDLE", mapped, mapped_len);
 		bundle_hex(bundle, "STATEID", wire, sizeof(wire));
 		bundle_hex(bundle, "SOURCE_UUID", uuid, uuid_len);
 		fprintf(bundle, "GENERATION=%llu\n",
 			(unsigned long long)generation);
 		fprintf(bundle, "CHUNK_SIZE=%u\n", chunk_size);
+		if (fflush(bundle) || fsync(fileno(bundle)))
+			die("cannot flush %s: %s", staged, strerror(errno));
 		if (fclose(bundle))
-			die("cannot complete %s: %s", bundle_path,
+			die("cannot complete %s: %s", staged, strerror(errno));
+		if (rename(staged, bundle_path))
+			die("cannot publish %s: %s", bundle_path,
 			    strerror(errno));
 		printf("PROTO-BUNDLE=%s\n", bundle_path);
 	}
@@ -387,7 +410,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: ffv2-proto-ctl enable\n"
-		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count> [bundle-path]\n"
+		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count> [bundle-path [run-token]]\n"
 		"       ffv2-proto-ctl unregister <source-uuid-hex> <generation>\n"
 		"       ffv2-proto-ctl disable\n");
 	exit(2);
@@ -403,11 +426,12 @@ int main(int argc, char **argv)
 
 	if (!strcmp(argv[1], "enable") && argc == 2)
 		cmd_enable(&nl);
-	else if (!strcmp(argv[1], "register") && (argc == 6 || argc == 7))
+	else if (!strcmp(argv[1], "register") && argc >= 6 && argc <= 8)
 		cmd_register(&nl, argv[2], argv[3],
 			     (uint32_t)strtoul(argv[4], NULL, 0),
 			     (uint32_t)strtoul(argv[5], NULL, 0),
-			     argc == 7 ? argv[6] : NULL);
+			     argc >= 7 ? argv[6] : NULL,
+			     argc == 8 ? argv[7] : NULL);
 	else if (!strcmp(argv[1], "unregister") && argc == 4)
 		cmd_unregister(&nl, argv[2], strtoull(argv[3], NULL, 0));
 	else if (!strcmp(argv[1], "disable") && argc == 2)
