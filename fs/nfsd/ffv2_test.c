@@ -10,6 +10,7 @@
 #include <linux/namei.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/slab.h>
 #include <linux/sunrpc/gss_api.h>
 #include <linux/sunrpc/svcsock.h>
@@ -11551,8 +11552,18 @@ static int nfsd_ffv2_proto_register_thread(void *data)
 {
 	struct nfsd_ffv2_proto_register_ctx *ctx = data;
 
+	/*
+	 * A registration waits interruptibly for the export's ordinary
+	 * access to drain.  Accepting a signal is what lets a test that has
+	 * given up on a wedged registration unblock it and join this thread,
+	 * instead of tearing the fixture down underneath it.  Nothing signals
+	 * this thread unless a test has already failed.
+	 */
+	allow_signal(SIGKILL);
 	ctx->result = nfsd_ffv2_prototype_register(ctx->f->nn, ctx->f->net,
 						   &ctx->req, ctx->bundle);
+	if (signal_pending(current))
+		flush_signals(current);
 	complete(&ctx->done);
 	nfsd_ffv2_test_thread_park();
 	return 0;
@@ -11769,14 +11780,30 @@ static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
 	f->enabled = false;
 out:
 	/*
-	 * The thread is joined only when its completion was observed: a
-	 * registration that kept its own access would never return, and this
-	 * test must report that rather than wait for it.
+	 * A registration that kept the access its own handle holds is still
+	 * inside that interruptible wait.  Signalling it is what a caller
+	 * that gave up would do, and it is what makes the broken path
+	 * bounded: the thread returns, is joined, and the fixture is never
+	 * torn down while it could still reach the export or the namespace.
 	 */
-	if (task && joined)
+	if (task && !joined) {
+		if (held->held) {
+			nfsd_ffv2_export_access_put(held->exp);
+			held->held = false;
+		}
+		send_sig(SIGKILL, task, 1);
+		joined = wait_for_completion_timeout(&ctx->done, 30 * HZ);
+		KUNIT_EXPECT_TRUE(test, joined);
+	}
+	if (task && joined) {
 		kthread_stop(task);
-	else if (task)
-		KUNIT_FAIL(test, "the registering thread never returned");
+		task = NULL;
+	}
+	if (task) {
+		KUNIT_FAIL(test,
+			   "the registering thread could not be joined; the fixture is left standing");
+		return;
+	}
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
