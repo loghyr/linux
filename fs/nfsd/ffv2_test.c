@@ -10647,6 +10647,47 @@ out:
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
 
 /*
+ * Which cleanups ran, and in what order.
+ *
+ * A test that has to say something about the order KUnit unwinds its
+ * actions in cannot ask KUnit; it can only ask the cleanups themselves.
+ * Each of them records that it did its work -- once, on the pass that
+ * actually did it -- into a log a test hands them, and the test reads the
+ * sequence back.
+ */
+enum nfsd_ffv2_proto_cleanup {
+	NFSD_FFV2_CLEANUP_OBJECT = 1,
+	NFSD_FFV2_CLEANUP_PAUSE,
+	NFSD_FFV2_CLEANUP_WORKER,
+	NFSD_FFV2_CLEANUP_FIXTURE,
+};
+
+struct nfsd_ffv2_proto_order {
+	struct kunit	*test;
+	u8		step[8];
+	unsigned int	steps;
+};
+
+static void nfsd_ffv2_proto_order_note(struct nfsd_ffv2_proto_order *order,
+				       enum nfsd_ffv2_proto_cleanup what)
+{
+	if (order && order->steps < ARRAY_SIZE(order->step))
+		order->step[order->steps++] = (u8)what;
+}
+
+/* Where in the log a cleanup ran, counting from one, or zero for never. */
+static unsigned int nfsd_ffv2_proto_order_at(struct nfsd_ffv2_proto_order *order,
+					     enum nfsd_ffv2_proto_cleanup what)
+{
+	unsigned int i;
+
+	for (i = 0; i < order->steps; i++)
+		if (order->step[i] == (u8)what)
+			return i + 1;
+	return 0;
+}
+
+/*
  * One arming of one of the prototype's pauses, held for a test.
  *
  * The arming is a refcounted record rather than a pair of pointers into
@@ -10659,6 +10700,7 @@ out:
 struct nfsd_ffv2_proto_pause {
 	struct nfsd_ffv2_prototype_test_pause	*pause;
 	enum nfsd_ffv2_prototype_test_pause_site site;
+	struct nfsd_ffv2_proto_order		*order;
 };
 
 static void nfsd_ffv2_proto_pause_release(void *data)
@@ -10667,6 +10709,7 @@ static void nfsd_ffv2_proto_pause_release(void *data)
 
 	if (!held->pause)
 		return;
+	nfsd_ffv2_proto_order_note(held->order, NFSD_FFV2_CLEANUP_PAUSE);
 	complete_all(&held->pause->proceed);
 	nfsd_ffv2_prototype_test_pause_disarm(held->site, held->pause);
 	nfsd_ffv2_prototype_test_pause_put(held->pause);
@@ -10718,6 +10761,7 @@ nfsd_ffv2_proto_pause_arm(struct kunit *test,
  */
 struct nfsd_ffv2_proto_object {
 	struct nfsd_ffv2_prototype_test_object	*obj;
+	struct nfsd_ffv2_proto_order		*order;
 	bool					armed;
 };
 
@@ -10727,6 +10771,7 @@ static void nfsd_ffv2_proto_object_release(void *data)
 
 	if (!held->obj)
 		return;
+	nfsd_ffv2_proto_order_note(held->order, NFSD_FFV2_CLEANUP_OBJECT);
 	if (held->armed)
 		nfsd_ffv2_prototype_test_object_disarm(held->obj);
 	nfsd_ffv2_prototype_test_object_put(held->obj);
@@ -11355,9 +11400,50 @@ static void nfsd_ffv2_proto_fixture_exit(struct nfsd_ffv2_proto_fixture *f)
  * is what keeps an assertion below from returning with the fixture, and
  * the arming it made, still standing.  Tearing one down twice is a no-op.
  */
+struct nfsd_ffv2_proto_fixture_hold {
+	struct nfsd_ffv2_proto_fixture	*f;
+	struct nfsd_ffv2_proto_order	*order;
+};
+
 static void nfsd_ffv2_proto_fixture_release(void *data)
 {
-	nfsd_ffv2_proto_fixture_exit(data);
+	struct nfsd_ffv2_proto_fixture_hold *held = data;
+
+	if (!held->f)
+		return;
+	nfsd_ffv2_proto_order_note(held->order, NFSD_FFV2_CLEANUP_FIXTURE);
+	nfsd_ffv2_proto_fixture_exit(held->f);
+	held->f = NULL;
+}
+
+/*
+ * Hand a fixture to KUnit.
+ *
+ * Registering it here and never tearing it down from the test body again
+ * is what puts it last: anything registered afterwards -- a consumer's
+ * reference on an arming this fixture made, above all -- is released
+ * before it.  An export-backed record released after this fixture's
+ * per-net cache had gone would put an export through a cache detail that
+ * no longer exists, so the order is not a tidiness question.
+ */
+static struct nfsd_ffv2_proto_fixture_hold *
+nfsd_ffv2_proto_fixture_own(struct kunit *test,
+			    struct nfsd_ffv2_proto_fixture *f,
+			    struct nfsd_ffv2_proto_order *order)
+{
+	struct nfsd_ffv2_proto_fixture_hold *held;
+
+	held = kunit_kzalloc(test, sizeof(*held), GFP_KERNEL);
+	if (!held) {
+		nfsd_ffv2_proto_fixture_exit(f);
+		return NULL;
+	}
+	held->f = f;
+	held->order = order;
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_fixture_release,
+				      held))
+		return NULL;
+	return held;
 }
 
 static bool nfsd_ffv2_proto_fixture_init(struct kunit *test,
@@ -12392,6 +12478,7 @@ static void nfsd_ffv2_prototype_hook_replace_test(struct kunit *test)
 /* One half of the replacement race: a disarm, started on its own thread. */
 struct nfsd_ffv2_proto_disarm_ctx {
 	struct nfsd_ffv2_prototype_test_object	*obj;
+	struct nfsd_ffv2_proto_order		*order;
 	struct task_struct			*task;
 	struct completion			start;
 	struct completion			done;
@@ -12414,6 +12501,7 @@ static void nfsd_ffv2_proto_disarm_stop(void *data)
 
 	if (!task)
 		return;
+	nfsd_ffv2_proto_order_note(ctx->order, NFSD_FFV2_CLEANUP_WORKER);
 	ctx->task = NULL;
 	WRITE_ONCE(ctx->stop, true);
 	complete(&ctx->start);
@@ -12529,45 +12617,63 @@ static void nfsd_ffv2_prototype_hook_replace_race_test(struct kunit *test)
  *
  * A test that fails an assertion never reaches the lines that would have
  * put its armings back; what runs instead is the cleanup registered when
- * each of them was taken.  That cleanup is therefore worth exercising on
- * purpose rather than only when something else goes wrong: here it is
- * called directly, in the order KUnit would call it, and asked to leave
- * nothing armed, nothing running, and nothing to go wrong if it is called
- * again.
+ * each of them was taken, and KUnit runs those in the reverse of the order
+ * they were registered in -- its resource list is a stack.  So that is the
+ * order this releases them in, through KUnit's own release call, with all
+ * four live at once, and the sequence each cleanup records for itself is
+ * what says the order was the one claimed.
+ *
+ * Then each is asked again, because the action will run after the body
+ * has, and a cleanup that did its work twice would be a cleanup that could
+ * put a reference twice.
  */
 static void nfsd_ffv2_prototype_hook_cleanup_test(struct kunit *test)
 {
-	static const u8 inner[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
+	struct nfsd_ffv2_proto_fixture_hold *fixture;
 	struct nfsd_ffv2_proto_disarm_ctx *ctx;
-	struct nfsd_ffv2_proto_object *held;
+	struct nfsd_ffv2_proto_object *taken;
 	struct nfsd_ffv2_proto_pause *pause;
-	u8 bytes[4] = { 1, 2, 3, 4 };
+	struct nfsd_ffv2_proto_order *order;
+	struct nfsd_ffv2_proto_fixture *f;
 	struct task_struct *task;
 
-	held = nfsd_ffv2_proto_object_arm(test, NULL, NULL, inner,
-					  sizeof(inner), bytes, sizeof(bytes),
-					  0, false);
-	KUNIT_ASSERT_NOT_NULL(test, held);
+	order = kunit_kzalloc(test, sizeof(*order), GFP_KERNEL);
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, order);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	order->test = test;
+	if (!nfsd_ffv2_proto_fixture_init(test, f)) {
+		nfsd_ffv2_proto_fixture_exit(f);
+		return;
+	}
+	/* Registered first, so released last, with everything else on top. */
+	fixture = nfsd_ffv2_proto_fixture_own(test, f, order);
+	if (!fixture) {
+		KUNIT_FAIL(test, "failed to register the fixture release");
+		return;
+	}
+	taken = nfsd_ffv2_proto_object_hold(test,
+					    nfsd_ffv2_prototype_test_object_acquire(),
+					    false);
+	if (!taken) {
+		KUNIT_FAIL(test, "the object hook was not armed to acquire");
+		return;
+	}
+	taken->order = order;
 	pause = nfsd_ffv2_proto_pause_hold(test, NFSD_FFV2_PAUSE_PUBLISH);
-	KUNIT_ASSERT_NOT_NULL(test, pause);
-	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_object_armed());
-
-	/* What an aborted case would leave to the actions, run here. */
-	nfsd_ffv2_proto_object_release(held);
-	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_armed());
-	KUNIT_EXPECT_NULL(test, held->obj);
-	nfsd_ffv2_proto_pause_release(pause);
-	KUNIT_EXPECT_NULL(test, pause->pause);
-	/* And again, because the action will run after this one has. */
-	nfsd_ffv2_proto_object_release(held);
-	nfsd_ffv2_proto_pause_release(pause);
-	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_armed());
-
-	/* The same for a thread the case would otherwise have stranded. */
+	if (!pause) {
+		KUNIT_FAIL(test, "failed to arm the publication pause");
+		return;
+	}
+	pause->order = order;
 	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
-	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	if (!ctx) {
+		KUNIT_FAIL(test, "failed to allocate the thread context");
+		return;
+	}
 	init_completion(&ctx->start);
 	init_completion(&ctx->done);
+	ctx->order = order;
 	task = kthread_run(nfsd_ffv2_proto_disarm_thread, ctx,
 			   "ffv2-proto-disarm");
 	if (IS_ERR(task)) {
@@ -12580,9 +12686,104 @@ static void nfsd_ffv2_prototype_hook_cleanup_test(struct kunit *test)
 		KUNIT_FAIL(test, "failed to register the thread release");
 		return;
 	}
-	nfsd_ffv2_proto_disarm_stop(ctx);
+
+	/* Last registered, first released, through KUnit's own call. */
+	kunit_release_action(test, nfsd_ffv2_proto_disarm_stop, ctx);
+	kunit_release_action(test, nfsd_ffv2_proto_pause_release, pause);
+	kunit_release_action(test, nfsd_ffv2_proto_object_release, taken);
+	kunit_release_action(test, nfsd_ffv2_proto_fixture_release, fixture);
+
+	KUNIT_EXPECT_EQ(test, 4U, order->steps);
+	KUNIT_EXPECT_EQ(test, 1U,
+			nfsd_ffv2_proto_order_at(order,
+						 NFSD_FFV2_CLEANUP_WORKER));
+	KUNIT_EXPECT_EQ(test, 2U,
+			nfsd_ffv2_proto_order_at(order,
+						 NFSD_FFV2_CLEANUP_PAUSE));
+	KUNIT_EXPECT_EQ(test, 3U,
+			nfsd_ffv2_proto_order_at(order,
+						 NFSD_FFV2_CLEANUP_OBJECT));
+	/* The consumer's reference went before the fixture's cache did. */
+	KUNIT_EXPECT_EQ(test, 4U,
+			nfsd_ffv2_proto_order_at(order,
+						 NFSD_FFV2_CLEANUP_FIXTURE));
 	KUNIT_EXPECT_NULL(test, ctx->task);
+	KUNIT_EXPECT_NULL(test, pause->pause);
+	KUNIT_EXPECT_NULL(test, taken->obj);
+	KUNIT_EXPECT_NULL(test, fixture->f);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_object_armed());
+
+	/* And again, which must do nothing and record nothing. */
 	nfsd_ffv2_proto_disarm_stop(ctx);
+	nfsd_ffv2_proto_pause_release(pause);
+	nfsd_ffv2_proto_object_release(taken);
+	nfsd_ffv2_proto_fixture_release(fixture);
+	KUNIT_EXPECT_EQ(test, 4U, order->steps);
+}
+
+/*
+ * The order KUnit itself unwinds in, on the path that made it matter.
+ *
+ * The consumer test's error branch takes a reference on the fixture's
+ * arming and then gives up before it can put it back, so what releases it
+ * is KUnit.  A reference released after the fixture's per-net cache had
+ * gone would put an export through a cache detail that no longer exists,
+ * so the question is not whether it is released but when.
+ *
+ * This takes that reference and gives up in exactly the same way.  Nothing
+ * in the body releases anything; the check runs from an action registered
+ * before either of them, so it is the last thing to run and sees the whole
+ * sequence.
+ */
+static void nfsd_ffv2_proto_order_check(void *data)
+{
+	struct nfsd_ffv2_proto_order *order = data;
+	unsigned int fixture, object;
+
+	object = nfsd_ffv2_proto_order_at(order, NFSD_FFV2_CLEANUP_OBJECT);
+	fixture = nfsd_ffv2_proto_order_at(order, NFSD_FFV2_CLEANUP_FIXTURE);
+	KUNIT_EXPECT_NE(order->test, 0U, object);
+	KUNIT_EXPECT_NE(order->test, 0U, fixture);
+	KUNIT_EXPECT_LT(order->test, object, fixture);
+}
+
+static void nfsd_ffv2_prototype_hook_teardown_order_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_fixture_hold *fixture;
+	struct nfsd_ffv2_proto_object *taken;
+	struct nfsd_ffv2_proto_order *order;
+	struct nfsd_ffv2_proto_fixture *f;
+
+	order = kunit_kzalloc(test, sizeof(*order), GFP_KERNEL);
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, order);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	order->test = test;
+	/* Registered before anything it has to see, so it runs after it. */
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_order_check,
+				      order)) {
+		KUNIT_FAIL(test, "failed to register the order check");
+		return;
+	}
+	if (!nfsd_ffv2_proto_fixture_init(test, f)) {
+		nfsd_ffv2_proto_fixture_exit(f);
+		return;
+	}
+	fixture = nfsd_ffv2_proto_fixture_own(test, f, order);
+	if (!fixture) {
+		KUNIT_FAIL(test, "failed to register the fixture release");
+		return;
+	}
+	taken = nfsd_ffv2_proto_object_hold(test,
+					    nfsd_ffv2_prototype_test_object_acquire(),
+					    false);
+	if (!taken) {
+		KUNIT_FAIL(test, "the object hook was not armed to acquire");
+		return;
+	}
+	taken->order = order;
+	KUNIT_EXPECT_PTR_EQ(test, f->object, taken->obj);
+	/* And give up here, exactly as the error branch does. */
 }
 
 /*
@@ -12606,19 +12807,26 @@ static void nfsd_ffv2_prototype_hook_consumer_test(struct kunit *test)
 {
 	static const u8 inner[] = { 2, 0, 2, 2, 0xa8, 0xb8, 0xc8, 0xd8 };
 	struct nfsd_ffv2_proto_object *taken, *replacement;
+	struct nfsd_ffv2_proto_fixture_hold *fixture;
 	struct nfsd_ffv2_proto_fixture *f;
 	u8 other[4] = { 9, 9, 9, 9 };
 
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, f);
-	if (!nfsd_ffv2_proto_fixture_init(test, f))
-		goto out;
+	if (!nfsd_ffv2_proto_fixture_init(test, f)) {
+		/* Nothing owns the partly built fixture yet. */
+		nfsd_ffv2_proto_fixture_exit(f);
+		return;
+	}
 	/*
-	 * The fixture is owned from here, so nothing below has to reach the
-	 * label for it to be torn down.  Tearing it down twice is a no-op.
+	 * Owned from here, and never torn down from this body again.  The
+	 * consumer's reference below is registered after it, so whatever
+	 * happens next -- an allocation that fails, an assertion, or simply
+	 * reaching the end -- the reference is released first and the
+	 * fixture's cache is still there when the export it pins goes back.
 	 */
-	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_fixture_release,
-				      f)) {
+	fixture = nfsd_ffv2_proto_fixture_own(test, f, NULL);
+	if (!fixture) {
 		KUNIT_FAIL(test, "failed to register the fixture release");
 		return;
 	}
@@ -12629,7 +12837,7 @@ static void nfsd_ffv2_prototype_hook_consumer_test(struct kunit *test)
 					    false);
 	if (!taken) {
 		KUNIT_FAIL(test, "the object hook was not armed to acquire");
-		goto out;
+		return;
 	}
 	KUNIT_EXPECT_PTR_EQ(test, f->object, taken->obj);
 	KUNIT_EXPECT_PTR_EQ(test, taken->obj->exp, f->seeded);
@@ -12641,7 +12849,7 @@ static void nfsd_ffv2_prototype_hook_consumer_test(struct kunit *test)
 						 sizeof(other), 0, false);
 	if (!replacement) {
 		KUNIT_FAIL(test, "failed to arm the replacement object");
-		goto out;
+		return;
 	}
 	/* And this one lets go of everything but the consumer's reference. */
 	KUNIT_EXPECT_FALSE(test,
@@ -12662,17 +12870,9 @@ static void nfsd_ffv2_prototype_hook_consumer_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, taken->obj->dentry, f->object_dentry);
 	/* Not the replacement's, which says nothing of it leaked across. */
 	KUNIT_EXPECT_NE(test, taken->obj->bytes[0], other[0]);
-	/*
-	 * The consumer lets go before the fixture is torn down: a teardown
-	 * under a live consumer would wait on the namespace the record's
-	 * export reference pins.
-	 */
-	nfsd_ffv2_proto_object_release(taken);
 
 	KUNIT_EXPECT_TRUE(test,
 			  nfsd_ffv2_prototype_test_object_disarm(replacement->obj));
-out:
-	nfsd_ffv2_proto_fixture_exit(f);
 }
 
 static void nfsd_ffv2_prototype_resolve_access_test(struct kunit *test)
@@ -14278,6 +14478,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_hook_replace_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_hook_replace_race_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_hook_cleanup_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_hook_teardown_order_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_hook_consumer_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_resolve_access_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_close_race_test),
