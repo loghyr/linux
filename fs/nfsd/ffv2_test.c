@@ -10844,11 +10844,6 @@ struct nfsd_ffv2_prototype_call_ctx {
 };
 
 /*
- * The final namespace destruction, on a thread of its own, so a test can
- * ask whether it is still waiting.  It runs exactly once: the caller takes
- * the fixture's cleanup action over before starting this.
- */
-/*
  * A crew: the workers one test starts, and everything they read.
  *
  * A test that starts a worker and then fails an assertion never reaches
@@ -11067,6 +11062,12 @@ static int nfsd_ffv2_proto_call_pre_exit(struct nfsd_ffv2_prototype_call_ctx *ct
 	return 0;
 }
 
+/*
+ * The namespace's destruction, on a worker of its own, so a test can ask
+ * whether it is still waiting for the anchor.  Running it here is what
+ * makes it the sole destruction: the crew owes that half only while no
+ * worker has recorded it, and records it only once the wait has returned.
+ */
 static int nfsd_ffv2_proto_call_destroy(struct nfsd_ffv2_prototype_call_ctx *ctx)
 {
 	struct nfsd_ffv2_proto_hand *hand =
@@ -11654,14 +11655,12 @@ nfsd_ffv2_proto_destroys_expect(struct kunit *test, int want)
  * A destroying worker that never starts, against a close owner that has
  * not returned.
  *
- * This is the one place a test performs the namespace's destruction
- * itself, and the one place it must not: the owner is parked at its pause
- * holding the anchor, so a destruction from here would wait for it without
- * a bound, after a bounded settle had already given up.  Nothing is
- * destroyed from the case at all.  The crew still owes the teardown and
- * owes it to its last reference, which is reached only once every worker
- * has ended -- and then nothing holds the anchor and the wait is not a
- * wait.
+ * No case destroys a namespace, and this is the state that says why: the
+ * owner is parked at its pause holding the anchor, so a destruction from
+ * the case would wait for it without a bound, after a bounded settle had
+ * already given up.  The crew owes the teardown instead, and owes it to
+ * its last reference -- reached only once every worker has ended, when
+ * nothing holds the anchor and the wait is not a wait.
  *
  * The destruction is counted, and the count is checked after the case has
  * ended: exactly one, performed by the crew and not by the case.
@@ -14733,11 +14732,12 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_NET_EXITING, nn->ffv2.net_state);
 
 	/*
-	 * Now the destruction itself, against the same parked owner.  The
-	 * namespace's own cleanup is taken over first so this runs exactly
-	 * once, and from here every way out of this test destroys it: the
-	 * crew is settled and the namespace destroyed explicitly, because
-	 * once the action is gone nothing else will.
+	 * Now the destruction itself, against the same parked owner.  It is
+	 * a worker that performs it, and the worker records that it did, so
+	 * the crew owes that half only if no worker ever ran it.  Either way
+	 * it happens exactly once, and no way out of this case performs it
+	 * here: a destruction from the case could wait without a bound on
+	 * the anchor the parked owner holds.
 	 */
 	nfsd_ffv2_test_destroy_entry_hook(nn, &crew->entered);
 	crew->hooked = true;
