@@ -10838,42 +10838,11 @@ struct nfsd_ffv2_prototype_call_ctx {
 	struct completion	done;
 };
 
-static int nfsd_ffv2_prototype_enable_thread(void *data)
-{
-	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
-
-	ctx->result = nfsd_ffv2_prototype_enable(ctx->nn, ctx->net);
-	complete(&ctx->done);
-	nfsd_ffv2_test_thread_park();
-	return 0;
-}
-
-static int nfsd_ffv2_prototype_disable_thread(void *data)
-{
-	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
-
-	ctx->result = nfsd_ffv2_prototype_disable(ctx->nn, ctx->net);
-	complete_all(&ctx->done);
-	nfsd_ffv2_test_thread_park();
-	return 0;
-}
-
 /*
  * The final namespace destruction, on a thread of its own, so a test can
  * ask whether it is still waiting.  It runs exactly once: the caller takes
  * the fixture's cleanup action over before starting this.
  */
-static int nfsd_ffv2_proto_destroy_thread(void *data)
-{
-	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
-
-	nfsd_ffv2_net_destroy(ctx->nn);
-	ctx->result = 0;
-	complete_all(&ctx->done);
-	nfsd_ffv2_test_thread_park();
-	return 0;
-}
-
 /*
  * A crew: the workers one test starts, and everything they read.
  *
@@ -10965,6 +10934,23 @@ static int nfsd_ffv2_proto_crew_thread(void *data)
 static int nfsd_ffv2_proto_call_enable(struct nfsd_ffv2_prototype_call_ctx *ctx)
 {
 	return nfsd_ffv2_prototype_enable(ctx->nn, ctx->net);
+}
+
+static int nfsd_ffv2_proto_call_disable(struct nfsd_ffv2_prototype_call_ctx *ctx)
+{
+	return nfsd_ffv2_prototype_disable(ctx->nn, ctx->net);
+}
+
+static int nfsd_ffv2_proto_call_pre_exit(struct nfsd_ffv2_prototype_call_ctx *ctx)
+{
+	nfsd_ffv2_net_pre_exit(ctx->nn);
+	return 0;
+}
+
+static int nfsd_ffv2_proto_call_destroy(struct nfsd_ffv2_prototype_call_ctx *ctx)
+{
+	nfsd_ffv2_net_destroy(ctx->nn);
+	return 0;
 }
 
 /*
@@ -11147,17 +11133,6 @@ static bool nfsd_ffv2_proto_crew_quiesced(void)
 	       time_before(jiffies, deadline))
 		schedule_timeout_uninterruptible(1);
 	return !atomic_read(&nfsd_ffv2_proto_crew_workers);
-}
-
-static int nfsd_ffv2_prototype_pre_exit_thread(void *data)
-{
-	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
-
-	nfsd_ffv2_net_pre_exit(ctx->nn);
-	ctx->result = 0;
-	complete_all(&ctx->done);
-	nfsd_ffv2_test_thread_park();
-	return 0;
 }
 
 /* Wait until @want callers are parked on the close owner's completion. */
@@ -11460,9 +11435,10 @@ static void nfsd_ffv2_prototype_crew_pause_test(struct kunit *test)
 
 static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 {
-	struct nfsd_ffv2_prototype_call_ctx enable = {}, first = {}, second = {};
-	struct task_struct *enable_task, *first_task, *second_task;
+	struct nfsd_ffv2_prototype_call_ctx *enable, *first, *second;
 	struct nfsd_ffv2_prototype_test_pause *setup;
+	struct nfsd_ffv2_proto_pause *held;
+	struct nfsd_ffv2_proto_crew *crew;
 	struct nfsd_net *nn;
 	bool closing, waited;
 	int error;
@@ -11472,29 +11448,41 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 
-	init_completion(&enable.done);
-	init_completion(&first.done);
-	init_completion(&second.done);
-	enable.nn = nn;
-	first.nn = nn;
-	second.nn = nn;
-	enable.net = &init_net;
-	first.net = &init_net;
-	second.net = &init_net;
-	setup = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_SETUP);
-	KUNIT_ASSERT_NOT_NULL(test, setup);
+	held = nfsd_ffv2_proto_pause_hold(test, NFSD_FFV2_PAUSE_SETUP);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	setup = held->pause;
+	/*
+	 * The crew owns every worker below from the moment it exists, so
+	 * whatever ends this case ends them first -- and the namespace the
+	 * action above releases outlives all of them, because it was
+	 * registered before the crew was.
+	 */
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, held);
 
-	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
-				  "ffv2-proto-enable");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&setup->reached, 15 * HZ) != 0);
+	enable = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					    nfsd_ffv2_proto_call_enable,
+					    "ffv2-proto-enable");
+	if (!enable) {
+		KUNIT_FAIL(test, "failed to start the enabling worker");
+		return;
+	}
+	if (!wait_for_completion_timeout(&setup->reached, 15 * HZ)) {
+		KUNIT_FAIL(test, "the enable never reached its pause");
+		return;
+	}
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_ENABLING,
 			nfsd_ffv2_prototype_state_get(nn));
 
-	first_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &first,
-				 "ffv2-proto-close1");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(first_task));
+	first = nfsd_ffv2_proto_crew_start(crew, 1, nn, &init_net,
+					   nfsd_ffv2_proto_call_disable,
+					   "ffv2-proto-close1");
+	if (!first) {
+		KUNIT_FAIL(test, "failed to start the first closing worker");
+		return;
+	}
 	/*
 	 * The close role is claimed before the enabling caller is released,
 	 * which is the interval this test exists for.
@@ -11502,9 +11490,13 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 	closing = nfsd_ffv2_prototype_wait_state(nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
-	second_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &second,
-				  "ffv2-proto-close2");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(second_task));
+	second = nfsd_ffv2_proto_crew_start(crew, 2, nn, &init_net,
+					    nfsd_ffv2_proto_call_disable,
+					    "ffv2-proto-close2");
+	if (!second) {
+		KUNIT_FAIL(test, "failed to start the second closing worker");
+		return;
+	}
 	/*
 	 * Wait until that closer is actually parked on the owner's
 	 * completion.  Starting a thread is not the same as running one, and
@@ -11515,20 +11507,12 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, waited);
 
 	complete(&setup->proceed);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&enable.done, 30 * HZ) != 0);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&first.done, 30 * HZ) != 0);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&second.done, 30 * HZ) != 0);
-	kthread_stop(enable_task);
-	kthread_stop(first_task);
-	kthread_stop(second_task);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
 
 	/* The enable never opened, the first closer owned the teardown. */
-	KUNIT_EXPECT_EQ(test, -EBUSY, enable.result);
-	KUNIT_EXPECT_EQ(test, 0, first.result);
-	KUNIT_EXPECT_EQ(test, -EBUSY, second.result);
+	KUNIT_EXPECT_EQ(test, -EBUSY, enable->result);
+	KUNIT_EXPECT_EQ(test, 0, first->result);
+	KUNIT_EXPECT_EQ(test, -EBUSY, second->result);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
@@ -11541,9 +11525,10 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
  */
 static void nfsd_ffv2_prototype_enabling_pre_exit_test(struct kunit *test)
 {
-	struct nfsd_ffv2_prototype_call_ctx enable = {}, exiting = {};
-	struct task_struct *enable_task, *exit_task;
+	struct nfsd_ffv2_prototype_call_ctx *enable, *exiting;
 	struct nfsd_ffv2_prototype_test_pause *setup;
+	struct nfsd_ffv2_proto_pause *held;
+	struct nfsd_ffv2_proto_crew *crew;
 	struct nfsd_net *nn;
 	bool closing;
 	int error;
@@ -11553,38 +11538,43 @@ static void nfsd_ffv2_prototype_enabling_pre_exit_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 
-	init_completion(&enable.done);
-	init_completion(&exiting.done);
-	enable.nn = nn;
-	exiting.nn = nn;
-	enable.net = &init_net;
-	setup = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_SETUP);
-	KUNIT_ASSERT_NOT_NULL(test, setup);
+	held = nfsd_ffv2_proto_pause_hold(test, NFSD_FFV2_PAUSE_SETUP);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	setup = held->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, held);
 
-	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
-				  "ffv2-proto-enable");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&setup->reached, 15 * HZ) != 0);
+	enable = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					    nfsd_ffv2_proto_call_enable,
+					    "ffv2-proto-enable");
+	if (!enable) {
+		KUNIT_FAIL(test, "failed to start the enabling worker");
+		return;
+	}
+	if (!wait_for_completion_timeout(&setup->reached, 15 * HZ)) {
+		KUNIT_FAIL(test, "the enable never reached its pause");
+		return;
+	}
 
-	exit_task = kthread_run(nfsd_ffv2_prototype_pre_exit_thread, &exiting,
-				"ffv2-proto-exit");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(exit_task));
+	exiting = nfsd_ffv2_proto_crew_start(crew, 1, nn, NULL,
+					     nfsd_ffv2_proto_call_pre_exit,
+					     "ffv2-proto-exit");
+	if (!exiting) {
+		KUNIT_FAIL(test, "failed to start the exiting worker");
+		return;
+	}
 	closing = nfsd_ffv2_prototype_wait_state(nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
 	/* Exit is still inside the gate, not past it. */
-	KUNIT_EXPECT_EQ(test, 0, exiting.result);
+	KUNIT_EXPECT_EQ(test, 0, exiting->result);
 
 	complete(&setup->proceed);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&enable.done, 30 * HZ) != 0);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&exiting.done, 30 * HZ) != 0);
-	kthread_stop(enable_task);
-	kthread_stop(exit_task);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
 
-	KUNIT_EXPECT_EQ(test, -EBUSY, enable.result);
+	KUNIT_EXPECT_EQ(test, -EBUSY, enable->result);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_NONE, nfsd_ffv2_source_get(nn));
@@ -13785,9 +13775,10 @@ out:
  */
 static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
 {
-	struct nfsd_ffv2_prototype_call_ctx enable = {}, closer = {};
 	struct nfsd_ffv2_prototype_test_pause *setup, *sup;
-	struct task_struct *enable_task, *close_task;
+	struct nfsd_ffv2_prototype_call_ctx *enable, *closer;
+	struct nfsd_ffv2_proto_pause *held, *loser;
+	struct nfsd_ffv2_proto_crew *crew;
 	struct nfsd_net *nn;
 	bool closing;
 	int error;
@@ -13797,40 +13788,54 @@ static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 
-	init_completion(&enable.done);
-	init_completion(&closer.done);
-	enable.nn = nn;
-	closer.nn = nn;
-	enable.net = &init_net;
-	closer.net = &init_net;
-	setup = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_SETUP);
-	KUNIT_ASSERT_NOT_NULL(test, setup);
+	held = nfsd_ffv2_proto_pause_hold(test, NFSD_FFV2_PAUSE_SETUP);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	setup = held->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, held);
 
-	enable_task = kthread_run(nfsd_ffv2_prototype_enable_thread, &enable,
-				  "ffv2-proto-enable");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(enable_task));
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&setup->reached, 15 * HZ) != 0);
+	enable = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					    nfsd_ffv2_proto_call_enable,
+					    "ffv2-proto-enable");
+	if (!enable) {
+		KUNIT_FAIL(test, "failed to start the enabling worker");
+		return;
+	}
+	if (!wait_for_completion_timeout(&setup->reached, 15 * HZ)) {
+		KUNIT_FAIL(test, "the enable never reached its pause");
+		return;
+	}
 
-	close_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &closer,
-				 "ffv2-proto-close");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(close_task));
+	closer = nfsd_ffv2_proto_crew_start(crew, 1, nn, &init_net,
+					    nfsd_ffv2_proto_call_disable,
+					    "ffv2-proto-close");
+	if (!closer) {
+		KUNIT_FAIL(test, "failed to start the closing worker");
+		return;
+	}
 	closing = nfsd_ffv2_prototype_wait_state(nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
 
 	/* Stop the loser between registering its wait and consuming it. */
-	sup = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_SUPERSEDE);
-	KUNIT_ASSERT_NOT_NULL(test, sup);
+	loser = nfsd_ffv2_proto_pause_hold(test, NFSD_FFV2_PAUSE_SUPERSEDE);
+	if (!loser) {
+		KUNIT_FAIL(test, "failed to arm the supersede pause");
+		return;
+	}
+	nfsd_ffv2_proto_crew_watch(crew, loser);
+	sup = loser->pause;
 	complete(&setup->proceed);
 	KUNIT_EXPECT_TRUE(test,
 			  wait_for_completion_timeout(&sup->reached, 30 * HZ) != 0);
 
 	/* The close owner may finish; the loser has not returned yet. */
 	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&closer.done,
+			  wait_for_completion_timeout(&closer->done,
 						      30 * HZ) != 0);
-	KUNIT_EXPECT_EQ(test, 0, closer.result);
+	KUNIT_EXPECT_EQ(test, 0, closer->result);
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	KUNIT_EXPECT_EQ(test, 1u,
@@ -13843,12 +13848,8 @@ static void nfsd_ffv2_prototype_supersede_cycle_test(struct kunit *test)
 			nfsd_ffv2_prototype_enable(nn, &init_net));
 
 	complete(&sup->proceed);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&enable.done,
-						      30 * HZ) != 0);
-	kthread_stop(enable_task);
-	kthread_stop(close_task);
-	KUNIT_EXPECT_EQ(test, -EBUSY, enable.result);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+	KUNIT_EXPECT_EQ(test, -EBUSY, enable->result);
 	KUNIT_EXPECT_EQ(test, 0u,
 			nfsd_ffv2_prototype_test_close_waiters(nn));
 
@@ -14120,9 +14121,10 @@ out:
  */
 static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 {
-	struct nfsd_ffv2_prototype_call_ctx owner = {}, waiter = {};
+	struct nfsd_ffv2_prototype_call_ctx *owner, *waiter;
 	struct nfsd_ffv2_prototype_test_pause *enter, *pub;
-	struct task_struct *owner_task, *waiter_task;
+	struct nfsd_ffv2_proto_pause *entered, *published;
+	struct nfsd_ffv2_proto_crew *crew;
 	struct nfsd_net *nn;
 	bool closing;
 	int error;
@@ -14131,21 +14133,35 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, nn);
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
-	owner.nn = nn;
-	waiter.nn = nn;
-	owner.net = &init_net;
-	waiter.net = &init_net;
+
+	/*
+	 * A crew per cycle.  Each owns the workers of its own cycle from the
+	 * moment they start and is settled before the next begins, so no
+	 * cycle can reach the next one's workers and none of them outlives
+	 * the namespace released above.
+	 */
 
 	/* One: nothing else is closing, so nothing else can refuse. */
-	init_completion(&owner.done);
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
-	pub = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_PUBLISHED);
-	KUNIT_ASSERT_NOT_NULL(test, pub);
-	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
-				 "ffv2-proto-owner");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&pub->reached, 30 * HZ) != 0);
+	published = nfsd_ffv2_proto_pause_hold(test,
+					       NFSD_FFV2_PAUSE_PUBLISHED);
+	KUNIT_ASSERT_NOT_NULL(test, published);
+	pub = published->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, published);
+	owner = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					   nfsd_ffv2_proto_call_disable,
+					   "ffv2-proto-owner");
+	if (!owner) {
+		KUNIT_FAIL(test, "failed to start the closing owner");
+		return;
+	}
+	if (!wait_for_completion_timeout(&pub->reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the close never reached its pause");
+		return;
+	}
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	KUNIT_EXPECT_EQ(test, 0u,
@@ -14159,54 +14175,64 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, -EBUSY,
 			nfsd_ffv2_prototype_enable(nn, &init_net));
 	complete(&pub->proceed);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
-	kthread_stop(owner_task);
-	KUNIT_EXPECT_EQ(test, 0, owner.result);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+	KUNIT_EXPECT_EQ(test, 0, owner->result);
 
 	/* Two: a closer parked on the completion, and the signal withheld. */
-	init_completion(&owner.done);
-	init_completion(&waiter.done);
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
 	/* Published first: the close reaches the entered one before it. */
-	pub = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_PUBLISHED);
-	enter = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_ENTERED);
-	KUNIT_ASSERT_NOT_NULL(test, pub);
-	KUNIT_ASSERT_NOT_NULL(test, enter);
-	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
-				 "ffv2-proto-owner2");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&enter->reached, 15 * HZ) != 0);
+	published = nfsd_ffv2_proto_pause_hold(test,
+					       NFSD_FFV2_PAUSE_PUBLISHED);
+	entered = nfsd_ffv2_proto_pause_hold(test, NFSD_FFV2_PAUSE_ENTERED);
+	KUNIT_ASSERT_NOT_NULL(test, published);
+	KUNIT_ASSERT_NOT_NULL(test, entered);
+	pub = published->pause;
+	enter = entered->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, published);
+	nfsd_ffv2_proto_crew_watch(crew, entered);
+	owner = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					   nfsd_ffv2_proto_call_disable,
+					   "ffv2-proto-owner2");
+	if (!owner) {
+		KUNIT_FAIL(test, "failed to start the closing owner");
+		return;
+	}
+	if (!wait_for_completion_timeout(&enter->reached, 15 * HZ)) {
+		KUNIT_FAIL(test, "the close never entered");
+		return;
+	}
 	closing = nfsd_ffv2_prototype_wait_state(nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
-	waiter_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &waiter,
-				  "ffv2-proto-waiter");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(waiter_task));
+	waiter = nfsd_ffv2_proto_crew_start(crew, 1, nn, &init_net,
+					    nfsd_ffv2_proto_call_disable,
+					    "ffv2-proto-waiter");
+	if (!waiter) {
+		KUNIT_FAIL(test, "failed to start the waiting closer");
+		return;
+	}
 	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_wait_waiters(nn, 1));
 	KUNIT_EXPECT_EQ(test, 0,
-			wait_for_completion_timeout(&waiter.done, HZ / 5));
+			wait_for_completion_timeout(&waiter->done, HZ / 5));
 
 	complete(&enter->proceed);
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&pub->reached, 30 * HZ) != 0);
+	if (!wait_for_completion_timeout(&pub->reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the close never reached its pause");
+		return;
+	}
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	/* The gate reads off, and the waiter is still not satisfied. */
 	KUNIT_EXPECT_EQ(test, 0,
-			wait_for_completion_timeout(&waiter.done, HZ / 5));
+			wait_for_completion_timeout(&waiter->done, HZ / 5));
 
 	complete(&pub->proceed);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&waiter.done,
-						      30 * HZ) != 0);
-	kthread_stop(owner_task);
-	kthread_stop(waiter_task);
-	KUNIT_EXPECT_EQ(test, 0, owner.result);
-	KUNIT_EXPECT_EQ(test, -EBUSY, waiter.result);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+	KUNIT_EXPECT_EQ(test, 0, owner->result);
+	KUNIT_EXPECT_EQ(test, -EBUSY, waiter->result);
 
 	/*
 	 * Three: the same shape again, in a cycle that follows a completed
@@ -14215,50 +14241,61 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
 	 * parked on a reinitialised completion; if it were not, the old
 	 * signal would satisfy it the moment it arrived.
 	 */
-	init_completion(&owner.done);
-	init_completion(&waiter.done);
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
-	/* Published first: the close reaches the entered one before it. */
-	pub = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_PUBLISHED);
-	enter = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_ENTERED);
-	KUNIT_ASSERT_NOT_NULL(test, pub);
-	KUNIT_ASSERT_NOT_NULL(test, enter);
-	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
-				 "ffv2-proto-owner3");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&enter->reached, 15 * HZ) != 0);
+	published = nfsd_ffv2_proto_pause_hold(test,
+					       NFSD_FFV2_PAUSE_PUBLISHED);
+	entered = nfsd_ffv2_proto_pause_hold(test, NFSD_FFV2_PAUSE_ENTERED);
+	KUNIT_ASSERT_NOT_NULL(test, published);
+	KUNIT_ASSERT_NOT_NULL(test, entered);
+	pub = published->pause;
+	enter = entered->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, published);
+	nfsd_ffv2_proto_crew_watch(crew, entered);
+	owner = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					   nfsd_ffv2_proto_call_disable,
+					   "ffv2-proto-owner3");
+	if (!owner) {
+		KUNIT_FAIL(test, "failed to start the closing owner");
+		return;
+	}
+	if (!wait_for_completion_timeout(&enter->reached, 15 * HZ)) {
+		KUNIT_FAIL(test, "the close never entered");
+		return;
+	}
 	closing = nfsd_ffv2_prototype_wait_state(nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
-	waiter_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &waiter,
-				  "ffv2-proto-waiter3");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(waiter_task));
+	waiter = nfsd_ffv2_proto_crew_start(crew, 1, nn, &init_net,
+					    nfsd_ffv2_proto_call_disable,
+					    "ffv2-proto-waiter3");
+	if (!waiter) {
+		KUNIT_FAIL(test, "failed to start the waiting closer");
+		return;
+	}
 	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_wait_waiters(nn, 1));
 	KUNIT_EXPECT_EQ(test, 0,
-			wait_for_completion_timeout(&waiter.done, HZ / 5));
+			wait_for_completion_timeout(&waiter->done, HZ / 5));
 
 	complete(&enter->proceed);
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&pub->reached, 30 * HZ) != 0);
+	if (!wait_for_completion_timeout(&pub->reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the close never reached its pause");
+		return;
+	}
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	/* Still parked: this cycle's owner has not signalled either. */
 	KUNIT_EXPECT_EQ(test, 0,
-			wait_for_completion_timeout(&waiter.done, HZ / 5));
+			wait_for_completion_timeout(&waiter->done, HZ / 5));
 	KUNIT_EXPECT_EQ(test, 1u,
 			nfsd_ffv2_prototype_test_close_waiters(nn));
 
 	complete(&pub->proceed);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
-	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&waiter.done,
-						      30 * HZ) != 0);
-	kthread_stop(owner_task);
-	kthread_stop(waiter_task);
-	KUNIT_EXPECT_EQ(test, 0, owner.result);
-	KUNIT_EXPECT_EQ(test, -EBUSY, waiter.result);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+	KUNIT_EXPECT_EQ(test, 0, owner->result);
+	KUNIT_EXPECT_EQ(test, -EBUSY, waiter->result);
 	KUNIT_EXPECT_EQ(test, 0u,
 			nfsd_ffv2_prototype_test_close_waiters(nn));
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
@@ -14284,11 +14321,10 @@ static void nfsd_ffv2_prototype_close_signal_test(struct kunit *test)
  */
 static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 {
-	struct nfsd_ffv2_prototype_call_ctx owner = {}, exiting = {};
-	struct nfsd_ffv2_prototype_call_ctx destroying = {};
-	struct task_struct *owner_task, *exit_task, *destroy_task;
+	struct nfsd_ffv2_prototype_call_ctx *owner, *exiting, *destroying;
 	struct nfsd_ffv2_prototype_test_pause *pub;
-	struct completion entered;
+	struct nfsd_ffv2_proto_pause *published;
+	struct nfsd_ffv2_proto_crew *crew;
 	struct nfsd_net *nn, *stranger;
 	unsigned int parked_ref;
 	int error;
@@ -14298,23 +14334,27 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
 	KUNIT_ASSERT_EQ(test, error, 0);
 
-	init_completion(&entered);
-	init_completion(&owner.done);
-	init_completion(&exiting.done);
-	init_completion(&destroying.done);
-	owner.nn = nn;
-	exiting.nn = nn;
-	destroying.nn = nn;
-	owner.net = &init_net;
-
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
-	pub = nfsd_ffv2_proto_pause_arm(test, NFSD_FFV2_PAUSE_PUBLISHED);
-	KUNIT_ASSERT_NOT_NULL(test, pub);
-	owner_task = kthread_run(nfsd_ffv2_prototype_disable_thread, &owner,
-				 "ffv2-proto-owner");
-	KUNIT_ASSERT_FALSE(test, IS_ERR(owner_task));
-	KUNIT_ASSERT_TRUE(test,
-			  wait_for_completion_timeout(&pub->reached, 30 * HZ) != 0);
+	published = nfsd_ffv2_proto_pause_hold(test,
+					       NFSD_FFV2_PAUSE_PUBLISHED);
+	KUNIT_ASSERT_NOT_NULL(test, published);
+	pub = published->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, published);
+
+	owner = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					   nfsd_ffv2_proto_call_disable,
+					   "ffv2-proto-owner");
+	if (!owner) {
+		KUNIT_FAIL(test, "failed to start the closing owner");
+		return;
+	}
+	if (!wait_for_completion_timeout(&pub->reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the close never reached its pause");
+		return;
+	}
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 
@@ -14322,22 +14362,20 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	parked_ref = nfsd_ffv2_test_anchor_refcount(nn);
 	KUNIT_EXPECT_GT(test, parked_ref, 1u);
 
-	exit_task = kthread_run(nfsd_ffv2_prototype_pre_exit_thread, &exiting,
-				"ffv2-proto-exit");
-	if (IS_ERR(exit_task)) {
-		KUNIT_FAIL(test, "failed to start the exiting thread");
-		complete(&pub->proceed);
-		wait_for_completion(&owner.done);
-		kthread_stop(owner_task);
+	exiting = nfsd_ffv2_proto_crew_start(crew, 1, nn, NULL,
+					     nfsd_ffv2_proto_call_pre_exit,
+					     "ffv2-proto-exit");
+	if (!exiting) {
+		KUNIT_FAIL(test, "failed to start the exiting worker");
 		return;
 	}
 	/* It finds an off gate and returns, rather than waiting on a signal. */
 	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&exiting.done,
+			  wait_for_completion_timeout(&exiting->done,
 						      30 * HZ) != 0);
 	/* And it did not disturb the owner, which is still holding on. */
 	KUNIT_EXPECT_EQ(test, 0,
-			wait_for_completion_timeout(&owner.done, HZ / 5));
+			wait_for_completion_timeout(&owner->done, HZ / 5));
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_OFF,
 			nfsd_ffv2_prototype_state_get(nn));
 	KUNIT_EXPECT_GT(test, nfsd_ffv2_test_anchor_refcount(nn), 1u);
@@ -14346,12 +14384,14 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 
 	/*
 	 * Now the destruction itself, against the same parked owner.  The
-	 * fixture's cleanup is taken over first so this runs exactly once,
-	 * and it must not get past the anchor's last reference while that
-	 * owner is still holding one.
+	 * namespace's own cleanup is taken over first so this runs exactly
+	 * once, and from here every way out of this test destroys it: the
+	 * crew is settled and the namespace destroyed explicitly, because
+	 * once the action is gone nothing else will.
 	 */
 	kunit_remove_action(test, nfsd_ffv2_test_net_exit, nn);
-	nfsd_ffv2_test_destroy_entry_hook(nn, &entered);
+	nfsd_ffv2_test_destroy_entry_hook(nn, &crew->entered);
+	crew->hooked = true;
 
 	/*
 	 * An arming names the namespace it is for.  Another namespace being
@@ -14363,20 +14403,18 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	if (stranger) {
 		nfsd_ffv2_test_net_exit(stranger);
 		KUNIT_EXPECT_EQ(test, 0,
-				wait_for_completion_timeout(&entered, HZ / 10));
+				wait_for_completion_timeout(&crew->entered,
+							    HZ / 10));
 	} else {
 		KUNIT_FAIL(test, "failed to allocate the unrelated namespace");
 	}
 
-	destroy_task = kthread_run(nfsd_ffv2_proto_destroy_thread, &destroying,
-				   "ffv2-proto-destroy");
-	if (IS_ERR(destroy_task)) {
-		KUNIT_FAIL(test, "failed to start the destroying thread");
-		nfsd_ffv2_test_destroy_entry_hook(NULL, NULL);
-		complete(&pub->proceed);
-		wait_for_completion(&owner.done);
-		kthread_stop(owner_task);
-		kthread_stop(exit_task);
+	destroying = nfsd_ffv2_proto_crew_start(crew, 2, nn, NULL,
+						nfsd_ffv2_proto_call_destroy,
+						"ffv2-proto-destroy");
+	if (!destroying) {
+		KUNIT_FAIL(test, "failed to start the destroying worker");
+		nfsd_ffv2_proto_crew_settle(crew);
 		nfsd_ffv2_net_destroy(nn);
 		return;
 	}
@@ -14388,24 +14426,23 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	 * what is holding destruction up.
 	 */
 	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&entered, 30 * HZ) != 0);
+			  wait_for_completion_timeout(&crew->entered,
+						      30 * HZ) != 0);
 	/* Inside the wait, and the only reference left is the owner's. */
 	KUNIT_EXPECT_EQ(test, 0,
-			wait_for_completion_timeout(&destroying.done, HZ / 5));
+			wait_for_completion_timeout(&destroying->done, HZ / 5));
 	KUNIT_EXPECT_EQ(test, 1u, nfsd_ffv2_test_anchor_refcount(nn));
 
 	/* The owner signals, gives up the role, and lets the anchor go. */
 	complete(&pub->proceed);
 	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&owner.done, 30 * HZ) != 0);
+			  wait_for_completion_timeout(&owner->done, 30 * HZ) != 0);
 	/* Only then does destruction get past its wait. */
 	KUNIT_EXPECT_TRUE(test,
-			  wait_for_completion_timeout(&destroying.done,
+			  wait_for_completion_timeout(&destroying->done,
 						      30 * HZ) != 0);
-	kthread_stop(owner_task);
-	kthread_stop(exit_task);
-	kthread_stop(destroy_task);
-	KUNIT_EXPECT_EQ(test, 0, owner.result);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+	KUNIT_EXPECT_EQ(test, 0, owner->result);
 	KUNIT_EXPECT_LT(test, nfsd_ffv2_test_anchor_refcount(nn), parked_ref);
 }
 
