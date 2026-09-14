@@ -11655,12 +11655,13 @@ nfsd_ffv2_proto_destroys_expect(struct kunit *test, int want)
  * A destroying worker that never starts, against a close owner that has
  * not returned.
  *
- * No case destroys a namespace, and this is the state that says why: the
- * owner is parked at its pause holding the anchor, so a destruction from
- * the case would wait for it without a bound, after a bounded settle had
- * already given up.  The crew owes the teardown instead, and owes it to
- * its last reference -- reached only once every worker has ended, when
- * nothing holds the anchor and the wait is not a wait.
+ * No case directly destroys the crew-owned namespace, and this is the
+ * state that says why: the owner is parked at its pause holding the
+ * anchor, so a destruction from the case would wait for it without a
+ * bound, after a bounded settle had already given up.  The crew still
+ * owes that teardown to its last reference -- reached only once every
+ * worker has ended, when nothing holds the anchor and the wait is not a
+ * wait.
  *
  * The destruction is counted, and the count is checked after the case has
  * ended: exactly one, performed by the crew and not by the case.
