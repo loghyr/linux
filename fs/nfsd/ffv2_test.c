@@ -10874,6 +10874,281 @@ static int nfsd_ffv2_proto_destroy_thread(void *data)
 	return 0;
 }
 
+/*
+ * A crew: the workers one test starts, and everything they read.
+ *
+ * A test that starts a worker and then fails an assertion never reaches
+ * the line that would have stopped it.  KUnit unwinds the case there and
+ * then, and a worker left running would be reading a context on a frame
+ * that has gone, waiting on a completion that has gone, or holding a
+ * namespace the test was about to release.  So a worker's context is not
+ * the test's to keep: it lives here, the test holds a reference and so
+ * does every worker started in it, and whichever lets go last frees it.
+ *
+ * The settle below is the only way out.  It is registered as a KUnit
+ * action before any worker exists, so it runs however the case ends, and
+ * it does the three things in the one order that is safe: release
+ * whatever a worker could still be waiting for, join each worker within a
+ * bound, and only then let the crew go.  A worker it cannot join is
+ * released rather than abandoned -- it ends by itself and drops the last
+ * reference -- and the test says what it left behind.
+ */
+#define NFSD_FFV2_PROTO_CREW_MAX	3
+
+struct nfsd_ffv2_proto_crew;
+
+struct nfsd_ffv2_proto_hand {
+	struct nfsd_ffv2_prototype_call_ctx	ctx;
+	struct nfsd_ffv2_proto_crew		*crew;
+	struct task_struct			*task;
+	int					(*call)(struct nfsd_ffv2_prototype_call_ctx *ctx);
+};
+
+struct nfsd_ffv2_proto_crew {
+	struct nfsd_ffv2_proto_hand	hand[NFSD_FFV2_PROTO_CREW_MAX];
+	struct nfsd_ffv2_proto_pause	*pause[NFSD_FFV2_PROTO_CREW_MAX];
+	/* What a destroy-entry hook this crew armed is armed with. */
+	struct completion		entered;
+	/* What a stand-in worker waits for, so a test can end it. */
+	struct completion		stall;
+	struct nfsd_ffv2_proto_order	*order;
+	refcount_t			ref;
+	unsigned long			join_bound;
+	unsigned int			pauses;
+	bool				hooked;
+	/* Test-only: refuse the next start, to reach the failure path. */
+	bool				refuse_start;
+	bool				released;
+	bool				settled;
+	bool				joined;
+};
+
+/* Workers started in a crew anywhere in this suite and not yet seen out. */
+static atomic_t nfsd_ffv2_proto_crew_workers = ATOMIC_INIT(0);
+
+static void nfsd_ffv2_proto_crew_put(struct nfsd_ffv2_proto_crew *crew)
+{
+	if (crew && refcount_dec_and_test(&crew->ref))
+		kfree(crew);
+}
+
+static void nfsd_ffv2_proto_crew_put_action(void *data)
+{
+	nfsd_ffv2_proto_crew_put(data);
+}
+
+/*
+ * How every worker in a crew ends: joined, because the test saw it
+ * return, or released, because the test could not wait for it any longer.
+ * The reference dropped here is what frees the context it has been
+ * reading, so it is dropped after the last thing it reads.
+ */
+static int nfsd_ffv2_proto_crew_thread(void *data)
+{
+	struct nfsd_ffv2_proto_hand *hand = data;
+	struct nfsd_ffv2_proto_crew *crew = hand->crew;
+
+	hand->ctx.result = hand->call(&hand->ctx);
+	complete_all(&hand->ctx.done);
+	for (;;) {
+		set_current_state(TASK_IDLE);
+		if (kthread_should_stop() || READ_ONCE(crew->released))
+			break;
+		schedule();
+	}
+	__set_current_state(TASK_RUNNING);
+	atomic_dec(&nfsd_ffv2_proto_crew_workers);
+	nfsd_ffv2_proto_crew_put(crew);
+	return 0;
+}
+
+static int nfsd_ffv2_proto_call_enable(struct nfsd_ffv2_prototype_call_ctx *ctx)
+{
+	return nfsd_ffv2_prototype_enable(ctx->nn, ctx->net);
+}
+
+/*
+ * A worker that does nothing but wait for the test that started it, so a
+ * test can ask what happens to one that does not return.  The wait is
+ * bounded even here: a test that never releases it should fail rather
+ * than leave a thread of its own behind.
+ */
+static int nfsd_ffv2_proto_call_stall(struct nfsd_ffv2_prototype_call_ctx *ctx)
+{
+	struct nfsd_ffv2_proto_hand *hand =
+		container_of(ctx, struct nfsd_ffv2_proto_hand, ctx);
+
+	wait_for_completion_timeout(&hand->crew->stall, 60 * HZ);
+	return 0;
+}
+
+/*
+ * Everything the crew must undo, in the only order that is safe, and
+ * idempotent so that a test body and the action can both ask for it.
+ *
+ * The pauses first: a worker parked in one is waiting for this test and
+ * will wait for as long as the pause stands, so nothing may be joined
+ * before they are released.  The destroy-entry hook goes with them,
+ * because it points into this crew and a later namespace teardown must
+ * not reach it.  Then each worker is joined within a bound.
+ *
+ * Returns whether every worker was joined.  When one was not, this
+ * releases them all instead: each ends by itself, the crew stays
+ * allocated until the last of them has, and the namespaces and references
+ * they hold are retained rather than freed underneath them.  That is a
+ * reported failure; freeing live state would not be.
+ */
+static bool nfsd_ffv2_proto_crew_settle(struct nfsd_ffv2_proto_crew *crew)
+{
+	bool joined = true;
+	unsigned int i;
+
+	if (crew->settled)
+		return crew->joined;
+	crew->settled = true;
+	for (i = 0; i < crew->pauses; i++)
+		if (crew->pause[i] && crew->pause[i]->pause)
+			complete_all(&crew->pause[i]->pause->proceed);
+	if (crew->hooked) {
+		nfsd_ffv2_test_destroy_entry_hook(NULL, NULL);
+		crew->hooked = false;
+	}
+	for (i = 0; i < NFSD_FFV2_PROTO_CREW_MAX; i++)
+		if (crew->hand[i].task &&
+		    !wait_for_completion_timeout(&crew->hand[i].ctx.done,
+						 crew->join_bound))
+			joined = false;
+	crew->joined = joined;
+	if (!joined) {
+		WRITE_ONCE(crew->released, true);
+		for (i = 0; i < NFSD_FFV2_PROTO_CREW_MAX; i++) {
+			struct task_struct *task = crew->hand[i].task;
+
+			if (!task)
+				continue;
+			crew->hand[i].task = NULL;
+			wake_up_process(task);
+			put_task_struct(task);
+		}
+		nfsd_ffv2_proto_order_note(crew->order,
+					   NFSD_FFV2_CLEANUP_WORKER);
+		pr_err("nfsd ffv2 test: a worker did not return within its bound; its context is retained\n");
+		return false;
+	}
+	for (i = 0; i < NFSD_FFV2_PROTO_CREW_MAX; i++) {
+		if (!crew->hand[i].task)
+			continue;
+		kthread_stop_put(crew->hand[i].task);
+		crew->hand[i].task = NULL;
+	}
+	nfsd_ffv2_proto_order_note(crew->order, NFSD_FFV2_CLEANUP_WORKER);
+	return true;
+}
+
+static void nfsd_ffv2_proto_crew_release(void *data)
+{
+	nfsd_ffv2_proto_crew_settle(data);
+}
+
+/*
+ * Set a crew up, with both actions in the order they must run in reverse:
+ * the settle runs first and the crew is released after it, so nothing a
+ * worker reads is freed before the settle has dealt with that worker.
+ */
+static struct nfsd_ffv2_proto_crew *nfsd_ffv2_proto_crew_begin(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_crew *crew;
+	unsigned int i;
+
+	crew = kzalloc_obj(*crew, GFP_KERNEL);
+	if (!crew) {
+		KUNIT_FAIL(test, "failed to allocate the worker crew");
+		return NULL;
+	}
+	refcount_set(&crew->ref, 1);
+	crew->join_bound = 30 * HZ;
+	init_completion(&crew->entered);
+	init_completion(&crew->stall);
+	for (i = 0; i < NFSD_FFV2_PROTO_CREW_MAX; i++) {
+		crew->hand[i].crew = crew;
+		init_completion(&crew->hand[i].ctx.done);
+	}
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_crew_put_action,
+				      crew)) {
+		KUNIT_FAIL(test, "failed to register the crew release");
+		return NULL;
+	}
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_crew_release,
+				      crew)) {
+		KUNIT_FAIL(test, "failed to register the crew settle");
+		return NULL;
+	}
+	return crew;
+}
+
+/* A pause this crew's workers may be parked in, released before any join. */
+static void nfsd_ffv2_proto_crew_watch(struct nfsd_ffv2_proto_crew *crew,
+				       struct nfsd_ffv2_proto_pause *pause)
+{
+	if (crew->pauses < ARRAY_SIZE(crew->pause))
+		crew->pause[crew->pauses++] = pause;
+}
+
+/*
+ * Start one worker.
+ *
+ * Two references are taken and both come back through the settle: one on
+ * the crew, which the worker drops when it ends, and one on the task,
+ * because kthread_run() hands back a pointer rather than a reference and a
+ * worker that has to be released instead of joined can end at any point
+ * after it is told to.  A start that fails takes neither and records no
+ * task, so nothing later can stop something that was never running.
+ */
+static struct nfsd_ffv2_prototype_call_ctx *
+nfsd_ffv2_proto_crew_start(struct nfsd_ffv2_proto_crew *crew, unsigned int slot,
+			   struct nfsd_net *nn, const struct net *net,
+			   int (*call)(struct nfsd_ffv2_prototype_call_ctx *),
+			   const char *name)
+{
+	struct nfsd_ffv2_proto_hand *hand;
+	struct task_struct *task;
+
+	if (slot >= NFSD_FFV2_PROTO_CREW_MAX)
+		return NULL;
+	hand = &crew->hand[slot];
+	if (hand->task)
+		return NULL;
+	hand->ctx.nn = nn;
+	hand->ctx.net = net;
+	hand->call = call;
+	refcount_inc(&crew->ref);
+	atomic_inc(&nfsd_ffv2_proto_crew_workers);
+	if (crew->refuse_start)
+		task = ERR_PTR(-ENOMEM);
+	else
+		task = kthread_run(nfsd_ffv2_proto_crew_thread, hand, "%s",
+				   name);
+	if (IS_ERR(task)) {
+		atomic_dec(&nfsd_ffv2_proto_crew_workers);
+		nfsd_ffv2_proto_crew_put(crew);
+		return NULL;
+	}
+	get_task_struct(task);
+	hand->task = task;
+	return &hand->ctx;
+}
+
+/* Wait, bounded, for every crew worker this suite started to have ended. */
+static bool nfsd_ffv2_proto_crew_quiesced(void)
+{
+	unsigned long deadline = jiffies + 30 * HZ;
+
+	while (atomic_read(&nfsd_ffv2_proto_crew_workers) &&
+	       time_before(jiffies, deadline))
+		schedule_timeout_uninterruptible(1);
+	return !atomic_read(&nfsd_ffv2_proto_crew_workers);
+}
+
 static int nfsd_ffv2_prototype_pre_exit_thread(void *data)
 {
 	struct nfsd_ffv2_prototype_call_ctx *ctx = data;
@@ -11045,6 +11320,144 @@ static void nfsd_ffv2_prototype_setup_failure_test(struct kunit *test)
  * what it staged, the closer alone drains and releases, and a third caller
  * that finds CLOSING waits rather than draining a second time.
  */
+/*
+ * A start that fails takes nothing with it.
+ *
+ * The one thing a caller must be able to rely on is that an unsuccessful
+ * start leaves nothing to stop: no task recorded, no reference taken, and
+ * a settle afterwards with nothing to do.  Reaching that path needs the
+ * start to fail, which this asks the crew to do rather than waiting for a
+ * machine that is short of memory.
+ */
+static void nfsd_ffv2_prototype_crew_start_failure_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_crew *crew;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_crew_workers));
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	KUNIT_ASSERT_EQ(test, 0,
+			kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit,
+						  nn));
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+
+	crew->refuse_start = true;
+	KUNIT_EXPECT_NULL(test,
+			  nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+						     nfsd_ffv2_proto_call_enable,
+						     "ffv2-proto-crew"));
+	KUNIT_EXPECT_NULL(test, crew->hand[0].task);
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_crew_workers));
+	/* The crew is still only the test's, so it is still only one. */
+	KUNIT_EXPECT_EQ(test, 1, (int)refcount_read(&crew->ref));
+	/* And settling has nothing to join. */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+}
+
+/*
+ * A worker that does not return is given up, not abandoned.
+ *
+ * The settle is bounded, so it can reach its bound with a worker still
+ * inside whatever it is doing.  It must not free what that worker is
+ * reading, must not wait for it without end, and must not leave it with
+ * nothing that will ever end it.  The bound is shortened here so the case
+ * costs seconds; the path through the settle is the one every test takes.
+ */
+static void nfsd_ffv2_prototype_crew_giveup_test(struct kunit *test)
+{
+	struct nfsd_ffv2_proto_crew *crew;
+	struct nfsd_net *nn;
+	unsigned long elapsed;
+
+	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_crew_workers));
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	KUNIT_ASSERT_EQ(test, 0,
+			kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit,
+						  nn));
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	crew->join_bound = HZ;
+	if (!nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					nfsd_ffv2_proto_call_stall,
+					"ffv2-proto-stall")) {
+		KUNIT_FAIL(test, "failed to start the stalled worker");
+		return;
+	}
+
+	elapsed = jiffies;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_crew_settle(crew));
+	elapsed = jiffies - elapsed;
+	KUNIT_EXPECT_TRUE(test, elapsed < 4 * crew->join_bound);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(crew->released));
+	KUNIT_EXPECT_NULL(test, crew->hand[0].task);
+	/* What it is still reading is still there to read. */
+	KUNIT_EXPECT_TRUE(test, refcount_read(&crew->ref) >= 2);
+
+	complete_all(&crew->stall);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_quiesced());
+	KUNIT_EXPECT_EQ(test, 1, (int)refcount_read(&crew->ref));
+}
+
+/*
+ * A worker parked in a pause is let out before it is joined.
+ *
+ * This is the ordering the settle exists for: a worker held at one of the
+ * prototype's pauses is waiting for the test, so joining it first would
+ * wait for a test that is already over.  Nothing here releases the pause;
+ * the settle does, and the join that follows it succeeds.
+ */
+static void nfsd_ffv2_prototype_crew_pause_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_call_ctx *enable;
+	struct nfsd_ffv2_prototype_test_pause *setup;
+	struct nfsd_ffv2_proto_pause *held;
+	struct nfsd_ffv2_proto_crew *crew;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_crew_workers));
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	KUNIT_ASSERT_EQ(test, 0,
+			kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit,
+						  nn));
+	held = nfsd_ffv2_proto_pause_hold(test, NFSD_FFV2_PAUSE_SETUP);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	setup = held->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, held);
+
+	enable = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					    nfsd_ffv2_proto_call_enable,
+					    "ffv2-proto-enable");
+	if (!enable) {
+		KUNIT_FAIL(test, "failed to start the enabling worker");
+		return;
+	}
+	if (!wait_for_completion_timeout(&setup->reached, 15 * HZ)) {
+		KUNIT_FAIL(test, "the enable never reached its pause");
+		return;
+	}
+	/* Held there, and nothing in this body lets it out. */
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_ENABLING,
+			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, 0UL,
+			wait_for_completion_timeout(&enable->done, HZ / 4));
+
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+	KUNIT_EXPECT_EQ(test, 0, enable->result);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_quiesced());
+	KUNIT_EXPECT_EQ(test, 0,
+			nfsd_ffv2_prototype_disable(nn, &init_net));
+}
+
 static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 {
 	struct nfsd_ffv2_prototype_call_ctx enable = {}, first = {}, second = {};
@@ -14462,6 +14875,9 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_gate_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_owner_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_setup_failure_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_crew_start_failure_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_crew_giveup_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_crew_pause_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_close_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_pre_exit_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_supersede_cycle_test),
