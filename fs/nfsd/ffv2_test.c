@@ -10913,6 +10913,14 @@ struct nfsd_ffv2_proto_crew {
 	struct nfsd_ffv2_proto_crew	*owner;
 	bool				hooked;
 	bool				net_live;
+	/*
+	 * Which halves of the namespace's teardown a worker of this crew has
+	 * already performed.  Neither may happen twice, and whichever is
+	 * still owed is owed to the last reference out -- by which time no
+	 * worker can be holding the anchor, so it cannot wait on one.
+	 */
+	bool				net_pre_exited;
+	bool				net_destroyed;
 	/* A shared starting gun, for workers that must run together. */
 	struct completion		start;
 	/* Test-only: refuse the next start, to reach the failure path. */
@@ -10921,6 +10929,12 @@ struct nfsd_ffv2_proto_crew {
 	bool				settled;
 	bool				joined;
 };
+
+/*
+ * Namespace destructions this suite has performed, counted so that a test
+ * can say one happened rather than assume it, and that a second did not.
+ */
+static atomic_t nfsd_ffv2_proto_crew_destroys = ATOMIC_INIT(0);
 
 /* Workers started in a crew anywhere in this suite and not yet seen out. */
 static atomic_t nfsd_ffv2_proto_crew_workers = ATOMIC_INIT(0);
@@ -10937,7 +10951,12 @@ static void nfsd_ffv2_proto_crew_put(struct nfsd_ffv2_proto_crew *crew)
 		return;
 	if (crew->net_live) {
 		crew->net_live = false;
-		nfsd_ffv2_test_net_exit(&crew->net);
+		if (!crew->net_pre_exited)
+			nfsd_ffv2_net_pre_exit(&crew->net);
+		if (!crew->net_destroyed) {
+			nfsd_ffv2_net_destroy(&crew->net);
+			atomic_inc(&nfsd_ffv2_proto_crew_destroys);
+		}
 	}
 	if (crew->owner) {
 		struct nfsd_ffv2_proto_crew *owner = crew->owner;
@@ -10951,9 +10970,9 @@ static void nfsd_ffv2_proto_crew_put(struct nfsd_ffv2_proto_crew *crew)
 }
 
 /*
- * The namespace this crew owns, initialised on first use.  A test that
- * hands the destruction to a worker of its own says so with
- * nfsd_ffv2_proto_crew_net_handed(), and the crew stops owing it one.
+ * The namespace this crew owns, initialised on first use.  A test whose
+ * workers perform either half of its teardown does not have to say so:
+ * the worker records what it did, and the crew owes only what is left.
  */
 static struct nfsd_net *nfsd_ffv2_proto_crew_net(struct nfsd_ffv2_proto_crew *crew)
 {
@@ -10962,11 +10981,6 @@ static struct nfsd_net *nfsd_ffv2_proto_crew_net(struct nfsd_ffv2_proto_crew *cr
 		crew->net_live = true;
 	}
 	return &crew->net;
-}
-
-static void nfsd_ffv2_proto_crew_net_handed(struct nfsd_ffv2_proto_crew *crew)
-{
-	crew->net_live = false;
 }
 
 /*
@@ -11040,13 +11054,27 @@ static int nfsd_ffv2_proto_call_disable(struct nfsd_ffv2_prototype_call_ctx *ctx
 
 static int nfsd_ffv2_proto_call_pre_exit(struct nfsd_ffv2_prototype_call_ctx *ctx)
 {
+	struct nfsd_ffv2_proto_hand *hand =
+		container_of(ctx, struct nfsd_ffv2_proto_hand, ctx);
+
 	nfsd_ffv2_net_pre_exit(ctx->nn);
+	/*
+	 * Recorded after the fact, so the crew owes this half only while no
+	 * worker has done it.  A worker released before it ran records
+	 * nothing, and the crew still owes it.
+	 */
+	WRITE_ONCE(hand->crew->net_pre_exited, true);
 	return 0;
 }
 
 static int nfsd_ffv2_proto_call_destroy(struct nfsd_ffv2_prototype_call_ctx *ctx)
 {
+	struct nfsd_ffv2_proto_hand *hand =
+		container_of(ctx, struct nfsd_ffv2_proto_hand, ctx);
+
 	nfsd_ffv2_net_destroy(ctx->nn);
+	atomic_inc(&nfsd_ffv2_proto_crew_destroys);
+	WRITE_ONCE(hand->crew->net_destroyed, true);
 	return 0;
 }
 
@@ -11582,6 +11610,189 @@ static void nfsd_ffv2_prototype_crew_retained_net_test(struct kunit *test)
  * wait for a test that is already over.  Nothing here releases the pause;
  * the settle does, and the join that follows it succeeds.
  */
+/*
+ * How many destructions a case may perform, checked after it has ended.
+ *
+ * The last of them happens when the crew's final reference goes, which is
+ * after the case body has returned, so the count can only be read from an
+ * action -- and only from one registered before the crew, so that it is
+ * the last thing to run.
+ */
+struct nfsd_ffv2_proto_destroys {
+	struct kunit	*test;
+	int		before;
+	int		want;
+};
+
+static void nfsd_ffv2_proto_destroys_check(void *data)
+{
+	struct nfsd_ffv2_proto_destroys *count = data;
+
+	KUNIT_EXPECT_EQ(count->test, count->want,
+			atomic_read(&nfsd_ffv2_proto_crew_destroys) -
+				count->before);
+}
+
+static struct nfsd_ffv2_proto_destroys *
+nfsd_ffv2_proto_destroys_expect(struct kunit *test, int want)
+{
+	struct nfsd_ffv2_proto_destroys *count;
+
+	count = kunit_kzalloc(test, sizeof(*count), GFP_KERNEL);
+	if (!count)
+		return NULL;
+	count->test = test;
+	count->want = want;
+	count->before = atomic_read(&nfsd_ffv2_proto_crew_destroys);
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_proto_destroys_check,
+				      count))
+		return NULL;
+	return count;
+}
+
+/*
+ * A destroying worker that never starts, against a close owner that has
+ * not returned.
+ *
+ * This is the one place a test performs the namespace's destruction
+ * itself, and the one place it must not: the owner is parked at its pause
+ * holding the anchor, so a destruction from here would wait for it without
+ * a bound, after a bounded settle had already given up.  Nothing is
+ * destroyed from the case at all.  The crew still owes the teardown and
+ * owes it to its last reference, which is reached only once every worker
+ * has ended -- and then nothing holds the anchor and the wait is not a
+ * wait.
+ *
+ * The destruction is counted, and the count is checked after the case has
+ * ended: exactly one, performed by the crew and not by the case.
+ */
+static void nfsd_ffv2_prototype_crew_destroy_giveup_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_test_pause *pub;
+	struct nfsd_ffv2_prototype_call_ctx *owner;
+	struct nfsd_ffv2_proto_pause *published;
+	struct nfsd_ffv2_proto_crew *crew;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_crew_workers));
+	KUNIT_ASSERT_NOT_NULL(test, nfsd_ffv2_proto_destroys_expect(test, 1));
+	published = nfsd_ffv2_proto_pause_hold(test,
+					       NFSD_FFV2_PAUSE_PUBLISHED);
+	KUNIT_ASSERT_NOT_NULL(test, published);
+	pub = published->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nn = nfsd_ffv2_proto_crew_net(crew);
+	crew->join_bound = HZ;
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+
+	/*
+	 * Deliberately not watched by the crew: the settle must reach its
+	 * bound with this owner still parked, which is the state the
+	 * destruction must not be attempted in.
+	 */
+	owner = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					   nfsd_ffv2_proto_call_disable,
+					   "ffv2-proto-owner");
+	if (!owner) {
+		KUNIT_FAIL(test, "failed to start the closing owner");
+		return;
+	}
+	if (!wait_for_completion_timeout(&pub->reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the close never reached its pause");
+		return;
+	}
+
+	/* And the destroying worker does not start. */
+	crew->refuse_start = true;
+	KUNIT_EXPECT_NULL(test,
+			  nfsd_ffv2_proto_crew_start(crew, 1, nn, NULL,
+						     nfsd_ffv2_proto_call_destroy,
+						     "ffv2-proto-destroy"));
+	crew->refuse_start = false;
+
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_proto_crew_settle(crew));
+	/* Given up on, with the owner still in the namespace. */
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(crew->released));
+	KUNIT_EXPECT_TRUE(test, atomic_read(&nfsd_ffv2_proto_crew_workers) > 0);
+	/* And the namespace is still there, and still owed a teardown. */
+	KUNIT_EXPECT_TRUE(test, crew->net_live);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(crew->net_destroyed));
+
+	/* Let the owner out; the teardown is the crew's, once it has gone. */
+	complete_all(&pub->proceed);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_quiesced());
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(crew->net_destroyed));
+}
+
+/*
+ * The same shape, with the destroying worker started.
+ *
+ * Here the worker performs the destruction and records that it did, so the
+ * crew has nothing left to destroy.  The count says so after the case has
+ * ended: one destruction, not two.
+ */
+static void nfsd_ffv2_prototype_crew_destroy_once_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_call_ctx *owner, *exiting, *destroying;
+	struct nfsd_ffv2_prototype_test_pause *pub;
+	struct nfsd_ffv2_proto_pause *published;
+	struct nfsd_ffv2_proto_crew *crew;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_EQ(test, 0, atomic_read(&nfsd_ffv2_proto_crew_workers));
+	KUNIT_ASSERT_NOT_NULL(test, nfsd_ffv2_proto_destroys_expect(test, 1));
+	published = nfsd_ffv2_proto_pause_hold(test,
+					       NFSD_FFV2_PAUSE_PUBLISHED);
+	KUNIT_ASSERT_NOT_NULL(test, published);
+	pub = published->pause;
+	crew = nfsd_ffv2_proto_crew_begin(test);
+	if (!crew)
+		return;
+	nfsd_ffv2_proto_crew_watch(crew, published);
+	nn = nfsd_ffv2_proto_crew_net(crew);
+	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(nn, &init_net));
+
+	owner = nfsd_ffv2_proto_crew_start(crew, 0, nn, &init_net,
+					   nfsd_ffv2_proto_call_disable,
+					   "ffv2-proto-owner");
+	if (!owner) {
+		KUNIT_FAIL(test, "failed to start the closing owner");
+		return;
+	}
+	if (!wait_for_completion_timeout(&pub->reached, 30 * HZ)) {
+		KUNIT_FAIL(test, "the close never reached its pause");
+		return;
+	}
+	exiting = nfsd_ffv2_proto_crew_start(crew, 1, nn, NULL,
+					     nfsd_ffv2_proto_call_pre_exit,
+					     "ffv2-proto-exit");
+	if (!exiting) {
+		KUNIT_FAIL(test, "failed to start the exiting worker");
+		return;
+	}
+	KUNIT_EXPECT_TRUE(test,
+			  wait_for_completion_timeout(&exiting->done,
+						      30 * HZ) != 0);
+	destroying = nfsd_ffv2_proto_crew_start(crew, 2, nn, NULL,
+						nfsd_ffv2_proto_call_destroy,
+						"ffv2-proto-destroy");
+	if (!destroying) {
+		KUNIT_FAIL(test, "failed to start the destroying worker");
+		return;
+	}
+
+	/* The owner lets go, and everything finishes in order. */
+	complete_all(&pub->proceed);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_proto_crew_settle(crew));
+	KUNIT_EXPECT_EQ(test, 0, owner->result);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(crew->net_pre_exited));
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(crew->net_destroyed));
+	/* The storage is still the crew's; the teardown is not owed twice. */
+	KUNIT_EXPECT_TRUE(test, crew->net_live);
+}
+
 static void nfsd_ffv2_prototype_crew_pause_test(struct kunit *test)
 {
 	struct nfsd_ffv2_prototype_call_ctx *enable;
@@ -14528,7 +14739,6 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 	 * crew is settled and the namespace destroyed explicitly, because
 	 * once the action is gone nothing else will.
 	 */
-	nfsd_ffv2_proto_crew_net_handed(crew);
 	nfsd_ffv2_test_destroy_entry_hook(nn, &crew->entered);
 	crew->hooked = true;
 
@@ -14552,9 +14762,14 @@ static void nfsd_ffv2_prototype_close_pre_exit_test(struct kunit *test)
 						nfsd_ffv2_proto_call_destroy,
 						"ffv2-proto-destroy");
 	if (!destroying) {
+		/*
+		 * Nothing is destroyed from here.  A close owner may still be
+		 * parked, and waiting for the anchor it holds would be an
+		 * unbounded wait after a bounded cleanup had already given
+		 * up.  The crew still owes the teardown, and owes it to its
+		 * last reference -- by which time no worker holds anything.
+		 */
 		KUNIT_FAIL(test, "failed to start the destroying worker");
-		nfsd_ffv2_proto_crew_settle(crew);
-		nfsd_ffv2_net_destroy(nn);
 		return;
 	}
 	/*
@@ -15055,6 +15270,8 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_crew_giveup_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_crew_retained_net_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_crew_pause_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_crew_destroy_giveup_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_crew_destroy_once_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_close_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_enabling_pre_exit_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_supersede_cycle_test),
