@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/crc32.h>
 #include <linux/errno.h>
+#include <linux/file.h>
+#include <linux/fs.h>
 #include <linux/kernel.h>
+#include <linux/magic.h>
+#include <linux/mutex.h>
 #include <linux/overflow.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
+#include <crypto/sha2.h>
 
+#include "ffv2.h"
 #include "ffv2_store.h"
 
 #define FFV2_SUPER_MAGIC	0x44325342
@@ -530,6 +537,56 @@ size_t nfsd_ffv2_payload_record_size(u32 content_len)
 	return ALIGN(total, NFSD_FFV2_PAYLOAD_ALIGN);
 }
 
+static bool
+ffv2_payload_checksum_valid(const struct nfsd_ffv2_payload_record *record)
+{
+	u8 computed[NFSD_FFV2_STORE_CHECKSUM_SIZE] = {};
+	u32 expected_len;
+	u64 a = 0, b = 0, c = 0, d = 0;
+	u32 i;
+
+	switch (record->checksum_algorithm) {
+	case 0:
+		expected_len = 0;
+		break;
+	case 1:
+		expected_len = sizeof(__be32);
+		put_unaligned_be32(~crc32_le(~0, record->content,
+					     record->content_len),
+			     computed);
+		break;
+	case 2:
+		expected_len = sizeof(__be32);
+		put_unaligned_be32(~crc32c(~0, record->content,
+					   record->content_len),
+			     computed);
+		break;
+	case 3:
+		if (!IS_ALIGNED(record->content_len, sizeof(u32)))
+			return false;
+		expected_len = 4 * sizeof(__be64);
+		for (i = 0; i < record->content_len; i += sizeof(u32)) {
+			a += get_unaligned_le32(record->content + i);
+			b += a;
+			c += b;
+			d += c;
+		}
+		put_unaligned_be64(a, computed);
+		put_unaligned_be64(b, computed + 8);
+		put_unaligned_be64(c, computed + 16);
+		put_unaligned_be64(d, computed + 24);
+		break;
+	case 4:
+		expected_len = SHA256_DIGEST_SIZE;
+		sha256(record->content, record->content_len, computed);
+		break;
+	default:
+		return false;
+	}
+	return record->checksum_len == expected_len &&
+	       !memcmp(record->checksum, computed, sizeof(computed));
+}
+
 int nfsd_ffv2_payload_encode(const struct nfsd_ffv2_payload_record *record,
 			     u8 *out, size_t capacity, size_t *written)
 {
@@ -540,7 +597,8 @@ int nfsd_ffv2_payload_encode(const struct nfsd_ffv2_payload_record *record,
 	    record->checksum_len > NFSD_FFV2_STORE_CHECKSUM_SIZE ||
 	    (record->content_len && !record->content) ||
 	    !ffv2_all_zero(record->checksum + record->checksum_len,
-			   NFSD_FFV2_STORE_CHECKSUM_SIZE - record->checksum_len))
+			   NFSD_FFV2_STORE_CHECKSUM_SIZE - record->checksum_len) ||
+	    !ffv2_payload_checksum_valid(record))
 		return -EINVAL;
 	object_size = nfsd_ffv2_payload_record_size(record->content_len);
 	total = NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE + record->content_len + 4;
@@ -623,6 +681,437 @@ int nfsd_ffv2_payload_decode(const u8 *in, size_t len,
 	record->content_crc32c = stored_crc;
 	record->object_bytes = object_size;
 	*content_valid = stored_crc ==
-			 ~crc32c(~0, record->content, record->content_len);
+			 ~crc32c(~0, record->content, record->content_len) &&
+			 ffv2_payload_checksum_valid(record);
 	return 0;
+}
+
+struct nfsd_ffv2_store {
+	struct nfsd_ffv2_reservation *reservation;
+	struct file *super_file;
+	struct file *wal_file;
+	struct file *payload_file;
+	struct nfsd_ffv2_super_record super;
+	/* Serializes checkpoints and their in-memory selected slot. */
+	struct mutex lock;
+	unsigned int newest_slot;
+};
+
+static struct file *ffv2_store_open_file(const struct path *root,
+					 const char *name)
+{
+	struct file *file;
+
+	file = file_open_root(root, name, O_RDWR | O_LARGEFILE, 0);
+	if (IS_ERR(file))
+		return file;
+	if (!S_ISREG(file_inode(file)->i_mode) || !file_inode(file)->i_nlink ||
+	    file->f_path.mnt != root->mnt ||
+	    file_inode(file)->i_sb != root->mnt->mnt_sb ||
+	    file->f_path.dentry->d_parent != root->dentry) {
+		fput(file);
+		return ERR_PTR(-EINVAL);
+	}
+	return file;
+}
+
+static int ffv2_store_read_all(struct file *file, void *data, size_t len,
+			       loff_t offset)
+{
+	u8 *cursor = data;
+	ssize_t done;
+
+	while (len) {
+		done = kernel_read(file, cursor, len, &offset);
+		if (done < 0)
+			return done;
+		if (!done)
+			return -EIO;
+		cursor += done;
+		len -= done;
+	}
+	return 0;
+}
+
+static int ffv2_store_write_all(struct file *file, const void *data, size_t len,
+				loff_t offset)
+{
+	const u8 *cursor = data;
+	ssize_t done;
+
+	while (len) {
+		done = kernel_write(file, cursor, len, &offset);
+		if (done < 0)
+			return done;
+		if (!done)
+			return -EIO;
+		cursor += done;
+		len -= done;
+	}
+	return 0;
+}
+
+static int ffv2_store_read_super(struct nfsd_ffv2_store *store,
+				 const u8 expected_store[16])
+{
+	struct nfsd_ffv2_super_record slots[2];
+	bool valid[2] = {};
+	u8 *bytes;
+	unsigned int i, selected;
+	int error;
+
+	bytes = kmalloc(NFSD_FFV2_SUPER_SLOT_SIZE, GFP_KERNEL);
+	if (!bytes)
+		return -ENOMEM;
+	for (i = 0; i < ARRAY_SIZE(slots); i++) {
+		error = ffv2_store_read_all(store->super_file, bytes,
+					    NFSD_FFV2_SUPER_SLOT_SIZE,
+					    i * NFSD_FFV2_SUPER_SLOT_SIZE);
+		if (!error)
+			valid[i] = !nfsd_ffv2_super_decode(bytes, expected_store,
+							    &slots[i]);
+	}
+	kfree(bytes);
+	if (!valid[0] && !valid[1])
+		return -EBADMSG;
+	if (valid[0] && valid[1] && slots[0].generation == slots[1].generation)
+		return -EBADMSG;
+	selected = !valid[0] ||
+		   (valid[1] && slots[1].generation > slots[0].generation);
+	store->super = slots[selected];
+	store->newest_slot = selected;
+	if (store->super.state == NFSD_FFV2_SUPER_FENCED ||
+	    store->super.state == NFSD_FFV2_SUPER_RETIRED)
+		return -ESHUTDOWN;
+	return 0;
+}
+
+static int ffv2_store_validate_files(struct nfsd_ffv2_store *store,
+				     const struct path *root)
+{
+	struct nfsd_ffv2_payload_header payload_header;
+	struct nfsd_ffv2_payload_header *header = &payload_header;
+	struct nfsd_ffv2_start_record start;
+	struct nfsd_ffv2_wal_header wal_header;
+	const u8 *store_uuid = store->super.store_uuid;
+	u8 *payload_bytes;
+	u8 *start_bytes;
+	loff_t payload_size;
+	loff_t wal_size;
+	int error;
+
+	wal_size = i_size_read(file_inode(store->wal_file));
+	payload_size = i_size_read(file_inode(store->payload_file));
+	if (i_size_read(file_inode(store->super_file)) !=
+					       NFSD_FFV2_SUPER_FILE_SIZE ||
+	    wal_size <= 0 || wal_size > store->super.capacity_wal_bytes ||
+	    payload_size < NFSD_FFV2_PAYLOAD_ALIGN ||
+	    payload_size > store->super.capacity_payload_bytes ||
+	    store->super.wal_durable_bytes > wal_size ||
+	    store->super.payload_durable_bytes > payload_size ||
+	    memcmp(root->mnt->mnt_sb->s_uuid.b, store->super.fs_uuid,
+		   sizeof(store->super.fs_uuid)))
+		return -EBADMSG;
+
+	payload_bytes = kmalloc(NFSD_FFV2_PAYLOAD_ALIGN, GFP_KERNEL);
+	start_bytes = kmalloc(NFSD_FFV2_START_RECORD_SIZE, GFP_KERNEL);
+	if (!payload_bytes || !start_bytes) {
+		error = -ENOMEM;
+		goto out;
+	}
+	error = ffv2_store_read_all(store->payload_file, payload_bytes,
+				    NFSD_FFV2_PAYLOAD_ALIGN, 0);
+	if (error)
+		goto out;
+	error = nfsd_ffv2_payload_header_decode(payload_bytes, store_uuid, header);
+	if (error || memcmp(payload_header.payload_uuid,
+			    store->super.payload_uuid, 16) ||
+	    memcmp(payload_header.wal_uuid, store->super.wal_uuid, 16)) {
+		error = -EBADMSG;
+		goto out;
+	}
+	error = ffv2_store_read_all(store->wal_file, start_bytes,
+				    NFSD_FFV2_START_RECORD_SIZE, 0);
+	if (error)
+		goto out;
+	error = nfsd_ffv2_start_decode(start_bytes,
+				       NFSD_FFV2_START_RECORD_SIZE,
+				       store->super.store_uuid,
+				       store->super.wal_uuid, &wal_header, &start);
+	if (!error && start.ds_incarnation != store->super.ds_incarnation)
+		error = -EBADMSG;
+out:
+	kfree(start_bytes);
+	kfree(payload_bytes);
+	return error;
+}
+
+int nfsd_ffv2_store_open(struct nfsd_ffv2_reservation *reservation,
+			 struct nfsd_ffv2_store **result)
+{
+	struct nfsd_ffv2_store *store = NULL;
+	struct path root;
+	u8 store_uuid[16];
+	int error;
+
+	if (!result)
+		return -EINVAL;
+	*result = NULL;
+	error = nfsd_ffv2_reservation_store_root(reservation, &root, store_uuid);
+	if (error)
+		return error;
+	error = nfsd_ffv2_reservation_store_begin(reservation);
+	if (error)
+		goto out_ref;
+	if (root.mnt->mnt_sb->s_magic != XFS_SUPER_MAGIC) {
+		error = -EOPNOTSUPP;
+		goto out_end;
+	}
+	store = kzalloc(sizeof(*store), GFP_KERNEL);
+	if (!store) {
+		error = -ENOMEM;
+		goto out_end;
+	}
+	store->reservation = reservation;
+	mutex_init(&store->lock);
+	store->super_file = ffv2_store_open_file(&root, "super");
+	if (IS_ERR(store->super_file)) {
+		error = PTR_ERR(store->super_file);
+		store->super_file = NULL;
+		goto out_store;
+	}
+	store->wal_file = ffv2_store_open_file(&root, "wal");
+	if (IS_ERR(store->wal_file)) {
+		error = PTR_ERR(store->wal_file);
+		store->wal_file = NULL;
+		goto out_store;
+	}
+	store->payload_file = ffv2_store_open_file(&root, "payload");
+	if (IS_ERR(store->payload_file)) {
+		error = PTR_ERR(store->payload_file);
+		store->payload_file = NULL;
+		goto out_store;
+	}
+	error = ffv2_store_read_super(store, store_uuid);
+	if (error)
+		goto out_store;
+	error = ffv2_store_validate_files(store, &root);
+	if (error)
+		goto out_store;
+	nfsd_ffv2_reservation_store_end(reservation);
+	path_put(&root);
+	*result = store;
+	return 0;
+
+out_store:
+	nfsd_ffv2_reservation_store_end(reservation);
+	nfsd_ffv2_store_close(store);
+	path_put(&root);
+	return error;
+out_end:
+	nfsd_ffv2_reservation_store_end(reservation);
+out_ref:
+	nfsd_ffv2_reservation_store_put(reservation);
+	path_put(&root);
+	return error;
+}
+
+void nfsd_ffv2_store_close(struct nfsd_ffv2_store *store)
+{
+	if (!store)
+		return;
+	if (store->payload_file)
+		fput(store->payload_file);
+	if (store->wal_file)
+		fput(store->wal_file);
+	if (store->super_file)
+		fput(store->super_file);
+	mutex_destroy(&store->lock);
+	nfsd_ffv2_reservation_store_put(store->reservation);
+	kfree(store);
+}
+
+int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store,
+			      struct nfsd_ffv2_super_record *record)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	*record = store->super;
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return 0;
+}
+
+static int ffv2_store_read_range_valid(struct file *file, size_t len,
+				       loff_t offset)
+{
+	loff_t end;
+
+	if (offset < 0 || check_add_overflow(offset, (loff_t)len, &end) ||
+	    end > i_size_read(file_inode(file)))
+		return -EIO;
+	return 0;
+}
+
+static int ffv2_store_write_range_valid(struct file *file, u64 capacity,
+					size_t len, loff_t offset)
+{
+	loff_t end;
+
+	if (i_size_read(file_inode(file)) > capacity)
+		return -EBADMSG;
+	if (offset < 0 || check_add_overflow(offset, (loff_t)len, &end) ||
+	    end > capacity)
+		return -EFBIG;
+	return 0;
+}
+
+int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data,
+				 size_t len, loff_t offset)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_read_range_valid(store->payload_file, len, offset);
+	if (!error)
+		error = ffv2_store_read_all(store->payload_file, data, len, offset);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_write_payload(struct nfsd_ffv2_store *store,
+				  const void *data, size_t len, loff_t offset)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_write_range_valid(store->payload_file,
+					     store->super.capacity_payload_bytes,
+					     len, offset);
+	if (!error)
+		error = ffv2_store_write_all(store->payload_file, data, len, offset);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_read_wal(struct nfsd_ffv2_store *store, void *data,
+			     size_t len, loff_t offset)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_read_range_valid(store->wal_file, len, offset);
+	if (!error)
+		error = ffv2_store_read_all(store->wal_file, data, len, offset);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_write_wal(struct nfsd_ffv2_store *store, const void *data,
+			      size_t len, loff_t offset)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_write_range_valid(store->wal_file,
+					     store->super.capacity_wal_bytes,
+					     len, offset);
+	if (!error)
+		error = ffv2_store_write_all(store->wal_file, data, len, offset);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_checkpoint(struct nfsd_ffv2_store *store,
+			       const struct nfsd_ffv2_super_record *record)
+{
+	u8 *bytes;
+	unsigned int slot;
+	int error;
+
+	if (!store || !record)
+		return -EINVAL;
+	bytes = kmalloc(NFSD_FFV2_SUPER_SLOT_SIZE, GFP_KERNEL);
+	if (!bytes)
+		return -ENOMEM;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		goto out;
+	mutex_lock(&store->lock);
+	if (memcmp(record->store_uuid, store->super.store_uuid, 16) ||
+	    memcmp(record->wal_uuid, store->super.wal_uuid, 16) ||
+	    memcmp(record->payload_uuid, store->super.payload_uuid, 16) ||
+	    record->generation <= store->super.generation ||
+	    record->capacity_wal_bytes != store->super.capacity_wal_bytes ||
+	    record->capacity_payload_bytes != store->super.capacity_payload_bytes) {
+		error = -EINVAL;
+		goto out_unlock;
+	}
+	error = nfsd_ffv2_super_encode(record, bytes);
+	if (error)
+		goto out_unlock;
+	if (i_size_read(file_inode(store->super_file)) !=
+					       NFSD_FFV2_SUPER_FILE_SIZE) {
+		error = -EBADMSG;
+		goto out_unlock;
+	}
+	error = ffv2_store_write_range_valid(store->payload_file,
+					     store->super.capacity_payload_bytes,
+					     0, 0);
+	if (error)
+		goto out_unlock;
+	error = ffv2_store_write_range_valid(store->wal_file,
+					     store->super.capacity_wal_bytes,
+					     0, 0);
+	if (error)
+		goto out_unlock;
+	if (record->payload_durable_bytes >
+				i_size_read(file_inode(store->payload_file)) ||
+	    record->wal_durable_bytes > i_size_read(file_inode(store->wal_file))) {
+		error = -EINVAL;
+		goto out_unlock;
+	}
+	error = vfs_fsync(store->payload_file, 0);
+	if (error)
+		goto out_unlock;
+	error = vfs_fsync(store->wal_file, 0);
+	if (error)
+		goto out_unlock;
+	slot = store->newest_slot ^ 1;
+	error = ffv2_store_write_all(store->super_file, bytes,
+				     NFSD_FFV2_SUPER_SLOT_SIZE,
+				     slot * NFSD_FFV2_SUPER_SLOT_SIZE);
+	if (error)
+		goto out_unlock;
+	error = vfs_fsync(store->super_file, 0);
+	if (!error) {
+		store->super = *record;
+		store->newest_slot = slot;
+	}
+out_unlock:
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+out:
+	kfree(bytes);
+	return error;
 }

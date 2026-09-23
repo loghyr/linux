@@ -13,6 +13,7 @@
 #include "ffv2_prototype.h"
 
 struct net;
+struct auth_domain;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
 struct nfsd_ffv2_object;
@@ -226,6 +227,11 @@ int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
 				const u8 binding_token[32],
 				struct nfsd_ffv2_reservation **result);
 int nfsd_ffv2_reservation_gate_io(struct nfsd_ffv2_reservation *reservation);
+int nfsd_ffv2_reservation_store_root(struct nfsd_ffv2_reservation *reservation,
+				     struct path *root, u8 store_uuid[16]);
+int nfsd_ffv2_reservation_store_begin(struct nfsd_ffv2_reservation *reservation);
+void nfsd_ffv2_reservation_store_end(struct nfsd_ffv2_reservation *reservation);
+void nfsd_ffv2_reservation_store_put(struct nfsd_ffv2_reservation *reservation);
 int nfsd_ffv2_reservation_claim_expected(struct nfsd_net *owner,
 					 const struct path *root,
 					 const u8 store_uuid[16],

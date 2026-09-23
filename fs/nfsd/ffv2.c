@@ -613,6 +613,49 @@ out_unlock:
 	return error;
 }
 
+int nfsd_ffv2_reservation_store_root(struct nfsd_ffv2_reservation *reservation,
+				     struct path *root, u8 store_uuid[16])
+{
+	int error = 0;
+
+	if (!reservation || !root || !store_uuid)
+		return -EINVAL;
+	mutex_lock(&reservation->entry_lock);
+	if (reservation->state != NFSD_FFV2_RESERVING &&
+	    reservation->state != NFSD_FFV2_RESERVATION_ACTIVE) {
+		error = -ESHUTDOWN;
+		goto out_unlock;
+	}
+	*root = reservation->root;
+	path_get(root);
+	refcount_inc(&reservation->ref);
+	memcpy(store_uuid, reservation->store_uuid,
+	       sizeof(reservation->store_uuid));
+out_unlock:
+	mutex_unlock(&reservation->entry_lock);
+	return error;
+}
+
+int nfsd_ffv2_reservation_store_begin(struct nfsd_ffv2_reservation *reservation)
+{
+	mutex_lock(&reservation->entry_lock);
+	if (reservation->state == NFSD_FFV2_RESERVING ||
+	    reservation->state == NFSD_FFV2_RESERVATION_ACTIVE)
+		return 0;
+	mutex_unlock(&reservation->entry_lock);
+	return -ESHUTDOWN;
+}
+
+void nfsd_ffv2_reservation_store_end(struct nfsd_ffv2_reservation *reservation)
+{
+	mutex_unlock(&reservation->entry_lock);
+}
+
+void nfsd_ffv2_reservation_store_put(struct nfsd_ffv2_reservation *reservation)
+{
+	nfsd_ffv2_reservation_put(reservation);
+}
+
 static bool nfsd_ffv2_superblock_reserved(struct super_block *sb)
 {
 	struct nfsd_ffv2_reservation *reservation;

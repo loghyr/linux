@@ -5,6 +5,9 @@
 #include <linux/bits.h>
 #include <linux/types.h>
 
+struct nfsd_ffv2_reservation;
+struct nfsd_ffv2_store;
+
 #define NFSD_FFV2_STORE_UUID_SIZE	16
 #define NFSD_FFV2_STORE_HANDLE_SIZE	128
 #define NFSD_FFV2_STORE_CHECKSUM_SIZE	64
@@ -139,5 +142,21 @@ int nfsd_ffv2_payload_decode(const u8 *in, size_t len,
 			     const u8 *expected_store,
 			     struct nfsd_ffv2_payload_record *record,
 			     bool *content_valid);
+
+int nfsd_ffv2_store_open(struct nfsd_ffv2_reservation *reservation,
+			 struct nfsd_ffv2_store **result);
+void nfsd_ffv2_store_close(struct nfsd_ffv2_store *store);
+int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store,
+			      struct nfsd_ffv2_super_record *record);
+int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data,
+				 size_t len, loff_t offset);
+int nfsd_ffv2_store_write_payload(struct nfsd_ffv2_store *store,
+				  const void *data, size_t len, loff_t offset);
+int nfsd_ffv2_store_read_wal(struct nfsd_ffv2_store *store, void *data,
+			     size_t len, loff_t offset);
+int nfsd_ffv2_store_write_wal(struct nfsd_ffv2_store *store, const void *data,
+			      size_t len, loff_t offset);
+int nfsd_ffv2_store_checkpoint(struct nfsd_ffv2_store *store,
+			       const struct nfsd_ffv2_super_record *record);
 
 #endif /* _NFSD_FFV2_STORE_H */

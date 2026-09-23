@@ -3,13 +3,19 @@
 
 #include <linux/debugfs.h>
 #include <linux/fs.h>
+#include <linux/hex.h>
+#include <linux/namei.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/wait.h>
+#include <net/net_namespace.h>
 
+#include "nfsd.h"
 #include "export.h"
 #include "ffv2.h"
+#include "ffv2_store.h"
 #include "filecache.h"
+#include "netns.h"
 
 struct nfsd_ffv2_live_test_state {
 	/* Serializes one-shot pause ownership and its observations. */
@@ -289,6 +295,122 @@ static const struct file_operations nfsd_ffv2_provider_probe_fops = {
 	.release = single_release,
 };
 
+struct nfsd_ffv2_store_test_state {
+	/* Serializes a run and its result. */
+	struct mutex lock;
+	int result;
+	u64 generation;
+};
+
+static struct nfsd_ffv2_store_test_state nfsd_ffv2_store_test = {
+	.lock = __MUTEX_INITIALIZER(nfsd_ffv2_store_test.lock),
+};
+
+static int nfsd_ffv2_store_reopen_test(const char *name,
+				       const u8 store_uuid[16], u64 *generation)
+{
+	struct nfsd_net *nn = net_generic(&init_net, nfsd_net_id);
+	struct nfsd_ffv2_reservation *reservation = NULL;
+	struct nfsd_ffv2_store *store = NULL;
+	struct nfsd_ffv2_super_record next;
+	u8 binding_token[32] = {};
+	struct path root;
+	int error;
+
+	error = kern_path(name, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &root);
+	if (error)
+		return error;
+	error = nfsd_ffv2_reservation_claim(nn, &root, store_uuid,
+					    binding_token, &reservation);
+	path_put(&root);
+	if (error)
+		return error;
+	error = nfsd_ffv2_store_open(reservation, &store);
+	if (error)
+		goto out_abort;
+	error = nfsd_ffv2_store_get_super(store, &next);
+	if (error)
+		goto out_close;
+	next.generation++;
+	error = nfsd_ffv2_store_checkpoint(store, &next);
+out_close:
+	nfsd_ffv2_store_close(store);
+	store = NULL;
+	if (error)
+		goto out_abort;
+	error = nfsd_ffv2_store_open(reservation, &store);
+	if (!error) {
+		struct nfsd_ffv2_super_record reopened;
+
+		error = nfsd_ffv2_store_get_super(store, &reopened);
+		if (!error && reopened.generation != next.generation)
+			error = -EBADMSG;
+	}
+	if (!error)
+		*generation = next.generation;
+	nfsd_ffv2_store_close(store);
+out_abort:
+	nfsd_ffv2_reservation_abort(reservation);
+	return error;
+}
+
+static ssize_t nfsd_ffv2_store_test_read(struct file *file, char __user *buf,
+					 size_t len, loff_t *ppos)
+{
+	struct nfsd_ffv2_store_test_state *state = &nfsd_ffv2_store_test;
+	char output[96];
+	int size;
+
+	mutex_lock(&state->lock);
+	size = scnprintf(output, sizeof(output), "result=%d generation=%llu\n",
+			 state->result, state->generation);
+	mutex_unlock(&state->lock);
+	return simple_read_from_buffer(buf, len, ppos, output, size);
+}
+
+static ssize_t nfsd_ffv2_store_test_write(struct file *file,
+					  const char __user *buf, size_t len,
+					  loff_t *ppos)
+{
+	struct nfsd_ffv2_store_test_state *state = &nfsd_ffv2_store_test;
+	char *input;
+	char *path, *uuid;
+	u8 store_uuid[16];
+	u64 generation = 0;
+	int error;
+
+	if (!len || len >= PATH_MAX + 34)
+		return -EINVAL;
+	input = memdup_user_nul(buf, len);
+	if (IS_ERR(input))
+		return PTR_ERR(input);
+	path = strim(input);
+	uuid = strrchr(path, ' ');
+	if (!uuid || strlen(uuid + 1) != 32) {
+		error = -EINVAL;
+		goto out;
+	}
+	*uuid++ = '\0';
+	error = hex2bin(store_uuid, uuid, sizeof(store_uuid));
+	if (error)
+		goto out;
+	error = nfsd_ffv2_store_reopen_test(path, store_uuid, &generation);
+	mutex_lock(&state->lock);
+	state->result = error;
+	state->generation = generation;
+	mutex_unlock(&state->lock);
+out:
+	kfree(input);
+	return error ? error : len;
+}
+
+static const struct file_operations nfsd_ffv2_store_test_fops = {
+	.owner = THIS_MODULE,
+	.read = nfsd_ffv2_store_test_read,
+	.write = nfsd_ffv2_store_test_write,
+	.llseek = default_llseek,
+};
+
 void nfsd_ffv2_live_test_debugfs_init(struct dentry *parent)
 {
 	debugfs_create_file("ffv2-live-test", 0600, parent, NULL,
@@ -299,6 +421,8 @@ void nfsd_ffv2_live_test_debugfs_init(struct dentry *parent)
 			    &nfsd_ffv2_live_state_fops);
 	debugfs_create_file("ffv2-provider-probe", 0400, parent, NULL,
 			    &nfsd_ffv2_provider_probe_fops);
+	debugfs_create_file("ffv2-store-test", 0600, parent, NULL,
+			    &nfsd_ffv2_store_test_fops);
 }
 
 void nfsd_ffv2_live_test_exit(void)
