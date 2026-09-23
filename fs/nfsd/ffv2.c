@@ -261,6 +261,7 @@ struct nfsd_ffv2_reservation {
 	u64			owner_generation;
 	enum nfsd_ffv2_reservation_state state;
 	u8			store_uuid[16];
+	u8			export_uuid[16];
 	u8			binding_token[32];
 	struct nlmsvc_ffv2_gate nlm_gate;
 	struct nfsd_file_ffv2_gate file_gate;
@@ -614,11 +615,13 @@ out_unlock:
 }
 
 int nfsd_ffv2_reservation_store_root(struct nfsd_ffv2_reservation *reservation,
-				     struct path *root, u8 store_uuid[16])
+				     struct path *root, u8 store_uuid[16],
+				     u8 export_uuid[16], u8 binding_token[32])
 {
 	int error = 0;
 
-	if (!reservation || !root || !store_uuid)
+	if (!reservation || !root || !store_uuid || !export_uuid ||
+	    !binding_token)
 		return -EINVAL;
 	mutex_lock(&reservation->entry_lock);
 	if (reservation->state != NFSD_FFV2_RESERVING &&
@@ -631,6 +634,10 @@ int nfsd_ffv2_reservation_store_root(struct nfsd_ffv2_reservation *reservation,
 	refcount_inc(&reservation->ref);
 	memcpy(store_uuid, reservation->store_uuid,
 	       sizeof(reservation->store_uuid));
+	memcpy(export_uuid, reservation->export_uuid,
+	       sizeof(reservation->export_uuid));
+	memcpy(binding_token, reservation->binding_token,
+	       sizeof(reservation->binding_token));
 out_unlock:
 	mutex_unlock(&reservation->entry_lock);
 	return error;
@@ -844,6 +851,7 @@ nfsd_ffv2_reservation_unlink(struct nfsd_ffv2_reservation *reservation)
 static int __nfsd_ffv2_reservation_claim(struct nfsd_net *owner,
 					 const struct path *root,
 					 const u8 store_uuid[16],
+					 const u8 export_uuid[16],
 					 const u8 binding_token[32],
 					 struct nfsd_ffv2_reservation **result,
 					 bool validate_backend,
@@ -856,7 +864,7 @@ static int __nfsd_ffv2_reservation_claim(struct nfsd_net *owner,
 	int error;
 
 	if (!owner || !root || !root->dentry || !root->mnt || !store_uuid ||
-	    !binding_token || !result || !d_is_dir(root->dentry) ||
+	    !export_uuid || !binding_token || !result || !d_is_dir(root->dentry) ||
 	    !IS_ROOT(root->dentry))
 		return -EOPNOTSUPP;
 	if (validate_backend && (root->mnt->mnt_sb->s_stack_depth ||
@@ -881,6 +889,8 @@ static int __nfsd_ffv2_reservation_claim(struct nfsd_net *owner,
 	reservation->state = NFSD_FFV2_RESERVING;
 	memcpy(reservation->store_uuid, store_uuid,
 	       sizeof(reservation->store_uuid));
+	memcpy(reservation->export_uuid, export_uuid,
+	       sizeof(reservation->export_uuid));
 	memcpy(reservation->binding_token, binding_token,
 	       sizeof(reservation->binding_token));
 
@@ -937,11 +947,12 @@ out_unlink:
 
 int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
 				const u8 store_uuid[16],
+				const u8 export_uuid[16],
 				const u8 binding_token[32],
 				struct nfsd_ffv2_reservation **result)
 {
-	return __nfsd_ffv2_reservation_claim(owner, root, store_uuid, binding_token,
-					     result, true, NULL);
+	return __nfsd_ffv2_reservation_claim(owner, root, store_uuid, export_uuid,
+					     binding_token, result, true, NULL);
 }
 
 static int nfsd_ffv2_claim_expected(struct nfsd_net *owner,
@@ -960,6 +971,7 @@ static int nfsd_ffv2_claim_expected(struct nfsd_net *owner,
 		error = -ESTALE;
 	else
 		error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
+						      expected->ex_uuid,
 						      binding_token, result,
 						      validate_backend, expected);
 	nfsd_ffv2_export_update_unlock();
@@ -1245,7 +1257,7 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 						 &reservation, validate_backend);
 	else
 		error = __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
-						      binding_token, &reservation,
+						      exp->ex_uuid, binding_token, &reservation,
 						      validate_backend, NULL);
 	if (error && expected)
 		goto out_reopen;
@@ -5641,7 +5653,7 @@ int nfsd_ffv2_test_reservation_claim(struct nfsd_net *owner,
 				     const u8 binding_token[32],
 				     struct nfsd_ffv2_reservation **result)
 {
-	return __nfsd_ffv2_reservation_claim(owner, root, store_uuid,
+	return __nfsd_ffv2_reservation_claim(owner, root, store_uuid, store_uuid,
 					     binding_token, result, false, NULL);
 }
 

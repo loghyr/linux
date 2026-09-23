@@ -224,11 +224,13 @@ nfsd_ffv2_export_update_rollback_wait(struct nfsd_ffv2_service_context *context)
 void nfsd_ffv2_export_release(struct svc_export *exp);
 int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
 				const u8 store_uuid[16],
+				const u8 export_uuid[16],
 				const u8 binding_token[32],
 				struct nfsd_ffv2_reservation **result);
 int nfsd_ffv2_reservation_gate_io(struct nfsd_ffv2_reservation *reservation);
 int nfsd_ffv2_reservation_store_root(struct nfsd_ffv2_reservation *reservation,
-				     struct path *root, u8 store_uuid[16]);
+				     struct path *root, u8 store_uuid[16],
+				     u8 export_uuid[16], u8 binding_token[32]);
 int nfsd_ffv2_reservation_store_begin(struct nfsd_ffv2_reservation *reservation);
 void nfsd_ffv2_reservation_store_end(struct nfsd_ffv2_reservation *reservation);
 void nfsd_ffv2_reservation_store_put(struct nfsd_ffv2_reservation *reservation);

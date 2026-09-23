@@ -19,6 +19,8 @@ struct nfsd_ffv2_store;
 #define NFSD_FFV2_SUPER_SLOT_SIZE	4096
 #define NFSD_FFV2_SUPER_FILE_SIZE	8192
 #define NFSD_FFV2_START_RECORD_SIZE	197
+#define NFSD_FFV2_MAX_WAL_RECORD_SIZE	4236
+#define NFSD_FFV2_MAX_DAMAGED_TAIL_SIZE	(1024U * 1024U)
 #define NFSD_FFV2_PAYLOAD_HEADER_SIZE	80
 #define NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE 136
 #define NFSD_FFV2_PAYLOAD_ALIGN		4096
@@ -150,13 +152,15 @@ int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store,
 			      struct nfsd_ffv2_super_record *record);
 int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data,
 				 size_t len, loff_t offset);
-int nfsd_ffv2_store_write_payload(struct nfsd_ffv2_store *store,
-				  const void *data, size_t len, loff_t offset);
+int nfsd_ffv2_store_append_payload(struct nfsd_ffv2_store *store,
+				   const struct nfsd_ffv2_payload_record *record,
+				   u64 *offset);
 int nfsd_ffv2_store_read_wal(struct nfsd_ffv2_store *store, void *data,
 			     size_t len, loff_t offset);
-int nfsd_ffv2_store_write_wal(struct nfsd_ffv2_store *store, const void *data,
-			      size_t len, loff_t offset);
 int nfsd_ffv2_store_checkpoint(struct nfsd_ffv2_store *store,
 			       const struct nfsd_ffv2_super_record *record);
+#ifdef CONFIG_NFSD_FFV2_LIVE_TEST
+void nfsd_ffv2_store_test_fail_next_io(struct nfsd_ffv2_store *store);
+#endif
 
 #endif /* _NFSD_FFV2_STORE_H */

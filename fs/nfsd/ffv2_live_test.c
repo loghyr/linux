@@ -307,20 +307,21 @@ static struct nfsd_ffv2_store_test_state nfsd_ffv2_store_test = {
 };
 
 static int nfsd_ffv2_store_reopen_test(const char *name,
-				       const u8 store_uuid[16], u64 *generation)
+				       const u8 store_uuid[16],
+				       const u8 export_uuid[16],
+				       const u8 binding_token[32], u64 *generation)
 {
 	struct nfsd_net *nn = net_generic(&init_net, nfsd_net_id);
 	struct nfsd_ffv2_reservation *reservation = NULL;
 	struct nfsd_ffv2_store *store = NULL;
 	struct nfsd_ffv2_super_record next;
-	u8 binding_token[32] = {};
 	struct path root;
 	int error;
 
 	error = kern_path(name, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &root);
 	if (error)
 		return error;
-	error = nfsd_ffv2_reservation_claim(nn, &root, store_uuid,
+	error = nfsd_ffv2_reservation_claim(nn, &root, store_uuid, export_uuid,
 					    binding_token, &reservation);
 	path_put(&root);
 	if (error)
@@ -331,6 +332,16 @@ static int nfsd_ffv2_store_reopen_test(const char *name,
 	error = nfsd_ffv2_store_get_super(store, &next);
 	if (error)
 		goto out_close;
+	if (next.payload_durable_bytes) {
+		struct nfsd_ffv2_super_record regressing = next;
+
+		regressing.generation++;
+		regressing.payload_durable_bytes--;
+		error = nfsd_ffv2_store_checkpoint(store, &regressing);
+		if (error != -EINVAL)
+			goto out_close;
+		error = 0;
+	}
 	next.generation++;
 	error = nfsd_ffv2_store_checkpoint(store, &next);
 out_close:
@@ -343,11 +354,70 @@ out_close:
 		struct nfsd_ffv2_super_record reopened;
 
 		error = nfsd_ffv2_store_get_super(store, &reopened);
-		if (!error && reopened.generation != next.generation)
+		if (!error && reopened.generation != next.generation + 1)
 			error = -EBADMSG;
 	}
 	if (!error)
-		*generation = next.generation;
+		*generation = next.generation + 1;
+	nfsd_ffv2_store_close(store);
+out_abort:
+	nfsd_ffv2_reservation_abort(reservation);
+	return error;
+}
+
+static int nfsd_ffv2_store_failure_test(const char *name,
+					const u8 store_uuid[16],
+					const u8 export_uuid[16],
+					const u8 binding_token[32])
+{
+	struct nfsd_net *nn = net_generic(&init_net, nfsd_net_id);
+	struct nfsd_ffv2_reservation *reservation = NULL;
+	struct nfsd_ffv2_store *store = NULL;
+	struct nfsd_ffv2_super_record next;
+	struct nfsd_ffv2_payload_record record = {
+		.object_id = (1ULL << 40) | 1,
+		.content_len = NFSD_FFV2_PAYLOAD_ALIGN,
+	};
+	u8 *bytes;
+	u64 offset;
+	struct path root;
+	int error;
+
+	error = kern_path(name, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &root);
+	if (error)
+		return error;
+	error = nfsd_ffv2_reservation_claim(nn, &root, store_uuid, export_uuid,
+					    binding_token, &reservation);
+	path_put(&root);
+	if (error)
+		return error;
+	error = nfsd_ffv2_store_open(reservation, &store);
+	if (error)
+		goto out_abort;
+	bytes = kzalloc(NFSD_FFV2_PAYLOAD_ALIGN, GFP_KERNEL);
+	if (!bytes) {
+		error = -ENOMEM;
+		goto out_close;
+	}
+	memcpy(record.store_uuid, store_uuid, sizeof(record.store_uuid));
+	record.content = bytes;
+	nfsd_ffv2_store_test_fail_next_io(store);
+	error = nfsd_ffv2_store_append_payload(store, &record, &offset);
+	if (error != -EIO)
+		goto out_free;
+	error = nfsd_ffv2_store_append_payload(store, &record, &offset);
+	if (error != -EIO)
+		goto out_free;
+	error = nfsd_ffv2_store_get_super(store, &next);
+	if (error)
+		goto out_free;
+	next.generation++;
+	error = nfsd_ffv2_store_checkpoint(store, &next);
+	if (error == -EIO)
+		error = 0;
+out_free:
+	kfree(bytes);
+out_close:
 	nfsd_ffv2_store_close(store);
 out_abort:
 	nfsd_ffv2_reservation_abort(reservation);
@@ -374,27 +444,60 @@ static ssize_t nfsd_ffv2_store_test_write(struct file *file,
 {
 	struct nfsd_ffv2_store_test_state *state = &nfsd_ffv2_store_test;
 	char *input;
-	char *path, *uuid;
-	u8 store_uuid[16];
+	char *path, *store, *export, *token, *mode;
+	u8 store_uuid[16], export_uuid[16], binding_token[32];
 	u64 generation = 0;
 	int error;
 
-	if (!len || len >= PATH_MAX + 34)
+	if (!len || len >= PATH_MAX + 138)
 		return -EINVAL;
 	input = memdup_user_nul(buf, len);
 	if (IS_ERR(input))
 		return PTR_ERR(input);
 	path = strim(input);
-	uuid = strrchr(path, ' ');
-	if (!uuid || strlen(uuid + 1) != 32) {
+	store = strchr(path, ' ');
+	if (!store) {
 		error = -EINVAL;
 		goto out;
 	}
-	*uuid++ = '\0';
-	error = hex2bin(store_uuid, uuid, sizeof(store_uuid));
+	*store++ = '\0';
+	export = strchr(store, ' ');
+	if (!export) {
+		error = -EINVAL;
+		goto out;
+	}
+	*export++ = '\0';
+	token = strchr(export, ' ');
+	if (!token) {
+		error = -EINVAL;
+		goto out;
+	}
+	*token++ = '\0';
+	mode = strchr(token, ' ');
+	if (mode)
+		*mode++ = '\0';
+	if (strlen(store) != 32 || strlen(export) != 32 ||
+	    strlen(token) != 64) {
+		error = -EINVAL;
+		goto out;
+	}
+	error = hex2bin(store_uuid, store, sizeof(store_uuid));
 	if (error)
 		goto out;
-	error = nfsd_ffv2_store_reopen_test(path, store_uuid, &generation);
+	error = hex2bin(export_uuid, export, sizeof(export_uuid));
+	if (error)
+		goto out;
+	error = hex2bin(binding_token, token, sizeof(binding_token));
+	if (error)
+		goto out;
+	if (mode && !strcmp(mode, "fail"))
+		error = nfsd_ffv2_store_failure_test(path, store_uuid,
+						     export_uuid, binding_token);
+	else if (!mode)
+		error = nfsd_ffv2_store_reopen_test(path, store_uuid, export_uuid,
+						    binding_token, &generation);
+	else
+		error = -EINVAL;
 	mutex_lock(&state->lock);
 	state->result = error;
 	state->generation = generation;

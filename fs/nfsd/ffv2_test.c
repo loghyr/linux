@@ -1434,7 +1434,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		goto out_root;
 	}
 
-	error = nfsd_ffv2_reservation_claim(nn, &root, uuid, token,
+	error = nfsd_ffv2_reservation_claim(nn, &root, uuid, uuid, token,
 					    &reservation);
 	if (!error) {
 		nfsd_ffv2_reservation_abort(reservation);
@@ -1926,7 +1926,7 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 
 	error = kern_path("/proc/self", LOOKUP_FOLLOW, &nonroot);
 	if (!error) {
-		error = nfsd_ffv2_reservation_claim(nn, &nonroot, uuid, token,
+		error = nfsd_ffv2_reservation_claim(nn, &nonroot, uuid, uuid, token,
 						    &reservation);
 		KUNIT_EXPECT_EQ(test, error, -EOPNOTSUPP);
 		path_put(&nonroot);
