@@ -1318,6 +1318,7 @@ int nfsd_ffv2_store_append_payload(struct nfsd_ffv2_store *store,
 	mutex_lock(&store->lock);
 	if (store->failed || store->payload_cursor !=
 				 i_size_read(file_inode(store->payload_file))) {
+		store->failed = true;
 		error = -EIO;
 		goto out_unlock;
 	}
