@@ -930,6 +930,16 @@ static void ffv2_visible_pending_committed_rollback_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, entries);
 	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
 					     0, 100, 0, 1, 2, 100, 0);
+	entries[1] = ffv2_test_visible_transition(&entries[0],
+						  NFSD_FFV2_ROLLED_BACK,
+						  0, 3, 0, 0, 2);
+	entries[1].admission.client_id = 99;
+	entries[1].admission.rights = NFSD_FFV2_RIGHT_REPAIR;
+	KUNIT_EXPECT_EQ(test,
+			ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+			-ENOENT);
+	KUNIT_EXPECT_EQ(test, eof, 0ULL);
+
 	entries[1] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
 					     0, 50, 1, 1, 1, 100, 0);
 	entries[1].transition = NFSD_FFV2_PREPARED;
@@ -937,8 +947,8 @@ static void ffv2_visible_pending_committed_rollback_test(struct kunit *test)
 	entries[1].predecessor_present = true;
 	entries[1].predecessor_object_id = 11;
 	entries[2] = ffv2_test_visible_transition(&entries[0],
-						  NFSD_FFV2_ROLLED_BACK, 0, 1,
-						 0, 0, 1);
+						  NFSD_FFV2_ROLLED_BACK, 0, 3,
+						 0, 0, 2);
 	entries[2].admission.client_id = 99;
 	entries[2].admission.rights = NFSD_FFV2_RIGHT_REPAIR;
 	KUNIT_EXPECT_EQ(test,
