@@ -3,6 +3,7 @@
 #include <linux/crc32.h>
 #include <linux/slab.h>
 #include <linux/unaligned.h>
+#include <crypto/sha2.h>
 
 #include "ffv2_store.h"
 
@@ -19,6 +20,51 @@ static void ffv2_test_crc(const char *domain, u8 *bytes, size_t len)
 	u32 crc = crc32c(~0, domain, strlen(domain));
 
 	put_unaligned_be32(~crc32c(crc, bytes, len - 4), bytes + len - 4);
+}
+
+static void ffv2_test_wal_header(u8 *bytes, u16 family, u32 total,
+				 const u8 store_uuid[16], const u8 wal_uuid[16],
+				 u64 lsn, u64 incarnation)
+{
+	put_unaligned_be32(0x4432574c, bytes);
+	put_unaligned_be16(NFSD_FFV2_FORMAT_VERSION, bytes + 4);
+	put_unaligned_be16(family, bytes + 6);
+	put_unaligned_be32(NFSD_FFV2_WAL_HEADER_SIZE, bytes + 8);
+	put_unaligned_be32(total, bytes + 12);
+	put_unaligned_be32(~total, bytes + 16);
+	memcpy(bytes + 20, store_uuid, 16);
+	memcpy(bytes + 36, wal_uuid, 16);
+	put_unaligned_be64(lsn, bytes + 52);
+	put_unaligned_be64(incarnation, bytes + 60);
+}
+
+static void ffv2_test_operation_key(const u8 session[16], u32 slot,
+				    u32 sequence, u32 ordinal, u8 out[32])
+{
+	u8 input[sizeof("FFV2-D2-OPKEY-v1") - 1 + 28];
+	u8 *at = input;
+
+	memcpy(at, "FFV2-D2-OPKEY-v1", sizeof("FFV2-D2-OPKEY-v1") - 1);
+	at += sizeof("FFV2-D2-OPKEY-v1") - 1;
+	memcpy(at, session, 16);
+	at += 16;
+	put_unaligned_be32(slot, at);
+	put_unaligned_be32(sequence, at + 4);
+	put_unaligned_be32(ordinal, at + 8);
+	sha256(input, sizeof(input), out);
+}
+
+static void ffv2_test_file_key(const u8 handle[32], u8 out[32])
+{
+	u8 input[sizeof("FFV2-D2-FILEKEY-v1") - 1 + 4 + 32];
+	u8 *at = input;
+
+	memcpy(at, "FFV2-D2-FILEKEY-v1",
+	       sizeof("FFV2-D2-FILEKEY-v1") - 1);
+	at += sizeof("FFV2-D2-FILEKEY-v1") - 1;
+	put_unaligned_be32(32, at);
+	memcpy(at + 4, handle, 32);
+	sha256(input, sizeof(input), out);
 }
 
 static void ffv2_super_vector_test(struct kunit *test)
@@ -111,6 +157,99 @@ static void ffv2_start_vector_test(struct kunit *test)
 			nfsd_ffv2_start_decode(bytes, NFSD_FFV2_START_RECORD_SIZE,
 					       header.store_uuid, header.wal_uuid,
 					       &decoded_header, &decoded),
+			-EBADMSG);
+	header.lsn = 2;
+	header.ds_incarnation = 2;
+	source.ds_incarnation = 2;
+	source.prev_incarnation = 1;
+	source.verifier_epoch = 2;
+	source.verifier_changed = true;
+	source.recovery_decision = NFSD_FFV2_RECOVERY_DISCARDED_UNSTABLE;
+	source.last_valid_lsn_before = 1;
+	source.wal_append_cursor = 2 * NFSD_FFV2_START_RECORD_SIZE;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_start_encode(&header, &source, bytes), 0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_start_decode(bytes,
+					       NFSD_FFV2_START_RECORD_SIZE,
+					       header.store_uuid, header.wal_uuid,
+					       &decoded_header, &decoded),
+			0);
+	KUNIT_EXPECT_TRUE(test, decoded.verifier_changed);
+}
+
+static void ffv2_semantic_record_vectors_test(struct kunit *test)
+{
+	struct nfsd_ffv2_file_register_record registration;
+	struct nfsd_ffv2_entry_record entry;
+	struct nfsd_ffv2_wal_header header;
+	u8 store_uuid[16], wal_uuid[16], handle[32], session[16];
+	u8 *bytes;
+
+	bytes = kunit_kzalloc(test, NFSD_FFV2_ENTRY_RECORD_SIZE, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	ffv2_test_fill(store_uuid, sizeof(store_uuid), 0x10);
+	ffv2_test_fill(wal_uuid, sizeof(wal_uuid), 0x30);
+	ffv2_test_fill(handle, sizeof(handle), 0x50);
+	ffv2_test_wal_header(bytes, NFSD_FFV2_WAL_CONTROL,
+			     NFSD_FFV2_FILE_REGISTER_RECORD_SIZE,
+			     store_uuid, wal_uuid, 2, 1);
+	put_unaligned_be32(NFSD_FFV2_FILE_REGISTER, bytes + 72);
+	put_unaligned_be32(NFSD_FFV2_COMMITTED, bytes + 76);
+	put_unaligned_be32(1, bytes + 80);
+	put_unaligned_be64(1, bytes + 84);
+	put_unaligned_be32(1, bytes + 96);
+	put_unaligned_be32(1, bytes + 168);
+	ffv2_test_file_key(handle, bytes + 208);
+	put_unaligned_be16(32, bytes + 242);
+	memcpy(bytes + 244, handle, sizeof(handle));
+	put_unaligned_be32(4096, bytes + 372);
+	put_unaligned_be64(8, bytes + 376);
+	ffv2_test_crc("FFV2-D2-WAL-v1", bytes,
+		      NFSD_FFV2_FILE_REGISTER_RECORD_SIZE);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_file_register_decode(bytes,
+						       NFSD_FFV2_FILE_REGISTER_RECORD_SIZE,
+				store_uuid, wal_uuid, &header, &registration),
+			0);
+	KUNIT_EXPECT_MEMEQ(test, registration.handle, handle, sizeof(handle));
+	bytes[243] = 0;
+	ffv2_test_crc("FFV2-D2-WAL-v1", bytes,
+		      NFSD_FFV2_FILE_REGISTER_RECORD_SIZE);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_file_register_decode(bytes,
+						       NFSD_FFV2_FILE_REGISTER_RECORD_SIZE,
+				store_uuid, wal_uuid, &header, &registration),
+			-EBADMSG);
+
+	memset(bytes, 0, NFSD_FFV2_ENTRY_RECORD_SIZE);
+	ffv2_test_wal_header(bytes, NFSD_FFV2_WAL_ENTRY,
+			     NFSD_FFV2_ENTRY_RECORD_SIZE,
+			     store_uuid, wal_uuid, 3, 1);
+	put_unaligned_be32(NFSD_FFV2_REFUSED, bytes + 72);
+	put_unaligned_be32(2, bytes + 76);
+	put_unaligned_be32(1, bytes + 80);
+	put_unaligned_be32(3, bytes + 84);
+	put_unaligned_be32(1, bytes + 92);
+	ffv2_test_fill(bytes + 96, 32, 0x70);
+	put_unaligned_be64(1, bytes + 136);
+	ffv2_test_fill(session, sizeof(session), 0x20);
+	memcpy(bytes + 144, session, sizeof(session));
+	put_unaligned_be32(1, bytes + 164);
+	ffv2_test_operation_key(session, 0, 1, 0, bytes + 172);
+	put_unaligned_be32(1, bytes + 402);
+	ffv2_test_crc("FFV2-D2-WAL-v1", bytes,
+		      NFSD_FFV2_ENTRY_RECORD_SIZE);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_entry_decode(bytes, NFSD_FFV2_ENTRY_RECORD_SIZE,
+					       store_uuid, wal_uuid, &header, &entry),
+			0);
+	KUNIT_EXPECT_EQ(test, entry.transition, (u32)NFSD_FFV2_REFUSED);
+	bytes[523] = 2;
+	ffv2_test_crc("FFV2-D2-WAL-v1", bytes,
+		      NFSD_FFV2_ENTRY_RECORD_SIZE);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_entry_decode(bytes, NFSD_FFV2_ENTRY_RECORD_SIZE,
+					       store_uuid, wal_uuid, &header, &entry),
 			-EBADMSG);
 }
 
@@ -219,7 +358,7 @@ static void ffv2_payload_vectors_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, content_valid);
 	put_unaligned_be32(NFSD_FFV2_STORE_CHECKSUM_SIZE + 1, bytes + 52);
 	ffv2_test_crc("FFV2-D2-PAY-v1", bytes,
-		      NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE + source.content_len + 4);
+		      NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE + 4);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_payload_decode(bytes, written, source.store_uuid,
 						 &decoded, &content_valid),
@@ -272,6 +411,7 @@ static void ffv2_payload_multipage_test(struct kunit *test)
 static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_super_vector_test),
 	KUNIT_CASE(ffv2_start_vector_test),
+	KUNIT_CASE(ffv2_semantic_record_vectors_test),
 	KUNIT_CASE(ffv2_payload_vectors_test),
 	KUNIT_CASE(ffv2_payload_checksum_vectors_test),
 	KUNIT_CASE(ffv2_payload_multipage_test),

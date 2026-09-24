@@ -19,6 +19,11 @@ struct nfsd_ffv2_store;
 #define NFSD_FFV2_SUPER_SLOT_SIZE	4096
 #define NFSD_FFV2_SUPER_FILE_SIZE	8192
 #define NFSD_FFV2_START_RECORD_SIZE	197
+#define NFSD_FFV2_CONTROL_PREFIX_SIZE	136
+#define NFSD_FFV2_FILE_REGISTER_BODY_SIZE 184
+#define NFSD_FFV2_FILE_REGISTER_RECORD_SIZE 396
+#define NFSD_FFV2_ENTRY_BODY_SIZE	460
+#define NFSD_FFV2_ENTRY_RECORD_SIZE	536
 #define NFSD_FFV2_MAX_WAL_RECORD_SIZE	4236
 #define NFSD_FFV2_MAX_DAMAGED_TAIL_SIZE	(1024U * 1024U)
 #define NFSD_FFV2_PAYLOAD_HEADER_SIZE	80
@@ -33,6 +38,23 @@ enum nfsd_ffv2_store_record_type {
 	NFSD_FFV2_PAYLOAD_DATA = 1,
 	NFSD_FFV2_PAYLOAD_FILE_HEADER = 2,
 	NFSD_FFV2_WAL_START = 1,
+	NFSD_FFV2_WAL_CONTROL = 2,
+	NFSD_FFV2_WAL_ENTRY = 3,
+	NFSD_FFV2_WAL_COHORT = 4,
+};
+
+enum nfsd_ffv2_transition {
+	NFSD_FFV2_ADMITTED = 1,
+	NFSD_FFV2_PREPARED = 2,
+	NFSD_FFV2_FINALIZED = 3,
+	NFSD_FFV2_COMMITTED = 4,
+	NFSD_FFV2_ABORTED = 5,
+	NFSD_FFV2_ROLLED_BACK = 6,
+	NFSD_FFV2_REFUSED = 7,
+};
+
+enum nfsd_ffv2_control_subtype {
+	NFSD_FFV2_FILE_REGISTER = 1,
 };
 
 enum nfsd_ffv2_super_state {
@@ -102,6 +124,34 @@ struct nfsd_ffv2_start_record {
 	u64 live_txn_payload_staged;
 };
 
+struct nfsd_ffv2_file_register_record {
+	u32 transition;
+	u32 status;
+	u8 file_key[32];
+	u16 handle_type;
+	u16 handle_len;
+	u8 handle[NFSD_FFV2_STORE_HANDLE_SIZE];
+	u32 chunk_bytes;
+	u64 max_chunks;
+	u64 logical_eof;
+};
+
+struct nfsd_ffv2_entry_record {
+	u32 transition;
+	u32 status;
+	u32 disposition;
+	u32 stability;
+	u32 batch_ordinal;
+	u32 batch_count;
+	u8 file_key[32];
+	u64 chunk_index;
+	u64 txn_id;
+	u64 payload_object_id;
+	u64 payload_object_offset;
+	u32 payload_content_len;
+	u32 extent_kind;
+};
+
 struct nfsd_ffv2_payload_header {
 	u8 store_uuid[NFSD_FFV2_STORE_UUID_SIZE];
 	u8 payload_uuid[NFSD_FFV2_STORE_UUID_SIZE];
@@ -132,6 +182,15 @@ int nfsd_ffv2_start_decode(const u8 *in, size_t len,
 			   const u8 *expected_store, const u8 *expected_wal,
 			   struct nfsd_ffv2_wal_header *header,
 			   struct nfsd_ffv2_start_record *record);
+int nfsd_ffv2_file_register_decode(const u8 *in, size_t len,
+				   const u8 *expected_store,
+				   const u8 *expected_wal,
+				   struct nfsd_ffv2_wal_header *header,
+				   struct nfsd_ffv2_file_register_record *record);
+int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
+			   const u8 *expected_store, const u8 *expected_wal,
+			   struct nfsd_ffv2_wal_header *header,
+			   struct nfsd_ffv2_entry_record *record);
 int nfsd_ffv2_payload_header_encode(const struct nfsd_ffv2_payload_header *header,
 				    u8 out[NFSD_FFV2_PAYLOAD_ALIGN]);
 int nfsd_ffv2_payload_header_decode(const u8 in[NFSD_FFV2_PAYLOAD_ALIGN],
