@@ -830,36 +830,34 @@ size_t nfsd_ffv2_payload_record_size(u32 content_len)
 	return ALIGN(total, NFSD_FFV2_PAYLOAD_ALIGN);
 }
 
-static bool
-ffv2_payload_checksum_valid(const struct nfsd_ffv2_payload_record *record)
+bool nfsd_ffv2_store_checksum_valid(u32 algorithm, const u8 *checksum,
+				    u32 checksum_len, const u8 *content,
+				    u32 content_len)
 {
 	u8 computed[NFSD_FFV2_STORE_CHECKSUM_SIZE] = {};
 	u32 expected_len;
 	u64 a = 0, b = 0, c = 0, d = 0;
 	u32 i;
 
-	switch (record->checksum_algorithm) {
-	case 0:
+	switch (algorithm) {
+	case NFSD_FFV2_STORE_CHECKSUM_NONE:
 		expected_len = 0;
 		break;
-	case 1:
+	case NFSD_FFV2_STORE_CHECKSUM_CRC32:
 		expected_len = sizeof(__be32);
-		put_unaligned_be32(~crc32_le(~0, record->content,
-					     record->content_len),
-			     computed);
+		put_unaligned_be32(~crc32_le(~0, content, content_len),
+				   computed);
 		break;
-	case 2:
+	case NFSD_FFV2_STORE_CHECKSUM_CRC32C:
 		expected_len = sizeof(__be32);
-		put_unaligned_be32(~crc32c(~0, record->content,
-					   record->content_len),
-			     computed);
+		put_unaligned_be32(~crc32c(~0, content, content_len), computed);
 		break;
-	case 3:
-		if (!IS_ALIGNED(record->content_len, sizeof(u32)))
+	case NFSD_FFV2_STORE_CHECKSUM_FLETCHER4:
+		if (!IS_ALIGNED(content_len, sizeof(u32)))
 			return false;
 		expected_len = 4 * sizeof(__be64);
-		for (i = 0; i < record->content_len; i += sizeof(u32)) {
-			a += get_unaligned_le32(record->content + i);
+		for (i = 0; i < content_len; i += sizeof(u32)) {
+			a += get_unaligned_le32(content + i);
 			b += a;
 			c += b;
 			d += c;
@@ -869,15 +867,25 @@ ffv2_payload_checksum_valid(const struct nfsd_ffv2_payload_record *record)
 		put_unaligned_be64(c, computed + 16);
 		put_unaligned_be64(d, computed + 24);
 		break;
-	case 4:
+	case NFSD_FFV2_STORE_CHECKSUM_SHA256:
 		expected_len = SHA256_DIGEST_SIZE;
-		sha256(record->content, record->content_len, computed);
+		sha256(content, content_len, computed);
 		break;
 	default:
 		return false;
 	}
-	return record->checksum_len == expected_len &&
-	       !memcmp(record->checksum, computed, sizeof(computed));
+	return checksum_len == expected_len &&
+	       !memcmp(checksum, computed, sizeof(computed));
+}
+
+static bool
+ffv2_payload_checksum_valid(const struct nfsd_ffv2_payload_record *record)
+{
+	return nfsd_ffv2_store_checksum_valid(record->checksum_algorithm,
+					      record->checksum,
+					      record->checksum_len,
+					      record->content,
+					      record->content_len);
 }
 
 int nfsd_ffv2_payload_encode(const struct nfsd_ffv2_payload_record *record,
@@ -961,8 +969,10 @@ int nfsd_ffv2_payload_decode(const u8 *in, size_t len,
 	if (cursor.failed || cursor.offset != cursor.capacity ||
 	    record->checksum_len > NFSD_FFV2_STORE_CHECKSUM_SIZE ||
 	    !ffv2_all_zero(record->checksum + record->checksum_len,
-			   NFSD_FFV2_STORE_CHECKSUM_SIZE - record->checksum_len) ||
-	    total != NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE + record->content_len + 4 ||
+			   NFSD_FFV2_STORE_CHECKSUM_SIZE -
+				   record->checksum_len) ||
+	    total != NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE + record->content_len +
+			     4 ||
 	    object_size != nfsd_ffv2_payload_record_size(record->content_len) ||
 	    object_size > len || reserved ||
 	    get_unaligned_be32(in + total - 4) !=
@@ -973,8 +983,8 @@ int nfsd_ffv2_payload_decode(const u8 *in, size_t len,
 	record->content = in + NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE;
 	record->content_crc32c = stored_crc;
 	record->object_bytes = object_size;
-	*content_valid = stored_crc ==
-			 ~crc32c(~0, record->content, record->content_len) &&
+	*content_valid = stored_crc == ~crc32c(~0, record->content,
+					       record->content_len) &&
 			 ffv2_payload_checksum_valid(record);
 	return 0;
 }

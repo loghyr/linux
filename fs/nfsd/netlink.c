@@ -137,7 +137,8 @@ static const struct nla_policy nfsd_ffv2_object_unregister_nl_policy[NFSD_A_FFV2
 };
 
 /* NFSD_CMD_FFV2_PROTOTYPE_REGISTER - do */
-static const struct nla_policy nfsd_ffv2_prototype_register_nl_policy[NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN + 1] = {
+static const struct nla_policy
+nfsd_ffv2_prototype_register_nl_policy[NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE + 1] = {
 	[NFSD_A_FFV2_PROTOTYPE_NONCE] = NLA_POLICY_EXACT_LEN(32),
 	[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN] = { .type = NLA_NUL_STRING, },
 	[NFSD_A_FFV2_PROTOTYPE_HANDLE] = NLA_POLICY_MAX_LEN(128),
@@ -146,6 +147,7 @@ static const struct nla_policy nfsd_ffv2_prototype_register_nl_policy[NFSD_A_FFV
 	[NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT] = { .type = NLA_U32, },
 	[NFSD_A_FFV2_PROTOTYPE_STORE_UUID] = NLA_POLICY_EXACT_LEN(16),
 	[NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN] = NLA_POLICY_EXACT_LEN(32),
+	[NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE] = NLA_POLICY_EXACT_LEN(32),
 };
 
 /* NFSD_CMD_FFV2_PROTOTYPE_UNREGISTER - do */
@@ -294,7 +296,7 @@ static const struct genl_split_ops nfsd_nl_ops[] = {
 		.cmd		= NFSD_CMD_FFV2_PROTOTYPE_REGISTER,
 		.doit		= nfsd_nl_ffv2_prototype_register_doit,
 		.policy		= nfsd_ffv2_prototype_register_nl_policy,
-		.maxattr	= NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN,
+		.maxattr	= NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE,
 		.flags		= GENL_ADMIN_PERM | GENL_CMD_CAP_DO,
 	},
 	{

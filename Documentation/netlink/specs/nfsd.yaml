@@ -358,6 +358,11 @@ attribute-sets:
         checks:
           exact-len: 32
       -
+        name: persisted-handle
+        type: binary
+        checks:
+          exact-len: 32
+      -
         name: control-root
         type: u64
       -
@@ -640,6 +645,7 @@ operations:
             - object-uuid
             - store-uuid
             - binding-token
+            - persisted-handle
             - control-root
             - mds-sessionid
         reply:

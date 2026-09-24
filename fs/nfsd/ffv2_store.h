@@ -11,6 +11,12 @@ struct nfsd_ffv2_store;
 #define NFSD_FFV2_STORE_UUID_SIZE	16
 #define NFSD_FFV2_STORE_HANDLE_SIZE	128
 #define NFSD_FFV2_STORE_CHECKSUM_SIZE	64
+#define NFSD_FFV2_STORE_CHECKSUM_NONE	0
+#define NFSD_FFV2_STORE_CHECKSUM_CRC32	1
+#define NFSD_FFV2_STORE_CHECKSUM_CRC32C	2
+#define NFSD_FFV2_STORE_CHECKSUM_FLETCHER4 3
+#define NFSD_FFV2_STORE_CHECKSUM_SHA256	4
+#define NFSD_FFV2_PAYLOAD_SEQUENCE_MASK	GENMASK_ULL(39, 0)
 
 #define NFSD_FFV2_FORMAT_VERSION		1
 #define NFSD_FFV2_PROLOGUE_SIZE		36
@@ -289,6 +295,9 @@ int nfsd_ffv2_payload_header_decode(const u8 in[NFSD_FFV2_PAYLOAD_ALIGN],
 				    const u8 *expected_store,
 				    struct nfsd_ffv2_payload_header *header);
 size_t nfsd_ffv2_payload_record_size(u32 content_len);
+bool nfsd_ffv2_store_checksum_valid(u32 algorithm, const u8 *checksum,
+				    u32 checksum_len, const u8 *content,
+				    u32 content_len);
 int nfsd_ffv2_payload_encode(const struct nfsd_ffv2_payload_record *record,
 			     u8 *out, size_t capacity, size_t *written);
 int nfsd_ffv2_payload_decode(const u8 *in, size_t len,

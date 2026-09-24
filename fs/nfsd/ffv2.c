@@ -4920,22 +4920,23 @@ int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
  * @fhp: a verified ordinary filehandle for a regular file in an export,
  *	released before the object is published
  * @chunk_size: bytes in one chunk of the object
+ * @persisted_handle: portable object identity recorded by FILE_REGISTER
  * @store_uuid: provisioned store identifier
  * @binding_token: secret binding the store to this service export
  * @cred: the credential the service context is published with
  * @validate_backend: whether the exporting filesystem must be one nfsd can
  *	export; false only from a KUnit build, whose root filesystem has no
  *	export operations at all
- * @object_uuid: receives the identifier this server minted for the object
+ * @object_uuid: receives the object identifier from @persisted_handle
  * @outer_fh: receives the mapped filehandle
  * @generation_id: receives the published generation
  *
  * The path-named registration derives the object from strings an
  * administrator supplied.  This one derives it from a handle that has
  * already been resolved and access-checked, which is what the prototype
- * profile is given.  The object identifier, store identifier and binding
- * token are minted here rather than accepted: a caller that could choose
- * them could name an object that already exists.
+ * profile is given.  The persisted identity comes from the recovered
+ * store, and its export half must name the export being converted before
+ * its object half is published in the mapped handle.
  *
  * Return: 0, or a negative errno.  The object is consumed either way, and
  * @fhp is released once everything it named has been copied.
@@ -4943,6 +4944,7 @@ int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
 int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 				 struct nfsd_ffv2_export_update *registration,
 				 struct svc_fh *fhp, u32 chunk_size,
+				 const u8 persisted_handle[32],
 				 const u8 store_uuid[16],
 				 const u8 binding_token[32],
 				 const struct cred *cred, bool validate_backend,
@@ -4953,8 +4955,10 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 	struct nfsd_ffv2_object *object;
 	int error;
 
-	if (!exp || !exp->ex_uuid || !fhp->fh_dentry)
+	if (!exp || !exp->ex_uuid || !fhp->fh_dentry || !persisted_handle)
 		return -ESTALE;
+	if (memcmp(persisted_handle, exp->ex_uuid, 16))
+		return -EXDEV;
 	if (!chunk_size || chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES)
 		return -EINVAL;
 	object = nfsd_ffv2_object_alloc();
@@ -4977,7 +4981,7 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 		nfsd_ffv2_object_free(object);
 		return -E2BIG;
 	}
-	get_random_bytes(object_uuid, 16);
+	memcpy(object_uuid, persisted_handle + 16, 16);
 	memcpy(object->object_uuid, object_uuid, sizeof(object->object_uuid));
 	memcpy(object->export_uuid, exp->ex_uuid, sizeof(object->export_uuid));
 	if (!store_uuid || !binding_token) {

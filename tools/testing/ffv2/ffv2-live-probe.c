@@ -1449,6 +1449,7 @@ static void usage(void)
 		"                       [--expect <file>] [--wait <seconds>]\n"
 		"                       [--read-count <chunks>]\n"
 		"                       [--read-index <index>] [--interleave]\n"
+		"                       [--read-only-profile]\n"
 		"                       [--no-retirement] [--mutate-ordinary]\n"
 		"                       [--mutate-sequence]\n");
 	exit(2);
@@ -1471,6 +1472,7 @@ int main(int argc, char **argv)
 	char value[1024];
 	char run[64];
 	bool interleave = false, retirement = true, mutate_ordinary = false;
+	bool read_only_profile = false;
 	bool mutate_sequence = false;
 	uint32_t read_count = 1;
 	uint64_t read_index = 0;
@@ -1496,6 +1498,8 @@ int main(int argc, char **argv)
 			read_index = (uint64_t)strtoull(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--interleave"))
 			interleave = true;
+		else if (!strcmp(argv[i], "--read-only-profile"))
+			read_only_profile = true;
 		else if (!strcmp(argv[i], "--no-retirement"))
 			retirement = false;
 		else if (!strcmp(argv[i], "--mutate-ordinary"))
@@ -1632,7 +1636,8 @@ int main(int argc, char **argv)
 	 */
 	chunk_case(&c, "CASE1-HEADER-READ", OP_CHUNK_HEADER_READ, mapped,
 		   mapped_len, stateid, read_index, read_count, TERM_FFV2,
-		   NFS4_OK, request, sizeof(request));
+		   read_only_profile ? NFS4ERR_NOTSUPP : NFS4_OK,
+		   request, sizeof(request));
 	/*
 	 * The interleaving harness retires the registration while that read
 	 * is held inside the server, so every later case would meet a

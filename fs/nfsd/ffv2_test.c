@@ -12384,6 +12384,10 @@ static void nfsd_ffv2_proto_request(struct nfsd_ffv2_prototype_request *req,
 	static const u8 handle[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
 	static const u8 store_uuid[16] = { 1 };
 	static const u8 binding_token[32] = { 2 };
+	static const u8 persisted_handle[32] = {
+		[0 ... 15] = 0x3d,
+		[16 ... 31] = 0x60,
+	};
 
 	memset(req, 0, sizeof(*req));
 	req->nonce = nonce;
@@ -12395,6 +12399,7 @@ static void nfsd_ffv2_proto_request(struct nfsd_ffv2_prototype_request *req,
 	req->parity_count = 0;
 	req->store_uuid = store_uuid;
 	req->binding_token = binding_token;
+	req->persisted_handle = persisted_handle;
 }
 
 /*
@@ -12409,6 +12414,7 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 	const struct nfsd_ffv2_chunk_request creq = { .offset = 0, .count = 4 };
 	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
 	u8 spent[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u8 wrong_persisted_handle[32];
 	struct nfsd_ffv2_prototype_request req;
 	struct nfsd_ffv2_prototype_bundle *bundle, *replay;
 	struct nfsd_ffv2_admission admission = {};
@@ -12434,6 +12440,17 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
 	f->enabled = true;
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires));
+	nfsd_ffv2_proto_request(&req, nonce);
+	memcpy(wrong_persisted_handle, req.persisted_handle,
+	       sizeof(wrong_persisted_handle));
+	wrong_persisted_handle[0] ^= 1;
+	req.persisted_handle = wrong_persisted_handle;
+	KUNIT_EXPECT_EQ(test, -EXDEV,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     replay));
 	KUNIT_ASSERT_EQ(test, 0,
 			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
 						      &expires));
@@ -14984,6 +15001,7 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 {
 	static const u8 store_uuid[16] = { 1 };
 	static const u8 binding_token[32] = { 2 };
+	static const u8 persisted_handle[32] = { 3 };
 	u8 handle[NFS4_FHSIZE] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 	char buf[NFSD_FFV2_NL_BUF];
 	size_t off;
@@ -15022,6 +15040,11 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
 					 NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN,
 					 binding_token, sizeof(binding_token));
+	if (!error)
+		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+					 NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE,
+					 persisted_handle,
+					 sizeof(persisted_handle));
 	if (!error && a->unknown_attr)
 		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
 					     a->unknown_attr, 0);
@@ -15218,14 +15241,16 @@ static int nfsd_ffv2_store_read_mock_visible(void *opaque,
 		return -ERANGE;
 
 	memset(chunk, 0, sizeof(*chunk));
-	chunk->payload_object_id = mock->malformed_payload_id ?
-				   (u64)U32_MAX + 1 : 17;
+	chunk->payload_object_id = 1ULL << 40;
+	chunk->payload_object_id |= mock->malformed_payload_id ?
+				    (u64)U32_MAX + 1 : 17;
 	chunk->payload_object_offset = 4096;
 	chunk->content_len = mock->malformed_geometry ? 15 : 16;
-	chunk->checksum_algorithm = mock->malformed_checksum ? 0 :
-				    NFSD_FFV2_CHECKSUM_ALG_CRC32;
+	chunk->checksum_algorithm = mock->malformed_checksum ?
+		NFSD_FFV2_STORE_CHECKSUM_NONE :
+		NFSD_FFV2_STORE_CHECKSUM_CRC32C;
 	chunk->checksum_len = NFSD_FFV2_CHECKSUM_CRC32_LEN;
-	crc = crc32_le(~0U, mock->payload, sizeof(mock->payload)) ^ ~0U;
+	crc = crc32c(~0U, mock->payload, sizeof(mock->payload)) ^ ~0U;
 	put_unaligned_be32(crc, chunk->checksum);
 	chunk->file_eof = 24;
 	chunk->owner_cohort = 23;
@@ -15350,7 +15375,7 @@ static void nfsd_ffv2_store_backed_read_negative_test(struct kunit *test)
 	mock.read_error = 0;
 
 	mock.malformed_checksum = true;
-	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+	KUNIT_EXPECT_EQ(test, nfserr_io,
 			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
 						       &result));
 	mock.malformed_checksum = false;

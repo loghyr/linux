@@ -1295,6 +1295,16 @@ static int nfsd_ffv2_prototype_store_read_payload(void *store, void *data,
 	return nfsd_ffv2_store_read_payload(store, data, len, offset);
 }
 
+static bool
+nfsd_ffv2_prototype_checksum_valid(const struct nfsd_ffv2_visible_chunk *chunk,
+				   const u8 *data, u32 len)
+{
+	return nfsd_ffv2_store_checksum_valid(chunk->checksum_algorithm,
+					      chunk->checksum,
+					      chunk->checksum_len,
+					      data, len);
+}
+
 static __be32
 nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 				     const struct nfsd_ffv2_object *object,
@@ -1335,9 +1345,11 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 	for (i = 0; i < count; i++) {
 		struct nfsd_ffv2_visible_chunk visible;
 		struct nfsd_ffv2_read_chunk *chunk = &owned->chunks[i];
-		u8 *data = owned->bytes + (size_t)i * provider->file.chunk_bytes;
-		u64 index = req->offset + i, payload_offset;
+		u8 *data =
+			owned->bytes + (size_t)i * provider->file.chunk_bytes;
+		u64 index = req->offset + i, payload_offset, payload_sequence;
 		u32 crc, len = provider->file.chunk_bytes;
+		bool checksum_valid;
 		int error;
 
 		end = (index + 1) * (u64)provider->file.chunk_bytes;
@@ -1347,31 +1359,41 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 			len = last_len;
 		}
 		error = provider->visible(provider->reader,
-					  provider->file.file_key, index, &visible);
+					  provider->file.file_key, index,
+					  &visible);
 		if (!error) {
+			/*
+			 * The store identity is incarnation:sequence.  The wire field
+			 * carries the allocation sequence, and has only 32 bits.  Do
+			 * not silently truncate a sequence the wire cannot represent.
+			 */
+			payload_sequence = visible.payload_object_id &
+					   NFSD_FFV2_PAYLOAD_SEQUENCE_MASK;
 			if (visible.file_eof != provider->file.logical_eof ||
 			    visible.content_len != len ||
-			    visible.checksum_algorithm != NFSD_FFV2_CHECKSUM_ALG_CRC32 ||
-			    visible.checksum_len != NFSD_FFV2_CHECKSUM_CRC32_LEN ||
-			    visible.payload_object_id > U32_MAX ||
+			    !visible.payload_object_id ||
+			    payload_sequence > U32_MAX ||
 			    visible.guard_never_written) {
 				nfsd_ffv2_store_read_result_free(owned);
 				return nfserr_serverfault;
 			}
 			if (check_add_overflow(visible.payload_object_offset,
-					       (u64)NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE,
-					       &payload_offset) || payload_offset > S64_MAX) {
+				    (u64)NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE,
+				    &payload_offset) ||
+			    payload_offset > S64_MAX) {
 				nfsd_ffv2_store_read_result_free(owned);
 				return nfserr_serverfault;
 			}
-			error = provider->read_payload(provider->reader, data, len,
-						       payload_offset);
+			error = provider->read_payload(provider->reader, data,
+						       len, payload_offset);
 			if (error) {
 				nfsd_ffv2_store_read_result_free(owned);
-				return error == -ENOMEM ? nfserr_jukebox : nfserr_io;
+				return error == -ENOMEM ? nfserr_jukebox :
+							  nfserr_io;
 			}
-			crc = crc32_le(~0U, data, len) ^ ~0U;
-			if (get_unaligned_be32(visible.checksum) != crc) {
+			checksum_valid =
+				nfsd_ffv2_prototype_checksum_valid(&visible, data, len);
+			if (!checksum_valid) {
 				nfsd_ffv2_store_read_result_free(owned);
 				return nfserr_io;
 			}
@@ -1380,7 +1402,7 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 			chunk->cr_owner.co_id = visible.owner_co_id;
 			chunk->cr_guard.cg_gen_id = visible.guard_generation;
 			chunk->cr_guard.cg_client_id = visible.guard_writer;
-			chunk->cr_payload_id = visible.payload_object_id;
+			chunk->cr_payload_id = payload_sequence;
 		} else if (error != -ENOENT) {
 			nfsd_ffv2_store_read_result_free(owned);
 			return error == -ENOMEM ? nfserr_jukebox : nfserr_io;
@@ -1429,6 +1451,7 @@ static const struct nfsd_ffv2_provider_ops nfsd_ffv2_prototype_provider_ops = {
 	.chunk_header_read	= nfsd_ffv2_prototype_chunk_header_read,
 };
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 /*
  * Read the registered object and derive everything a reply needs from it.
  *
@@ -1598,11 +1621,12 @@ out_close:
 #endif
 	return error;
 }
+#endif
 
 static int
 nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
-				   const struct cred *cred, const u8 *handle,
-				   u32 handle_len, u32 chunk_size,
+				   const struct cred *cred,
+				   const u8 persisted_handle[32], u32 chunk_size,
 				   u32 data_count, u64 generation,
 				   struct nfsd_ffv2_prototype_provider **result)
 {
@@ -1615,8 +1639,6 @@ nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 							  data_count, generation,
 							  result);
 #endif
-	if (handle_len != sizeof(provider->store_handle))
-		return -ESTALE;
 	provider = kzalloc_obj(*provider, GFP_KERNEL);
 	if (!provider)
 		return -ENOMEM;
@@ -1624,8 +1646,8 @@ nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 						&provider->store);
 	if (error)
 		goto out_free;
-	error = nfsd_ffv2_store_lookup_file(provider->store, handle,
-						    &provider->file);
+	error = nfsd_ffv2_store_lookup_file(provider->store, persisted_handle,
+					    &provider->file);
 	if (error)
 		goto out_free;
 	if (provider->file.chunk_bytes != chunk_size ||
@@ -1640,7 +1662,8 @@ nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 	provider->visible = nfsd_ffv2_prototype_store_visible;
 	provider->read_payload = nfsd_ffv2_prototype_store_read_payload;
 	provider->reader = provider->store;
-	memcpy(provider->store_handle, handle, sizeof(provider->store_handle));
+	memcpy(provider->store_handle, persisted_handle,
+	       sizeof(provider->store_handle));
 	*result = provider;
 	return 0;
 
@@ -1943,7 +1966,8 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	if (error)
 		goto out_registration;
 	error = nfsd_ffv2_object_register_fh(nn, &registration, &fhp,
-					     req->chunk_size, req->store_uuid,
+					     req->chunk_size,
+					     req->persisted_handle, req->store_uuid,
 					     req->binding_token, cred,
 					     !nfsd_ffv2_prototype_test_armed(),
 					     object_uuid, &outer_fh,
@@ -1956,8 +1980,8 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 * names the generation it belongs to, and there is no generation to
 	 * name until the object has been published.
 	 */
-	error = nfsd_ffv2_prototype_provider_build(nn, &path, cred, req->handle,
-						   req->handle_len,
+	error = nfsd_ffv2_prototype_provider_build(nn, &path, cred,
+						   req->persisted_handle,
 						   req->chunk_size,
 						   req->data_count,
 						   generation_id, &provider);
