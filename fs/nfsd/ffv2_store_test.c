@@ -920,6 +920,32 @@ static void ffv2_visible_predecessor_generation_test(struct kunit *test)
 		-EBADMSG);
 }
 
+static void ffv2_visible_pending_committed_rollback_test(struct kunit *test)
+{
+	struct nfsd_ffv2_visible_chunk chunk;
+	struct nfsd_ffv2_entry_record *entries;
+	u64 eof;
+
+	entries = kunit_kcalloc(test, 3, sizeof(*entries), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, entries);
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     0, 100, 0, 1, 2, 100, 0);
+	entries[1] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     0, 50, 1, 1, 1, 100, 0);
+	entries[1].transition = NFSD_FFV2_PREPARED;
+	entries[1].result_activated = false;
+	entries[1].predecessor_present = true;
+	entries[1].predecessor_object_id = 11;
+	entries[2] = ffv2_test_visible_transition(&entries[0],
+						  NFSD_FFV2_ROLLED_BACK, 0, 1,
+						 0, 0, 1);
+	entries[2].admission.client_id = 99;
+	entries[2].admission.rights = NFSD_FFV2_RIGHT_REPAIR;
+	KUNIT_EXPECT_EQ(test,
+			ffv2_test_visible_replay(entries, 3, 0, &chunk, &eof),
+			-EBADMSG);
+}
+
 static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_super_vector_test),
 	KUNIT_CASE(ffv2_start_vector_test),
@@ -936,6 +962,7 @@ static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_visible_owner_lifetime_test),
 	KUNIT_CASE(ffv2_visible_pending_lifetime_test),
 	KUNIT_CASE(ffv2_visible_predecessor_generation_test),
+	KUNIT_CASE(ffv2_visible_pending_committed_rollback_test),
 	{},
 };
 

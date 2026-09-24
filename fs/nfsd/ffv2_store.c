@@ -1823,6 +1823,8 @@ static int ffv2_replay_visible_entry(
 		break;
 	case NFSD_FFV2_ROLLED_BACK:
 		if (transaction->phase == NFSD_FFV2_COMMITTED) {
+			if (registration->pending[entry->chunk_index])
+				return -EBADMSG;
 			predecessor = transaction->predecessor_present ?
 				ffv2_replay_version(
 					store,
