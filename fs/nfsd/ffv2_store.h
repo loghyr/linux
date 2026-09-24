@@ -247,6 +247,10 @@ int nfsd_ffv2_payload_decode(const u8 *in, size_t len,
 			     const u8 *expected_store,
 			     struct nfsd_ffv2_payload_record *record,
 			     bool *content_valid);
+bool nfsd_ffv2_restart_fits(u64 valid_bytes, u64 live_wal_reserved,
+			    u64 capacity_wal_bytes, u64 *append_cursor);
+bool nfsd_ffv2_payload_geometry_valid(u64 chunk_index, u32 content_len,
+				      u32 chunk_bytes, u64 max_chunks);
 
 int nfsd_ffv2_store_open(struct nfsd_ffv2_reservation *reservation,
 			 struct nfsd_ffv2_store **result);
@@ -264,6 +268,7 @@ int nfsd_ffv2_store_checkpoint(struct nfsd_ffv2_store *store,
 			       const struct nfsd_ffv2_super_record *record);
 #ifdef CONFIG_NFSD_FFV2_LIVE_TEST
 void nfsd_ffv2_store_test_fail_next_io(struct nfsd_ffv2_store *store);
+u64 nfsd_ffv2_store_test_payload_size(struct nfsd_ffv2_store *store);
 #endif
 
 #endif /* _NFSD_FFV2_STORE_H */

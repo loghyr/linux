@@ -479,6 +479,8 @@ static int ffv2_store_raw_checkpoint_test(const char *name,
 		error = nfsd_ffv2_store_get_super(store, &next);
 		if (!error && next.payload_durable_bytes != durable)
 			error = -EBADMSG;
+		if (!error && nfsd_ffv2_store_test_payload_size(store) != durable)
+			error = -EBADMSG;
 	}
 out_close:
 	nfsd_ffv2_store_close(store);

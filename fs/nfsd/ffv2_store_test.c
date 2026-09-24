@@ -294,7 +294,8 @@ static void ffv2_authority_record_vectors_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, control.subtype,
 			(u32)NFSD_FFV2_TRUST_STATEID);
 	KUNIT_EXPECT_EQ(test, control.body_len, 84U);
-	bytes[284] ^= 1;
+	memset(bytes + 148, 0, 16);
+	ffv2_test_crc("FFV2-D2-WAL-v1", bytes, total);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_control_decode(bytes, total, store_uuid,
 						 wal_uuid, &header, &control),
@@ -456,6 +457,33 @@ static void ffv2_payload_multipage_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, content_valid);
 }
 
+static void ffv2_replay_boundaries_test(struct kunit *test)
+{
+	bool valid;
+	u64 append_cursor;
+	u64 exact = 4096 + NFSD_FFV2_START_RECORD_SIZE + 1000;
+
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_restart_fits(4096, 1000,
+							exact - 1,
+							&append_cursor));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_restart_fits(4096, 1000, exact,
+						       &append_cursor));
+	KUNIT_EXPECT_EQ(test, append_cursor,
+			(u64)(4096 + NFSD_FFV2_START_RECORD_SIZE));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_restart_fits(4096, 1000, exact + 1,
+						       &append_cursor));
+	valid = nfsd_ffv2_payload_geometry_valid(63, 4096, 4096, 128);
+	KUNIT_EXPECT_TRUE(test, valid);
+	valid = nfsd_ffv2_payload_geometry_valid(64, 4096, 4096, 128);
+	KUNIT_EXPECT_FALSE(test, valid);
+	valid = nfsd_ffv2_payload_geometry_valid(4, 4096, 4096, 4);
+	KUNIT_EXPECT_FALSE(test, valid);
+	valid = nfsd_ffv2_payload_geometry_valid(0, 0, 4096, 64);
+	KUNIT_EXPECT_FALSE(test, valid);
+	valid = nfsd_ffv2_payload_geometry_valid(0, 4097, 4096, 64);
+	KUNIT_EXPECT_FALSE(test, valid);
+}
+
 static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_super_vector_test),
 	KUNIT_CASE(ffv2_start_vector_test),
@@ -464,6 +492,7 @@ static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_payload_vectors_test),
 	KUNIT_CASE(ffv2_payload_checksum_vectors_test),
 	KUNIT_CASE(ffv2_payload_multipage_test),
+	KUNIT_CASE(ffv2_replay_boundaries_test),
 	{},
 };
 

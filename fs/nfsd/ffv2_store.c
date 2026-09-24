@@ -1488,6 +1488,13 @@ static int ffv2_replay_payload(struct nfsd_ffv2_store *store,
 	return 0;
 }
 
+bool nfsd_ffv2_payload_geometry_valid(u64 chunk_index, u32 content_len,
+				      u32 chunk_bytes, u64 max_chunks)
+{
+	return chunk_index < 64 && chunk_index < max_chunks && content_len &&
+	       content_len <= chunk_bytes;
+}
+
 static int ffv2_replay_entry(struct nfsd_ffv2_store *store,
 			     const struct nfsd_ffv2_wal_header *header,
 			     const struct nfsd_ffv2_entry_record *entry,
@@ -1501,8 +1508,7 @@ static int ffv2_replay_entry(struct nfsd_ffv2_store *store,
 	int error;
 
 	registration = ffv2_replay_file(store, entry->file_key);
-	if (!registration || entry->chunk_index >= registration->max_chunks ||
-	    entry->payload_content_len > registration->chunk_bytes)
+	if (!registration)
 		return -EBADMSG;
 	admission = ffv2_replay_admission_find(store,
 					       entry->admission.client_id);
@@ -1517,6 +1523,8 @@ static int ffv2_replay_entry(struct nfsd_ffv2_store *store,
 		   admission->incarnation != header->ds_incarnation ||
 		   memcmp(&admission->authority, &entry->admission,
 			  sizeof(entry->admission)) ||
+		   (entry->payload_object_id &&
+		    !(admission->authority.rights & NFSD_FFV2_RIGHT_WRITE)) ||
 		   (admission->object_known &&
 		    memcmp(admission->file_key, entry->file_key, 32))) {
 		return -EBADMSG;
@@ -1524,6 +1532,12 @@ static int ffv2_replay_entry(struct nfsd_ffv2_store *store,
 		memcpy(admission->file_key, entry->file_key, 32);
 		admission->object_known = true;
 	}
+	if (entry->payload_object_id &&
+	    !nfsd_ffv2_payload_geometry_valid(entry->chunk_index,
+					      entry->payload_content_len,
+					      registration->chunk_bytes,
+					      registration->max_chunks))
+		return -EBADMSG;
 	error = ffv2_replay_payload(store, entry, &object_end);
 	if (error)
 		return error;
@@ -1614,7 +1628,7 @@ static int
 ffv2_store_decode_registration(struct nfsd_ffv2_store *store,
 			       const u8 *record,
 			       size_t len, struct nfsd_ffv2_wal_header *header,
-			struct nfsd_ffv2_file_register_record *registration)
+			       struct nfsd_ffv2_file_register_record *registration)
 {
 	return nfsd_ffv2_file_register_decode(record, len,
 					       store->super.store_uuid,
@@ -1856,16 +1870,23 @@ static int ffv2_store_write_super(struct nfsd_ffv2_store *store,
 	return 0;
 }
 
+bool nfsd_ffv2_restart_fits(u64 valid_bytes, u64 live_wal_reserved,
+			    u64 capacity_wal_bytes, u64 *append_cursor)
+{
+	u64 required;
+
+	return !check_add_overflow((u64)NFSD_FFV2_START_RECORD_SIZE,
+				   live_wal_reserved, &required) &&
+	       !check_add_overflow(valid_bytes,
+				   (u64)NFSD_FFV2_START_RECORD_SIZE,
+				   append_cursor) &&
+	       valid_bytes <= capacity_wal_bytes &&
+	       required <= capacity_wal_bytes - valid_bytes;
+}
+
 static int ffv2_store_start(struct nfsd_ffv2_store *store,
 			    const struct ffv2_scan_result *scan)
 {
-	u64 restarts = min_t(u64, scan->incarnation ? scan->incarnation - 1 : 0,
-			     NFSD_FFV2_MIN_RESTARTS);
-	u64 recovery_headroom = (NFSD_FFV2_MIN_RESTARTS - restarts) *
-				NFSD_FFV2_RESTART_HEADROOM +
-				(NFSD_FFV2_RECOVERY_HEADROOM -
-				 NFSD_FFV2_MIN_RESTARTS *
-				 NFSD_FFV2_RESTART_HEADROOM);
 	struct nfsd_ffv2_wal_header header = {
 		.family = NFSD_FFV2_WAL_START,
 		.lsn = scan->last_lsn + 1,
@@ -1879,8 +1900,6 @@ static int ffv2_store_start(struct nfsd_ffv2_store *store,
 			NFSD_FFV2_RECOVERY_CLEAN_SCAN,
 		.truncated_bytes = scan->truncated_bytes,
 		.last_valid_lsn_before = scan->last_lsn,
-		.wal_append_cursor = scan->valid_bytes +
-					NFSD_FFV2_START_RECORD_SIZE,
 		.payload_append_cursor = scan->payload_cursor,
 		.capacity_wal_bytes = store->super.capacity_wal_bytes,
 		.capacity_payload_bytes = store->super.capacity_payload_bytes,
@@ -1891,14 +1910,12 @@ static int ffv2_store_start(struct nfsd_ffv2_store *store,
 	u8 bytes[NFSD_FFV2_START_RECORD_SIZE];
 	int error;
 
-	if (scan->incarnation >= NFSD_FFV2_MAX_INCARNATION ||
-	    scan->valid_bytes > store->super.capacity_wal_bytes ||
-	    NFSD_FFV2_START_RECORD_SIZE + recovery_headroom >
-				store->super.capacity_wal_bytes - scan->valid_bytes ||
-	    scan->live_wal_reserved > store->super.capacity_wal_bytes -
-					scan->valid_bytes -
-					NFSD_FFV2_START_RECORD_SIZE -
-					recovery_headroom ||
+	/* RECOVERY_ADMIT charging and restart reap bytes remain unsupported. */
+	if (!nfsd_ffv2_restart_fits(scan->valid_bytes,
+				    scan->live_wal_reserved,
+				    store->super.capacity_wal_bytes,
+				    &start.wal_append_cursor) ||
+	    scan->incarnation >= NFSD_FFV2_MAX_INCARNATION ||
 	    store->super.generation == U64_MAX)
 		return -ENOSPC;
 	if (scan->nonzero_tail) {
@@ -2166,6 +2183,11 @@ void nfsd_ffv2_store_test_fail_next_io(struct nfsd_ffv2_store *store)
 	mutex_lock(&store->lock);
 	store->fail_next_io = true;
 	mutex_unlock(&store->lock);
+}
+
+u64 nfsd_ffv2_store_test_payload_size(struct nfsd_ffv2_store *store)
+{
+	return i_size_read(file_inode(store->payload_file));
 }
 #endif
 
