@@ -1198,6 +1198,11 @@ struct nfsd_ffv2_prototype_provider {
 	struct nfsd_ffv2_store		*store;
 	struct nfsd_ffv2_store_file	file;
 	u8				store_handle[32];
+	int (*visible)(void *store, const u8 file_key[32], u64 chunk_index,
+		       struct nfsd_ffv2_visible_chunk *chunk);
+	int (*read_payload)(void *store, void *data, size_t len, loff_t offset);
+	void				*reader;
+	bool				fail_alloc;
 	u8				*bytes;
 	struct nfsd_ffv2_read_chunk	*read;
 	__be32				*status;
@@ -1251,7 +1256,7 @@ nfsd_ffv2_prototype_chunk_read(void *opaque,
 {
 	struct nfsd_ffv2_prototype_provider *provider = opaque;
 
-	if (provider->store)
+	if (provider->visible)
 		return nfserr_notsupp;
 
 	result->count = nfsd_ffv2_prototype_range(provider, req, &result->eof);
@@ -1276,6 +1281,20 @@ static void nfsd_ffv2_store_read_result_free(void *private)
 	kfree(result);
 }
 
+static int nfsd_ffv2_prototype_store_visible(void *store,
+					     const u8 file_key[32], u64 chunk_index,
+	struct nfsd_ffv2_visible_chunk *chunk)
+{
+	return nfsd_ffv2_store_visible_chunk(store, file_key, chunk_index,
+					     chunk);
+}
+
+static int nfsd_ffv2_prototype_store_read_payload(void *store, void *data,
+						  size_t len, loff_t offset)
+{
+	return nfsd_ffv2_store_read_payload(store, data, len, offset);
+}
+
 static __be32
 nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 				     const struct nfsd_ffv2_object *object,
@@ -1288,7 +1307,7 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 	u32 count, i;
 	size_t bytes;
 
-	if (!provider->store)
+	if (!provider->visible)
 		return nfsd_ffv2_prototype_chunk_read(opaque, object, req, result);
 	file_chunks = DIV_ROUND_UP_ULL(provider->file.logical_eof,
 				       provider->file.chunk_bytes);
@@ -1303,7 +1322,7 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 	if (check_mul_overflow((size_t)count,
 			       (size_t)provider->file.chunk_bytes, &bytes))
 		return nfserr_serverfault;
-	owned = kzalloc_obj(*owned, GFP_KERNEL);
+	owned = provider->fail_alloc ? NULL : kzalloc_obj(*owned, GFP_KERNEL);
 	if (!owned)
 		return nfserr_jukebox;
 	owned->chunks = kvcalloc(count, sizeof(*owned->chunks), GFP_KERNEL);
@@ -1317,7 +1336,7 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 		struct nfsd_ffv2_visible_chunk visible;
 		struct nfsd_ffv2_read_chunk *chunk = &owned->chunks[i];
 		u8 *data = owned->bytes + (size_t)i * provider->file.chunk_bytes;
-		u64 index = req->offset + i;
+		u64 index = req->offset + i, payload_offset;
 		u32 crc, len = provider->file.chunk_bytes;
 		int error;
 
@@ -1327,9 +1346,8 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 				   index * (u64)provider->file.chunk_bytes;
 			len = last_len;
 		}
-		error = nfsd_ffv2_store_visible_chunk(provider->store,
-						      provider->file.file_key,
-						      index, &visible);
+		error = provider->visible(provider->reader,
+					  provider->file.file_key, index, &visible);
 		if (!error) {
 			if (visible.file_eof != provider->file.logical_eof ||
 			    visible.content_len != len ||
@@ -1340,10 +1358,14 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 				nfsd_ffv2_store_read_result_free(owned);
 				return nfserr_serverfault;
 			}
-			error = nfsd_ffv2_store_read_payload(provider->store, data,
-							     len,
-							     visible.payload_object_offset +
-							     NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE);
+			if (check_add_overflow(visible.payload_object_offset,
+					       (u64)NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE,
+					       &payload_offset) || payload_offset > S64_MAX) {
+				nfsd_ffv2_store_read_result_free(owned);
+				return nfserr_serverfault;
+			}
+			error = provider->read_payload(provider->reader, data, len,
+						       payload_offset);
 			if (error) {
 				nfsd_ffv2_store_read_result_free(owned);
 				return error == -ENOMEM ? nfserr_jukebox : nfserr_io;
@@ -1387,7 +1409,7 @@ nfsd_ffv2_prototype_chunk_header_read(void *opaque,
 	struct nfsd_ffv2_prototype_provider *provider = opaque;
 	u32 first;
 
-	if (provider->store)
+	if (provider->visible)
 		return nfserr_notsupp;
 
 	result->count = nfsd_ffv2_prototype_range(provider, req, &result->eof);
@@ -1615,6 +1637,9 @@ nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 	}
 	provider->chunk_size = chunk_size;
 	provider->chunks = data_count;
+	provider->visible = nfsd_ffv2_prototype_store_visible;
+	provider->read_payload = nfsd_ffv2_prototype_store_read_payload;
+	provider->reader = provider->store;
 	memcpy(provider->store_handle, handle, sizeof(provider->store_handle));
 	*result = provider;
 	return 0;
@@ -1623,6 +1648,36 @@ out_free:
 	nfsd_ffv2_prototype_provider_free(provider);
 	return error;
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd_ffv2_prototype_test_store_read(const struct nfsd_ffv2_store_file *file,
+					   const struct nfsd_ffv2_prototype_test_store_ops *ops,
+					   void *store, bool fail_alloc,
+					   const struct nfsd_ffv2_chunk_request *request,
+					   struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_prototype_provider provider = {
+		.chunk_size = file->chunk_bytes,
+		.chunks = file->max_chunks,
+		.file = *file,
+		.visible = ops->visible,
+		.read_payload = ops->read,
+		.reader = store,
+		.fail_alloc = fail_alloc,
+	};
+
+	memset(result, 0, sizeof(*result));
+	return nfsd_ffv2_prototype_store_chunk_read(&provider, NULL, request,
+						    result);
+}
+
+void nfsd_ffv2_prototype_test_result_release(struct nfsd_ffv2_chunk_result *result)
+{
+	if (result->release)
+		result->release(result->private);
+	memset(result, 0, sizeof(*result));
+}
+#endif
 
 /*
  * Remove whatever the one registration published, if it is still owned.

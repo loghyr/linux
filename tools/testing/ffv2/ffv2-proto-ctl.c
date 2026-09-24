@@ -277,12 +277,15 @@ static void bundle_hex(FILE *f, const char *key, const void *data, size_t len)
  */
 static void cmd_register(struct ffv2_nl *nl, const char *domain,
 			 const char *handle_hex, uint32_t chunk_size,
-			 uint32_t data_count, const char *bundle_path,
+			 uint32_t data_count, const char *store_uuid_hex,
+			 const char *binding_token_hex, const char *bundle_path,
 			 const char *run)
 {
 	uint8_t reply[NLMSG_BUF_SIZE];
 	uint8_t handle[128];
 	uint8_t nonce[32];
+	uint8_t store_uuid[16];
+	uint8_t binding_token[32];
 	uint8_t wire[16];
 	const struct nlattr *nla;
 	size_t handle_len, len, attrlen;
@@ -307,6 +310,12 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	handle_len = parse_hex(handle_hex, handle, sizeof(handle));
 	if (!handle_len)
 		die("the ordinary filehandle is empty");
+	if (parse_hex(store_uuid_hex, store_uuid, sizeof(store_uuid)) !=
+	    sizeof(store_uuid))
+		die("store uuid must be 16 bytes");
+	if (parse_hex(binding_token_hex, binding_token,
+		      sizeof(binding_token)) != sizeof(binding_token))
+		die("binding token must be 32 bytes");
 	nl_start(nl, nl->family, NFSD_CMD_FFV2_PROTOTYPE_REGISTER);
 	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_NONCE, nonce, sizeof(nonce));
 	nl_put_str(nl, NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN, domain);
@@ -315,6 +324,10 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE, chunk_size);
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_DATA_COUNT, data_count);
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT, 0);
+	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_STORE_UUID, store_uuid,
+	       sizeof(store_uuid));
+	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN, binding_token,
+	       sizeof(binding_token));
 	len = nl_talk(nl, reply, sizeof(reply));
 
 	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID);
@@ -450,7 +463,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: ffv2-proto-ctl enable\n"
-		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count> [bundle-path [run-token]]\n"
+		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count> <store-uuid-hex> <binding-token-hex> [bundle-path [run-token]]\n"
 		"       ffv2-proto-ctl unregister <source-uuid-hex> <generation>\n"
 		"       ffv2-proto-ctl disable\n");
 	exit(2);
@@ -466,12 +479,13 @@ int main(int argc, char **argv)
 
 	if (!strcmp(argv[1], "enable") && argc == 2)
 		cmd_enable(&nl);
-	else if (!strcmp(argv[1], "register") && argc >= 6 && argc <= 8)
+	else if (!strcmp(argv[1], "register") && argc >= 8 && argc <= 10)
 		cmd_register(&nl, argv[2], argv[3],
 			     (uint32_t)strtoul(argv[4], NULL, 0),
 			     (uint32_t)strtoul(argv[5], NULL, 0),
-			     argc >= 7 ? argv[6] : NULL,
-			     argc == 8 ? argv[7] : NULL);
+			     argv[6], argv[7],
+			     argc >= 9 ? argv[8] : NULL,
+			     argc == 10 ? argv[9] : NULL);
 	else if (!strcmp(argv[1], "unregister") && argc == 4)
 		cmd_unregister(&nl, argv[2], strtoull(argv[3], NULL, 0));
 	else if (!strcmp(argv[1], "disable") && argc == 2)

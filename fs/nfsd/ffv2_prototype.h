@@ -17,6 +17,10 @@ struct dentry;
 struct svc_export;
 struct svc_fh;
 struct user_namespace;
+struct nfsd_ffv2_chunk_request;
+struct nfsd_ffv2_chunk_result;
+struct nfsd_ffv2_store_file;
+struct nfsd_ffv2_visible_chunk;
 
 /*
  * The prototype authority profile.
@@ -187,6 +191,19 @@ int nfsd_ffv2_prototype_disable(struct nfsd_net *nn, const struct net *net);
 enum nfsd_ffv2_prototype_state
 nfsd_ffv2_prototype_state_get(struct nfsd_net *nn);
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct nfsd_ffv2_prototype_test_store_ops {
+	int (*visible)(void *store, const u8 file_key[32], u64 chunk_index,
+		       struct nfsd_ffv2_visible_chunk *chunk);
+	int (*read)(void *store, void *data, size_t len, loff_t offset);
+};
+
+__be32 nfsd_ffv2_prototype_test_store_read(const struct nfsd_ffv2_store_file *file,
+					   const struct nfsd_ffv2_prototype_test_store_ops *ops,
+					   void *store, bool fail_alloc,
+					   const struct nfsd_ffv2_chunk_request *request,
+					   struct nfsd_ffv2_chunk_result *result);
+void nfsd_ffv2_prototype_test_result_release(struct nfsd_ffv2_chunk_result *result);
+
 /*
  * The intervals a test can hold a caller at.  Each slot holds at most one
  * arming, and an arming is a record rather than a pair of pointers so that

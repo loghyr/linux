@@ -2,6 +2,7 @@
 #include <kunit/test.h>
 #include <linux/completion.h>
 #include <linux/cred.h>
+#include <linux/crc32.h>
 #include <linux/delay.h>
 #include <linux/fs_struct.h>
 #include <linux/iopoll.h>
@@ -25,6 +26,7 @@
 #include <uapi/linux/sunrpc_netlink.h>
 #include "ffv2.h"
 #include "ffv2_prototype.h"
+#include "ffv2_store.h"
 #include "ffv2_trust.h"
 #include "export.h"
 #include "filecache.h"
@@ -15187,6 +15189,215 @@ out_close:
 	put_net(net);
 }
 
+struct nfsd_ffv2_store_read_mock {
+	u8		file_key[32];
+	u8		payload[16];
+	int		visible_error;
+	int		read_error;
+	bool		malformed_checksum;
+	bool		malformed_geometry;
+	bool		malformed_payload_id;
+	atomic_t	reads;
+};
+
+static int nfsd_ffv2_store_read_mock_visible(void *opaque,
+					     const u8 file_key[32], u64 chunk_index,
+	struct nfsd_ffv2_visible_chunk *chunk)
+{
+	struct nfsd_ffv2_store_read_mock *mock = opaque;
+	u32 crc;
+
+	if (memcmp(file_key, mock->file_key, sizeof(mock->file_key)))
+		return -EINVAL;
+	if (mock->visible_error)
+		return mock->visible_error;
+	/* The second visible range is an ordinary sparse chunk. */
+	if (chunk_index == 1)
+		return -ENOENT;
+	if (chunk_index)
+		return -ERANGE;
+
+	memset(chunk, 0, sizeof(*chunk));
+	chunk->payload_object_id = mock->malformed_payload_id ?
+				   (u64)U32_MAX + 1 : 17;
+	chunk->payload_object_offset = 4096;
+	chunk->content_len = mock->malformed_geometry ? 15 : 16;
+	chunk->checksum_algorithm = mock->malformed_checksum ? 0 :
+				    NFSD_FFV2_CHECKSUM_ALG_CRC32;
+	chunk->checksum_len = NFSD_FFV2_CHECKSUM_CRC32_LEN;
+	crc = crc32_le(~0U, mock->payload, sizeof(mock->payload)) ^ ~0U;
+	put_unaligned_be32(crc, chunk->checksum);
+	chunk->file_eof = 24;
+	chunk->owner_cohort = 23;
+	chunk->owner_client_id = 29;
+	chunk->owner_co_id = 31;
+	chunk->guard_generation = 37;
+	chunk->guard_writer = 41;
+	return 0;
+}
+
+static int nfsd_ffv2_store_read_mock_payload(void *opaque, void *data,
+					     size_t len, loff_t offset)
+{
+	struct nfsd_ffv2_store_read_mock *mock = opaque;
+
+	if (mock->read_error)
+		return mock->read_error;
+	if (offset != 4096 + NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE ||
+	    len != sizeof(mock->payload))
+		return -EINVAL;
+	atomic_inc(&mock->reads);
+	memcpy(data, mock->payload, len);
+	return 0;
+}
+
+static const struct nfsd_ffv2_prototype_test_store_ops
+nfsd_ffv2_store_read_mock_ops = {
+	.visible = nfsd_ffv2_store_read_mock_visible,
+	.read = nfsd_ffv2_store_read_mock_payload,
+};
+
+static void nfsd_ffv2_store_read_mock_init(struct nfsd_ffv2_store_read_mock *mock,
+					   struct nfsd_ffv2_store_file *file)
+{
+	u32 i;
+
+	memset(mock, 0, sizeof(*mock));
+	memset(file, 0, sizeof(*file));
+	for (i = 0; i < sizeof(mock->payload); i++)
+		mock->payload[i] = 0x80 + i;
+	memset(mock->file_key, 0x5a, sizeof(mock->file_key));
+	memcpy(file->file_key, mock->file_key, sizeof(file->file_key));
+	file->chunk_bytes = sizeof(mock->payload);
+	file->max_chunks = 2;
+	file->logical_eof = 24;
+	atomic_set(&mock->reads, 0);
+}
+
+static __be32 nfsd_ffv2_store_read_mock_call(struct nfsd_ffv2_store_read_mock *mock,
+					     const struct nfsd_ffv2_store_file *file,
+					     bool fail_alloc, u32 count,
+					     struct nfsd_ffv2_chunk_result *result)
+{
+	const struct nfsd_ffv2_chunk_request request = { .count = count };
+
+	return nfsd_ffv2_prototype_test_store_read(file,
+		&nfsd_ffv2_store_read_mock_ops, mock, fail_alloc,
+		&request, result);
+}
+
+static void nfsd_ffv2_store_backed_read_test(struct kunit *test)
+{
+	struct nfsd_ffv2_store_read_mock mock;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_store_file file;
+	u8 zeroes[8] = {};
+	__be32 status;
+
+	nfsd_ffv2_store_read_mock_init(&mock, &file);
+	status = nfsd_ffv2_store_read_mock_call(&mock, &file, false, 2,
+						&result);
+	KUNIT_ASSERT_EQ(test, nfs_ok, status);
+	KUNIT_ASSERT_EQ(test, 2U, result.count);
+	KUNIT_EXPECT_TRUE(test, result.eof);
+	KUNIT_ASSERT_NOT_NULL(test, result.private);
+	KUNIT_ASSERT_NOT_NULL(test, result.release);
+	KUNIT_ASSERT_NOT_NULL(test, result.read.chunks);
+	KUNIT_EXPECT_EQ(test, 1, atomic_read(&mock.reads));
+	KUNIT_EXPECT_MEMEQ(test, result.read.chunks[0].cr_chunk,
+			   mock.payload, sizeof(mock.payload));
+	KUNIT_EXPECT_EQ(test, 16U,
+			result.read.chunks[0].cr_effective_len);
+	KUNIT_EXPECT_EQ(test, 23ULL,
+			result.read.chunks[0].cr_owner.co_cohort_id);
+	KUNIT_EXPECT_EQ(test, 29U,
+			result.read.chunks[0].cr_owner.co_client_id);
+	KUNIT_EXPECT_EQ(test, 31U, result.read.chunks[0].cr_owner.co_id);
+	KUNIT_EXPECT_EQ(test, 37U,
+			result.read.chunks[0].cr_guard.cg_gen_id);
+	KUNIT_EXPECT_EQ(test, 41U,
+			result.read.chunks[0].cr_guard.cg_client_id);
+	KUNIT_EXPECT_EQ(test, 17U, result.read.chunks[0].cr_payload_id);
+	KUNIT_EXPECT_EQ(test, 8U,
+			result.read.chunks[1].cr_effective_len);
+	KUNIT_EXPECT_MEMEQ(test, result.read.chunks[1].cr_chunk,
+			   zeroes, sizeof(zeroes));
+	nfsd_ffv2_prototype_test_result_release(&result);
+	KUNIT_EXPECT_NULL(test, result.private);
+}
+
+static void nfsd_ffv2_store_backed_read_negative_test(struct kunit *test)
+{
+	struct nfsd_ffv2_store_read_mock mock;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_store_file file;
+
+	nfsd_ffv2_store_read_mock_init(&mock, &file);
+	KUNIT_EXPECT_EQ(test, nfserr_jukebox,
+			nfsd_ffv2_store_read_mock_call(&mock, &file, true, 1,
+						       &result));
+	KUNIT_EXPECT_NULL(test, result.private);
+
+	mock.read_error = -EIO;
+	KUNIT_EXPECT_EQ(test, nfserr_io,
+			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						       &result));
+	KUNIT_EXPECT_NULL(test, result.private);
+	mock.read_error = -ENOMEM;
+	KUNIT_EXPECT_EQ(test, nfserr_jukebox,
+			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						       &result));
+	mock.read_error = 0;
+
+	mock.malformed_checksum = true;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						       &result));
+	mock.malformed_checksum = false;
+	mock.malformed_geometry = true;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						       &result));
+	mock.malformed_geometry = false;
+	mock.malformed_payload_id = true;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
+			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						       &result));
+
+	mock.malformed_payload_id = false;
+	file.file_key[0] ^= 1;
+	KUNIT_EXPECT_EQ(test, nfserr_io,
+			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						       &result));
+}
+
+static void nfsd_ffv2_store_backed_read_isolation_test(struct kunit *test)
+{
+	struct nfsd_ffv2_chunk_result first, second;
+	struct nfsd_ffv2_store_read_mock mock;
+	struct nfsd_ffv2_store_file file;
+	__be32 status;
+
+	nfsd_ffv2_store_read_mock_init(&mock, &file);
+	status = nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						&first);
+	KUNIT_ASSERT_EQ(test, nfs_ok, status);
+	status = nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						&second);
+	KUNIT_ASSERT_EQ(test, nfs_ok, status);
+	KUNIT_EXPECT_PTR_NE(test, first.private, second.private);
+	KUNIT_EXPECT_PTR_NE(test, first.read.chunks, second.read.chunks);
+	KUNIT_EXPECT_PTR_NE(test, first.read.chunks[0].cr_chunk,
+			    second.read.chunks[0].cr_chunk);
+	KUNIT_EXPECT_MEMEQ(test, first.read.chunks[0].cr_chunk,
+			   second.read.chunks[0].cr_chunk,
+			   sizeof(mock.payload));
+	nfsd_ffv2_prototype_test_result_release(&second);
+	KUNIT_EXPECT_MEMEQ(test, first.read.chunks[0].cr_chunk,
+			   mock.payload, sizeof(mock.payload));
+	nfsd_ffv2_prototype_test_result_release(&first);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -15277,6 +15488,9 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_destroy_entry_arming_test),
 	KUNIT_CASE(nfsd_ffv2_source_reservation_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_nl_test),
+	KUNIT_CASE(nfsd_ffv2_store_backed_read_test),
+	KUNIT_CASE(nfsd_ffv2_store_backed_read_negative_test),
+	KUNIT_CASE(nfsd_ffv2_store_backed_read_isolation_test),
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
 	KUNIT_CASE(nfsd_ffv2_prototype_gate_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_owner_test),

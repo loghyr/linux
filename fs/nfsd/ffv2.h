@@ -401,10 +401,10 @@ struct nfsd_ffv2_chunk_request {
  * produced; it is never more, and the
  * arrays an encoder walks are present whenever @count is non-zero, both
  * checked at the boundary before this is handed back.  Every pointer here
- * is borrowed from provider-owned storage and stays valid only while the
- * caller's execution admission is held: the admission carries a reference
- * on the provider that produced the result, so provider removal cannot
- * complete, and the storage cannot be freed, until the admission does.
+ * stays valid while the caller's execution admission is held.  A provider
+ * may use immutable provider-owned storage, or attach per-operation storage
+ * through @private and @release.  The admission retains the provider and
+ * adopts any per-operation storage until completion.
  * That admission is also what retirement and namespace exit drain.  A
  * caller that must outlive its admission -- a wire encoder, once one
  * exists -- has to copy what it needs or hold the admission through
@@ -476,9 +476,9 @@ struct nfsd_ffv2_admission {
 	struct task_struct		*task;
 	/*
 	 * The provider a callback ran against, held from the callback until
-	 * this admission completes.  A result borrows provider storage, so
-	 * the storage has to outlive every consumer of the result, and this
-	 * admission is what those consumers are bounded by.
+	 * this admission completes.  Result storage has the same bound,
+	 * whether it is immutable provider storage or per-operation storage
+	 * adopted below.
 	 */
 	struct nfsd_ffv2_provider	*provider;
 	void				*provider_result;
