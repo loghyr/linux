@@ -80,15 +80,6 @@ static void ffv2_get_bytes(struct ffv2_cursor *cursor, void *value, size_t len)
 	cursor->offset += len;
 }
 
-static void ffv2_skip(struct ffv2_cursor *cursor, size_t len)
-{
-	if (cursor->failed || len > cursor->capacity - cursor->offset) {
-		cursor->failed = true;
-		return;
-	}
-	cursor->offset += len;
-}
-
 static u8 ffv2_get_u8(struct ffv2_cursor *cursor)
 {
 	u8 value = 0;
@@ -658,12 +649,10 @@ int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 			   struct nfsd_ffv2_entry_record *record)
 {
 	struct ffv2_cursor cursor = { .data = (u8 *)in, .capacity = len };
-	u8 operation_key[32], request_digest[32], session[16], scratch[64];
-	u64 predecessor_id, postcond_id;
-	u32 slot, sequence, ordinal, predecessor_generation;
-	u32 result_ck_len;
+	u8 operation_key[32], request_digest[32], session[16];
 	u8 predecessor_present, postcond_present, result_activated;
-	u8 guard_never_written;
+	u8 result_guard_never_written;
+	u32 slot, sequence, ordinal;
 	int error;
 
 	if (!in || !header || !record || len < NFSD_FFV2_ENTRY_RECORD_SIZE)
@@ -702,23 +691,34 @@ int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 	ffv2_get_bytes(&cursor, record->admission.stateid_other, 12);
 	record->admission.writer = ffv2_get_u32(&cursor);
 	record->admission.rights = ffv2_get_u32(&cursor);
-	ffv2_skip(&cursor, 20);
+	record->owner_cohort = ffv2_get_u64(&cursor);
+	record->owner_client_id = ffv2_get_u32(&cursor);
+	record->owner_co_id = ffv2_get_u32(&cursor);
+	record->generation = ffv2_get_u32(&cursor);
 	predecessor_present = ffv2_get_u8(&cursor);
-	predecessor_id = ffv2_get_u64(&cursor);
-	predecessor_generation = ffv2_get_u32(&cursor);
+	record->predecessor_object_id = ffv2_get_u64(&cursor);
+	record->predecessor_generation = ffv2_get_u32(&cursor);
 	postcond_present = ffv2_get_u8(&cursor);
-	postcond_id = ffv2_get_u64(&cursor);
+	record->postcond_id = ffv2_get_u64(&cursor);
 	record->payload_object_id = ffv2_get_u64(&cursor);
 	record->payload_object_offset = ffv2_get_u64(&cursor);
 	record->payload_content_len = ffv2_get_u32(&cursor);
 	record->extent_kind = ffv2_get_u32(&cursor);
-	ffv2_skip(&cursor, 24 + 8);
+	record->extent_high_water = ffv2_get_u64(&cursor);
+	record->extent_highest_index = ffv2_get_u64(&cursor);
+	record->index_generation = ffv2_get_u64(&cursor);
+	ffv2_get_bytes(&cursor, record->result_verifier,
+		       sizeof(record->result_verifier));
 	result_activated = ffv2_get_u8(&cursor);
-	ffv2_skip(&cursor, 8 + 4 + 4);
-	result_ck_len = ffv2_get_u32(&cursor);
-	ffv2_get_bytes(&cursor, scratch, sizeof(scratch));
-	guard_never_written = ffv2_get_u8(&cursor);
-	ffv2_skip(&cursor, 4 + 4);
+	record->result_visible_object_id = ffv2_get_u64(&cursor);
+	record->result_effective_len = ffv2_get_u32(&cursor);
+	record->result_checksum_algorithm = ffv2_get_u32(&cursor);
+	record->result_checksum_len = ffv2_get_u32(&cursor);
+	ffv2_get_bytes(&cursor, record->result_checksum,
+		       sizeof(record->result_checksum));
+	result_guard_never_written = ffv2_get_u8(&cursor);
+	record->result_guard_generation = ffv2_get_u32(&cursor);
+	record->result_guard_writer = ffv2_get_u32(&cursor);
 	if (cursor.failed || cursor.offset != NFSD_FFV2_ENTRY_RECORD_SIZE - 4 ||
 	    !ffv2_operation_key_valid(operation_key, session, slot, sequence,
 				      ordinal) ||
@@ -729,11 +729,15 @@ int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 	    record->stability < 1 || record->stability > 3 ||
 	    record->extent_kind < 1 || record->extent_kind > 3 ||
 	    predecessor_present > 1 || postcond_present > 1 ||
-	    result_activated > 1 || guard_never_written > 1 ||
-	    (!predecessor_present && (predecessor_id || predecessor_generation)) ||
-	    (!postcond_present && postcond_id) || result_ck_len > sizeof(scratch) ||
-	    !ffv2_all_zero(scratch + result_ck_len,
-			   sizeof(scratch) - result_ck_len) ||
+	    result_activated > 1 || result_guard_never_written > 1 ||
+	    (!predecessor_present &&
+	     (record->predecessor_object_id || record->predecessor_generation)) ||
+	    (!postcond_present && record->postcond_id) ||
+	    record->result_checksum_len > sizeof(record->result_checksum) ||
+	    !ffv2_all_zero(record->result_checksum +
+				     record->result_checksum_len,
+			   sizeof(record->result_checksum) -
+				     record->result_checksum_len) ||
 	    (!record->payload_object_id && record->payload_object_offset) ||
 	    (record->payload_object_id &&
 	     (!(record->payload_object_id >> 40) ||
@@ -742,6 +746,10 @@ int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 	      !IS_ALIGNED(record->payload_object_offset,
 			  NFSD_FFV2_PAYLOAD_ALIGN))))
 		return -EBADMSG;
+	record->predecessor_present = predecessor_present;
+	record->postcond_present = postcond_present;
+	record->result_activated = result_activated;
+	record->result_guard_never_written = result_guard_never_written;
 	return 0;
 }
 

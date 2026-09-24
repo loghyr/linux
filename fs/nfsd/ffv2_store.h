@@ -186,10 +186,32 @@ struct nfsd_ffv2_entry_record {
 	u64 chunk_index;
 	u64 txn_id;
 	struct nfsd_ffv2_admission_record admission;
+	u64 owner_cohort;
+	u32 owner_client_id;
+	u32 owner_co_id;
+	u32 generation;
+	bool predecessor_present;
+	u64 predecessor_object_id;
+	u32 predecessor_generation;
+	bool postcond_present;
+	u64 postcond_id;
 	u64 payload_object_id;
 	u64 payload_object_offset;
 	u32 payload_content_len;
 	u32 extent_kind;
+	u64 extent_high_water;
+	u64 extent_highest_index;
+	u64 index_generation;
+	u8 result_verifier[8];
+	bool result_activated;
+	u64 result_visible_object_id;
+	u32 result_effective_len;
+	u32 result_checksum_algorithm;
+	u32 result_checksum_len;
+	u8 result_checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
+	bool result_guard_never_written;
+	u32 result_guard_generation;
+	u32 result_guard_writer;
 };
 
 struct nfsd_ffv2_payload_header {
