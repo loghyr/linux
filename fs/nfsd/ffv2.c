@@ -25,6 +25,7 @@
 #include "export.h"
 #include "ffv2.h"
 #include "ffv2_prototype.h"
+#include "ffv2_store.h"
 #include "ffv2_trust.h"
 #include "filecache.h"
 #include "nfsfh.h"
@@ -2161,6 +2162,22 @@ nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
 	 * Nothing borrows storage from a failed call.  A reference already
 	 * owned by the admission stays owned by it and is not dropped here.
 	 */
+	if (status != nfs_ok) {
+		if (result->release)
+			result->release(result->private);
+		result->private = NULL;
+		result->release = NULL;
+	} else if (result->release) {
+		if (!result->private || admission->provider_result) {
+			result->release(result->private);
+			result->private = NULL;
+			result->release = NULL;
+			status = nfserr_serverfault;
+		} else {
+			admission->provider_result = result->private;
+			admission->provider_result_release = result->release;
+		}
+	}
 	if (!pinned) {
 		if (status != nfs_ok)
 			nfsd_ffv2_provider_put(provider);
@@ -4903,6 +4920,8 @@ int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
  * @fhp: a verified ordinary filehandle for a regular file in an export,
  *	released before the object is published
  * @chunk_size: bytes in one chunk of the object
+ * @store_uuid: provisioned store identifier
+ * @binding_token: secret binding the store to this service export
  * @cred: the credential the service context is published with
  * @validate_backend: whether the exporting filesystem must be one nfsd can
  *	export; false only from a KUnit build, whose root filesystem has no
@@ -4924,14 +4943,14 @@ int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
 int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 				 struct nfsd_ffv2_export_update *registration,
 				 struct svc_fh *fhp, u32 chunk_size,
+				 const u8 store_uuid[16],
+				 const u8 binding_token[32],
 				 const struct cred *cred, bool validate_backend,
 				 u8 object_uuid[16], struct knfsd_fh *outer_fh,
 				 u64 *generation_id)
 {
 	struct svc_export *exp = fhp->fh_export;
 	struct nfsd_ffv2_object *object;
-	u8 binding_token[32];
-	u8 store_uuid[16];
 	int error;
 
 	if (!exp || !exp->ex_uuid || !fhp->fh_dentry)
@@ -4961,8 +4980,10 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 	get_random_bytes(object_uuid, 16);
 	memcpy(object->object_uuid, object_uuid, sizeof(object->object_uuid));
 	memcpy(object->export_uuid, exp->ex_uuid, sizeof(object->export_uuid));
-	get_random_bytes(store_uuid, sizeof(store_uuid));
-	get_random_bytes(binding_token, sizeof(binding_token));
+	if (!store_uuid || !binding_token) {
+		nfsd_ffv2_object_free(object);
+		return -EINVAL;
+	}
 
 	/*
 	 * Publication converts this export into a service export, and that
@@ -4980,7 +5001,32 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 					 validate_backend, outer_fh,
 					 generation_id);
 	nfsd_export_put(exp);
-	memzero_explicit(binding_token, sizeof(binding_token));
+	return error;
+}
+
+int nfsd_ffv2_store_open_generation(struct nfsd_net *nn, u64 generation_id,
+				    struct nfsd_ffv2_store **result)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	int error = -ESTALE;
+
+	if (!result)
+		return -EINVAL;
+	mutex_lock(&anchor->lock);
+	generation = anchor->active;
+	if (generation &&
+	    generation->identity->generation == generation_id) {
+		refcount_inc(&generation->ref);
+		context = generation->payload;
+		error = 0;
+	}
+	mutex_unlock(&anchor->lock);
+	if (error)
+		return error;
+	error = nfsd_ffv2_store_open(context->reservation, result);
+	nfsd_ffv2_generation_put_owned(generation);
 	return error;
 }
 #endif
@@ -5555,6 +5601,11 @@ void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 	 * Last: the result this request may still have been reading borrows
 	 * provider storage, and provider removal is waiting on this.
 	 */
+	if (admission->provider_result_release) {
+		admission->provider_result_release(admission->provider_result);
+		admission->provider_result = NULL;
+		admission->provider_result_release = NULL;
+	}
 	if (admission->provider) {
 		nfsd_ffv2_provider_put(admission->provider);
 		admission->provider = NULL;

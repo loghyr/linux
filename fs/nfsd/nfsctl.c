@@ -2659,7 +2659,9 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_HANDLE) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_DATA_COUNT) ||
-	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT))
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_STORE_UUID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN))
 		return -EINVAL;
 	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN],
 				     NAME_MAX, false);
@@ -2677,6 +2679,10 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 		nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_DATA_COUNT]);
 	request.parity_count =
 		nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT]);
+	request.store_uuid =
+		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_STORE_UUID]);
+	request.binding_token =
+		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN]);
 
 	error = nfsd_ffv2_prototype_register(net_generic(net, nfsd_net_id),
 					     net, &request, &bundle);

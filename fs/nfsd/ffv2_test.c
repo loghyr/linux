@@ -12380,6 +12380,8 @@ static void nfsd_ffv2_proto_request(struct nfsd_ffv2_prototype_request *req,
 				    const u8 *nonce)
 {
 	static const u8 handle[] = { 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 };
+	static const u8 store_uuid[16] = { 1 };
+	static const u8 binding_token[32] = { 2 };
 
 	memset(req, 0, sizeof(*req));
 	req->nonce = nonce;
@@ -12389,6 +12391,8 @@ static void nfsd_ffv2_proto_request(struct nfsd_ffv2_prototype_request *req,
 	req->chunk_size = NFSD_FFV2_PROTO_CHUNK_SIZE;
 	req->data_count = NFSD_FFV2_PROTO_CHUNKS;
 	req->parity_count = 0;
+	req->store_uuid = store_uuid;
+	req->binding_token = binding_token;
 }
 
 /*
@@ -14976,6 +14980,8 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 				       const struct nfsd_ffv2_nl_register_args *a,
 				       void *reply, size_t reply_cap)
 {
+	static const u8 store_uuid[16] = { 1 };
+	static const u8 binding_token[32] = { 2 };
 	u8 handle[NFS4_FHSIZE] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 	char buf[NFSD_FFV2_NL_BUF];
 	size_t off;
@@ -15006,6 +15012,14 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
 					     NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT,
 					     a->parity_count);
+	if (!error)
+		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+					 NFSD_A_FFV2_PROTOTYPE_STORE_UUID,
+					 store_uuid, sizeof(store_uuid));
+	if (!error)
+		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+					 NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN,
+					 binding_token, sizeof(binding_token));
 	if (!error && a->unknown_attr)
 		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
 					     a->unknown_attr, 0);

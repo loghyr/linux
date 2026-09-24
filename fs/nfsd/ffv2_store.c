@@ -2507,6 +2507,36 @@ int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store,
 	return 0;
 }
 
+int nfsd_ffv2_store_lookup_file(struct nfsd_ffv2_store *store,
+				const u8 handle[32],
+				struct nfsd_ffv2_store_file *file)
+{
+	struct ffv2_registration *registration;
+	int error = -ENOENT;
+
+	if (!store || !handle || !file)
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	list_for_each_entry(registration, &store->registrations, node) {
+		if (memcmp(registration->handle, handle,
+			   sizeof(registration->handle)))
+			continue;
+		memcpy(file->file_key, registration->file_key,
+		       sizeof(file->file_key));
+		file->chunk_bytes = registration->chunk_bytes;
+		file->max_chunks = registration->max_chunks;
+		file->logical_eof = registration->logical_eof;
+		error = 0;
+		break;
+	}
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
 int nfsd_ffv2_store_visible_chunk(struct nfsd_ffv2_store *store,
 				  const u8 file_key[32], u64 chunk_index,
 				  struct nfsd_ffv2_visible_chunk *chunk)
@@ -2542,6 +2572,12 @@ int nfsd_ffv2_store_visible_chunk(struct nfsd_ffv2_store *store,
 	chunk->checksum_len = version->checksum_len;
 	memcpy(chunk->checksum, version->checksum, sizeof(chunk->checksum));
 	chunk->file_eof = registration->logical_eof;
+	chunk->owner_cohort = version->owner_cohort;
+	chunk->owner_client_id = version->owner_client_id;
+	chunk->owner_co_id = version->owner_co_id;
+	chunk->guard_generation = version->guard_generation;
+	chunk->guard_writer = version->guard_writer;
+	chunk->guard_never_written = version->guard_never_written;
 	error = 0;
 out_unlock:
 	mutex_unlock(&store->lock);

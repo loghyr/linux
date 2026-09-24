@@ -243,6 +243,19 @@ struct nfsd_ffv2_visible_chunk {
 	u32 checksum_len;
 	u8 checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
 	u64 file_eof;
+	u64 owner_cohort;
+	u32 owner_client_id;
+	u32 owner_co_id;
+	u32 guard_generation;
+	u32 guard_writer;
+	bool guard_never_written;
+};
+
+struct nfsd_ffv2_store_file {
+	u8 file_key[32];
+	u32 chunk_bytes;
+	u64 max_chunks;
+	u64 logical_eof;
 };
 
 int nfsd_ffv2_super_encode(const struct nfsd_ffv2_super_record *record,
@@ -292,6 +305,9 @@ int nfsd_ffv2_store_open(struct nfsd_ffv2_reservation *reservation,
 void nfsd_ffv2_store_close(struct nfsd_ffv2_store *store);
 int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store,
 			      struct nfsd_ffv2_super_record *record);
+int nfsd_ffv2_store_lookup_file(struct nfsd_ffv2_store *store,
+				const u8 handle[32],
+				struct nfsd_ffv2_store_file *file);
 int nfsd_ffv2_store_visible_chunk(struct nfsd_ffv2_store *store,
 				  const u8 file_key[32], u64 chunk_index,
 				  struct nfsd_ffv2_visible_chunk *chunk);

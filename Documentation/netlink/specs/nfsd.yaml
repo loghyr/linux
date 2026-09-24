@@ -430,6 +430,16 @@ attribute-sets:
         type: binary
         checks:
           max-len: 128
+      -
+        name: store-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: binding-token
+        type: binary
+        checks:
+          exact-len: 32
 
 operations:
   list:
@@ -686,6 +696,8 @@ operations:
             - chunk-size
             - data-count
             - parity-count
+            - store-uuid
+            - binding-token
         reply:
           attributes:
             - source-uuid

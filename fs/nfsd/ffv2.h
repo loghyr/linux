@@ -20,6 +20,7 @@ struct nfsd_ffv2_object;
 struct nfsd_ffv2_binding;
 struct nfsd_ffv2_reservation;
 struct nfsd_ffv2_service_context;
+struct nfsd_ffv2_store;
 struct cred;
 struct path;
 struct seq_file;
@@ -420,6 +421,13 @@ struct nfsd_ffv2_chunk_request {
 struct nfsd_ffv2_chunk_result {
 	bool	eof;
 	u32	count;
+	/*
+	 * Optional per-operation storage.  The provider gives ownership to
+	 * the execution admission on a successful callback.  Completion
+	 * releases it after the last result consumer has finished.
+	 */
+	void	*private;
+	void	(*release)(void *private);
 	union {
 		/* CHUNK_READ4resok */
 		struct {
@@ -473,6 +481,8 @@ struct nfsd_ffv2_admission {
 	 * admission is what those consumers are bounded by.
 	 */
 	struct nfsd_ffv2_provider	*provider;
+	void				*provider_result;
+	void				(*provider_result_release)(void *private);
 };
 
 __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
@@ -647,9 +657,13 @@ int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn,
 int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 				 struct nfsd_ffv2_export_update *registration,
 				 struct svc_fh *fhp, u32 chunk_size,
+				 const u8 store_uuid[16],
+				 const u8 binding_token[32],
 				 const struct cred *cred, bool validate_backend,
 				 u8 object_uuid[16], struct knfsd_fh *outer_fh,
 				 u64 *generation_id);
+int nfsd_ffv2_store_open_generation(struct nfsd_net *nn, u64 generation_id,
+				    struct nfsd_ffv2_store **result);
 #endif
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) || \
 	IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)

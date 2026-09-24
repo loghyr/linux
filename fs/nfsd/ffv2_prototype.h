@@ -152,6 +152,8 @@ struct nfsd_ffv2_prototype_request {
 	u32		chunk_size;
 	u32		data_count;
 	u32		parity_count;
+	const u8	*store_uuid;
+	const u8	*binding_token;
 };
 
 struct nfsd_ffv2_prototype_bundle {
