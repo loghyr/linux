@@ -177,6 +177,55 @@ static void ffv2_start_vector_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, decoded.verifier_changed);
 }
 
+/* ENTRY encoded by reffs main 8946ac5b2eb. */
+static const u8 ffv2_oracle_entry_vector[NFSD_FFV2_ENTRY_RECORD_SIZE] = {
+	0x44, 0x32, 0x57, 0x4c, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x48,
+	0x00, 0x00, 0x02, 0x18, 0xff, 0xff, 0xfd, 0xe7, 0xa4, 0x70, 0x3c, 0x73,
+	0x6f, 0x80, 0x45, 0x58, 0xac, 0xce, 0xee, 0x4b, 0x60, 0x0a, 0x13, 0x00,
+	0xb6, 0x78, 0x07, 0x58, 0xe1, 0x88, 0x46, 0x39, 0x95, 0xf2, 0x3a, 0x5d,
+	0x77, 0xc3, 0xfc, 0x90, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+	0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+	0xe1, 0x5e, 0x32, 0x35, 0xe0, 0x7a, 0xeb, 0xd0, 0xe9, 0xac, 0x40, 0x2a,
+	0x40, 0xc8, 0x3c, 0x1b, 0x24, 0x83, 0x3e, 0xf4, 0x7d, 0x33, 0xef, 0x3c,
+	0xda, 0x1e, 0xc7, 0x75, 0x12, 0x5b, 0xdd, 0xd8, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+	0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac,
+	0xad, 0xae, 0xaf, 0xb0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+	0x00, 0x00, 0x00, 0x00, 0x33, 0x7a, 0x14, 0xa9, 0x4b, 0xcd, 0x25, 0x3f,
+	0x7f, 0x82, 0x53, 0x11, 0x3b, 0x22, 0x83, 0x80, 0x5e, 0x18, 0x06, 0xa3,
+	0x2d, 0x95, 0xe4, 0x11, 0x86, 0xd7, 0xbe, 0x9f, 0x41, 0x61, 0xcb, 0x4a,
+	0x96, 0x2e, 0x05, 0x3e, 0x9e, 0xdc, 0x5c, 0xdf, 0x6e, 0xee, 0x4d, 0xfa,
+	0x6b, 0xf6, 0xb0, 0xc1, 0x37, 0x7e, 0x4b, 0xcc, 0x4d, 0x41, 0xdc, 0xae,
+	0x64, 0x2b, 0x3e, 0x23, 0x4e, 0xdf, 0xc1, 0x54, 0x91, 0x92, 0x93, 0x94,
+	0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f, 0xa0,
+	0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c,
+	0x8d, 0x8e, 0x8f, 0x90, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+	0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x03, 0x44, 0x32, 0x42, 0x53, 0x54, 0x41, 0x54, 0x45,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x5c,
+	0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+	0x00, 0x00, 0x00, 0x5c, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x10, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00,
+	0x00, 0x00, 0x04, 0x9a, 0xe8, 0x96, 0x5f, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x5c, 0xac, 0xa6, 0xe7, 0x10,
+};
+
 static void ffv2_semantic_record_vectors_test(struct kunit *test)
 {
 	struct nfsd_ffv2_file_register_record registration;
@@ -187,6 +236,28 @@ static void ffv2_semantic_record_vectors_test(struct kunit *test)
 
 	bytes = kunit_kzalloc(test, NFSD_FFV2_ENTRY_RECORD_SIZE, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	KUNIT_ASSERT_EQ(test,
+		nfsd_ffv2_entry_decode(ffv2_oracle_entry_vector,
+				       sizeof(ffv2_oracle_entry_vector),
+				       ffv2_oracle_entry_vector + 20,
+				       ffv2_oracle_entry_vector + 36,
+				       &header, &entry), 0);
+	KUNIT_EXPECT_EQ(test, entry.transition, (u32)NFSD_FFV2_COMMITTED);
+	KUNIT_EXPECT_EQ(test, entry.chunk_index, 1ULL);
+	KUNIT_EXPECT_EQ(test, entry.owner_client_id, 92U);
+	KUNIT_EXPECT_EQ(test, entry.payload_object_id, (1ULL << 40) | 1);
+	KUNIT_EXPECT_EQ(test, entry.payload_object_offset, 4096ULL);
+	KUNIT_EXPECT_EQ(test, entry.extent_kind, 2U);
+	KUNIT_EXPECT_EQ(test, entry.extent_high_water, 8192ULL);
+	KUNIT_EXPECT_EQ(test, entry.extent_highest_index, 1ULL);
+	KUNIT_EXPECT_EQ(test, entry.index_generation, 1ULL);
+	KUNIT_EXPECT_EQ(test, entry.result_visible_object_id, 1ULL);
+	KUNIT_EXPECT_EQ(test, entry.result_effective_len, 4096U);
+	KUNIT_EXPECT_EQ(test, entry.result_checksum_algorithm, 2U);
+	KUNIT_EXPECT_EQ(test, entry.result_checksum_len, 4U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be32(entry.result_checksum),
+			0x9ae8965fU);
+	KUNIT_EXPECT_EQ(test, entry.result_guard_writer, 92U);
 	ffv2_test_fill(store_uuid, sizeof(store_uuid), 0x10);
 	ffv2_test_fill(wal_uuid, sizeof(wal_uuid), 0x30);
 	ffv2_test_fill(handle, sizeof(handle), 0x50);
@@ -484,6 +555,252 @@ static void ffv2_replay_boundaries_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, valid);
 }
 
+static struct nfsd_ffv2_entry_record
+ffv2_test_visible_write(u64 txn_id, u64 version_id, u64 payload_id,
+			 u64 index, u32 len, u32 generation, u64 index_generation,
+			 u32 extent_kind, u64 eof, u64 highest)
+{
+	struct nfsd_ffv2_entry_record entry = {
+		.transition = NFSD_FFV2_COMMITTED,
+		.status = 1,
+		.stability = 3,
+		.txn_id = txn_id,
+		.chunk_index = index,
+		.payload_object_id = payload_id,
+		.payload_object_offset = NFSD_FFV2_PAYLOAD_ALIGN * payload_id,
+		.payload_content_len = len,
+		.extent_kind = extent_kind,
+		.extent_high_water = eof,
+		.extent_highest_index = highest,
+		.index_generation = index_generation,
+		.result_activated = true,
+		.result_visible_object_id = version_id,
+		.result_effective_len = len,
+		.result_checksum_algorithm = 2,
+		.result_checksum_len = 4,
+		.generation = generation,
+		.result_guard_generation = generation,
+		.result_guard_writer = 17,
+	};
+
+	memset(entry.file_key, 0x41, sizeof(entry.file_key));
+	entry.admission.writer = 17;
+	entry.admission.rights = NFSD_FFV2_RIGHT_WRITE;
+	put_unaligned_be32(0x12345678, entry.result_checksum);
+	return entry;
+}
+
+static struct nfsd_ffv2_entry_record
+ffv2_test_visible_transition(const struct nfsd_ffv2_entry_record *source,
+			     u32 transition, u64 result_version,
+			     u32 extent_kind, u64 eof, u64 highest,
+			     u64 index_generation)
+{
+	struct nfsd_ffv2_entry_record entry = *source;
+
+	entry.transition = transition;
+	entry.payload_object_id = 0;
+	entry.payload_object_offset = 0;
+	entry.payload_content_len = 0;
+	entry.result_activated = false;
+	entry.result_visible_object_id = result_version;
+	entry.result_effective_len = 0;
+	entry.result_checksum_algorithm = 0;
+	entry.result_checksum_len = 0;
+	memset(entry.result_checksum, 0, sizeof(entry.result_checksum));
+	entry.extent_kind = extent_kind;
+	entry.extent_high_water = eof;
+	entry.extent_highest_index = highest;
+	entry.index_generation = index_generation;
+	return entry;
+}
+
+static int ffv2_test_visible_replay(
+	const struct nfsd_ffv2_entry_record *entries, size_t count, u64 index,
+	struct nfsd_ffv2_visible_chunk *chunk, u64 *eof)
+{
+	return nfsd_ffv2_store_test_visible_replay(entries, count, 4096, 64,
+						   index, chunk, eof);
+}
+
+static void ffv2_visible_lifecycle_test(struct kunit *test)
+{
+	struct nfsd_ffv2_visible_chunk chunk;
+	struct nfsd_ffv2_entry_record *entries;
+	u64 eof;
+	int error;
+
+	entries = kunit_kcalloc(test, 3, sizeof(*entries), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, entries);
+	error = nfsd_ffv2_store_test_visible_replay(NULL, 0, 4096, 64, 0,
+							    &chunk, &eof);
+	KUNIT_EXPECT_EQ(test, error, -ENOENT);
+	KUNIT_EXPECT_EQ(test, eof, 0ULL);
+
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     2, 100, 0, 0, 1, 0, 0);
+	entries[0].transition = NFSD_FFV2_PREPARED;
+	entries[0].result_activated = false;
+	KUNIT_ASSERT_EQ(test,
+		ffv2_test_visible_replay(entries, 1, 2, &chunk, &eof),
+		-ENOENT);
+	KUNIT_EXPECT_EQ(test, eof, 0ULL);
+	entries[1] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_FINALIZED, 11, 1, 0, 0, 0);
+	KUNIT_ASSERT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 2, &chunk, &eof),
+		-ENOENT);
+	entries[2] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_COMMITTED, 11, 2, 2 * 4096 + 100, 2, 1);
+	KUNIT_ASSERT_EQ(test,
+		ffv2_test_visible_replay(entries, 3, 2, &chunk, &eof), 0);
+	KUNIT_EXPECT_EQ(test, chunk.version_object_id, 11ULL);
+	KUNIT_EXPECT_EQ(test, chunk.payload_object_id, (1ULL << 40) | 1);
+	KUNIT_EXPECT_EQ(test, chunk.content_len, 100U);
+	KUNIT_EXPECT_EQ(test, chunk.checksum_algorithm, 2U);
+	KUNIT_EXPECT_EQ(test, chunk.checksum_len, 4U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be32(chunk.checksum), 0x12345678U);
+	KUNIT_EXPECT_EQ(test, eof, 2ULL * 4096 + 100);
+}
+
+static void ffv2_visible_replace_rollback_test(struct kunit *test)
+{
+	struct nfsd_ffv2_visible_chunk chunk;
+	struct nfsd_ffv2_entry_record *entries;
+	u64 eof;
+
+	entries = kunit_kcalloc(test, 3, sizeof(*entries), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, entries);
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     0, 100, 0, 1, 2, 100, 0);
+	entries[1] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     0, 40, 1, 2, 3, 40, 0);
+	entries[1].predecessor_present = true;
+	entries[1].predecessor_object_id = 11;
+	KUNIT_ASSERT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof), 0);
+	KUNIT_EXPECT_EQ(test, chunk.version_object_id, 12ULL);
+	KUNIT_EXPECT_EQ(test, eof, 40ULL);
+	entries[2] = ffv2_test_visible_transition(&entries[1],
+			NFSD_FFV2_ROLLED_BACK, 11, 2, 100, 0, 3);
+	entries[2].admission.client_id = 99;
+	entries[2].admission.rights = NFSD_FFV2_RIGHT_REPAIR;
+	KUNIT_ASSERT_EQ(test,
+		ffv2_test_visible_replay(entries, 3, 0, &chunk, &eof), 0);
+	KUNIT_EXPECT_EQ(test, chunk.version_object_id, 11ULL);
+	KUNIT_EXPECT_EQ(test, eof, 100ULL);
+
+	entries[0] = ffv2_test_visible_write(3, 13, (1ULL << 40) | 3,
+					     0, 80, 0, 1, 2, 80, 0);
+	entries[1] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_ROLLED_BACK, 0, 3, 0, 0, 2);
+	entries[1].admission.rights = NFSD_FFV2_RIGHT_REPAIR;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-ENOENT);
+	KUNIT_EXPECT_EQ(test, eof, 0ULL);
+}
+
+static void ffv2_visible_sparse_extent_test(struct kunit *test)
+{
+	struct nfsd_ffv2_visible_chunk chunk;
+	struct nfsd_ffv2_entry_record *entries;
+	u64 eof = 5 * 4096 + 10;
+
+	entries = kunit_kcalloc(test, 3, sizeof(*entries), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, entries);
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     5, 10, 0, 1, 2, eof, 5);
+	entries[1] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     1, 20, 0, 2, 1, eof, 5);
+	entries[2] = ffv2_test_visible_transition(&entries[1],
+			NFSD_FFV2_ROLLED_BACK, 0, 1, eof, 5, 3);
+	entries[2].admission.rights = NFSD_FFV2_RIGHT_REPAIR;
+	KUNIT_ASSERT_EQ(test,
+		ffv2_test_visible_replay(entries, 3, 5, &chunk, &eof), 0);
+	KUNIT_EXPECT_EQ(test, chunk.version_object_id, 11ULL);
+	KUNIT_EXPECT_EQ(test, eof, 5ULL * 4096 + 10);
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 3, 1, &chunk, &eof),
+		-ENOENT);
+}
+
+static void ffv2_visible_replay_negative_test(struct kunit *test)
+{
+	struct nfsd_ffv2_visible_chunk chunk;
+	struct nfsd_ffv2_entry_record *entries, *bad;
+	u64 eof;
+
+	entries = kunit_kcalloc(test, 3, sizeof(*entries), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, entries);
+	bad = &entries[2];
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     0, 100, 0, 1, 2, 100, 0);
+	*bad = entries[0];
+	bad->extent_kind = 1;
+	KUNIT_EXPECT_EQ(test, ffv2_test_visible_replay(bad, 1, 0, &chunk, &eof),
+			-EBADMSG);
+	KUNIT_EXPECT_EQ(test, eof, 0ULL);
+	*bad = entries[0];
+	bad->extent_high_water++;
+	KUNIT_EXPECT_EQ(test, ffv2_test_visible_replay(bad, 1, 0, &chunk, &eof),
+			-EBADMSG);
+	*bad = entries[0];
+	bad->extent_highest_index = 1;
+	KUNIT_EXPECT_EQ(test, ffv2_test_visible_replay(bad, 1, 0, &chunk, &eof),
+			-EBADMSG);
+
+	entries[1] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     0, 40, 1, 2, 3, 40, 0);
+	entries[1].predecessor_present = true;
+	entries[1].predecessor_object_id = 99;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-EBADMSG);
+	entries[1] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_ROLLED_BACK, 0, 3, 0, 0, 2);
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-EBADMSG);
+
+	*bad = entries[0];
+	bad->transition = NFSD_FFV2_FINALIZED;
+	bad->result_activated = false;
+	KUNIT_EXPECT_EQ(test, ffv2_test_visible_replay(bad, 1, 0, &chunk, &eof),
+			-EBADMSG);
+	entries[1] = entries[0];
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-EBADMSG);
+
+	*bad = entries[0];
+	bad->payload_object_id = (2ULL << 40) | 1;
+	KUNIT_EXPECT_EQ(test, ffv2_test_visible_replay(bad, 1, 0, &chunk, &eof),
+			-EBADMSG);
+	*bad = entries[0];
+	bad->file_key[0] ^= 1;
+	entries[1] = *bad;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-EBADMSG);
+
+	entries[0].transition = NFSD_FFV2_PREPARED;
+	entries[0].result_activated = false;
+	entries[0].extent_kind = 1;
+	entries[0].extent_high_water = 0;
+	entries[0].index_generation = 0;
+	entries[1] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_FINALIZED, 11, 1, 0, 0, 0);
+	entries[1].admission.client_id = 2;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-EBADMSG);
+
+	KUNIT_EXPECT_EQ(test,
+		nfsd_ffv2_store_test_visible_replay(&entries[0], 1, 4096,
+			U64_MAX / 4096 + 1, 0, &chunk, &eof), -EINVAL);
+}
+
 static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_super_vector_test),
 	KUNIT_CASE(ffv2_start_vector_test),
@@ -493,6 +810,10 @@ static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_payload_checksum_vectors_test),
 	KUNIT_CASE(ffv2_payload_multipage_test),
 	KUNIT_CASE(ffv2_replay_boundaries_test),
+	KUNIT_CASE(ffv2_visible_lifecycle_test),
+	KUNIT_CASE(ffv2_visible_replace_rollback_test),
+	KUNIT_CASE(ffv2_visible_sparse_extent_test),
+	KUNIT_CASE(ffv2_visible_replay_negative_test),
 	{},
 };
 

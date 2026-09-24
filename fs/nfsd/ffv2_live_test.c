@@ -315,6 +315,8 @@ static int nfsd_ffv2_store_reopen_test(const char *name,
 	struct nfsd_ffv2_reservation *reservation = NULL;
 	struct nfsd_ffv2_store *store = NULL;
 	struct nfsd_ffv2_super_record next;
+	u8 *before = NULL, *after = NULL;
+	size_t before_len = 0, after_len = 0;
 	struct path root;
 	int error;
 
@@ -344,6 +346,9 @@ static int nfsd_ffv2_store_reopen_test(const char *name,
 	}
 	next.generation++;
 	error = nfsd_ffv2_store_checkpoint(store, &next);
+	if (!error)
+		error = nfsd_ffv2_store_test_visible_snapshot(
+			store, &before, &before_len);
 out_close:
 	nfsd_ffv2_store_close(store);
 	store = NULL;
@@ -356,11 +361,19 @@ out_close:
 		error = nfsd_ffv2_store_get_super(store, &reopened);
 		if (!error && reopened.generation != next.generation + 1)
 			error = -EBADMSG;
+		if (!error)
+			error = nfsd_ffv2_store_test_visible_snapshot(
+				store, &after, &after_len);
+		if (!error && (after_len != before_len ||
+			       memcmp(after, before, before_len)))
+			error = -EBADMSG;
 	}
 	if (!error)
 		*generation = next.generation + 1;
 	nfsd_ffv2_store_close(store);
 out_abort:
+	kvfree(after);
+	kvfree(before);
 	nfsd_ffv2_reservation_abort(reservation);
 	return error;
 }
