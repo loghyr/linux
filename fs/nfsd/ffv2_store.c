@@ -1112,8 +1112,10 @@ static int ffv2_store_start(struct nfsd_ffv2_store *store,
 	error = nfsd_ffv2_start_encode(&header, &start, bytes);
 	if (error)
 		return error;
-	error = ffv2_store_write_all(store->wal_file, bytes, sizeof(bytes),
-				     scan->valid_bytes);
+	error = vfs_fsync(store->payload_file, 0);
+	if (!error)
+		error = ffv2_store_write_all(store->wal_file, bytes, sizeof(bytes),
+					     scan->valid_bytes);
 	if (!error)
 		error = vfs_fsync(store->wal_file, 0);
 	if (error) {
