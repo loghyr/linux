@@ -995,6 +995,7 @@ struct nfsd_ffv2_store {
 	u64 index_generation;
 	struct list_head registrations;
 	struct list_head transactions;
+	struct list_head owners;
 	struct list_head admissions;
 	u32 registration_count;
 	u32 transaction_count;
@@ -1014,6 +1015,7 @@ struct ffv2_registration {
 	u32 chunk_bytes;
 	u64 max_chunks;
 	struct ffv2_transaction *visible[64];
+	struct ffv2_transaction *pending[64];
 	u64 logical_eof;
 	struct {
 		u32 generation;
@@ -1034,6 +1036,7 @@ struct ffv2_admission {
 
 struct ffv2_transaction {
 	struct list_head node;
+	struct list_head owner_node;
 	u8 file_key[32];
 	u64 chunk_index;
 	u64 txn_id;
@@ -1486,6 +1489,20 @@ ffv2_replay_transaction(struct nfsd_ffv2_store *store, u64 txn_id)
 	return NULL;
 }
 
+static struct ffv2_transaction *
+ffv2_replay_owner(struct nfsd_ffv2_store *store, u64 cohort, u32 client_id,
+		  u32 co_id)
+{
+	struct ffv2_transaction *transaction;
+
+	list_for_each_entry(transaction, &store->owners, owner_node)
+		if (transaction->owner_cohort == cohort &&
+		    transaction->owner_client_id == client_id &&
+		    transaction->owner_co_id == co_id)
+			return transaction;
+	return NULL;
+}
+
 static int ffv2_replay_payload(struct nfsd_ffv2_store *store,
 			       const struct nfsd_ffv2_entry_record *entry,
 			       u64 *object_end,
@@ -1614,7 +1631,9 @@ static int ffv2_replay_publish(struct nfsd_ffv2_store *store,
 			store, transaction->predecessor_object_id);
 		if (!predecessor ||
 		    memcmp(predecessor->file_key, transaction->file_key, 32) ||
-		    predecessor->chunk_index != transaction->chunk_index)
+		    predecessor->chunk_index != transaction->chunk_index ||
+		    predecessor->version_generation !=
+					transaction->predecessor_generation)
 			return -EBADMSG;
 	}
 	if (registration->visible[transaction->chunk_index] != predecessor ||
@@ -1638,7 +1657,9 @@ static int ffv2_replay_unpublish(struct nfsd_ffv2_store *store,
 			store, transaction->predecessor_object_id);
 		if (!predecessor ||
 		    memcmp(predecessor->file_key, transaction->file_key, 32) ||
-		    predecessor->chunk_index != transaction->chunk_index)
+		    predecessor->chunk_index != transaction->chunk_index ||
+		    predecessor->version_generation !=
+					transaction->predecessor_generation)
 			return -EBADMSG;
 	}
 	if (store->index_generation == U64_MAX)
@@ -1668,6 +1689,11 @@ static int ffv2_replay_visible_entry(
 		    !entry->result_visible_object_id ||
 		    ffv2_replay_transaction(store, entry->txn_id) ||
 		    ffv2_replay_version(store, entry->result_visible_object_id) ||
+		    ffv2_replay_owner(store, entry->owner_cohort,
+				      entry->owner_client_id,
+				      entry->owner_co_id) ||
+		    entry->owner_client_id != entry->admission.writer ||
+		    registration->pending[entry->chunk_index] ||
 		    (entry->transition != NFSD_FFV2_PREPARED &&
 		     entry->transition != NFSD_FFV2_COMMITTED) ||
 		    entry->result_activated !=
@@ -1684,8 +1710,10 @@ static int ffv2_replay_visible_entry(
 		predecessor = registration->visible[entry->chunk_index];
 		if (entry->predecessor_present != !!predecessor ||
 		    (predecessor &&
-		     entry->predecessor_object_id !=
-						predecessor->version_object_id))
+		     (entry->predecessor_object_id !=
+						predecessor->version_object_id ||
+		      entry->predecessor_generation !=
+						predecessor->version_generation)))
 			return -EBADMSG;
 		if (registration->guard[entry->chunk_index].never_written) {
 			if (entry->generation)
@@ -1732,6 +1760,7 @@ static int ffv2_replay_visible_entry(
 		transaction->admission_id = entry->admission.client_id;
 		transaction->phase = entry->transition;
 		list_add_tail(&transaction->node, &store->transactions);
+		list_add_tail(&transaction->owner_node, &store->owners);
 		store->transaction_count++;
 		registration->guard[entry->chunk_index].never_written = false;
 		registration->guard[entry->chunk_index].generation =
@@ -1743,6 +1772,8 @@ static int ffv2_replay_visible_entry(
 						    transaction);
 			if (error)
 				return error;
+		} else {
+			registration->pending[entry->chunk_index] = transaction;
 		}
 		return ffv2_replay_extent(store, registration, entry,
 					  prior_eof);
@@ -1774,18 +1805,21 @@ static int ffv2_replay_visible_entry(
 	switch (entry->transition) {
 	case NFSD_FFV2_FINALIZED:
 		if (transaction->phase != NFSD_FFV2_PREPARED ||
+		    registration->pending[entry->chunk_index] != transaction ||
 		    entry->result_visible_object_id !=
 						transaction->version_object_id)
 			return -EBADMSG;
 		break;
 	case NFSD_FFV2_COMMITTED:
 		if (transaction->phase != NFSD_FFV2_FINALIZED ||
+		    registration->pending[entry->chunk_index] != transaction ||
 		    entry->result_visible_object_id !=
 						transaction->version_object_id)
 			return -EBADMSG;
 		error = ffv2_replay_publish(store, registration, transaction);
 		if (error)
 			return error;
+		registration->pending[entry->chunk_index] = NULL;
 		break;
 	case NFSD_FFV2_ROLLED_BACK:
 		if (transaction->phase == NFSD_FFV2_COMMITTED) {
@@ -1809,9 +1843,12 @@ static int ffv2_replay_visible_entry(
 			    (transaction->phase != NFSD_FFV2_PREPARED &&
 			     transaction->phase != NFSD_FFV2_FINALIZED) ||
 			    entry->result_visible_object_id ||
+			    registration->pending[entry->chunk_index] !=
+								 transaction ||
 			    registration->visible[entry->chunk_index] !=
 								 predecessor)
 				return -EBADMSG;
+			registration->pending[entry->chunk_index] = NULL;
 		}
 		break;
 	default:
@@ -1841,6 +1878,7 @@ int nfsd_ffv2_store_test_visible_replay(
 	*eof = 0;
 	INIT_LIST_HEAD(&store.registrations);
 	INIT_LIST_HEAD(&store.transactions);
+	INIT_LIST_HEAD(&store.owners);
 	INIT_LIST_HEAD(&store.admissions);
 	registration = kzalloc_obj(*registration, GFP_KERNEL);
 	if (!registration)
@@ -2385,6 +2423,7 @@ int nfsd_ffv2_store_open(struct nfsd_ffv2_reservation *reservation,
 	mutex_init(&store->lock);
 	INIT_LIST_HEAD(&store->registrations);
 	INIT_LIST_HEAD(&store->transactions);
+	INIT_LIST_HEAD(&store->owners);
 	INIT_LIST_HEAD(&store->admissions);
 	store->super_file = ffv2_store_open_file(&root, "super");
 	if (IS_ERR(store->super_file)) {

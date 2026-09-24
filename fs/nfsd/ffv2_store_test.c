@@ -586,6 +586,9 @@ ffv2_test_visible_write(u64 txn_id, u64 version_id, u64 payload_id,
 	memset(entry.file_key, 0x41, sizeof(entry.file_key));
 	entry.admission.writer = 17;
 	entry.admission.rights = NFSD_FFV2_RIGHT_WRITE;
+	entry.owner_cohort = txn_id;
+	entry.owner_client_id = 17;
+	entry.owner_co_id = txn_id;
 	put_unaligned_be32(0x12345678, entry.result_checksum);
 	return entry;
 }
@@ -801,6 +804,122 @@ static void ffv2_visible_replay_negative_test(struct kunit *test)
 			U64_MAX / 4096 + 1, 0, &chunk, &eof), -EINVAL);
 }
 
+static void ffv2_visible_owner_lifetime_test(struct kunit *test)
+{
+	struct nfsd_ffv2_visible_chunk chunk;
+	struct nfsd_ffv2_entry_record *entries;
+	u64 eof;
+
+	entries = kunit_kcalloc(test, 3, sizeof(*entries), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, entries);
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     0, 100, 0, 1, 2, 100, 0);
+	entries[0].owner_client_id++;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 1, 0, &chunk, &eof),
+		-EBADMSG);
+
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     0, 100, 0, 1, 2, 100, 0);
+	entries[1] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     1, 50, 0, 2, 2, 4146, 1);
+	entries[1].owner_cohort = entries[0].owner_cohort;
+	entries[1].owner_co_id = entries[0].owner_co_id;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-EBADMSG);
+
+	entries[0] = ffv2_test_visible_write(3, 13, (1ULL << 40) | 3,
+					     0, 80, 0, 0, 1, 0, 0);
+	entries[0].transition = NFSD_FFV2_PREPARED;
+	entries[0].result_activated = false;
+	entries[1] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_ROLLED_BACK, 0, 1, 0, 0, 0);
+	entries[2] = ffv2_test_visible_write(4, 14, (1ULL << 40) | 4,
+					     1, 40, 0, 0, 1, 0, 0);
+	entries[2].transition = NFSD_FFV2_PREPARED;
+	entries[2].result_activated = false;
+	entries[2].owner_cohort = entries[0].owner_cohort;
+	entries[2].owner_co_id = entries[0].owner_co_id;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 3, 0, &chunk, &eof),
+		-EBADMSG);
+}
+
+static void ffv2_visible_pending_lifetime_test(struct kunit *test)
+{
+	struct nfsd_ffv2_visible_chunk chunk;
+	struct nfsd_ffv2_entry_record *entries;
+	u64 eof;
+
+	entries = kunit_kcalloc(test, 4, sizeof(*entries), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, entries);
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     0, 100, 0, 0, 1, 0, 0);
+	entries[0].transition = NFSD_FFV2_PREPARED;
+	entries[0].result_activated = false;
+	entries[1] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     0, 50, 1, 0, 1, 0, 0);
+	entries[1].transition = NFSD_FFV2_PREPARED;
+	entries[1].result_activated = false;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-EBADMSG);
+
+	entries[1] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_FINALIZED, 11, 1, 0, 0, 0);
+	entries[2] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     0, 50, 1, 0, 1, 0, 0);
+	entries[2].transition = NFSD_FFV2_PREPARED;
+	entries[2].result_activated = false;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 3, 0, &chunk, &eof),
+		-EBADMSG);
+
+	entries[2] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_COMMITTED, 11, 2, 100, 0, 1);
+	entries[3] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     0, 50, 1, 1, 1, 100, 0);
+	entries[3].transition = NFSD_FFV2_PREPARED;
+	entries[3].result_activated = false;
+	entries[3].predecessor_present = true;
+	entries[3].predecessor_object_id = 11;
+	entries[3].predecessor_generation = 0;
+	KUNIT_ASSERT_EQ(test,
+		ffv2_test_visible_replay(entries, 4, 0, &chunk, &eof), 0);
+	KUNIT_EXPECT_EQ(test, chunk.version_object_id, 11ULL);
+
+	entries[1] = ffv2_test_visible_transition(&entries[0],
+			NFSD_FFV2_ROLLED_BACK, 0, 1, 0, 0, 0);
+	entries[2] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     0, 50, 1, 0, 1, 0, 0);
+	entries[2].transition = NFSD_FFV2_PREPARED;
+	entries[2].result_activated = false;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 3, 0, &chunk, &eof),
+		-ENOENT);
+}
+
+static void ffv2_visible_predecessor_generation_test(struct kunit *test)
+{
+	struct nfsd_ffv2_visible_chunk chunk;
+	struct nfsd_ffv2_entry_record *entries;
+	u64 eof;
+
+	entries = kunit_kcalloc(test, 2, sizeof(*entries), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, entries);
+	entries[0] = ffv2_test_visible_write(1, 11, (1ULL << 40) | 1,
+					     0, 100, 0, 1, 2, 100, 0);
+	entries[1] = ffv2_test_visible_write(2, 12, (1ULL << 40) | 2,
+					     0, 50, 1, 2, 3, 50, 0);
+	entries[1].predecessor_present = true;
+	entries[1].predecessor_object_id = 11;
+	entries[1].predecessor_generation = 1;
+	KUNIT_EXPECT_EQ(test,
+		ffv2_test_visible_replay(entries, 2, 0, &chunk, &eof),
+		-EBADMSG);
+}
+
 static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_super_vector_test),
 	KUNIT_CASE(ffv2_start_vector_test),
@@ -814,6 +933,9 @@ static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_visible_replace_rollback_test),
 	KUNIT_CASE(ffv2_visible_sparse_extent_test),
 	KUNIT_CASE(ffv2_visible_replay_negative_test),
+	KUNIT_CASE(ffv2_visible_owner_lifetime_test),
+	KUNIT_CASE(ffv2_visible_pending_lifetime_test),
+	KUNIT_CASE(ffv2_visible_predecessor_generation_test),
 	{},
 };
 
