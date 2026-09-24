@@ -253,6 +253,54 @@ static void ffv2_semantic_record_vectors_test(struct kunit *test)
 			-EBADMSG);
 }
 
+static void ffv2_authority_record_vectors_test(struct kunit *test)
+{
+	struct nfsd_ffv2_control_record control;
+	struct nfsd_ffv2_wal_header header;
+	u8 store_uuid[16], wal_uuid[16], session[16];
+	u8 *bytes;
+	u32 total = NFSD_FFV2_WAL_HEADER_SIZE +
+		    NFSD_FFV2_CONTROL_PREFIX_SIZE + 84 + 4;
+
+	bytes = kunit_kzalloc(test, total, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, bytes);
+	ffv2_test_fill(store_uuid, sizeof(store_uuid), 0x10);
+	ffv2_test_fill(wal_uuid, sizeof(wal_uuid), 0x30);
+	ffv2_test_fill(session, sizeof(session), 0x80);
+	ffv2_test_wal_header(bytes, NFSD_FFV2_WAL_CONTROL, total,
+			     store_uuid, wal_uuid, 3, 1);
+	put_unaligned_be32(NFSD_FFV2_TRUST_STATEID, bytes + 72);
+	put_unaligned_be32(NFSD_FFV2_COMMITTED, bytes + 76);
+	put_unaligned_be32(1, bytes + 80);
+	ffv2_test_operation_key(session, 0, 3, 0, bytes + 84);
+	memcpy(bytes + 148, session, 16);
+	put_unaligned_be32(3, bytes + 168);
+	ffv2_test_fill(bytes + 176, 16, 0xf0);
+	put_unaligned_be64(7, bytes + 200);
+	put_unaligned_be32(0x44324253, bytes + 208);
+	memcpy(bytes + 212, "TATE", 4);
+	put_unaligned_be64(7, bytes + 216);
+	put_unaligned_be32(3, bytes + 240);
+	memcpy(bytes + 244, session, 16);
+	put_unaligned_be64(7, bytes + 260);
+	ffv2_test_fill(bytes + 268, 16, 0x20);
+	put_unaligned_be32(17, bytes + 284);
+	put_unaligned_be32(0x13, bytes + 288);
+	ffv2_test_crc("FFV2-D2-WAL-v1", bytes, total);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_control_decode(bytes, total, store_uuid,
+						 wal_uuid, &header, &control),
+		0);
+	KUNIT_EXPECT_EQ(test, control.subtype,
+			(u32)NFSD_FFV2_TRUST_STATEID);
+	KUNIT_EXPECT_EQ(test, control.body_len, 84U);
+	bytes[284] ^= 1;
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_control_decode(bytes, total, store_uuid,
+						 wal_uuid, &header, &control),
+		-EBADMSG);
+}
+
 static void ffv2_payload_checksum_vectors_test(struct kunit *test)
 {
 	static const struct {
@@ -358,7 +406,7 @@ static void ffv2_payload_vectors_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, content_valid);
 	put_unaligned_be32(NFSD_FFV2_STORE_CHECKSUM_SIZE + 1, bytes + 52);
 	ffv2_test_crc("FFV2-D2-PAY-v1", bytes,
-		      NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE + 4);
+		      NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE + source.content_len + 4);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_payload_decode(bytes, written, source.store_uuid,
 						 &decoded, &content_valid),
@@ -412,6 +460,7 @@ static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_super_vector_test),
 	KUNIT_CASE(ffv2_start_vector_test),
 	KUNIT_CASE(ffv2_semantic_record_vectors_test),
+	KUNIT_CASE(ffv2_authority_record_vectors_test),
 	KUNIT_CASE(ffv2_payload_vectors_test),
 	KUNIT_CASE(ffv2_payload_checksum_vectors_test),
 	KUNIT_CASE(ffv2_payload_multipage_test),

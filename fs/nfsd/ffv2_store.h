@@ -32,6 +32,17 @@ struct nfsd_ffv2_store;
 
 #define NFSD_FFV2_MIN_WAL_SIZE		3352780ULL
 #define NFSD_FFV2_MAX_INCARNATION	0x00ffffffULL
+#define NFSD_FFV2_MAX_OBJECTS		4U
+#define NFSD_FFV2_MAX_TRANSACTIONS	256U
+#define NFSD_FFV2_MAX_ADMISSIONS		32U
+#define NFSD_FFV2_MAX_AUTHORITY_STATEIDS 64U
+#define NFSD_FFV2_MIN_RESTARTS		64U
+#define NFSD_FFV2_RESTART_HEADROOM	51909ULL
+#define NFSD_FFV2_RECOVERY_HEADROOM	3322572ULL
+
+#define NFSD_FFV2_RIGHT_READ		BIT(0)
+#define NFSD_FFV2_RIGHT_WRITE		BIT(1)
+#define NFSD_FFV2_RIGHT_CONTROL		BIT(3)
 
 enum nfsd_ffv2_store_record_type {
 	NFSD_FFV2_SUPER_SLOT = 1,
@@ -55,6 +66,8 @@ enum nfsd_ffv2_transition {
 
 enum nfsd_ffv2_control_subtype {
 	NFSD_FFV2_FILE_REGISTER = 1,
+	NFSD_FFV2_AUTHORITY_ADMIT = 3,
+	NFSD_FFV2_TRUST_STATEID = 5,
 };
 
 enum nfsd_ffv2_super_state {
@@ -136,6 +149,32 @@ struct nfsd_ffv2_file_register_record {
 	u64 logical_eof;
 };
 
+struct nfsd_ffv2_admission_record {
+	u8 session[16];
+	u8 principal[16];
+	u8 issuer[16];
+	u64 authority_epoch;
+	u64 fence_sequence;
+	u64 lease_epoch;
+	u64 client_id;
+	u32 stateid_seqid;
+	u8 stateid_other[12];
+	u32 writer;
+	u32 rights;
+};
+
+struct nfsd_ffv2_control_record {
+	u32 subtype;
+	u32 transition;
+	u32 status;
+	u8 session[16];
+	u8 admission_issuer[16];
+	u64 admission_authority_epoch;
+	u64 admission_client_id;
+	u32 body_len;
+	const u8 *body;
+};
+
 struct nfsd_ffv2_entry_record {
 	u32 transition;
 	u32 status;
@@ -146,6 +185,7 @@ struct nfsd_ffv2_entry_record {
 	u8 file_key[32];
 	u64 chunk_index;
 	u64 txn_id;
+	struct nfsd_ffv2_admission_record admission;
 	u64 payload_object_id;
 	u64 payload_object_offset;
 	u32 payload_content_len;
@@ -187,6 +227,10 @@ int nfsd_ffv2_file_register_decode(const u8 *in, size_t len,
 				   const u8 *expected_wal,
 				   struct nfsd_ffv2_wal_header *header,
 				   struct nfsd_ffv2_file_register_record *record);
+int nfsd_ffv2_control_decode(const u8 *in, size_t len,
+			     const u8 *expected_store, const u8 *expected_wal,
+			     struct nfsd_ffv2_wal_header *header,
+			     struct nfsd_ffv2_control_record *record);
 int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 			   const u8 *expected_store, const u8 *expected_wal,
 			   struct nfsd_ffv2_wal_header *header,

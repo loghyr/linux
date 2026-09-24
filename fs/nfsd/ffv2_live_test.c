@@ -424,6 +424,69 @@ out_abort:
 	return error;
 }
 
+static int ffv2_store_raw_checkpoint_test(const char *name,
+					  const u8 store_uuid[16],
+					  const u8 export_uuid[16],
+					  const u8 binding_token[32])
+{
+	struct nfsd_net *nn = net_generic(&init_net, nfsd_net_id);
+	struct nfsd_ffv2_reservation *reservation = NULL;
+	struct nfsd_ffv2_store *store = NULL;
+	struct nfsd_ffv2_super_record next;
+	struct nfsd_ffv2_payload_record record = {
+		.content_len = NFSD_FFV2_PAYLOAD_ALIGN,
+	};
+	u8 *bytes;
+	u64 durable, offset;
+	struct path root;
+	int error;
+
+	error = kern_path(name, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &root);
+	if (error)
+		return error;
+	error = nfsd_ffv2_reservation_claim(nn, &root, store_uuid, export_uuid,
+					    binding_token, &reservation);
+	path_put(&root);
+	if (error)
+		return error;
+	error = nfsd_ffv2_store_open(reservation, &store);
+	if (error)
+		goto out_abort;
+	error = nfsd_ffv2_store_get_super(store, &next);
+	if (error)
+		goto out_close;
+	durable = next.payload_durable_bytes;
+	record.object_id = (next.ds_incarnation << 40) | 1;
+	memcpy(record.store_uuid, store_uuid, sizeof(record.store_uuid));
+	bytes = kzalloc(NFSD_FFV2_PAYLOAD_ALIGN, GFP_KERNEL);
+	if (!bytes) {
+		error = -ENOMEM;
+		goto out_close;
+	}
+	record.content = bytes;
+	error = nfsd_ffv2_store_append_payload(store, &record, &offset);
+	if (!error) {
+		next.generation++;
+		error = nfsd_ffv2_store_checkpoint(store, &next);
+	}
+	kfree(bytes);
+	if (error)
+		goto out_close;
+	nfsd_ffv2_store_close(store);
+	store = NULL;
+	error = nfsd_ffv2_store_open(reservation, &store);
+	if (!error) {
+		error = nfsd_ffv2_store_get_super(store, &next);
+		if (!error && next.payload_durable_bytes != durable)
+			error = -EBADMSG;
+	}
+out_close:
+	nfsd_ffv2_store_close(store);
+out_abort:
+	nfsd_ffv2_reservation_abort(reservation);
+	return error;
+}
+
 static ssize_t nfsd_ffv2_store_test_read(struct file *file, char __user *buf,
 					 size_t len, loff_t *ppos)
 {
@@ -493,6 +556,9 @@ static ssize_t nfsd_ffv2_store_test_write(struct file *file,
 	if (mode && !strcmp(mode, "fail"))
 		error = nfsd_ffv2_store_failure_test(path, store_uuid,
 						     export_uuid, binding_token);
+	else if (mode && !strcmp(mode, "raw"))
+		error = ffv2_store_raw_checkpoint_test(path, store_uuid,
+						       export_uuid, binding_token);
 	else if (!mode)
 		error = nfsd_ffv2_store_reopen_test(path, store_uuid, export_uuid,
 						    binding_token, &generation);
