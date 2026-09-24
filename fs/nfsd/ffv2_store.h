@@ -42,6 +42,7 @@ struct nfsd_ffv2_store;
 
 #define NFSD_FFV2_RIGHT_READ		BIT(0)
 #define NFSD_FFV2_RIGHT_WRITE		BIT(1)
+#define NFSD_FFV2_RIGHT_REPAIR		BIT(2)
 #define NFSD_FFV2_RIGHT_CONTROL		BIT(3)
 
 enum nfsd_ffv2_store_record_type {
@@ -232,6 +233,18 @@ struct nfsd_ffv2_payload_record {
 	const u8 *content;
 };
 
+struct nfsd_ffv2_visible_chunk {
+	u64 version_object_id;
+	u32 version_generation;
+	u64 payload_object_id;
+	u64 payload_object_offset;
+	u32 content_len;
+	u32 checksum_algorithm;
+	u32 checksum_len;
+	u8 checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
+	u64 file_eof;
+};
+
 int nfsd_ffv2_super_encode(const struct nfsd_ffv2_super_record *record,
 			   u8 out[NFSD_FFV2_SUPER_SLOT_SIZE]);
 int nfsd_ffv2_super_decode(const u8 in[NFSD_FFV2_SUPER_SLOT_SIZE],
@@ -279,6 +292,15 @@ int nfsd_ffv2_store_open(struct nfsd_ffv2_reservation *reservation,
 void nfsd_ffv2_store_close(struct nfsd_ffv2_store *store);
 int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store,
 			      struct nfsd_ffv2_super_record *record);
+int nfsd_ffv2_store_visible_chunk(struct nfsd_ffv2_store *store,
+				  const u8 file_key[32], u64 chunk_index,
+				  struct nfsd_ffv2_visible_chunk *chunk);
+#ifdef CONFIG_KUNIT
+int nfsd_ffv2_store_test_visible_replay(
+	const struct nfsd_ffv2_entry_record *entries, size_t count,
+	u32 chunk_bytes, u64 max_chunks, u64 query_index,
+	struct nfsd_ffv2_visible_chunk *chunk, u64 *eof);
+#endif
 int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data,
 				 size_t len, loff_t offset);
 int nfsd_ffv2_store_append_payload(struct nfsd_ffv2_store *store,
@@ -291,6 +313,8 @@ int nfsd_ffv2_store_checkpoint(struct nfsd_ffv2_store *store,
 #ifdef CONFIG_NFSD_FFV2_LIVE_TEST
 void nfsd_ffv2_store_test_fail_next_io(struct nfsd_ffv2_store *store);
 u64 nfsd_ffv2_store_test_payload_size(struct nfsd_ffv2_store *store);
+int nfsd_ffv2_store_test_visible_snapshot(struct nfsd_ffv2_store *store,
+					  u8 **snapshot, size_t *len);
 #endif
 
 #endif /* _NFSD_FFV2_STORE_H */
