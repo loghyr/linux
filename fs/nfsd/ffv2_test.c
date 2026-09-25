@@ -2810,7 +2810,7 @@ static void nfsd_ffv2_trust_lookup_test(struct kunit *test)
 	struct nfsd_ffv2_trust_fixture f = {};
 	struct nfsd_ffv2_trust_entry *entry;
 	struct nfsd_ffv2_trust_request req;
-	stateid_t sid, other;
+	stateid_t sid, other, member_b;
 
 	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_trust_fixture_init(test, &f, 31));
 
@@ -2875,6 +2875,25 @@ static void nfsd_ffv2_trust_lookup_test(struct kunit *test)
 			  nfsd_ffv2_trust_lookup(f.registry, &sid,
 						 nfsd_ffv2_test_uuid_a,
 						 f.epoch + 1));
+
+	/* Stateids and member handles are one pair and cannot be swapped. */
+	member_b = nfsd_ffv2_test_stateid(1, 0x44, 0x55, 0x66);
+	nfsd_ffv2_test_trust_request(&req, &member_b, nfsd_ffv2_test_uuid_b,
+				     IOMODE_RW, NULL, 3600);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_trust_install(f.registry, f.authority, NULL,
+						31, &req),
+			nfs_ok);
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_trust_lookup(f.registry, &sid,
+						       nfsd_ffv2_test_uuid_b,
+						       f.epoch));
+	KUNIT_EXPECT_NULL(test, nfsd_ffv2_trust_lookup(f.registry, &member_b,
+						       nfsd_ffv2_test_uuid_a,
+						       f.epoch));
+	entry = nfsd_ffv2_trust_lookup(f.registry, &member_b,
+				       nfsd_ffv2_test_uuid_b, f.epoch);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	nfsd_ffv2_trust_entry_put(entry);
 
 	nfsd_ffv2_trust_fixture_exit(test, &f);
 }
@@ -12440,6 +12459,131 @@ static void nfsd_ffv2_prototype_challenge_test(struct kunit *test)
 #define NFSD_FFV2_PROTO_CHUNKS		4
 #define NFSD_FFV2_PROTO_DOMAIN		"ffv2-proto-kunit"
 
+static void nfsd_ffv2_prototype_vector_identity_test(struct kunit *test)
+{
+	static const u8 handles[3][8] = {
+		{ 1, 0, 1, 1, 0x10, 0x11, 0x12, 0x13 },
+		{ 1, 0, 1, 1, 0x20, 0x21, 0x22, 0x23 },
+		{ 1, 0, 1, 1, 0x30, 0x31, 0x32, 0x33 },
+	};
+	static const u8 persisted[3][32] = {
+		{ [0 ... 31] = 0x41 },
+		{ [0 ... 31] = 0x42 },
+		{ [0 ... 31] = 0x43 },
+	};
+	static const u8 store_uuid[16] = { 1 };
+	static const u8 binding_token[32] = { 2 };
+	struct nfsd_ffv2_prototype_request original = {
+		.auth_domain = NFSD_FFV2_PROTO_DOMAIN,
+		.chunk_size = 4096,
+		.data_count = 1,
+		.parity_count = 1,
+		.store_uuid = store_uuid,
+		.binding_token = binding_token,
+		.writer_id = 7,
+		.pnfs_clientid = 9,
+		.object_count = 2,
+	};
+	struct nfsd_ffv2_prototype_request retry = original;
+	u8 changed[8];
+	u32 i;
+
+	for (i = 0; i < 3; i++) {
+		original.objects[i].handle = handles[i];
+		original.objects[i].handle_len = sizeof(handles[i]);
+		original.objects[i].persisted_handle = persisted[i];
+	}
+	retry = original;
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_request_equal(
+					&original, &retry));
+
+	memcpy(changed, handles[0], sizeof(changed));
+	changed[7] ^= 1;
+	retry.objects[0].handle = changed;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_request_equal(
+					 &original, &retry));
+
+	retry = original;
+	retry.object_count = 1;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_request_equal(
+					 &original, &retry));
+
+	retry = original;
+	retry.object_count = 3;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_request_equal(
+					 &original, &retry));
+
+	retry = original;
+	retry.objects[0] = original.objects[1];
+	retry.objects[1] = original.objects[0];
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_request_equal(
+					 &original, &retry));
+
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_prototype_test_geometry_valid(
+				  64, 64 * 1024, NFSD_FFV2_MAX_PAYLOAD_BYTES));
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd_ffv2_prototype_test_geometry_valid(
+				   64, 68 * 1024, NFSD_FFV2_MAX_PAYLOAD_BYTES));
+	KUNIT_EXPECT_FALSE(
+		test, nfsd_ffv2_prototype_test_geometry_valid(0, 64 * 1024, 0));
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd_ffv2_prototype_test_geometry_valid(
+				   65, 64 * 1024, NFSD_FFV2_MAX_PAYLOAD_BYTES));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_geometry_valid(
+					 64, 64 * 1024,
+					 NFSD_FFV2_MAX_PAYLOAD_BYTES + 1ULL));
+}
+
+static void nfsd_ffv2_member_identity_test(struct kunit *test)
+{
+	struct knfsd_fh inner[2] = {
+		{ .fh_size = 8, .fh_raw = { 1, 0, 1, 1, 1, 2, 3, 4 } },
+		{ .fh_size = 8, .fh_raw = { 1, 0, 1, 1, 5, 6, 7, 8 } },
+	};
+	u8 persisted[2][32] = {
+		{ [0 ... 15] = 0x10, [16 ... 31] = 0x20 },
+		{ [0 ... 15] = 0x10, [16 ... 31] = 0x30 },
+	};
+	struct inode *inodes;
+
+	inodes = kunit_kcalloc(test, 2, sizeof(*inodes), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, inodes);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_member_identity_duplicate(
+					 persisted[0], &inner[0], &inodes[0],
+					 persisted[1], &inner[1], &inodes[1]));
+
+	memcpy(persisted[1], persisted[0], sizeof(persisted[1]));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_member_identity_duplicate(
+					persisted[0], &inner[0], &inodes[0],
+					persisted[1], &inner[1], &inodes[1]));
+	persisted[1][0] ^= 1;
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_member_identity_duplicate(
+					persisted[0], &inner[0], &inodes[0],
+					persisted[1], &inner[1], &inodes[1]));
+
+	memset(persisted[1] + 16, 0x30, 16);
+	inner[1] = inner[0];
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_member_identity_duplicate(
+					persisted[0], &inner[0], &inodes[0],
+					persisted[1], &inner[1], &inodes[1]));
+	inner[1].fh_raw[7] ^= 1;
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_member_identity_duplicate(
+					persisted[0], &inner[0], &inodes[0],
+					persisted[1], &inner[1], &inodes[0]));
+
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_inner_fh_valid(&inner[0]));
+	inner[0].fh_size = 4;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_inner_fh_valid(&inner[0]));
+	inner[0].fh_size = NFSD_FFV2_FH_INNER_MAX + 4;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_inner_fh_valid(&inner[0]));
+	inner[0].fh_size = 10;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_inner_fh_valid(&inner[0]));
+	inner[0].fh_size = 8;
+	inner[0].fh_raw[0] = 2;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_inner_fh_valid(&inner[0]));
+}
+
 struct nfsd_ffv2_proto_fixture {
 	struct net			*net;
 	struct nfsd_net			*nn;
@@ -12889,6 +13033,15 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 	f->mapped->fh_export = nfsd_export_get(f->published);
 	f->mapped->fh_dentry = dget(f->object_dentry);
 	f->mapped->fh_ffv2_binding = f->binding;
+	/* Preparation's old export cannot substitute for the published one. */
+	f->mapped->fh_export = f->seeded;
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd_ffv2_test_mapped_target_valid(f->mapped,
+							      f->binding));
+	f->mapped->fh_export = f->published;
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_test_mapped_target_valid(f->mapped,
+							     f->binding));
 	f->binding = NULL;
 
 	memcpy(&stateid, bundle->stateid, sizeof(stateid));
@@ -12984,6 +13137,76 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 						       bundle->source_uuid,
 						       bundle->generation));
 out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
+static void nfsd_ffv2_prototype_registration_unwind_test(struct kunit *test)
+{
+	static const enum nfsd_ffv2_fault_phase phases[] = {
+		NFSD_FFV2_FAULT_PROTOTYPE_RESOLVE,
+		NFSD_FFV2_FAULT_TEMPLATE_CLONE,
+		NFSD_FFV2_FAULT_RESERVATION_CLAIM,
+		NFSD_FFV2_FAULT_CONTEXT_ALLOC,
+		NFSD_FFV2_FAULT_GENERATION_ALLOC,
+		NFSD_FFV2_FAULT_PROTOTYPE_MAPPED_ENCODE,
+		NFSD_FFV2_FAULT_EXACT_CURRENT,
+		NFSD_FFV2_FAULT_CACHE_REPLACE,
+		NFSD_FFV2_FAULT_REGISTRY_INSERT,
+		NFSD_FFV2_FAULT_GENERATION_ACTIVATE,
+		NFSD_FFV2_FAULT_PROTOTYPE_FILE_LOOKUP,
+		NFSD_FFV2_FAULT_PROTOTYPE_WRITER_ADMISSION,
+		NFSD_FFV2_FAULT_PROTOTYPE_PROVIDER_INSTALL,
+		NFSD_FFV2_FAULT_PROTOTYPE_TRUST_INSTALL,
+		NFSD_FFV2_FAULT_PROTOTYPE_PRE_READY,
+	};
+	struct nfsd_ffv2_prototype_bundle *bundle;
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct nfsd_ffv2_generation *generation;
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u64 expires;
+	u32 i;
+	int error;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+
+	for (i = 0; i < ARRAY_SIZE(phases); i++) {
+		if (!nfsd_ffv2_proto_fixture_init(test, f))
+			goto out;
+		KUNIT_ASSERT_EQ(test, nfsd_ffv2_prototype_enable(f->nn, f->net),
+				0);
+		f->enabled = true;
+		memset(bundle, 0, sizeof(*bundle));
+		KUNIT_ASSERT_EQ(test,
+				nfsd_ffv2_prototype_challenge(f->nn, f->net,
+							      nonce, &expires),
+				0);
+		nfsd_ffv2_proto_request(&req, nonce);
+		nfsd_ffv2_test_fault_arm(phases[i]);
+		error = nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     bundle);
+		KUNIT_EXPECT_LT_MSG(test, error, 0, "phase %u succeeded",
+				    phases[i]);
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_fault_hit(), phases[i]);
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_prototype_state_get(f->nn),
+				NFSD_FFV2_PROTOTYPE_OPEN);
+		generation = nfsd_ffv2_test_active_generation_get(f->nn);
+		KUNIT_EXPECT_PTR_EQ(test, generation, NULL);
+		if (generation)
+			nfsd_ffv2_test_generation_put(generation);
+		KUNIT_EXPECT_PTR_EQ(
+			test, memchr_inv(bundle, 0, sizeof(*bundle)), NULL);
+		KUNIT_EXPECT_EQ(test,
+				nfsd_ffv2_prototype_disable(f->nn, f->net), 0);
+		f->enabled = false;
+		nfsd_ffv2_proto_fixture_exit(f);
+	}
+	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_NONE);
+out:
+	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_NONE);
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
@@ -15356,7 +15579,13 @@ struct nfsd_ffv2_nl_register_args {
 	bool		omit_domain;
 	u32		object_count;
 	bool		missing_nested;
+	bool empty_child;
+	bool omit_last;
+	bool duplicate_type;
+	bool reverse_types;
+	bool output_attr;
 	u16		first_type;
+	u16 persisted_len;
 	u16		unknown_attr;
 };
 
@@ -15367,7 +15596,7 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 	static const u8 store_uuid[16] = { 1 };
 	static const u8 binding_token[32] = { 2 };
 	u8 persisted_handle[32] = { 3 };
-	u8 handle[NFS4_FHSIZE] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+	u8 handle[NFS4_FHSIZE + 1] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 	u8 object_attrs[256];
 	u8 children[896] = {};
 	char buf[NFSD_FFV2_NL_BUF];
@@ -15411,22 +15640,33 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 	if (!error)
 		error = nfsd_ffv2_nl_put_u64(buf, sizeof(buf), &off,
 					     NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID, 0);
-	for (i = 0; !error && i < count; i++) {
-		u16 type = (i ? i : a->first_type) |
-			   (a->missing_nested ? 0 : NLA_F_NESTED);
+	for (i = 0; !error && i < count - a->omit_last; i++) {
+		u16 index = a->reverse_types ? count - i - 1 : i;
+		u16 child_type = !i && a->first_type ? a->first_type : index;
+		u16 type = child_type | (a->missing_nested ? 0 : NLA_F_NESTED);
+
+		if (a->duplicate_type && i)
+			type = NLA_F_NESTED;
 
 		memset(object_attrs, 0, sizeof(object_attrs));
 		object_off = 0;
 		persisted_handle[31] = 3 + i;
-		error = nfsd_ffv2_nl_put(object_attrs, sizeof(object_attrs),
-			&object_off,
-			NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE,
-			handle, a->handle_len);
-		if (!error)
-			error = nfsd_ffv2_nl_put(object_attrs,
-						 sizeof(object_attrs), &object_off,
+		if (!a->empty_child)
+			error = nfsd_ffv2_nl_put(
+				object_attrs, sizeof(object_attrs), &object_off,
+				NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE,
+				handle, a->handle_len);
+		if (!error && !a->empty_child)
+			error = nfsd_ffv2_nl_put(
+				object_attrs, sizeof(object_attrs), &object_off,
 				NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE,
-				persisted_handle, sizeof(persisted_handle));
+				persisted_handle,
+				a->persisted_len ?: sizeof(persisted_handle));
+		if (!error && a->output_attr)
+			error = nfsd_ffv2_nl_put(
+				object_attrs, sizeof(object_attrs), &object_off,
+				NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE,
+				handle, 8);
 		if (!error)
 			error = nfsd_ffv2_nl_put(children, sizeof(children),
 						 &child_off, type, object_attrs,
@@ -15499,6 +15739,7 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 	args.nonce_len = sizeof(stranger) - 1;
 	args.domain = "ffv2-proto-kunit";
 	args.handle_len = 8;
+	args.persisted_len = 32;
 	args.chunk_size = 64;
 	args.data_count = 1;
 	/* A length the policy pins exactly is a range violation, not a
@@ -15551,6 +15792,60 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
 						    sizeof(reply)));
 	args.first_type = 0;
+	args.empty_child = true;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.empty_child = false;
+	args.omit_last = true;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.omit_last = false;
+	args.duplicate_type = true;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.duplicate_type = false;
+	args.reverse_types = true;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.reverse_types = false;
+	args.output_attr = true;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.output_attr = false;
+	args.persisted_len = 31;
+	KUNIT_EXPECT_EQ(test, -ERANGE,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.persisted_len = 32;
+	args.handle_len = 0;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.handle_len = NFS4_FHSIZE + 1;
+	KUNIT_EXPECT_EQ(test, -EMSGSIZE,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.handle_len = 8;
+	args.data_count = U32_MAX;
+	args.parity_count = 3;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.data_count = 1;
+	args.parity_count = 0;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.data_count = 0;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.data_count = 1;
 	args.object_count = 0;
 	args.parity_count = 0;
 
@@ -15974,7 +16269,10 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_close_pre_exit_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_challenge_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_nonce_reap_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_vector_identity_test),
+	KUNIT_CASE(nfsd_ffv2_member_identity_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_registration_unwind_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_giveup_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_hook_release_test),

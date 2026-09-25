@@ -101,6 +101,26 @@ nfsd_ffv2_fault_phase_name(enum nfsd_ffv2_fault_phase phase)
 		return "generation_activate";
 	case NFSD_FFV2_FAULT_REPLY_BUILD:
 		return "reply_build";
+	case NFSD_FFV2_FAULT_TRUST_REPLACE:
+		return "trust_replace";
+	case NFSD_FFV2_FAULT_PROTOTYPE_RESOLVE:
+		return "prototype_resolve";
+	case NFSD_FFV2_FAULT_PROTOTYPE_MAPPED_ENCODE:
+		return "prototype_mapped_encode";
+	case NFSD_FFV2_FAULT_PROTOTYPE_FILE_LOOKUP:
+		return "prototype_file_lookup";
+	case NFSD_FFV2_FAULT_PROTOTYPE_WRITER_ADMISSION:
+		return "prototype_writer_admission";
+	case NFSD_FFV2_FAULT_PROTOTYPE_PROVIDER_INSTALL:
+		return "prototype_provider_install";
+	case NFSD_FFV2_FAULT_PROTOTYPE_TRUST_INSTALL:
+		return "prototype_trust_install";
+	case NFSD_FFV2_FAULT_PROTOTYPE_PRE_READY:
+		return "prototype_pre_ready";
+	case NFSD_FFV2_FAULT_PROTOTYPE_SETUP:
+		return "prototype_setup";
+	case NFSD_FFV2_FAULT_RESPONSE_COPY:
+		return "response_copy";
 	case NFSD_FFV2_FAULT_NONE:
 	default:
 		return "none";
@@ -113,7 +133,7 @@ nfsd_ffv2_fault_phase_parse(const char *name)
 	enum nfsd_ffv2_fault_phase phase;
 
 	for (phase = NFSD_FFV2_FAULT_REPLY_SKB;
-	     phase <= NFSD_FFV2_FAULT_REPLY_BUILD; phase++)
+	     phase <= NFSD_FFV2_FAULT_RESPONSE_COPY; phase++)
 		if (!strcmp(name, nfsd_ffv2_fault_phase_name(phase)))
 			return phase;
 	return NFSD_FFV2_FAULT_NONE;

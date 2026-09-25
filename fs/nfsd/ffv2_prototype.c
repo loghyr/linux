@@ -1860,6 +1860,64 @@ out_close:
 }
 #endif
 
+static bool nfsd_ffv2_prototype_file_geometry_valid(u64 max_chunks,
+						    u32 chunk_bytes,
+						    u64 logical_eof)
+{
+	u64 capacity;
+
+	return max_chunks && max_chunks <= 64 &&
+	       !check_mul_overflow(max_chunks, (u64)chunk_bytes, &capacity) &&
+	       capacity && capacity <= NFSD_FFV2_MAX_PAYLOAD_BYTES &&
+	       logical_eof <= capacity;
+}
+
+static int nfsd_ffv2_prototype_store_vector_validate(
+	const struct nfsd_ffv2_store_file *const *files, u32 count,
+	u32 chunk_size)
+{
+	u64 max_chunks = 0;
+	u32 i, j;
+
+	for (i = 0; i < count; i++) {
+		if (!nfsd_ffv2_prototype_file_geometry_valid(
+			    files[i]->max_chunks, files[i]->chunk_bytes,
+			    files[i]->logical_eof) ||
+		    files[i]->chunk_bytes != chunk_size ||
+		    (max_chunks && files[i]->max_chunks != max_chunks))
+			return -EINVAL;
+		for (j = 0; j < i; j++)
+			if (!memcmp(files[i]->file_key, files[j]->file_key,
+				    sizeof(files[i]->file_key)))
+				return -EEXIST;
+		max_chunks = files[i]->max_chunks;
+	}
+	return count ? 0 : -EINVAL;
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+bool nfsd_ffv2_prototype_test_geometry_valid(u64 max_chunks, u32 chunk_bytes,
+					     u64 logical_eof)
+{
+	return nfsd_ffv2_prototype_file_geometry_valid(max_chunks, chunk_bytes,
+						       logical_eof);
+}
+
+bool nfsd_ffv2_prototype_test_store_vector_valid(
+	const struct nfsd_ffv2_store_file *files, u32 count, u32 chunk_size)
+{
+	const struct nfsd_ffv2_store_file *members[NFSD_FFV2_MAX_OBJECTS];
+	u32 i;
+
+	if (!count || count > ARRAY_SIZE(members))
+		return false;
+	for (i = 0; i < count; i++)
+		members[i] = &files[i];
+	return !nfsd_ffv2_prototype_store_vector_validate(members, count,
+							  chunk_size);
+}
+#endif
+
 static int
 nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 				   const struct cred *cred,
@@ -1870,9 +1928,8 @@ nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 {
 	struct nfsd_ffv2_prototype_provider *provider;
 	struct nfsd_ffv2_prototype_member *member;
-	u64 capacity;
-	u64 max_chunks = 0;
-	u32 i, j;
+	const struct nfsd_ffv2_store_file *files[NFSD_FFV2_MAX_OBJECTS];
+	u32 i;
 	int error;
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
@@ -1900,29 +1957,15 @@ nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 						    &member->file);
 		if (error)
 			goto out_free;
-		for (j = 0; j < i; j++) {
-			if (!memcmp(member->file.file_key,
-				    provider->members[j].file.file_key,
-				    sizeof(member->file.file_key))) {
-				error = -EEXIST;
-				goto out_free;
-			}
-		}
-		if (check_mul_overflow(member->file.max_chunks,
-				       (u64)member->file.chunk_bytes, &capacity) ||
-		    !capacity || capacity > NFSD_FFV2_MAX_PAYLOAD_BYTES ||
-		    !member->file.max_chunks || member->file.max_chunks > 64 ||
-		    member->file.chunk_bytes != chunk_size ||
-		    member->file.logical_eof > capacity ||
-		    (max_chunks && member->file.max_chunks != max_chunks)) {
-			error = -EINVAL;
-			goto out_free;
-		}
-		max_chunks = member->file.max_chunks;
+		files[i] = &member->file;
 		memcpy(member->store_handle, persisted_handles[i], 32);
 	}
+	error = nfsd_ffv2_prototype_store_vector_validate(files, count,
+							  chunk_size);
+	if (error)
+		goto out_free;
 	provider->chunk_size = chunk_size;
-	provider->chunks = max_chunks;
+	provider->chunks = files[0]->max_chunks;
 	provider->visible = nfsd_ffv2_prototype_store_visible;
 	provider->read_payload = nfsd_ffv2_prototype_store_read_payload;
 	provider->reader = provider->store;
@@ -2083,6 +2126,19 @@ nfsd_ffv2_prototype_commit_record(struct nfsd_ffv2_prototype_committed *rec,
 		memcpy(rec->objects[i].persisted_handle, persisted, 32);
 	}
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+bool nfsd_ffv2_prototype_test_request_equal(
+	const struct nfsd_ffv2_prototype_request *left,
+	const struct nfsd_ffv2_prototype_request *right)
+{
+	struct nfsd_ffv2_prototype_committed left_record, right_record;
+
+	nfsd_ffv2_prototype_commit_record(&left_record, left);
+	nfsd_ffv2_prototype_commit_record(&right_record, right);
+	return !memcmp(&left_record, &right_record, sizeof(left_record));
+}
+#endif
 
 /*
  * Install the one trust entry the demonstrator reads through, and mint the
@@ -2279,6 +2335,10 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 		}
 	}
 	fhs_live = true;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_PROTOTYPE_RESOLVE)) {
+		error = -EIO;
+		goto out_registration;
+	}
 	path.mnt = work->fhps[0].fh_export->ex_path.mnt;
 	path.dentry = work->fhps[0].fh_dentry;
 	/*
@@ -2336,6 +2396,10 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 						   generation_id, &provider);
 	if (error)
 		goto out_published;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_PROTOTYPE_FILE_LOOKUP)) {
+		error = -EIO;
+		goto out_published;
+	}
 	if (provider->store) {
 		error = nfsd_ffv2_store_admit_writers(provider->store,
 						      req->writer_id,
@@ -2361,11 +2425,21 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	}
 	if (error)
 		goto out_published;
+	if (nfsd_ffv2_fault_inject(
+		    NFSD_FFV2_FAULT_PROTOTYPE_WRITER_ADMISSION)) {
+		error = -EIO;
+		goto out_published;
+	}
 	error = nfsd_ffv2_provider_install(nn, &nfsd_ffv2_prototype_provider_ops,
 					   provider, req->chunk_size);
 	if (error)
 		goto out_published;
 	installed = true;
+	if (nfsd_ffv2_fault_inject(
+		    NFSD_FFV2_FAULT_PROTOTYPE_PROVIDER_INSTALL)) {
+		error = -EIO;
+		goto out_published;
+	}
 	memset(staged, 0, sizeof(*staged));
 	for (i = 0; i < object_count; i++) {
 		stateid_t stateid;
@@ -2401,6 +2475,10 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	memcpy(staged->handle, staged->objects[0].handle,
 	       staged->objects[0].handle_len);
 	staged->handle_len = staged->objects[0].handle_len;
+	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_PROTOTYPE_PRE_READY)) {
+		error = -EIO;
+		goto out_published;
+	}
 
 	/*
 	 * The single linearization point.  Until this store a mapping is

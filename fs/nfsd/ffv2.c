@@ -202,6 +202,13 @@ static const u8 nfsd_ffv2_fh_magic[8] = {
 	0xff, 'F', 'F', 'V', '2', 'F', 'H', 0,
 };
 
+static bool nfsd_ffv2_inner_fh_valid(const struct knfsd_fh *inner)
+{
+	return inner->fh_size >= 8 &&
+	       inner->fh_size <= NFSD_FFV2_FH_INNER_MAX &&
+	       !(inner->fh_size & 3) && inner->fh_raw[0] == 1;
+}
+
 int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info)
 {
 	const u8 *raw = fh->fh_raw;
@@ -1382,6 +1389,10 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 		fh_info.inner = object->inner_fh.fh_raw;
 		fh_info.inner_len = object->inner_fh.fh_size;
 		error = nfsd_ffv2_fh_encode(&outer_fhs[i], &fh_info);
+		if (!error && !i &&
+		    nfsd_ffv2_fault_inject(
+			    NFSD_FFV2_FAULT_PROTOTYPE_MAPPED_ENCODE))
+			error = -ENOMEM;
 		if (error) {
 			nfsd_ffv2_generation_cancel(owner, generation);
 			nfsd_ffv2_service_context_abort(context, NULL);
@@ -1641,9 +1652,7 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 		goto out_put_fh;
 	}
 	object->inner_fh = ordinary.fh_handle;
-	if (object->inner_fh.fh_size < 8 ||
-	    object->inner_fh.fh_size > NFSD_FFV2_FH_INNER_MAX ||
-	    object->inner_fh.fh_size & 3 || object->inner_fh.fh_raw[0] != 1) {
+	if (!nfsd_ffv2_inner_fh_valid(&object->inner_fh)) {
 		error = -E2BIG;
 		goto out_put_fh;
 	}
@@ -2544,6 +2553,22 @@ int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v)
 	return 0;
 }
 
+static bool
+nfsd_ffv2_mapped_target_valid(struct svc_fh *fhp,
+			      struct nfsd_ffv2_binding *binding)
+{
+	struct nfsd_ffv2_service_context *context =
+		binding->admission.generation->payload;
+
+	return fhp->fh_export->ex_uuid && context &&
+	       fhp->fh_export == context->export &&
+	       !memcmp(fhp->fh_export->ex_uuid, binding->object->export_uuid,
+		       sizeof(binding->object->export_uuid)) &&
+	       fhp->fh_export->ex_client == binding->object->client &&
+	       fhp->fh_dentry == binding->object->object_path.dentry &&
+	       !nfsd_ffv2_object_validate(fhp->fh_export, binding->object);
+}
+
 __be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp)
 {
 	struct nfsd_ffv2_binding *binding;
@@ -2580,15 +2605,7 @@ __be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp)
 				       NFSD_MAY_BYPASS_GSS);
 	if (status)
 		goto out_fh;
-	if (!fhp->fh_export->ex_uuid ||
-	    !binding->admission.generation->payload ||
-	    fhp->fh_export != ((struct nfsd_ffv2_service_context *)
-		binding->admission.generation->payload)->export ||
-	    memcmp(fhp->fh_export->ex_uuid, binding->object->export_uuid,
-		   sizeof(binding->object->export_uuid)) ||
-	    fhp->fh_export->ex_client != binding->object->client ||
-	    fhp->fh_dentry != binding->object->object_path.dentry ||
-	    nfsd_ffv2_object_validate(fhp->fh_export, binding->object)) {
+	if (!nfsd_ffv2_mapped_target_valid(fhp, binding)) {
 		status = nfserr_stale;
 		goto out_fh;
 	}
@@ -4450,8 +4467,13 @@ __be32 nfsd_ffv2_trust_install(struct nfsd_ffv2_trust_registry *registry,
 			replaced = old;
 		}
 	} else {
-		error = rhashtable_insert_fast(&registry->table, &entry->node,
-					       nfsd_ffv2_trust_params);
+		if (nfsd_ffv2_fault_inject(
+			    NFSD_FFV2_FAULT_PROTOTYPE_TRUST_INSTALL))
+			error = -ENOMEM;
+		else
+			error = rhashtable_insert_fast(&registry->table,
+						       &entry->node,
+						       nfsd_ffv2_trust_params);
 	}
 	if (error) {
 		/* The old entry, if any, is still hashed and still LIVE. */
@@ -5226,9 +5248,7 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 	path_get(&object->object_path);
 	object->object_valid = true;
 	object->inner_fh = fhp->fh_handle;
-	if (object->inner_fh.fh_size < 8 ||
-	    object->inner_fh.fh_size > NFSD_FFV2_FH_INNER_MAX ||
-	    object->inner_fh.fh_size & 3 || object->inner_fh.fh_raw[0] != 1) {
+	if (!nfsd_ffv2_inner_fh_valid(&object->inner_fh)) {
 		nfsd_ffv2_object_free(object);
 		return -E2BIG;
 	}
@@ -5258,6 +5278,37 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 	nfsd_export_put(exp);
 	return error;
 }
+
+static bool nfsd_ffv2_member_identity_duplicate(
+	const u8 first_persisted[32], const struct knfsd_fh *first_inner,
+	const struct inode *first_inode, const u8 second_persisted[32],
+	const struct knfsd_fh *second_inner, const struct inode *second_inode)
+{
+	return !memcmp(first_persisted, second_persisted, 32) ||
+	       first_inode == second_inode ||
+	       (first_inner->fh_size == second_inner->fh_size &&
+		!memcmp(first_inner->fh_raw, second_inner->fh_raw,
+			first_inner->fh_size)) ||
+	       !memcmp(first_persisted + 16, second_persisted + 16, 16);
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+bool nfsd_ffv2_test_inner_fh_valid(const struct knfsd_fh *inner)
+{
+	return nfsd_ffv2_inner_fh_valid(inner);
+}
+
+bool nfsd_ffv2_test_member_identity_duplicate(
+	const u8 first_persisted[32], const struct knfsd_fh *first_inner,
+	const struct inode *first_inode, const u8 second_persisted[32],
+	const struct knfsd_fh *second_inner, const struct inode *second_inode)
+{
+	return nfsd_ffv2_member_identity_duplicate(first_persisted, first_inner,
+						   first_inode,
+						   second_persisted,
+						   second_inner, second_inode);
+}
+#endif
 
 int nfsd_ffv2_object_register_fhs(struct nfsd_net *nn,
 				  struct nfsd_ffv2_export_update *registration,
@@ -5299,24 +5350,16 @@ int nfsd_ffv2_object_register_fhs(struct nfsd_net *nn,
 			error = -EXDEV;
 			goto out_fhs;
 		}
-		if (fhps[i].fh_handle.fh_size < 8 ||
-		    fhps[i].fh_handle.fh_size > NFSD_FFV2_FH_INNER_MAX ||
-		    fhps[i].fh_handle.fh_size & 3 ||
-		    fhps[i].fh_handle.fh_raw[0] != 1) {
+		if (!nfsd_ffv2_inner_fh_valid(&fhps[i].fh_handle)) {
 			error = -E2BIG;
 			goto out_fhs;
 		}
 		for (j = 0; j < i; j++) {
-			if (!memcmp(persisted_handles[i], persisted_handles[j], 32) ||
-			    d_inode(fhps[i].fh_dentry) ==
-				    d_inode(fhps[j].fh_dentry) ||
-			    (fhps[i].fh_handle.fh_size ==
-					    fhps[j].fh_handle.fh_size &&
-			     !memcmp(fhps[i].fh_handle.fh_raw,
-				     fhps[j].fh_handle.fh_raw,
-				     fhps[i].fh_handle.fh_size)) ||
-			    !memcmp(persisted_handles[i] + 16,
-				    persisted_handles[j] + 16, 16)) {
+			if (nfsd_ffv2_member_identity_duplicate(
+				    persisted_handles[i], &fhps[i].fh_handle,
+				    d_inode(fhps[i].fh_dentry),
+				    persisted_handles[j], &fhps[j].fh_handle,
+				    d_inode(fhps[j].fh_dentry))) {
 				error = -EEXIST;
 				goto out_fhs;
 			}
@@ -5567,6 +5610,12 @@ __be32 nfsd_ffv2_test_validate_operation(struct svc_rqst *rqstp,
 {
 	return nfsd_ffv2_validate_operation(rqstp, fhp, session, opnum,
 					    stateid, actor, admission);
+}
+
+bool nfsd_ffv2_test_mapped_target_valid(
+	struct svc_fh *fhp, struct nfsd_ffv2_binding *binding)
+{
+	return nfsd_ffv2_mapped_target_valid(fhp, binding);
 }
 #endif
 

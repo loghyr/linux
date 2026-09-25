@@ -281,6 +281,13 @@ int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 void nfsd_ffv2_prototype_test_nonce_age(struct nfsd_net *nn, const u8 *nonce);
 unsigned int nfsd_ffv2_prototype_test_nonce_count(struct nfsd_net *nn);
 unsigned int nfsd_ffv2_prototype_test_close_waiters(struct nfsd_net *nn);
+bool nfsd_ffv2_prototype_test_request_equal(
+	const struct nfsd_ffv2_prototype_request *left,
+	const struct nfsd_ffv2_prototype_request *right);
+bool nfsd_ffv2_prototype_test_geometry_valid(u64 max_chunks, u32 chunk_bytes,
+					     u64 logical_eof);
+bool nfsd_ffv2_prototype_test_store_vector_valid(
+	const struct nfsd_ffv2_store_file *files, u32 count, u32 chunk_size);
 #endif
 #else
 static inline void nfsd_ffv2_prototype_net_init(struct nfsd_net *nn) { }

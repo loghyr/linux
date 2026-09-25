@@ -5,6 +5,7 @@
 #include <linux/unaligned.h>
 #include <crypto/sha2.h>
 
+#include "ffv2_prototype.h"
 #include "ffv2_store.h"
 
 static void ffv2_test_fill(u8 *data, size_t len, u8 first)
@@ -960,6 +961,365 @@ static void ffv2_visible_pending_committed_rollback_test(struct kunit *test)
 			-EBADMSG);
 }
 
+static void ffv2_store_test_operation(struct nfsd_ffv2_store_operation *op,
+				      u32 sequence, u8 digest)
+{
+	memset(op, 0, sizeof(*op));
+	memset(op->session, 0x51, sizeof(op->session));
+	op->slot = 1;
+	op->sequence = sequence;
+	memset(op->request_digest, digest, sizeof(op->request_digest));
+}
+
+static void ffv2_store_test_write_request(struct nfsd_ffv2_store_write *write,
+					  u32 admission_id, u64 chunk_index,
+					  u32 owner_co_id, u32 sequence)
+{
+	static const u8 content[32] = { [0 ... 31] = 0xa5 };
+
+	memset(write, 0, sizeof(*write));
+	ffv2_store_test_operation(&write->operation, sequence, sequence);
+	write->admission_id = admission_id;
+	write->chunk_index = chunk_index;
+	write->owner_cohort = 0x4234000000000001ULL;
+	write->owner_client_id = 0x5150;
+	write->owner_co_id = owner_co_id;
+	write->writer_payload_id = 0x8000 + sequence;
+	write->checksum_algorithm = NFSD_FFV2_STORE_CHECKSUM_NONE;
+	write->content = content;
+	write->content_len = sizeof(content);
+}
+
+static void
+ffv2_store_test_lifecycle_request(struct nfsd_ffv2_store_lifecycle *lifecycle,
+				  u32 admission_id, u64 chunk_index,
+				  u32 owner_co_id, u32 sequence)
+{
+	memset(lifecycle, 0, sizeof(*lifecycle));
+	ffv2_store_test_operation(&lifecycle->operation, sequence, sequence);
+	lifecycle->admission_id = admission_id;
+	lifecycle->chunk_index = chunk_index;
+	lifecycle->owner_cohort = 0x4234000000000001ULL;
+	lifecycle->owner_client_id = 0x5150;
+	lifecycle->owner_co_id = owner_co_id;
+}
+
+static void ffv2_store_test_close_action(void *data)
+{
+	nfsd_ffv2_store_test_close(data);
+}
+
+static void ffv2_store_multi_admission_lifecycle_test(struct kunit *test)
+{
+	struct nfsd_ffv2_store_admission admitted[2], fresh[2];
+	struct nfsd_ffv2_store_mutation_result result;
+	struct nfsd_ffv2_store_lifecycle lifecycle;
+	struct nfsd_ffv2_store_write write;
+	struct nfsd_ffv2_store *store, *reopened;
+	u8 file_keys[2][32];
+	u64 payload_size, wal_size;
+	int error;
+
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_create(&store, file_keys),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, ffv2_store_test_close_action, store),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(store, 0x5150, 2,
+							   admitted),
+			0);
+	KUNIT_ASSERT_NE(test, admitted[0].id, admitted[1].id);
+
+	/* A refusal before append neither binds nor poisons the admission. */
+	ffv2_store_test_write_request(&write, admitted[0].id, 0, 1, 1);
+	write.checksum_algorithm = U32_MAX;
+	payload_size = nfsd_ffv2_store_test_payload_size_kunit(store);
+	wal_size = nfsd_ffv2_store_test_wal_size(store);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_kunit_write(store, file_keys[0], &write,
+						   &result),
+			-EINVAL);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_store_test_binding(
+					 store, admitted[0].id, file_keys[0]));
+	KUNIT_EXPECT_EQ(test, payload_size,
+			nfsd_ffv2_store_test_payload_size_kunit(store));
+	KUNIT_EXPECT_EQ(test, wal_size, nfsd_ffv2_store_test_wal_size(store));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_store_test_failed(store));
+
+	ffv2_store_test_write_request(&write, admitted[0].id, 0, 1, 2);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_kunit_write(store, file_keys[0], &write,
+						   &result),
+			0);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_store_test_binding(
+					store, admitted[0].id, file_keys[0]));
+	ffv2_store_test_write_request(&write, admitted[0].id, 1, 2, 3);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_kunit_write(store, file_keys[0], &write,
+						   &result),
+			0);
+
+	/* The established A admission is rejected for B before any append. */
+	ffv2_store_test_write_request(&write, admitted[0].id, 0, 3, 4);
+	payload_size = nfsd_ffv2_store_test_payload_size_kunit(store);
+	wal_size = nfsd_ffv2_store_test_wal_size(store);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_kunit_write(store, file_keys[1], &write,
+						   &result),
+			-EINVAL);
+	KUNIT_EXPECT_EQ(test, payload_size,
+			nfsd_ffv2_store_test_payload_size_kunit(store));
+	KUNIT_EXPECT_EQ(test, wal_size, nfsd_ffv2_store_test_wal_size(store));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_store_test_failed(store));
+
+	/* Empty and cross-admission lifecycle requests are rejected. */
+	ffv2_store_test_lifecycle_request(&lifecycle, admitted[1].id, 0, 3, 5);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_test_lifecycle(store, file_keys[1],
+						       &lifecycle, &result,
+						       NFSD_FFV2_FINALIZED),
+			-EINVAL);
+	ffv2_store_test_lifecycle_request(&lifecycle, admitted[1].id, 0, 1, 6);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_test_lifecycle(store, file_keys[0],
+						       &lifecycle, &result,
+						       NFSD_FFV2_FINALIZED),
+			-EINVAL);
+
+	ffv2_store_test_write_request(&write, admitted[1].id, 0, 3, 7);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_kunit_write(store, file_keys[1], &write,
+						   &result),
+			0);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_store_test_binding(
+					store, admitted[1].id, file_keys[1]));
+
+	ffv2_store_test_lifecycle_request(&lifecycle, admitted[0].id, 0, 1, 8);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lifecycle(store, file_keys[0],
+						       &lifecycle, &result,
+						       NFSD_FFV2_FINALIZED),
+			0);
+	ffv2_store_test_operation(&lifecycle.operation, 9, 9);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lifecycle(store, file_keys[0],
+						       &lifecycle, &result,
+						       NFSD_FFV2_COMMITTED),
+			0);
+	ffv2_store_test_lifecycle_request(&lifecycle, admitted[0].id, 1, 2, 10);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lifecycle(store, file_keys[0],
+						       &lifecycle, &result,
+						       NFSD_FFV2_FINALIZED),
+			0);
+	ffv2_store_test_operation(&lifecycle.operation, 11, 11);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lifecycle(store, file_keys[0],
+						       &lifecycle, &result,
+						       NFSD_FFV2_COMMITTED),
+			0);
+	ffv2_store_test_lifecycle_request(&lifecycle, admitted[1].id, 0, 3, 12);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lifecycle(store, file_keys[1],
+						       &lifecycle, &result,
+						       NFSD_FFV2_FINALIZED),
+			0);
+	ffv2_store_test_operation(&lifecycle.operation, 13, 13);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lifecycle(store, file_keys[1],
+						       &lifecycle, &result,
+						       NFSD_FFV2_COMMITTED),
+			0);
+
+	error = nfsd_ffv2_store_test_reopen(store, &reopened, file_keys);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, ffv2_store_test_close_action, reopened),
+			0);
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_store_test_binding(reopened, admitted[0].id,
+						       file_keys[0]));
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_store_test_binding(reopened, admitted[1].id,
+						       file_keys[1]));
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(reopened, 0x5150, 2,
+							   fresh),
+			0);
+	KUNIT_EXPECT_GT(test, fresh[0].id, admitted[1].id);
+	ffv2_store_test_write_request(&write, fresh[0].id, 2, 4, 14);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_kunit_write(reopened, file_keys[0],
+						   &write, &result),
+			0);
+}
+
+static void ffv2_store_failed_binding_publish_test(struct kunit *test)
+{
+	struct nfsd_ffv2_store_admission admitted;
+	struct nfsd_ffv2_store_mutation_result result;
+	struct nfsd_ffv2_store_write write;
+	struct nfsd_ffv2_store *store;
+	u8 file_keys[2][32];
+	u64 wal_size;
+
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_create(&store, file_keys),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, ffv2_store_test_close_action, store),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(store, 0x5150, 1,
+							   &admitted),
+			0);
+	ffv2_store_test_write_request(&write, admitted.id, 0, 1, 1);
+	wal_size = nfsd_ffv2_store_test_wal_size(store);
+	nfsd_ffv2_store_test_fail_visible_replay(store);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_kunit_write(store, file_keys[0], &write,
+						   &result),
+			-EBADMSG);
+	KUNIT_EXPECT_GT(test, nfsd_ffv2_store_test_wal_size(store), wal_size);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_store_test_failed(store));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_store_test_binding(
+					 store, admitted.id, file_keys[0]));
+}
+
+static void ffv2_store_admission_capacity_test(struct kunit *test)
+{
+	struct nfsd_ffv2_store_admission admitted[4];
+	struct nfsd_ffv2_store *store;
+	u8 file_keys[2][32];
+	u32 i;
+
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_create(&store, file_keys),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, ffv2_store_test_close_action, store),
+			0);
+	for (i = 0; i < 7; i++)
+		KUNIT_ASSERT_EQ(test,
+				nfsd_ffv2_store_test_admit_writers(
+					store, 0x5150, 4, admitted),
+				0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(store, 0x5150, 3,
+							   admitted),
+			0);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_admission_count(store), 31u);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(store, 0x5150, 2,
+							   admitted),
+			-ENOSPC);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_admission_count(store), 31u);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(store, 0x5150, 1,
+							   admitted),
+			0);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_admission_count(store), 32u);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(store, 0x5150, 1,
+							   admitted),
+			-ENOSPC);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_admission_count(store), 32u);
+}
+
+static void ffv2_store_durable_prefix_test(struct kunit *test)
+{
+	struct nfsd_ffv2_store_admission lost, fresh;
+	struct nfsd_ffv2_store *store, *reopened;
+	u8 file_keys[2][32];
+
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_create(&store, file_keys),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, ffv2_store_test_close_action, store),
+			0);
+	nfsd_ffv2_store_test_fail_admission_after_trust(store);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(store, 0x5150, 1,
+							   &lost),
+			-EIO);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_admission_count(store), 1u);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_store_test_failed(store));
+	KUNIT_ASSERT_EQ(
+		test, nfsd_ffv2_store_test_reopen(store, &reopened, file_keys),
+		0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, ffv2_store_test_close_action, reopened),
+			0);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_admission_count(reopened),
+			1u);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_admit_writers(reopened, 0x5150, 1,
+							   &fresh),
+			0);
+	KUNIT_EXPECT_GT(test, fresh.id, lost.id);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_admission_count(reopened),
+			2u);
+}
+
+static void ffv2_store_complete_vector_test(struct kunit *test)
+{
+	struct nfsd_ffv2_store_file files[2];
+	struct nfsd_ffv2_store *store;
+	u8 file_keys[2][32];
+	u8 handles[2][32] = { { [0] = 1 }, { [1] = 2 } };
+	u8 wrong[32];
+
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_create(&store, file_keys),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, ffv2_store_test_close_action, store),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lookup_file(store, handles[0],
+							 &files[0]),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lookup_file(store, handles[1],
+							 &files[1]),
+			0);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_prototype_test_store_vector_valid(
+					files, ARRAY_SIZE(files), 4096));
+
+	memcpy(wrong, handles[0], sizeof(wrong));
+	wrong[31] = 1;
+	KUNIT_EXPECT_EQ(
+		test, nfsd_ffv2_store_test_lookup_file(store, wrong, &files[0]),
+		-ENOENT);
+	memcpy(wrong, handles[0], sizeof(wrong));
+	wrong[0] = 0;
+	wrong[15] = 1;
+	KUNIT_EXPECT_EQ(
+		test, nfsd_ffv2_store_test_lookup_file(store, wrong, &files[0]),
+		-ENOENT);
+
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lookup_file(store, handles[0],
+							 &files[0]),
+			0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_lookup_file(store, handles[0],
+							 &files[1]),
+			0);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_store_vector_valid(
+					 files, ARRAY_SIZE(files), 4096));
+	files[1] = files[0];
+	files[1].file_key[0] ^= 1;
+	files[1].max_chunks++;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_prototype_test_store_vector_valid(
+					 files, ARRAY_SIZE(files), 4096));
+}
+
 static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_super_vector_test),
 	KUNIT_CASE(ffv2_start_vector_test),
@@ -977,6 +1337,11 @@ static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_visible_pending_lifetime_test),
 	KUNIT_CASE(ffv2_visible_predecessor_generation_test),
 	KUNIT_CASE(ffv2_visible_pending_committed_rollback_test),
+	KUNIT_CASE(ffv2_store_multi_admission_lifecycle_test),
+	KUNIT_CASE(ffv2_store_failed_binding_publish_test),
+	KUNIT_CASE(ffv2_store_admission_capacity_test),
+	KUNIT_CASE(ffv2_store_durable_prefix_test),
+	KUNIT_CASE(ffv2_store_complete_vector_test),
 	{},
 };
 

@@ -408,6 +408,35 @@ int nfsd_ffv2_store_test_visible_replay(
 	const struct nfsd_ffv2_entry_record *entries, size_t count,
 	u32 chunk_bytes, u64 max_chunks, u64 query_index,
 	struct nfsd_ffv2_visible_chunk *chunk, u64 *eof);
+int nfsd_ffv2_store_test_create(struct nfsd_ffv2_store **result,
+				u8 file_keys[2][32]);
+int nfsd_ffv2_store_test_reopen(struct nfsd_ffv2_store *old,
+				struct nfsd_ffv2_store **result,
+				const u8 file_keys[2][32]);
+int nfsd_ffv2_store_test_lookup_file(struct nfsd_ffv2_store *store,
+				     const u8 handle[32],
+				     struct nfsd_ffv2_store_file *file);
+void nfsd_ffv2_store_test_close(struct nfsd_ffv2_store *store);
+int nfsd_ffv2_store_test_admit_writers(struct nfsd_ffv2_store *store,
+				       u32 writer, u32 count,
+				       struct nfsd_ffv2_store_admission *result);
+int nfsd_ffv2_store_kunit_write(struct nfsd_ffv2_store *store,
+			       const u8 file_key[32],
+			       const struct nfsd_ffv2_store_write *request,
+			       struct nfsd_ffv2_store_mutation_result *result);
+int nfsd_ffv2_store_test_lifecycle(
+	struct nfsd_ffv2_store *store, const u8 file_key[32],
+	const struct nfsd_ffv2_store_lifecycle *request,
+	struct nfsd_ffv2_store_mutation_result *result, u32 transition);
+bool nfsd_ffv2_store_test_binding(struct nfsd_ffv2_store *store, u32 id,
+				  const u8 file_key[32]);
+void nfsd_ffv2_store_test_fail_visible_replay(struct nfsd_ffv2_store *store);
+void nfsd_ffv2_store_test_fail_admission_after_trust(
+	struct nfsd_ffv2_store *store);
+u32 nfsd_ffv2_store_test_admission_count(struct nfsd_ffv2_store *store);
+bool nfsd_ffv2_store_test_failed(struct nfsd_ffv2_store *store);
+u64 nfsd_ffv2_store_test_wal_size(struct nfsd_ffv2_store *store);
+u64 nfsd_ffv2_store_test_payload_size_kunit(struct nfsd_ffv2_store *store);
 #endif
 int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data,
 				 size_t len, loff_t offset);

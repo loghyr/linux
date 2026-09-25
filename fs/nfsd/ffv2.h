@@ -585,6 +585,13 @@ enum nfsd_ffv2_fault_phase {
 	NFSD_FFV2_FAULT_GENERATION_ACTIVATE,
 	NFSD_FFV2_FAULT_REPLY_BUILD,
 	NFSD_FFV2_FAULT_TRUST_REPLACE,
+	NFSD_FFV2_FAULT_PROTOTYPE_RESOLVE,
+	NFSD_FFV2_FAULT_PROTOTYPE_MAPPED_ENCODE,
+	NFSD_FFV2_FAULT_PROTOTYPE_FILE_LOOKUP,
+	NFSD_FFV2_FAULT_PROTOTYPE_WRITER_ADMISSION,
+	NFSD_FFV2_FAULT_PROTOTYPE_PROVIDER_INSTALL,
+	NFSD_FFV2_FAULT_PROTOTYPE_TRUST_INSTALL,
+	NFSD_FFV2_FAULT_PROTOTYPE_PRE_READY,
 	NFSD_FFV2_FAULT_PROTOTYPE_SETUP,
 	NFSD_FFV2_FAULT_RESPONSE_COPY,
 };
@@ -680,6 +687,11 @@ void nfsd_ffv2_test_worker(struct svc_rqst *rqstp, struct svc_xprt *xprt);
 void nfsd_ffv2_test_set_start_failure(bool fail);
 bool nfsd_ffv2_test_start_failure(void);
 void nfsd_ffv2_test_fault_arm(enum nfsd_ffv2_fault_phase phase);
+bool nfsd_ffv2_test_member_identity_duplicate(
+	const u8 first_persisted[32], const struct knfsd_fh *first_inner,
+	const struct inode *first_inode, const u8 second_persisted[32],
+	const struct knfsd_fh *second_inner, const struct inode *second_inode);
+bool nfsd_ffv2_test_inner_fh_valid(const struct knfsd_fh *inner);
 struct nfsd_ffv2_authority *
 nfsd_ffv2_test_authority_create(struct nfsd_net *nn,
 				struct nfsd4_session *session);
@@ -759,6 +771,8 @@ void *nfsd_ffv2_test_provider_unpublish(struct nfsd_net *nn);
 void nfsd_ffv2_test_provider_drain(void *handle);
 u64 nfsd_ffv2_test_provider_fenced(void);
 void nfsd_ffv2_test_release_counters(u64 *admissions, u64 *providers);
+bool nfsd_ffv2_test_mapped_target_valid(
+	struct svc_fh *fhp, struct nfsd_ffv2_binding *binding);
 
 /*
  * What the server built for the last compound reply, as values: the head's
