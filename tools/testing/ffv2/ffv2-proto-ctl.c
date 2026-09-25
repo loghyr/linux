@@ -128,6 +128,11 @@ static void nl_put_u32(struct ffv2_nl *nl, uint16_t type, uint32_t value)
 	nl_put(nl, type, &value, sizeof(value));
 }
 
+static void nl_put_u64(struct ffv2_nl *nl, uint16_t type, uint64_t value)
+{
+	nl_put(nl, type, &value, sizeof(value));
+}
+
 static void nl_put_str(struct ffv2_nl *nl, uint16_t type, const char *value)
 {
 	nl_put(nl, type, value, (uint16_t)(strlen(value) + 1));
@@ -279,7 +284,8 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 			 const char *handle_hex, uint32_t chunk_size,
 			 uint32_t data_count, const char *store_uuid_hex,
 			 const char *binding_token_hex,
-			 const char *persisted_handle_hex, const char *bundle_path,
+			 const char *persisted_handle_hex, uint32_t writer_id,
+			 uint64_t pnfs_clientid, const char *bundle_path,
 			 const char *run)
 {
 	uint8_t reply[NLMSG_BUF_SIZE];
@@ -335,6 +341,8 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	       sizeof(binding_token));
 	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE, persisted_handle,
 	       sizeof(persisted_handle));
+	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_WRITER_ID, writer_id);
+	nl_put_u64(nl, NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID, pnfs_clientid);
 	len = nl_talk(nl, reply, sizeof(reply));
 
 	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID);
@@ -470,7 +478,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: ffv2-proto-ctl enable\n"
-		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count> <store-uuid-hex> <binding-token-hex> <persisted-handle-hex> [bundle-path [run-token]]\n"
+		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count> <store-uuid-hex> <binding-token-hex> <persisted-handle-hex> <writer-id> <pnfs-clientid> [bundle-path [run-token]]\n"
 		"       ffv2-proto-ctl unregister <source-uuid-hex> <generation>\n"
 		"       ffv2-proto-ctl disable\n");
 	exit(2);
@@ -486,13 +494,15 @@ int main(int argc, char **argv)
 
 	if (!strcmp(argv[1], "enable") && argc == 2)
 		cmd_enable(&nl);
-	else if (!strcmp(argv[1], "register") && argc >= 9 && argc <= 11)
+	else if (!strcmp(argv[1], "register") && argc >= 11 && argc <= 13)
 		cmd_register(&nl, argv[2], argv[3],
 			     (uint32_t)strtoul(argv[4], NULL, 0),
 			     (uint32_t)strtoul(argv[5], NULL, 0),
 			     argv[6], argv[7], argv[8],
-			     argc >= 10 ? argv[9] : NULL,
-			     argc == 11 ? argv[10] : NULL);
+			     (uint32_t)strtoul(argv[9], NULL, 0),
+			     strtoull(argv[10], NULL, 0),
+			     argc >= 12 ? argv[11] : NULL,
+			     argc == 13 ? argv[12] : NULL);
 	else if (!strcmp(argv[1], "unregister") && argc == 4)
 		cmd_unregister(&nl, argv[2], strtoull(argv[3], NULL, 0));
 	else if (!strcmp(argv[1], "disable") && argc == 2)

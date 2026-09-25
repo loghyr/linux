@@ -6645,7 +6645,7 @@ nfsd4_encode_chunk_write(struct nfsd4_compoundres *resp, __be32 nfserr,
 
 	if (nfserr || ffv2->result_count != 1)
 		return nfserr ?: nfserr_serverfault;
-	if (nfsd4_encode_uint32_t(xdr, ffv2->payload_len) != nfs_ok ||
+	if (nfsd4_encode_uint32_t(xdr, ffv2->result_bytes) != nfs_ok ||
 	    nfsd4_encode_uint32_t(xdr, ffv2->result_stability) != nfs_ok ||
 	    nfsd4_encode_verifier4(xdr, &ffv2->result_verifier) != nfs_ok ||
 	    nfsd4_encode_uint32_t(xdr, 1) != nfs_ok ||

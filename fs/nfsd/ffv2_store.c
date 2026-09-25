@@ -3343,11 +3343,14 @@ int nfsd_ffv2_store_write(struct nfsd_ffv2_store *store,
 					    request->checksum,
 					    request->checksum_len,
 					    request->content,
-					    request->content_len) ||
-	    ffv2_replay_owner(store, request->owner_cohort,
+					    request->content_len)) {
+		error = -EINVAL;
+		goto out_unlock;
+	}
+	if (ffv2_replay_owner(store, request->owner_cohort,
 			      request->owner_client_id, request->owner_co_id) ||
 	    registration->pending[request->chunk_index]) {
-		error = -EINVAL;
+		error = -EAGAIN;
 		goto out_unlock;
 	}
 	if (request->guard_check) {

@@ -10829,6 +10829,7 @@ static void nfsd_ffv2_encode_mutation_test(struct kunit *test)
 		verifier[i] = i + 1;
 	ffv2->payload_len = 123;
 	ffv2->result_count = 1;
+	ffv2->result_bytes = 123;
 	ffv2->result_stability = NFS_FILE_SYNC;
 	memcpy(ffv2->result_verifier.data, verifier, sizeof(verifier));
 	ffv2->result_status = nfs_ok;
@@ -12751,6 +12752,8 @@ static void nfsd_ffv2_proto_request(struct nfsd_ffv2_prototype_request *req,
 	req->store_uuid = store_uuid;
 	req->binding_token = binding_token;
 	req->persisted_handle = persisted_handle;
+	req->writer_id = 7;
+	req->pnfs_clientid = 0;
 }
 
 /*

@@ -2321,6 +2321,124 @@ stale:
 	return nfserr_stale;
 }
 
+static __be32
+nfsd_ffv2_provider_mutation_dispatch(struct nfsd_net *nn, u32 opnum,
+				     const struct nfsd_ffv2_object *object,
+	const void *request, struct nfsd_ffv2_mutation_result *result,
+	struct nfsd_ffv2_admission *admission)
+{
+	struct nfsd_ffv2_provider *provider;
+	bool pinned = admission->provider;
+	__be32 status;
+
+	if (pinned) {
+		provider = admission->provider;
+	} else {
+		rcu_read_lock();
+		provider = rcu_dereference(nn->ffv2.provider);
+		if (!provider || !refcount_inc_not_zero(&provider->ref)) {
+			rcu_read_unlock();
+			return nfserr_notsupp;
+		}
+		rcu_read_unlock();
+	}
+	memset(result, 0, sizeof(*result));
+	switch (opnum) {
+	case OP_CHUNK_WRITE:
+		status = provider->ops->chunk_write ?
+			provider->ops->chunk_write(provider->data, object,
+						   request, result) :
+			nfserr_notsupp;
+		break;
+	case OP_CHUNK_FINALIZE:
+		status = provider->ops->chunk_finalize ?
+			provider->ops->chunk_finalize(provider->data, object,
+						      request, result) :
+			nfserr_notsupp;
+		break;
+	case OP_CHUNK_COMMIT:
+		status = provider->ops->chunk_commit ?
+			provider->ops->chunk_commit(provider->data, object,
+						    request, result) :
+			nfserr_notsupp;
+		break;
+	default:
+		status = nfserr_notsupp;
+		break;
+	}
+	if (!pinned) {
+		if (status == nfs_ok)
+			admission->provider = provider;
+		else
+			nfsd_ffv2_provider_put(provider);
+	}
+	return status;
+}
+
+static bool
+nfsd_ffv2_mutation_result_valid(u32 opnum, const void *request,
+				const struct nfsd_ffv2_mutation_result *result)
+{
+	const struct nfsd_ffv2_chunk_owner *owner;
+
+	if (result->count != 1)
+		return false;
+	if (opnum == OP_CHUNK_WRITE) {
+		const struct nfsd_ffv2_write_request *write = request;
+
+		if (result->stability > NFS_FILE_SYNC)
+			return false;
+		if (result->bytes > write->payload_len ||
+		    (result->status == nfs_ok &&
+		     result->bytes != write->payload_len) ||
+		    (result->status != nfs_ok && result->bytes))
+			return false;
+		owner = &write->owner;
+	} else {
+		const struct nfsd_ffv2_lifecycle_request *lifecycle = request;
+
+		owner = &lifecycle->owner;
+	}
+	return !memcmp(owner, &result->owner, sizeof(*owner));
+}
+
+__be32 nfsd_ffv2_provider_mutate(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				 u32 opnum, const void *request,
+				 struct nfsd_ffv2_mutation_result *result,
+				 struct nfsd_ffv2_admission *admission)
+{
+	struct nfsd_ffv2_binding *binding = fhp->fh_ffv2_binding;
+	struct nfsd_net *nn;
+	bool had_provider;
+	__be32 status;
+
+	if (!request || !result || !admission || !admission->generation ||
+	    admission->task != current)
+		return nfserr_serverfault;
+	if (opnum != OP_CHUNK_WRITE && opnum != OP_CHUNK_FINALIZE &&
+	    opnum != OP_CHUNK_COMMIT)
+		return nfserr_notsupp;
+	if (!binding || binding->net != SVC_NET(rqstp))
+		return nfserr_stale;
+	nn = net_generic(binding->net, nfsd_net_id);
+	if (!nfsd_ffv2_binding_current(nn, binding))
+		return nfserr_stale;
+	had_provider = admission->provider;
+	status = nfsd_ffv2_provider_mutation_dispatch(nn, opnum,
+						      binding->object, request,
+						      result, admission);
+	if (status != nfs_ok)
+		return status;
+	if (nfsd_ffv2_mutation_result_valid(opnum, request, result))
+		return nfs_ok;
+	memset(result, 0, sizeof(*result));
+	if (!had_provider && admission->provider) {
+		nfsd_ffv2_provider_put(admission->provider);
+		admission->provider = NULL;
+	}
+	return nfserr_serverfault;
+}
+
 int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v)
 {
 	seq_printf(m,

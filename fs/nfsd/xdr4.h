@@ -877,6 +877,7 @@ struct nfsd4_ffv2 {
 
 	/* Bounded ordinary mutation response. */
 	u32		result_count;
+	u32		result_bytes;
 	u32		result_stability;
 	nfs4_verifier	result_verifier;
 	__be32		result_status;

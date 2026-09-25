@@ -159,6 +159,8 @@ struct nfsd_ffv2_prototype_request {
 	const u8	*store_uuid;
 	const u8	*binding_token;
 	const u8	*persisted_handle;
+	u32		writer_id;
+	u64		pnfs_clientid;
 };
 
 struct nfsd_ffv2_prototype_bundle {

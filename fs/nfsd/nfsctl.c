@@ -2662,7 +2662,9 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_STORE_UUID) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN) ||
-	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE))
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_WRITER_ID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID))
 		return -EINVAL;
 	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN],
 				     NAME_MAX, false);
@@ -2686,6 +2688,10 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN]);
 	request.persisted_handle =
 		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE]);
+	request.writer_id =
+		nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_WRITER_ID]);
+	request.pnfs_clientid =
+		nla_get_u64(attrs[NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID]);
 
 	error = nfsd_ffv2_prototype_register(net_generic(net, nfsd_net_id),
 					     net, &request, &bundle);

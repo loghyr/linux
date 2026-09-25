@@ -38,6 +38,7 @@ struct nfsd_ffv2_authority;
 #define NFSD_FFV2_FH_HEADER_SIZE	56
 #define NFSD_FFV2_FH_INNER_MAX	72
 #define NFSD_FFV2_FH_MAX		128
+#define NFSD_FFV2_REQUEST_DIGEST_SIZE	32
 
 struct nfsd_ffv2_fh_info {
 	u64		generation;
@@ -444,6 +445,47 @@ struct nfsd_ffv2_chunk_result {
 	};
 };
 
+struct nfsd_ffv2_mutation_operation {
+	u8	session[16];
+	u32	slot;
+	u32	sequence;
+	u32	ordinal;
+	u8	request_digest[NFSD_FFV2_REQUEST_DIGEST_SIZE];
+};
+
+struct nfsd_ffv2_write_request {
+	struct nfsd_ffv2_mutation_operation operation;
+	u64	chunk_index;
+	u32	stability;
+	struct nfsd_ffv2_chunk_owner owner;
+	u32	payload_id;
+	bool	guard_check;
+	bool	guard_never_written;
+	u32	guard_generation;
+	u32	guard_writer;
+	bool	activate_if_empty;
+	u32	chunk_size;
+	struct nfsd_ffv2_checksum checksum;
+	const u8 *payload;
+	u32	payload_len;
+};
+
+struct nfsd_ffv2_lifecycle_request {
+	struct nfsd_ffv2_mutation_operation operation;
+	u64	chunk_index;
+	struct nfsd_ffv2_chunk_owner owner;
+};
+
+struct nfsd_ffv2_mutation_result {
+	u32	count;
+	u32	bytes;
+	u32	stability;
+	u8	verifier[8];
+	__be32	status;
+	bool	activated;
+	struct nfsd_ffv2_chunk_owner owner;
+};
+
 /*
  * The read-only half of the provider boundary.  A callback runs only after
  * the ordered gate has authorized the request and taken an execution
@@ -467,6 +509,18 @@ struct nfsd_ffv2_provider_ops {
 				    const struct nfsd_ffv2_object *object,
 				    const struct nfsd_ffv2_chunk_request *request,
 				    struct nfsd_ffv2_chunk_result *result);
+	__be32 (*chunk_write)(void *provider,
+			      const struct nfsd_ffv2_object *object,
+			      const struct nfsd_ffv2_write_request *request,
+			      struct nfsd_ffv2_mutation_result *result);
+	__be32 (*chunk_finalize)(void *provider,
+				 const struct nfsd_ffv2_object *object,
+				 const struct nfsd_ffv2_lifecycle_request *request,
+				 struct nfsd_ffv2_mutation_result *result);
+	__be32 (*chunk_commit)(void *provider,
+			       const struct nfsd_ffv2_object *object,
+			       const struct nfsd_ffv2_lifecycle_request *request,
+			       struct nfsd_ffv2_mutation_result *result);
 };
 
 struct nfsd_ffv2_admission {
@@ -491,6 +545,10 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				struct nfsd_ffv2_chunk_result *result,
 				u32 available,
 				struct nfsd_ffv2_admission *admission);
+__be32 nfsd_ffv2_provider_mutate(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				 u32 opnum, const void *request,
+				 struct nfsd_ffv2_mutation_result *result,
+				 struct nfsd_ffv2_admission *admission);
 int nfsd_ffv2_provider_probe_show(struct seq_file *m, void *v);
 
 int nfsd_ffv2_admit(struct svc_rqst *rqstp,
