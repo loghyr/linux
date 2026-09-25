@@ -1418,8 +1418,11 @@ static bool bundle_read(const char *dir, struct bundle *b)
  */
 static const char * const bundle_keys[] = {
 	"RUN", "MAPPED_HANDLE", "STATEID", "SOURCE_UUID", "GENERATION",
-	"CHUNK_SIZE",
+	"CHUNK_SIZE", "OBJECT_COUNT", "MAPPED_HANDLE_0", "STATEID_0",
+	"MAPPED_HANDLE_1", "STATEID_1",
 };
+
+#define BUNDLE_REQUIRED_KEYS	6
 
 /*
  * Which key a line names, or -1 for none of them.  The length is compared
@@ -1508,7 +1511,7 @@ static bool bundle_well_formed(const struct bundle *b, const char **why)
 		*why = "the bundle carries bytes outside its records";
 		return false;
 	}
-	for (i = 0; i < ARRAY_SIZE(bundle_keys); i++)
+	for (i = 0; i < BUNDLE_REQUIRED_KEYS; i++)
 		if (!seen[i]) {
 			*why = "the bundle is missing a key this client requires";
 			return false;
@@ -1686,6 +1689,7 @@ static void usage(void)
 		"                       [--expect-payload-id-base <id>]\n"
 		"                       [--expect-sparse-index <index>]\n"
 		"                       [--write-lifecycle] [--writer-id <id>]\n"
+		"                       [--member <0|1>]\n"
 		"                       [--store-profile]\n"
 		"                       [--read-only-profile]\n"
 		"                       [--no-retirement] [--mutate-ordinary]\n"
@@ -1715,6 +1719,7 @@ int main(int argc, char **argv)
 	bool write_lifecycle = false;
 	uint32_t writer_id = 0x5150;
 	uint32_t read_count = 1;
+	unsigned int member = 0;
 	uint64_t read_index = 0;
 	uint16_t port = 2049;
 	int i;
@@ -1752,6 +1757,8 @@ int main(int argc, char **argv)
 			write_lifecycle = true;
 		else if (!strcmp(argv[i], "--writer-id") && i + 1 < argc)
 			writer_id = (uint32_t)strtoul(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--member") && i + 1 < argc)
+			member = (unsigned int)strtoul(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--store-profile"))
 			store_profile = true;
 		else if (!strcmp(argv[i], "--read-only-profile"))
@@ -1765,7 +1772,7 @@ int main(int argc, char **argv)
 		else
 			usage();
 	}
-	if (!server || !file || !read_count || !writer_id)
+	if (!server || !file || !read_count || !writer_id || member > 1)
 		usage();
 	if (write_lifecycle && !expect)
 		die("--write-lifecycle requires --expect");
@@ -1846,8 +1853,30 @@ int main(int argc, char **argv)
 	}
 	if (!bundle_well_formed(&bundle, &why))
 		die("registration is malformed: %s", why);
-	if (!bundle_value(&bundle, "MAPPED_HANDLE", value, sizeof(value)))
+	if (bundle_value(&bundle, "OBJECT_COUNT", value, sizeof(value))) {
+		char key[32];
+		char *end;
+		unsigned long count = strtoul(value, &end, 10);
+		unsigned int n;
+
+		if (*end || !count || count > 2 || member >= count)
+			die("registration published invalid object count %s", value);
+		for (n = 0; n < count; n++) {
+			snprintf(key, sizeof(key), "MAPPED_HANDLE_%u", n);
+			if (!bundle_value(&bundle, key, value, sizeof(value)))
+				die("registration omitted %s", key);
+			snprintf(key, sizeof(key), "STATEID_%u", n);
+			if (!bundle_value(&bundle, key, value, sizeof(value)))
+				die("registration omitted %s", key);
+		}
+		snprintf(key, sizeof(key), "MAPPED_HANDLE_%u", member);
+		if (!bundle_value(&bundle, key, value, sizeof(value)))
+			die("registration published no member %u handle", member);
+	} else if (member ||
+		   !bundle_value(&bundle, "MAPPED_HANDLE", value,
+				 sizeof(value))) {
 		die("registration published no mapped handle");
+	}
 	mapped_len = parse_hex(value, mapped, sizeof(mapped));
 	/*
 	 * A filehandle is at least one byte and at most NFS4_FHSIZE.  This
@@ -1868,8 +1897,15 @@ int main(int argc, char **argv)
 		die("registration published no run token");
 	if (strcmp(value, run))
 		die("registration belongs to run %s, not %s", value, run);
-	if (!bundle_value(&bundle, "STATEID", value, sizeof(value)))
+	if (bundle_value(&bundle, "OBJECT_COUNT", value, sizeof(value))) {
+		char key[32];
+
+		snprintf(key, sizeof(key), "STATEID_%u", member);
+		if (!bundle_value(&bundle, key, value, sizeof(value)))
+			die("registration published no member %u stateid", member);
+	} else if (!bundle_value(&bundle, "STATEID", value, sizeof(value))) {
 		die("registration published no stateid");
+	}
 	if (parse_hex(value, stateid, sizeof(stateid)) != sizeof(stateid))
 		die("stateid must be 16 bytes");
 	/*

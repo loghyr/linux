@@ -302,30 +302,37 @@ static void bundle_hex(FILE *f, const char *key, const void *data, size_t len)
  * discovered as a refused read.
  */
 static void cmd_register(struct ffv2_nl *nl, const char *domain,
-			 const char *handle_hex, uint32_t chunk_size,
-			 uint32_t data_count, const char *store_uuid_hex,
+			 const char *handle_hex, const char *handle2_hex,
+			 uint32_t chunk_size, uint32_t data_count,
+			 const char *store_uuid_hex,
 			 const char *binding_token_hex,
-			 const char *persisted_handle_hex, uint32_t writer_id,
+			 const char *persisted_handle_hex,
+			 const char *persisted_handle2_hex, uint32_t writer_id,
 			 uint64_t pnfs_clientid, const char *bundle_path,
 			 const char *run)
 {
 	uint8_t reply[NLMSG_BUF_SIZE];
-	uint8_t handle[128];
+	uint8_t handles[2][128];
 	uint8_t nonce[32];
 	uint8_t store_uuid[16];
 	uint8_t binding_token[32];
-	uint8_t persisted_handle[32];
-	uint8_t wire[16];
+	uint8_t persisted_handles[2][32];
+	uint8_t wires[2][16];
 	const struct nlattr *nla;
-	size_t handle_len, len, attrlen;
+	size_t handle_lens[2], len, attrlen;
 	size_t object_len;
-	size_t mapped_len = 0, uuid_len = 0;
-	uint8_t mapped[128], uuid[16];
+	size_t mapped_lens[2] = {}, uuid_len = 0;
+	uint8_t mapped[2][128], uuid[16];
 	const void *value;
 	const void *object_data;
 	uint64_t generation;
 	uint32_t seqid;
+	unsigned int object_count = handle2_hex ? 2 : 1;
+	unsigned int i;
 	FILE *bundle = NULL;
+
+	if (!data_count || data_count > object_count)
+		die("data count must fit the object array");
 
 	nl_start(nl, nl->family, NFSD_CMD_FFV2_PROTOTYPE_CHALLENGE);
 	len = nl_talk(nl, reply, sizeof(reply));
@@ -338,24 +345,35 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	memcpy(nonce, value, sizeof(nonce));
 	print_hex("PROTO-NONCE", nonce, sizeof(nonce));
 
-	handle_len = parse_hex(handle_hex, handle, sizeof(handle));
-	if (!handle_len)
+	handle_lens[0] = parse_hex(handle_hex, handles[0], sizeof(handles[0]));
+	if (!handle_lens[0])
 		die("the ordinary filehandle is empty");
+	if (handle2_hex) {
+		handle_lens[1] = parse_hex(handle2_hex, handles[1],
+					   sizeof(handles[1]));
+		if (!handle_lens[1])
+			die("the second ordinary filehandle is empty");
+	}
 	if (parse_hex(store_uuid_hex, store_uuid, sizeof(store_uuid)) !=
 	    sizeof(store_uuid))
 		die("store uuid must be 16 bytes");
 	if (parse_hex(binding_token_hex, binding_token,
 		      sizeof(binding_token)) != sizeof(binding_token))
 		die("binding token must be 32 bytes");
-	if (parse_hex(persisted_handle_hex, persisted_handle,
-		      sizeof(persisted_handle)) != sizeof(persisted_handle))
+	if (parse_hex(persisted_handle_hex, persisted_handles[0],
+		      sizeof(persisted_handles[0])) != sizeof(persisted_handles[0]))
 		die("persisted handle must be 32 bytes");
+	if (persisted_handle2_hex &&
+	    parse_hex(persisted_handle2_hex, persisted_handles[1],
+		      sizeof(persisted_handles[1])) != sizeof(persisted_handles[1]))
+		die("second persisted handle must be 32 bytes");
 	nl_start(nl, nl->family, NFSD_CMD_FFV2_PROTOTYPE_REGISTER);
 	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_NONCE, nonce, sizeof(nonce));
 	nl_put_str(nl, NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN, domain);
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE, chunk_size);
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_DATA_COUNT, data_count);
-	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT, 0);
+	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT,
+		   object_count - data_count);
 	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_STORE_UUID, store_uuid,
 	       sizeof(store_uuid));
 	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN, binding_token,
@@ -363,15 +381,20 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_WRITER_ID, writer_id);
 	nl_put_u64(nl, NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID, pnfs_clientid);
 	{
-		struct nlattr *objects, *object;
+		struct nlattr *objects;
 
 		objects = nl_nest_start(nl, NFSD_A_FFV2_PROTOTYPE_OBJECTS);
-		object = nl_nest_start(nl, 0);
-		nl_put(nl, NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE,
-		       handle, (uint16_t)handle_len);
-		nl_put(nl, NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE,
-		       persisted_handle, sizeof(persisted_handle));
-		nl_nest_end(nl, object);
+		for (i = 0; i < object_count; i++) {
+			struct nlattr *object = nl_nest_start(nl, (uint16_t)i);
+
+			nl_put(nl,
+			       NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE,
+			       handles[i], (uint16_t)handle_lens[i]);
+			nl_put(nl,
+			       NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE,
+			       persisted_handles[i], sizeof(persisted_handles[i]));
+			nl_nest_end(nl, object);
+		}
 		nl_nest_end(nl, objects);
 	}
 	len = nl_talk(nl, reply, sizeof(reply));
@@ -408,41 +431,48 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_OBJECTS);
 	if (!nla)
 		die("registration returned no object array");
-	value = nl_data(nla, &attrlen);
-	nla = nl_find(value, attrlen, 0);
-	if (!nla)
-		die("registration returned no object zero");
 	object_data = nl_data(nla, &object_len);
-	nla = nl_find(object_data, object_len,
-		      NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID);
-	if (!nla)
-		die("registration returned no stateid");
-	value = nl_data(nla, &attrlen);
-	if (attrlen != sizeof(wire))
-		die("stateid is %zu bytes", attrlen);
-	print_hex("PROTO-STATEID-RAW", value, attrlen);
-	memcpy(&seqid, value, sizeof(seqid));
-	seqid = htonl(seqid);
-	memcpy(wire, &seqid, sizeof(seqid));
-	memcpy(wire + sizeof(seqid), (const uint8_t *)value + sizeof(seqid),
-	       sizeof(wire) - sizeof(seqid));
-	print_hex("PROTO-STATEID", wire, sizeof(wire));
+	for (i = 0; i < object_count; i++) {
+		char label[64];
+		const struct nlattr *object;
+		const void *attrs;
+		size_t attrs_len;
 
-	nla = nl_find(object_data, object_len,
-		      NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE);
-	if (!nla)
-		die("registration returned no mapped handle");
-	value = nl_data(nla, &attrlen);
-	/*
-	 * A filehandle of no bytes is not one a client can present, and
-	 * publishing it would hand the harness something it would have to
-	 * index into.  Refuse it here rather than downstream.
-	 */
-	if (!attrlen || attrlen > sizeof(mapped))
-		die("mapped handle is %zu bytes", attrlen);
-	memcpy(mapped, value, attrlen);
-	mapped_len = attrlen;
-	print_hex("PROTO-MAPPED-HANDLE", mapped, mapped_len);
+		object = nl_find(object_data, object_len, (uint16_t)i);
+		if (!object)
+			die("registration returned no object %u", i);
+		attrs = nl_data(object, &attrs_len);
+		nla = nl_find(attrs, attrs_len,
+			      NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID);
+		if (!nla)
+			die("object %u returned no stateid", i);
+		value = nl_data(nla, &attrlen);
+		if (attrlen != sizeof(wires[i]))
+			die("object %u stateid is %zu bytes", i, attrlen);
+		memcpy(&seqid, value, sizeof(seqid));
+		seqid = htonl(seqid);
+		memcpy(wires[i], &seqid, sizeof(seqid));
+		memcpy(wires[i] + sizeof(seqid),
+		       (const uint8_t *)value + sizeof(seqid),
+		       sizeof(wires[i]) - sizeof(seqid));
+		snprintf(label, sizeof(label), "PROTO-STATEID-%u", i);
+		print_hex(label, wires[i], sizeof(wires[i]));
+
+		nla = nl_find(attrs, attrs_len,
+			      NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE);
+		if (!nla)
+			die("object %u returned no mapped handle", i);
+		value = nl_data(nla, &attrlen);
+		if (!attrlen || attrlen > sizeof(mapped[i]))
+			die("object %u mapped handle is %zu bytes", i, attrlen);
+		memcpy(mapped[i], value, attrlen);
+		mapped_lens[i] = attrlen;
+		snprintf(label, sizeof(label), "PROTO-MAPPED-HANDLE-%u", i);
+		print_hex(label, mapped[i], mapped_lens[i]);
+	}
+	/* Preserve the singleton names consumed by the B3 harness. */
+	print_hex("PROTO-STATEID", wires[0], sizeof(wires[0]));
+	print_hex("PROTO-MAPPED-HANDLE", mapped[0], mapped_lens[0]);
 
 	if (bundle_path) {
 		char staged[512];
@@ -468,8 +498,17 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 			die("cannot write %s: %s", staged, strerror(errno));
 		}
 		fprintf(bundle, "RUN=%s\n", run ? run : "");
-		bundle_hex(bundle, "MAPPED_HANDLE", mapped, mapped_len);
-		bundle_hex(bundle, "STATEID", wire, sizeof(wire));
+		bundle_hex(bundle, "MAPPED_HANDLE", mapped[0], mapped_lens[0]);
+		bundle_hex(bundle, "STATEID", wires[0], sizeof(wires[0]));
+		for (i = 0; i < object_count; i++) {
+			char key[32];
+
+			snprintf(key, sizeof(key), "MAPPED_HANDLE_%u", i);
+			bundle_hex(bundle, key, mapped[i], mapped_lens[i]);
+			snprintf(key, sizeof(key), "STATEID_%u", i);
+			bundle_hex(bundle, key, wires[i], sizeof(wires[i]));
+		}
+		fprintf(bundle, "OBJECT_COUNT=%u\n", object_count);
 		bundle_hex(bundle, "SOURCE_UUID", uuid, uuid_len);
 		fprintf(bundle, "GENERATION=%llu\n",
 			(unsigned long long)generation);
@@ -520,6 +559,7 @@ static void usage(void)
 	fprintf(stderr,
 		"usage: ffv2-proto-ctl enable\n"
 		"       ffv2-proto-ctl register <auth-domain> <handle-hex> <chunk-size> <data-count> <store-uuid-hex> <binding-token-hex> <persisted-handle-hex> <writer-id> <pnfs-clientid> [bundle-path [run-token]]\n"
+		"       ffv2-proto-ctl register2 <auth-domain> <handle0-hex> <handle1-hex> <chunk-size> <store-uuid-hex> <binding-token-hex> <persisted0-hex> <persisted1-hex> <writer-id> <pnfs-clientid> [bundle-path [run-token]]\n"
 		"       ffv2-proto-ctl unregister <source-uuid-hex> <generation>\n"
 		"       ffv2-proto-ctl disable\n");
 	exit(2);
@@ -536,14 +576,22 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "enable") && argc == 2)
 		cmd_enable(&nl);
 	else if (!strcmp(argv[1], "register") && argc >= 11 && argc <= 13)
-		cmd_register(&nl, argv[2], argv[3],
+		cmd_register(&nl, argv[2], argv[3], NULL,
 			     (uint32_t)strtoul(argv[4], NULL, 0),
 			     (uint32_t)strtoul(argv[5], NULL, 0),
-			     argv[6], argv[7], argv[8],
+			     argv[6], argv[7], argv[8], NULL,
 			     (uint32_t)strtoul(argv[9], NULL, 0),
 			     strtoull(argv[10], NULL, 0),
 			     argc >= 12 ? argv[11] : NULL,
 			     argc == 13 ? argv[12] : NULL);
+	else if (!strcmp(argv[1], "register2") && argc >= 12 && argc <= 14)
+		cmd_register(&nl, argv[2], argv[3], argv[4],
+			     (uint32_t)strtoul(argv[5], NULL, 0), 1,
+			     argv[6], argv[7], argv[8], argv[9],
+			     (uint32_t)strtoul(argv[10], NULL, 0),
+			     strtoull(argv[11], NULL, 0),
+			     argc >= 13 ? argv[12] : NULL,
+			     argc == 14 ? argv[13] : NULL);
 	else if (!strcmp(argv[1], "unregister") && argc == 4)
 		cmd_unregister(&nl, argv[2], strtoull(argv[3], NULL, 0));
 	else if (!strcmp(argv[1], "disable") && argc == 2)

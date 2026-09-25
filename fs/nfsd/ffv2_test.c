@@ -15354,6 +15354,9 @@ struct nfsd_ffv2_nl_register_args {
 	u32		data_count;
 	u32		parity_count;
 	bool		omit_domain;
+	u32		object_count;
+	bool		missing_nested;
+	u16		first_type;
 	u16		unknown_attr;
 };
 
@@ -15363,12 +15366,14 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 {
 	static const u8 store_uuid[16] = { 1 };
 	static const u8 binding_token[32] = { 2 };
-	static const u8 persisted_handle[32] = { 3 };
+	u8 persisted_handle[32] = { 3 };
 	u8 handle[NFS4_FHSIZE] = { 1, 2, 3, 4, 5, 6, 7, 8 };
-	u8 object_attrs[256] = {};
-	u8 children[320] = {};
+	u8 object_attrs[256];
+	u8 children[896] = {};
 	char buf[NFSD_FFV2_NL_BUF];
-	size_t child_off = 0, object_off = 0, off;
+	size_t child_off = 0, object_off, off;
+	u32 count = a->object_count ?: 1;
+	u32 i;
 	int error;
 
 	off = nfsd_ffv2_nl_proto_begin(nl, buf,
@@ -15406,20 +15411,27 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 	if (!error)
 		error = nfsd_ffv2_nl_put_u64(buf, sizeof(buf), &off,
 					     NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID, 0);
-	if (!error)
+	for (i = 0; !error && i < count; i++) {
+		u16 type = (i ? i : a->first_type) |
+			   (a->missing_nested ? 0 : NLA_F_NESTED);
+
+		memset(object_attrs, 0, sizeof(object_attrs));
+		object_off = 0;
+		persisted_handle[31] = 3 + i;
 		error = nfsd_ffv2_nl_put(object_attrs, sizeof(object_attrs),
-					 &object_off,
-					 NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE,
-					 handle, a->handle_len);
-	if (!error)
-		error = nfsd_ffv2_nl_put(object_attrs, sizeof(object_attrs),
-					 &object_off,
-					 NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE,
-					 persisted_handle,
-					 sizeof(persisted_handle));
-	if (!error)
-		error = nfsd_ffv2_nl_put(children, sizeof(children), &child_off,
-					 NLA_F_NESTED, object_attrs, object_off);
+			&object_off,
+			NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE,
+			handle, a->handle_len);
+		if (!error)
+			error = nfsd_ffv2_nl_put(object_attrs,
+						 sizeof(object_attrs), &object_off,
+				NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE,
+				persisted_handle, sizeof(persisted_handle));
+		if (!error)
+			error = nfsd_ffv2_nl_put(children, sizeof(children),
+						 &child_off, type, object_attrs,
+						 object_off);
+	}
 	if (!error)
 		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
 					 NFSD_A_FFV2_PROTOTYPE_OBJECTS |
@@ -15512,6 +15524,35 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
 						    sizeof(reply)), 0);
 	args.unknown_attr = 0;
+
+	/* A valid singleton and k=1,m=1 array reach the closed gate. */
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.object_count = 2;
+	args.parity_count = 1;
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+
+	/* Array shape is rejected before a nonce can reach the gate. */
+	args.object_count = NFSD_FFV2_PROTOTYPE_OBJECT_MAX + 1;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.object_count = 2;
+	args.missing_nested = true;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.missing_nested = false;
+	args.first_type = 1;
+	KUNIT_EXPECT_EQ(test, -EINVAL,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    sizeof(reply)));
+	args.first_type = 0;
+	args.object_count = 0;
+	args.parity_count = 0;
 
 	/* A closed gate refuses everything a repeated transition would. */
 	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
