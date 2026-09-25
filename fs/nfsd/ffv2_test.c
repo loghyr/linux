@@ -4913,7 +4913,7 @@ static void nfsd_ffv2_provider_negative_test(struct kunit *test)
 	sid = nfsd_ffv2_test_stateid(1, 0x31, 0x32, 0x33);
 	nfsd_ffv2_test_trust_request(&trust, &sid, wrong_uuid, IOMODE_READ,
 				     NULL, 3600);
-	KUNIT_EXPECT_EQ(test, nfs_ok,
+	KUNIT_EXPECT_EQ(test, nfserr_stale,
 			nfsd_ffv2_test_trust_install_active(f.nn, NULL,
 							    &trust));
 	KUNIT_EXPECT_EQ(test, nfserr_bad_stateid,

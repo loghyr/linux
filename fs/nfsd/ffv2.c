@@ -39,6 +39,12 @@ enum nfsd_ffv2_identity_state {
 	NFSD_FFV2_IDENTITY_RETIRED,
 };
 
+enum nfsd_ffv2_unregister_kind {
+	NFSD_FFV2_UNREGISTER_NONE,
+	NFSD_FFV2_UNREGISTER_OBJECT,
+	NFSD_FFV2_UNREGISTER_PROTOTYPE,
+};
+
 enum nfsd_ffv2_generation_state {
 	NFSD_FFV2_GENERATION_ACTIVE,
 	NFSD_FFV2_GENERATION_STOPPING,
@@ -49,8 +55,9 @@ enum nfsd_ffv2_generation_state {
 struct nfsd_ffv2_identity {
 	refcount_t	ref;
 	u64		generation;
-	u8		object_uuid[16];
+	u8		unregister_uuid[16];
 	u8		export_uuid[16];
+	enum nfsd_ffv2_unregister_kind unregister_kind;
 	int		state;
 };
 
@@ -84,6 +91,11 @@ struct nfsd_ffv2_object {
 	bool			export_valid;
 	bool			object_valid;
 	bool			visible;
+};
+
+struct nfsd_ffv2_object_set {
+	u32			count;
+	struct nfsd_ffv2_object	*objects[NFSD_FFV2_MAX_OBJECTS];
 };
 
 struct nfsd_ffv2_binding {
@@ -358,14 +370,14 @@ struct nfsd_ffv2_service_context {
 	struct nfsd_net		*nn;
 	struct nfsd_ffv2_reservation *reservation;
 	struct svc_export	*export;
-	struct nfsd_ffv2_object *object;
+	struct nfsd_ffv2_object_set objects;
 	struct nfsd_ffv2_authority *authority;
 	const struct cred	*cred;
 	struct completion	export_released;
 	u64			control_root;
 	u64			owner_generation;
 	bool			published;
-	bool			object_owned;
+	bool			objects_owned;
 	/*
 	 * Set when publication transferred the namespace's MDS source
 	 * reservation to this context.  The reservation then lives as long as
@@ -373,6 +385,35 @@ struct nfsd_ffv2_service_context {
 	 */
 	bool			source_claimed;
 };
+
+static struct nfsd_ffv2_object *
+nfsd_ffv2_object_set_find(const struct nfsd_ffv2_object_set *set,
+			  const u8 object_uuid[16])
+{
+	struct nfsd_ffv2_object *found = NULL;
+	u32 i;
+
+	for (i = 0; i < set->count; i++) {
+		struct nfsd_ffv2_object *object = set->objects[i];
+
+		if (!object || memcmp(object->object_uuid, object_uuid, 16))
+			continue;
+		if (found)
+			return NULL;
+		found = object;
+	}
+	return found;
+}
+
+static void nfsd_ffv2_object_set_free(struct nfsd_ffv2_object_set *set)
+{
+	while (set->count) {
+		struct nfsd_ffv2_object *object = set->objects[--set->count];
+
+		set->objects[set->count] = NULL;
+		nfsd_ffv2_object_free(object);
+	}
+}
 
 struct nfsd_ffv2_participant_snapshot {
 	struct nfsd_ffv2_participant *participant;
@@ -400,7 +441,8 @@ nfsd_ffv2_export_update_put(struct nfsd_ffv2_export_update *update);
 static int
 nfsd_ffv2_generation_prepare(struct nfsd_net *nn, void *payload,
 			     void (*release)(void *),
-			     const u8 object_uuid[16],
+			     enum nfsd_ffv2_unregister_kind unregister_kind,
+			     const u8 unregister_uuid[16],
 			     const u8 export_uuid[16],
 			     struct nfsd_ffv2_generation **result,
 			     u64 *generation_id);
@@ -1183,9 +1225,12 @@ nfsd_ffv2_transition_publish(struct nfsd_net *owner,
 	mutex_lock(&nfsd_ffv2_registry_lock);
 	reservation->state = NFSD_FFV2_RESERVATION_ACTIVE;
 	reservation->owner_generation = generation->identity->generation;
-	if (context->object) {
-		context->object_owned = true;
-		context->object->visible = true;
+	if (context->objects.count) {
+		u32 i;
+
+		context->objects_owned = true;
+		for (i = 0; i < context->objects.count; i++)
+			context->objects.objects[i]->visible = true;
 	}
 	anchor->pending = NULL;
 	anchor->active = generation;
@@ -1294,7 +1339,10 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 		error = -ENOMEM;
 		goto out_reopen;
 	}
-	context->object = object;
+	if (object) {
+		context->objects.count = 1;
+		context->objects.objects[0] = object;
+	}
 	if (nfsd_ffv2_fault_inject(NFSD_FFV2_FAULT_GENERATION_ALLOC)) {
 		nfsd_ffv2_service_context_abort(context, NULL);
 		nfsd_ffv2_reservation_abort(reservation);
@@ -1303,6 +1351,8 @@ __nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 	}
 	error = nfsd_ffv2_generation_prepare(owner, context,
 					     nfsd_ffv2_service_context_release,
+					     object ? NFSD_FFV2_UNREGISTER_OBJECT :
+						      NFSD_FFV2_UNREGISTER_NONE,
 					     object ? object->object_uuid : NULL,
 					     object ? object->export_uuid : NULL,
 					     &generation, &prepared_generation);
@@ -1552,7 +1602,7 @@ int nfsd_ffv2_object_register(struct nfsd_net *nn,
 	object->inner_fh = ordinary.fh_handle;
 	if (object->inner_fh.fh_size < 8 ||
 	    object->inner_fh.fh_size > NFSD_FFV2_FH_INNER_MAX ||
-	    object->inner_fh.fh_size & 3) {
+	    object->inner_fh.fh_size & 3 || object->inner_fh.fh_raw[0] != 1) {
 		error = -E2BIG;
 		goto out_put_fh;
 	}
@@ -1618,17 +1668,17 @@ static int nfsd_ffv2_binding_admit(struct nfsd_net *nn,
 	generation = anchor->active;
 	if (!generation || !generation->registry_generation ||
 	    generation->identity->generation != info->generation ||
-	    memcmp(generation->identity->object_uuid, info->object_uuid,
-		   sizeof(generation->identity->object_uuid)) ||
 	    memcmp(generation->identity->export_uuid, info->export_uuid,
 		   sizeof(generation->identity->export_uuid)))
 		goto out_unlock;
 	context = generation->payload;
-	if (!context || !context->object)
+	if (!context)
 		goto out_unlock;
 	mutex_lock(&nfsd_ffv2_registry_lock);
-	object = context->object;
-	if (!object->visible || object->inner_fh.fh_size != info->inner_len ||
+	object = nfsd_ffv2_object_set_find(&context->objects,
+					   info->object_uuid);
+	if (!object || !object->visible ||
+	    object->inner_fh.fh_size != info->inner_len ||
 	    memcmp(object->inner_fh.fh_raw, info->inner, info->inner_len)) {
 		mutex_unlock(&nfsd_ffv2_registry_lock);
 		goto out_unlock;
@@ -2490,6 +2540,9 @@ __be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp)
 	if (status)
 		goto out_fh;
 	if (!fhp->fh_export->ex_uuid ||
+	    !binding->admission.generation->payload ||
+	    fhp->fh_export != ((struct nfsd_ffv2_service_context *)
+		binding->admission.generation->payload)->export ||
 	    memcmp(fhp->fh_export->ex_uuid, binding->object->export_uuid,
 		   sizeof(binding->object->export_uuid)) ||
 	    fhp->fh_export->ex_client != binding->object->client ||
@@ -2559,8 +2612,8 @@ void nfsd_ffv2_service_context_release(void *payload)
 	}
 	put_cred(context->cred);
 	nfsd_ffv2_reservation_fence(context->reservation);
-	if (context->object_owned)
-		nfsd_ffv2_object_free(context->object);
+	if (context->objects_owned)
+		nfsd_ffv2_object_set_free(&context->objects);
 	/*
 	 * Last: the namespace may admit another authority source only once
 	 * this generation's objects and trust are gone.
@@ -3045,7 +3098,8 @@ static atomic_t nfsd_ffv2_start_failure;
 
 static struct nfsd_ffv2_generation *
 nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *),
-			   const u8 object_uuid[16],
+			   enum nfsd_ffv2_unregister_kind unregister_kind,
+			   const u8 unregister_uuid[16],
 			   const u8 export_uuid[16])
 {
 	struct nfsd_ffv2_generation *generation;
@@ -3062,9 +3116,10 @@ nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *),
 	}
 
 	refcount_set(&identity->ref, 1);
-	if (object_uuid)
-		memcpy(identity->object_uuid, object_uuid,
-		       sizeof(identity->object_uuid));
+	identity->unregister_kind = unregister_kind;
+	if (unregister_uuid)
+		memcpy(identity->unregister_uuid, unregister_uuid,
+		       sizeof(identity->unregister_uuid));
 	if (export_uuid)
 		memcpy(identity->export_uuid, export_uuid,
 		       sizeof(identity->export_uuid));
@@ -3079,14 +3134,15 @@ nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *),
 	init_completion(&generation->retired);
 	generation->payload = payload;
 	generation->release = release;
-	generation->registry_generation = object_uuid && export_uuid;
+	generation->registry_generation = unregister_uuid && export_uuid;
 	return generation;
 }
 
 static int
 nfsd_ffv2_generation_prepare(struct nfsd_net *nn, void *payload,
 			     void (*release)(void *),
-			     const u8 object_uuid[16],
+			     enum nfsd_ffv2_unregister_kind unregister_kind,
+			     const u8 unregister_uuid[16],
 			     const u8 export_uuid[16],
 			     struct nfsd_ffv2_generation **result,
 			     u64 *generation_id)
@@ -3095,7 +3151,8 @@ nfsd_ffv2_generation_prepare(struct nfsd_net *nn, void *payload,
 	struct nfsd_ffv2_generation *generation;
 	int error = 0;
 
-	generation = nfsd_ffv2_generation_alloc(payload, release, object_uuid,
+	generation = nfsd_ffv2_generation_alloc(payload, release,
+						unregister_kind, unregister_uuid,
 						export_uuid);
 	if (!generation)
 		return -ENOMEM;
@@ -3187,8 +3244,12 @@ nfsd_ffv2_retire_begin_locked(struct nfsd_ffv2_anchor *anchor)
 		if (generation->registry_generation) {
 			context = generation->payload;
 			mutex_lock(&nfsd_ffv2_registry_lock);
-			if (context && context->object)
-				context->object->visible = false;
+			if (context) {
+				u32 i;
+
+				for (i = 0; i < context->objects.count; i++)
+					context->objects.objects[i]->visible = false;
+			}
 			mutex_unlock(&nfsd_ffv2_registry_lock);
 		}
 		anchor->active = NULL;
@@ -4819,6 +4880,7 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	struct nfsd_ffv2_generation *generation;
 	struct nfsd_ffv2_generation *owned = NULL;
 	struct nfsd_ffv2_authority *authority;
+	struct nfsd_ffv2_object *object;
 	struct nfsd_ffv2_binding *binding;
 	struct nfsd_ffv2_trust_entry *entry;
 	struct nfsd_net *nn;
@@ -4859,7 +4921,10 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	}
 
 	context = generation->payload;
-	if (!context || !context->object) {
+	object = binding ? binding->object :
+		 context && context->objects.count == 1 ?
+		 context->objects.objects[0] : NULL;
+	if (!context || !object) {
 		status = nfserr_stale;
 		goto out;
 	}
@@ -4917,13 +4982,13 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		goto out;
 
 	entry = nfsd_ffv2_trust_lookup(&context->trust, stateid,
-				       context->object->object_uuid, epoch);
+				       object->object_uuid, epoch);
 	if (!entry)
 		goto out;
 
 	status = nfsd_ffv2_trust_validate(entry,
 					  generation->identity->generation,
-					  context->object->object_uuid, epoch,
+					  object->object_uuid, epoch,
 					  profile->profile_bit,
 					  rqstp->rq_cred.cr_principal);
 	if (status == nfs_ok)
@@ -4969,20 +5034,23 @@ __be32 nfsd_ffv2_trust_install_active(struct nfsd_net *nn,
 {
 	struct nfsd_ffv2_service_context *context;
 	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_object *object;
 	__be32 status;
 
 	generation = nfsd_ffv2_active_generation_get(nn);
 	if (!generation)
 		return nfserr_stale;
 	context = generation->payload;
-	if (!context || !context->object || !context->authority) {
+	object = context ? nfsd_ffv2_object_set_find(&context->objects,
+						     req->object_uuid) : NULL;
+	if (!context || !object || !context->authority) {
 		nfsd_ffv2_generation_put_owned(generation);
 		return nfserr_stale;
 	}
 	status = nfsd_ffv2_trust_install(&context->trust,
 					 authority ? authority :
 						     context->authority,
-					 context->object,
+					 object,
 					 generation->identity->generation, req);
 	nfsd_ffv2_generation_put_owned(generation);
 	return status;
@@ -5113,7 +5181,7 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 	object->inner_fh = fhp->fh_handle;
 	if (object->inner_fh.fh_size < 8 ||
 	    object->inner_fh.fh_size > NFSD_FFV2_FH_INNER_MAX ||
-	    object->inner_fh.fh_size & 3) {
+	    object->inner_fh.fh_size & 3 || object->inner_fh.fh_raw[0] != 1) {
 		nfsd_ffv2_object_free(object);
 		return -E2BIG;
 	}
@@ -5214,10 +5282,10 @@ bool nfsd_ffv2_test_trust_revoke_active(struct nfsd_net *nn,
 	if (!generation)
 		return false;
 	context = generation->payload;
-	if (context && context->object && context->authority &&
+	if (context && context->objects.count == 1 && context->authority &&
 	    nfsd_ffv2_authority_published(context->authority, &epoch))
 		revoked = nfsd_ffv2_trust_revoke(&context->trust, stateid,
-						 context->object->object_uuid,
+						 context->objects.objects[0]->object_uuid,
 						 epoch);
 	nfsd_ffv2_generation_put_owned(generation);
 	return revoked;
@@ -5241,8 +5309,8 @@ bool nfsd_ffv2_test_active_object_uuid(struct nfsd_net *nn, u8 uuid[16])
 	if (!generation)
 		return false;
 	context = generation->payload;
-	if (context && context->object) {
-		memcpy(uuid, context->object->object_uuid, 16);
+	if (context && context->objects.count == 1) {
+		memcpy(uuid, context->objects.objects[0]->object_uuid, 16);
 		found = true;
 	}
 	nfsd_ffv2_generation_put_owned(generation);
@@ -5828,8 +5896,9 @@ int nfsd_ffv2_object_unregister(struct nfsd_net *nn, u64 generation_id,
 		generation = anchor->retiring;
 	if (!generation ||
 	    generation->identity->generation != generation_id ||
-	    memcmp(generation->identity->object_uuid, object_uuid,
-		   sizeof(generation->identity->object_uuid)))
+	    generation->identity->unregister_kind != NFSD_FFV2_UNREGISTER_OBJECT ||
+	    memcmp(generation->identity->unregister_uuid, object_uuid,
+		   sizeof(generation->identity->unregister_uuid)))
 		error = -ENOENT;
 	mutex_unlock(&anchor->lock);
 	if (error)
@@ -5953,7 +6022,9 @@ int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
 	int error;
 
 	lockdep_assert_held(&nfsd_mutex);
-	error = nfsd_ffv2_generation_prepare(nn, payload, release, NULL, NULL,
+	error = nfsd_ffv2_generation_prepare(nn, payload, release,
+					     NFSD_FFV2_UNREGISTER_NONE,
+					     NULL, NULL,
 					     &generation, generation_id);
 	if (error)
 		return error;
