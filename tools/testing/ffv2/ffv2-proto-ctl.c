@@ -218,6 +218,24 @@ static const struct nlattr *nl_find(const uint8_t *reply, size_t len,
 	return NULL;
 }
 
+static const struct nlattr *nl_next(const uint8_t *attrs, size_t len,
+				    size_t *offset)
+{
+	const struct nlattr *nla;
+	size_t next;
+
+	if (*offset + NLA_HDRLEN > len)
+		return NULL;
+	nla = (const struct nlattr *)(attrs + *offset);
+	if (nla->nla_len < NLA_HDRLEN || nla->nla_len > len - *offset)
+		return NULL;
+	next = *offset + NLA_ALIGN(nla->nla_len);
+	if (next > len)
+		return NULL;
+	*offset = next;
+	return nla;
+}
+
 static const void *nl_data(const struct nlattr *nla, size_t *len)
 {
 	*len = nla->nla_len - NLA_HDRLEN;
@@ -272,10 +290,6 @@ static void cmd_disable(struct ffv2_nl *nl)
 	printf("PROTO-DISABLE=ok\n");
 }
 
-/*
- * A registration presents a nonce the gate issued, so the challenge and the
- * registration are one command here: the nonce is never useful on its own.
- */
 /* Append one "KEY=hex" line to the bundle a client reads. */
 static void bundle_hex(FILE *f, const char *key, const void *data, size_t len)
 {
@@ -325,6 +339,7 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	uint8_t mapped[2][128], uuid[16];
 	const void *value;
 	const void *object_data;
+	size_t object_offset = 0;
 	uint64_t generation;
 	uint32_t seqid;
 	unsigned int object_count = handle2_hex ? 2 : 1;
@@ -438,38 +453,53 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 		const void *attrs;
 		size_t attrs_len;
 
-		object = nl_find(object_data, object_len, (uint16_t)i);
-		if (!object)
-			die("registration returned no object %u", i);
+		object = nl_next(object_data, object_len, &object_offset);
+		if (!object || !(object->nla_type & NLA_F_NESTED) ||
+		    (object->nla_type & NLA_TYPE_MASK) != i)
+			die("registration returned object %u out of order", i);
 		attrs = nl_data(object, &attrs_len);
-		nla = nl_find(attrs, attrs_len,
-			      NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID);
-		if (!nla)
-			die("object %u returned no stateid", i);
-		value = nl_data(nla, &attrlen);
-		if (attrlen != sizeof(wires[i]))
-			die("object %u stateid is %zu bytes", i, attrlen);
-		memcpy(&seqid, value, sizeof(seqid));
-		seqid = htonl(seqid);
-		memcpy(wires[i], &seqid, sizeof(seqid));
-		memcpy(wires[i] + sizeof(seqid),
-		       (const uint8_t *)value + sizeof(seqid),
-		       sizeof(wires[i]) - sizeof(seqid));
-		snprintf(label, sizeof(label), "PROTO-STATEID-%u", i);
-		print_hex(label, wires[i], sizeof(wires[i]));
+		{
+			size_t attrs_offset = 0;
 
-		nla = nl_find(attrs, attrs_len,
-			      NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE);
-		if (!nla)
-			die("object %u returned no mapped handle", i);
-		value = nl_data(nla, &attrlen);
-		if (!attrlen || attrlen > sizeof(mapped[i]))
-			die("object %u mapped handle is %zu bytes", i, attrlen);
-		memcpy(mapped[i], value, attrlen);
-		mapped_lens[i] = attrlen;
-		snprintf(label, sizeof(label), "PROTO-MAPPED-HANDLE-%u", i);
-		print_hex(label, mapped[i], mapped_lens[i]);
+			nla = nl_next(attrs, attrs_len, &attrs_offset);
+			if (!nla ||
+			    (nla->nla_type & NLA_TYPE_MASK) !=
+				    NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE)
+				die("object %u returned no ordered mapped handle",
+				    i);
+			value = nl_data(nla, &attrlen);
+			if (!attrlen || attrlen > sizeof(mapped[i]))
+				die("object %u mapped handle is %zu bytes", i,
+				    attrlen);
+			memcpy(mapped[i], value, attrlen);
+			mapped_lens[i] = attrlen;
+			snprintf(label, sizeof(label), "PROTO-MAPPED-HANDLE-%u",
+				 i);
+			print_hex(label, mapped[i], mapped_lens[i]);
+
+			nla = nl_next(attrs, attrs_len, &attrs_offset);
+			if (!nla ||
+			    (nla->nla_type & NLA_TYPE_MASK) !=
+				    NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID)
+				die("object %u returned no ordered stateid", i);
+			value = nl_data(nla, &attrlen);
+			if (attrlen != sizeof(wires[i]))
+				die("object %u stateid is %zu bytes", i,
+				    attrlen);
+			memcpy(&seqid, value, sizeof(seqid));
+			seqid = htonl(seqid);
+			memcpy(wires[i], &seqid, sizeof(seqid));
+			memcpy(wires[i] + sizeof(seqid),
+			       (const uint8_t *)value + sizeof(seqid),
+			       sizeof(wires[i]) - sizeof(seqid));
+			snprintf(label, sizeof(label), "PROTO-STATEID-%u", i);
+			print_hex(label, wires[i], sizeof(wires[i]));
+			if (attrs_offset != attrs_len)
+				die("object %u returned extra attributes", i);
+		}
 	}
+	if (object_offset != object_len)
+		die("registration returned extra object entries");
 	/* Preserve the singleton names consumed by the B3 harness. */
 	print_hex("PROTO-STATEID", wires[0], sizeof(wires[0]));
 	print_hex("PROTO-MAPPED-HANDLE", mapped[0], mapped_lens[0]);
