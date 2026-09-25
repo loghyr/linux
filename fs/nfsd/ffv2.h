@@ -255,6 +255,9 @@ int nfsd_ffv2_service_export_publish(struct nfsd_net *owner,
 				     u64 *generation_id);
 int nfsd_ffv2_service_generation_retire(struct nfsd_net *nn,
 					u64 generation_id);
+bool nfsd_ffv2_prototype_generation_matches(struct nfsd_net *nn,
+					    const u8 source_uuid[16],
+					    u64 generation_id);
 void nfsd_ffv2_service_context_release(void *payload);
 __be32 nfsd4_ffv2_export_policy_check(struct svc_export *exp, u32 opnum);
 int nfsd_ffv2_service_up(struct nfsd_net *nn);
@@ -721,6 +724,17 @@ int nfsd_ffv2_object_register_fh(struct nfsd_net *nn,
 				 const struct cred *cred, bool validate_backend,
 				 u8 object_uuid[16], struct knfsd_fh *outer_fh,
 				 u64 *generation_id);
+int nfsd_ffv2_object_register_fhs(struct nfsd_net *nn,
+				  struct nfsd_ffv2_export_update *registration,
+				  struct svc_fh *fhps,
+				  const u8 persisted_handles[][32], u32 count,
+				  u32 chunk_size, const u8 store_uuid[16],
+				  const u8 binding_token[32],
+				  const struct cred *cred, bool validate_backend,
+				  const u8 unregister_uuid[16],
+				  u8 object_uuids[][16],
+				  struct knfsd_fh *outer_fhs,
+				  u64 *generation_id);
 int nfsd_ffv2_store_open_generation(struct nfsd_net *nn, u64 generation_id,
 				    struct nfsd_ffv2_store **result);
 #endif

@@ -2644,27 +2644,72 @@ out_zero:
 	return error;
 }
 
+static int
+nfsd_ffv2_prototype_objects_parse(struct nlattr *objects,
+				  struct nfsd_ffv2_prototype_request *request)
+{
+	struct nlattr *child;
+	int remaining;
+	u32 expected = 0;
+
+	nla_for_each_nested(child, objects, remaining) {
+		struct nlattr *attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_MAX + 1];
+		struct nlattr *ordinary, *persisted;
+		int error;
+
+		if (!(child->nla_type & NLA_F_NESTED) ||
+		    nla_type(child) != expected ||
+		    expected == NFSD_FFV2_PROTOTYPE_OBJECT_MAX)
+			return -EINVAL;
+		error = nla_parse_nested(attrs,
+					 NFSD_A_FFV2_PROTOTYPE_OBJECT_MAX, child,
+					 nfsd_ffv2_prototype_object_nl_policy,
+					 NULL);
+		if (error ||
+		    !attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE] ||
+		    !attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE] ||
+		    attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE] ||
+		    attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID])
+			return -EINVAL;
+		ordinary = attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE];
+		persisted = attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE];
+		request->objects[expected].handle = nla_data(ordinary);
+		request->objects[expected].handle_len = nla_len(ordinary);
+		request->objects[expected].persisted_handle = nla_data(persisted);
+		expected++;
+	}
+	if (remaining || !expected)
+		return -EINVAL;
+	request->object_count = expected;
+	return 0;
+}
+
 int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 					 struct genl_info *info)
 {
 	struct nfsd_ffv2_prototype_request request = {};
 	struct nfsd_ffv2_prototype_bundle bundle;
 	struct nlattr **attrs = info->attrs;
+	struct nlattr *objects;
 	struct net *net = genl_info_net(info);
 	void *hdr;
 	int error;
 
 	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_NONCE) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN) ||
-	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_HANDLE) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_DATA_COUNT) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_STORE_UUID) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN) ||
-	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE) ||
 	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_WRITER_ID) ||
-	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID))
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_OBJECTS))
+		return -EINVAL;
+	if (attrs[NFSD_A_FFV2_PROTOTYPE_HANDLE] ||
+	    attrs[NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE] ||
+	    attrs[NFSD_A_FFV2_PROTOTYPE_MAPPED_HANDLE] ||
+	    attrs[NFSD_A_FFV2_PROTOTYPE_STATEID])
 		return -EINVAL;
 	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN],
 				     NAME_MAX, false);
@@ -2674,8 +2719,6 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 	request.nonce = nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_NONCE]);
 	request.auth_domain =
 		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN]);
-	request.handle = nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_HANDLE]);
-	request.handle_len = nla_len(attrs[NFSD_A_FFV2_PROTOTYPE_HANDLE]);
 	request.chunk_size =
 		nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE]);
 	request.data_count =
@@ -2686,22 +2729,21 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_STORE_UUID]);
 	request.binding_token =
 		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN]);
-	request.persisted_handle =
-		nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE]);
 	request.writer_id =
 		nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_WRITER_ID]);
 	request.pnfs_clientid =
 		nla_get_u64(attrs[NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID]);
+	objects = attrs[NFSD_A_FFV2_PROTOTYPE_OBJECTS];
+	error = nfsd_ffv2_prototype_objects_parse(objects, &request);
+	if (error)
+		return error;
 
 	error = nfsd_ffv2_prototype_register(net_generic(net, nfsd_net_id),
 					     net, &request, &bundle);
 	if (error)
 		return error;
 
-	skb = genlmsg_new(3 * nla_total_size(16) +
-			  nla_total_size_64bit(sizeof(bundle.generation)) +
-			  nla_total_size(sizeof(bundle.stateid)) +
-			  nla_total_size(sizeof(bundle.handle)), GFP_KERNEL);
+	skb = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
 	if (!skb)
 		return -ENOMEM;
 	hdr = genlmsg_iput(skb, info);
@@ -2716,13 +2758,36 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_REPLAY_UUID,
 		    sizeof(bundle.replay_uuid), bundle.replay_uuid) ||
 	    nla_put_u64_64bit(skb, NFSD_A_FFV2_PROTOTYPE_GENERATION,
-			      bundle.generation, 0) ||
-	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_STATEID,
-		    sizeof(bundle.stateid), bundle.stateid) ||
-	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_MAPPED_HANDLE,
-		    bundle.handle_len, bundle.handle)) {
+			      bundle.generation, 0)) {
 		error = -EMSGSIZE;
 		goto out_free;
+	}
+	{
+		struct nlattr *objects;
+		u32 i;
+
+		objects = nla_nest_start(skb, NFSD_A_FFV2_PROTOTYPE_OBJECTS);
+		if (!objects) {
+			error = -EMSGSIZE;
+			goto out_free;
+		}
+		for (i = 0; i < bundle.object_count; i++) {
+			struct nlattr *child = nla_nest_start(skb, i);
+
+			if (!child ||
+			    nla_put(skb,
+				    NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE,
+				    bundle.objects[i].handle_len,
+				    bundle.objects[i].handle) ||
+			    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID,
+				    sizeof(bundle.objects[i].stateid),
+				    bundle.objects[i].stateid)) {
+				error = -EMSGSIZE;
+				goto out_free;
+			}
+			nla_nest_end(skb, child);
+		}
+		nla_nest_end(skb, objects);
 	}
 	genlmsg_end(skb, hdr);
 	/*

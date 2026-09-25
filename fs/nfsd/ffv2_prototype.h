@@ -80,6 +80,7 @@ enum nfsd_ffv2_prototype_state {
 /* Bytes in the opaque a challenge hands out, and how long it stays valid. */
 #define NFSD_FFV2_PROTOTYPE_NONCE_LEN	32
 #define NFSD_FFV2_PROTOTYPE_NONCE_TTL_NS	(60ULL * NSEC_PER_SEC)
+#define NFSD_FFV2_PROTOTYPE_OBJECT_MAX	4
 
 /*
  * The administrator that enabled the gate.  Registration, disable and
@@ -161,6 +162,12 @@ struct nfsd_ffv2_prototype_request {
 	const u8	*persisted_handle;
 	u32		writer_id;
 	u64		pnfs_clientid;
+	u32		object_count;
+	struct {
+		const u8 *handle;
+		u32 handle_len;
+		const u8 *persisted_handle;
+	} objects[NFSD_FFV2_PROTOTYPE_OBJECT_MAX];
 };
 
 struct nfsd_ffv2_prototype_bundle {
@@ -173,6 +180,12 @@ struct nfsd_ffv2_prototype_bundle {
 	/* The mapped handle, which is never longer than an ordinary one. */
 	u8		handle[NFS4_FHSIZE];
 	u32		handle_len;
+	u32		object_count;
+	struct {
+		u8 stateid[NFS4_STATEID_SIZE];
+		u8 handle[NFS4_FHSIZE];
+		u32 handle_len;
+	} objects[NFSD_FFV2_PROTOTYPE_OBJECT_MAX];
 };
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)

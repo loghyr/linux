@@ -65,16 +65,19 @@ enum nfsd_ffv2_prototype_nonce_state {
  */
 struct nfsd_ffv2_prototype_committed {
 	char	auth_domain[NFSD_FFV2_PROTOTYPE_DOMAIN_MAX + 1];
-	u8	handle[NFS4_FHSIZE];
-	u32	handle_len;
 	u32	chunk_size;
 	u32	data_count;
 	u32	parity_count;
 	u8	store_uuid[16];
 	u8	binding_token[32];
-	u8	persisted_handle[32];
 	u32	writer_id;
 	u64	pnfs_clientid;
+	u32	object_count;
+	struct {
+		u8 handle[NFS4_FHSIZE];
+		u32 handle_len;
+		u8 persisted_handle[32];
+	} objects[NFSD_FFV2_PROTOTYPE_OBJECT_MAX];
 };
 
 struct nfsd_ffv2_prototype_nonce {
@@ -1221,6 +1224,16 @@ struct nfsd_ffv2_prototype_provider {
 	struct nfsd_ffv2_retained	*predecessors;
 };
 
+struct nfsd_ffv2_prototype_registration {
+	struct nfsd_ffv2_prototype_committed record;
+	struct nfsd_ffv2_store_admission admitted[NFSD_FFV2_PROTOTYPE_OBJECT_MAX];
+	struct knfsd_fh outer_fhs[NFSD_FFV2_PROTOTYPE_OBJECT_MAX];
+	u8 persisted_handles[NFSD_FFV2_PROTOTYPE_OBJECT_MAX][32];
+	u8 object_uuids[NFSD_FFV2_PROTOTYPE_OBJECT_MAX][16];
+	struct svc_fh fhps[NFSD_FFV2_PROTOTYPE_OBJECT_MAX];
+	u8 source_input[32 + 8 + 32 * NFSD_FFV2_PROTOTYPE_OBJECT_MAX];
+};
+
 static struct nfsd_ffv2_prototype_member *
 nfsd_ffv2_prototype_member(struct nfsd_ffv2_prototype_provider *provider,
 			   const struct nfsd_ffv2_object *object)
@@ -1849,52 +1862,69 @@ out_close:
 static int
 nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 				   const struct cred *cred,
-				   const u8 object_uuid[16],
-				   const u8 persisted_handle[32], u32 chunk_size,
-				   u32 data_count, u64 generation,
+				   const u8 object_uuids[][16],
+				   const u8 persisted_handles[][32], u32 count,
+				   u32 chunk_size, u32 data_count, u64 generation,
 				   struct nfsd_ffv2_prototype_provider **result)
 {
 	struct nfsd_ffv2_prototype_provider *provider;
 	struct nfsd_ffv2_prototype_member *member;
 	u64 capacity;
+	u64 max_chunks = 0;
+	u32 i, j;
 	int error;
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
-	if (nfsd_ffv2_prototype_test_armed())
+	if (nfsd_ffv2_prototype_test_armed()) {
+		if (count != 1)
+			return -EOPNOTSUPP;
 		return nfsd_ffv2_prototype_snapshot_build(path, cred, chunk_size,
 							  data_count, generation,
 							  result);
+	}
 #endif
 	provider = kzalloc_obj(*provider, GFP_KERNEL);
 	if (!provider)
 		return -ENOMEM;
-	provider->count = 1;
-	member = &provider->members[0];
-	memcpy(member->object_uuid, object_uuid, sizeof(member->object_uuid));
+	provider->count = count;
 	error = nfsd_ffv2_store_open_generation(nn, generation,
 						&provider->store);
 	if (error)
 		goto out_free;
-	error = nfsd_ffv2_store_lookup_file(provider->store, persisted_handle,
-					    &member->file);
-	if (error)
-		goto out_free;
-	if (check_mul_overflow(member->file.max_chunks,
-			       (u64)member->file.chunk_bytes, &capacity) ||
-	    !capacity || capacity > NFSD_FFV2_MAX_PAYLOAD_BYTES ||
-	    member->file.chunk_bytes != chunk_size ||
-	    member->file.max_chunks != data_count ||
-	    member->file.logical_eof > capacity) {
-		error = -EINVAL;
-		goto out_free;
+	for (i = 0; i < count; i++) {
+		member = &provider->members[i];
+		memcpy(member->object_uuid, object_uuids[i], 16);
+		error = nfsd_ffv2_store_lookup_file(provider->store,
+						    persisted_handles[i],
+						    &member->file);
+		if (error)
+			goto out_free;
+		for (j = 0; j < i; j++) {
+			if (!memcmp(member->file.file_key,
+				    provider->members[j].file.file_key,
+				    sizeof(member->file.file_key))) {
+				error = -EEXIST;
+				goto out_free;
+			}
+		}
+		if (check_mul_overflow(member->file.max_chunks,
+				       (u64)member->file.chunk_bytes, &capacity) ||
+		    !capacity || capacity > NFSD_FFV2_MAX_PAYLOAD_BYTES ||
+		    !member->file.max_chunks || member->file.max_chunks > 64 ||
+		    member->file.chunk_bytes != chunk_size ||
+		    member->file.logical_eof > capacity ||
+		    (max_chunks && member->file.max_chunks != max_chunks)) {
+			error = -EINVAL;
+			goto out_free;
+		}
+		max_chunks = member->file.max_chunks;
+		memcpy(member->store_handle, persisted_handles[i], 32);
 	}
 	provider->chunk_size = chunk_size;
-	provider->chunks = data_count;
+	provider->chunks = max_chunks;
 	provider->visible = nfsd_ffv2_prototype_store_visible;
 	provider->read_payload = nfsd_ffv2_prototype_store_read_payload;
 	provider->reader = provider->store;
-	memcpy(member->store_handle, persisted_handle,
-	       sizeof(member->store_handle));
 	*result = provider;
 	return 0;
 
@@ -1979,10 +2009,11 @@ static void nfsd_ffv2_prototype_teardown_published(struct nfsd_net *nn)
 }
 
 /* Resolve the ordinary filehandle a registration named. */
-static int nfsd_ffv2_prototype_resolve(const struct net *net,
-				       const struct cred *cred,
-				       const struct nfsd_ffv2_prototype_request *req,
-				       struct svc_fh *fhp)
+static int ffv2_prototype_resolve(const struct net *net,
+				  const struct cred *cred,
+				  const struct nfsd_ffv2_prototype_request *req,
+				  const u8 *handle, u32 handle_len,
+				  struct svc_fh *fhp)
 {
 	struct auth_domain *domain;
 	struct svc_cred rq_cred = {};
@@ -2003,8 +2034,8 @@ static int nfsd_ffv2_prototype_resolve(const struct net *net,
 		return -ENOMEM;
 	}
 	fh_init(fhp, NFS4_FHSIZE);
-	fhp->fh_handle.fh_size = req->handle_len;
-	memcpy(fhp->fh_handle.fh_raw, req->handle, req->handle_len);
+	fhp->fh_handle.fh_size = handle_len;
+	memcpy(fhp->fh_handle.fh_raw, handle, handle_len);
 	status = fh_verify_local((struct net *)net, &rq_cred, domain, fhp,
 				 S_IFREG, NFSD_MAY_READ);
 	put_group_info(rq_cred.cr_group_info);
@@ -2023,20 +2054,33 @@ static void
 nfsd_ffv2_prototype_commit_record(struct nfsd_ffv2_prototype_committed *rec,
 				  const struct nfsd_ffv2_prototype_request *req)
 {
+	u32 count = req->object_count ?: 1;
+	u32 i;
+
 	memset(rec, 0, sizeof(*rec));
 	strscpy(rec->auth_domain, req->auth_domain, sizeof(rec->auth_domain));
-	memcpy(rec->handle, req->handle, req->handle_len);
-	rec->handle_len = req->handle_len;
 	rec->chunk_size = req->chunk_size;
 	rec->data_count = req->data_count;
 	rec->parity_count = req->parity_count;
 	memcpy(rec->store_uuid, req->store_uuid, sizeof(rec->store_uuid));
 	memcpy(rec->binding_token, req->binding_token,
 	       sizeof(rec->binding_token));
-	memcpy(rec->persisted_handle, req->persisted_handle,
-	       sizeof(rec->persisted_handle));
 	rec->writer_id = req->writer_id;
 	rec->pnfs_clientid = req->pnfs_clientid;
+	rec->object_count = count;
+	for (i = 0; i < count; i++) {
+		const u8 *handle = req->object_count ? req->objects[i].handle :
+						      req->handle;
+		const u8 *persisted = req->object_count ?
+					 req->objects[i].persisted_handle :
+					 req->persisted_handle;
+		u32 handle_len = req->object_count ? req->objects[i].handle_len :
+							 req->handle_len;
+
+		memcpy(rec->objects[i].handle, handle, handle_len);
+		rec->objects[i].handle_len = handle_len;
+		memcpy(rec->objects[i].persisted_handle, persisted, 32);
+	}
 }
 
 /*
@@ -2098,23 +2142,21 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 				 struct nfsd_ffv2_prototype_bundle *bundle)
 {
 	struct nfsd_ffv2_prototype_provider *provider = NULL;
+	struct nfsd_ffv2_prototype_registration *work;
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_prototype *proto = &anchor->prototype;
-	struct nfsd_ffv2_prototype_committed record;
 	struct nfsd_ffv2_export_update registration;
 	struct nfsd_ffv2_prototype_bundle *staged;
 	struct nfsd_ffv2_prototype_nonce *nonce;
 	struct nfsd_ffv2_prototype_ctx *ctx;
 	bool slot_open = false, installed = false, claimed = false;
+	bool fhs_live = false;
 	bool spent = false;
-	struct knfsd_fh outer_fh = {};
 	const struct cred *cred;
 	u64 generation_id = 0;
-	u8 object_uuid[16];
-	u8 raw_stateid[16];
-	struct svc_fh fhp;
-	stateid_t stateid;
+	u8 source_uuid[16], digest[SHA256_DIGEST_SIZE];
 	struct path path = {};
+	u32 object_count, i;
 	u32 secid = 0;
 	int error = 0;
 
@@ -2124,16 +2166,43 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 * The layout is checked before the gate is even entered: a request
 	 * that cannot describe an object must not consume a nonce.
 	 */
-	if (!req->handle_len || req->handle_len > NFS4_FHSIZE ||
-	    !req->chunk_size || !req->data_count || req->parity_count ||
-	    !req->store_uuid || !req->binding_token || !req->persisted_handle ||
+	object_count = req->object_count ?: 1;
+	if (!req->chunk_size || !req->data_count ||
+	    !req->store_uuid || !req->binding_token ||
 	    !req->writer_id || req->writer_id == U32_MAX ||
-	    req->chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES ||
-	    (u64)req->chunk_size * req->data_count > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+	    object_count > NFSD_FFV2_PROTOTYPE_OBJECT_MAX ||
+	    (req->object_count &&
+	     object_count != req->data_count + req->parity_count) ||
+	    (req->object_count && !req->parity_count && object_count != 1) ||
+	    (!req->object_count && req->parity_count) ||
+	    req->chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES)
 		return -EINVAL;
+	for (i = 0; i < object_count; i++) {
+		const u8 *handle = req->object_count ? req->objects[i].handle :
+						      req->handle;
+		const u8 *persisted = req->object_count ?
+					 req->objects[i].persisted_handle :
+					 req->persisted_handle;
+		u32 handle_len = req->object_count ? req->objects[i].handle_len :
+							 req->handle_len;
+
+		if (!handle || !handle_len || handle_len > NFS4_FHSIZE ||
+		    !persisted)
+			return -EINVAL;
+	}
 	if (strnlen(req->auth_domain, NFSD_FFV2_PROTOTYPE_DOMAIN_MAX + 1) >
 	    NFSD_FFV2_PROTOTYPE_DOMAIN_MAX)
 		return -EINVAL;
+	work = kzalloc_obj(*work, GFP_KERNEL);
+	if (!work)
+		return -ENOMEM;
+	for (i = 0; i < object_count; i++) {
+		const u8 *persisted = req->object_count ?
+					 req->objects[i].persisted_handle :
+					 req->persisted_handle;
+
+		memcpy(work->persisted_handles[i], persisted, 32);
+	}
 
 	security_cred_getsecid(current_cred(), &secid);
 	/*
@@ -2144,7 +2213,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 */
 	error = nfsd_ffv2_prototype_user_get(nn, net, secid);
 	if (error)
-		return error;
+		goto out_free;
 	ctx = nfsd_ffv2_prototype_ctx_of(nn);
 	if (WARN_ON_ONCE(!ctx)) {
 		error = -EOPNOTSUPP;
@@ -2161,7 +2230,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 * storage and none can read an unset pointer.
 	 */
 	staged = &nonce->bundle;
-	nfsd_ffv2_prototype_commit_record(&record, req);
+	nfsd_ffv2_prototype_commit_record(&work->record, req);
 
 	/*
 	 * One decision, under the lock that publishes the state it reads:
@@ -2179,7 +2248,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 		 * different registration and is refused rather than merged.
 		 */
 		spent = true;
-		if (memcmp(&nonce->committed, &record, sizeof(record)))
+		if (memcmp(&nonce->committed, &work->record, sizeof(work->record)))
 			error = -EEXIST;
 		else
 			*bundle = *staged;
@@ -2191,18 +2260,39 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	if (spent || error)
 		goto out_put;
 	cred = ctx->cred;
+	for (i = 0; i < object_count; i++) {
+		const u8 *handle = req->object_count ? req->objects[i].handle :
+						      req->handle;
+		struct svc_fh *fhp = &work->fhps[i];
+		u32 handle_len = req->object_count ? req->objects[i].handle_len :
+							 req->handle_len;
 
-	error = nfsd_ffv2_prototype_resolve(net, cred, req, &fhp);
-	if (error)
-		goto out_put;
-	path.mnt = fhp.fh_export->ex_path.mnt;
-	path.dentry = fhp.fh_dentry;
+		error = ffv2_prototype_resolve(net, cred, req, handle, handle_len,
+					       fhp);
+		if (error) {
+			while (i)
+				fh_put(&work->fhps[--i]);
+			goto out_put;
+		}
+	}
+	fhs_live = true;
+	path.mnt = work->fhps[0].fh_export->ex_path.mnt;
+	path.dentry = work->fhps[0].fh_dentry;
 	/*
 	 * The registration releases the handle that named the object before
 	 * it publishes, so the file this profile reads is named by a
 	 * reference of this function's own from here on.
 	 */
 	path_get(&path);
+	memset(work->source_input, 0, sizeof(work->source_input));
+	memcpy(work->source_input, "NFSD-FFV2-SET-V1", 16);
+	memcpy(work->source_input + 16, req->store_uuid, 16);
+	put_unaligned_be32(req->data_count, work->source_input + 32);
+	put_unaligned_be32(req->parity_count, work->source_input + 36);
+	for (i = 0; i < object_count; i++)
+		memcpy(work->source_input + 40 + i * 32, work->persisted_handles[i], 32);
+	sha256(work->source_input, 40 + object_count * 32, digest);
+	memcpy(source_uuid, digest, sizeof(source_uuid));
 
 	mutex_lock(&nfsd_mutex);
 	error = nfsd_ffv2_registration_begin_prototype(nn, &registration);
@@ -2213,15 +2303,21 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	error = nfsd_ffv2_authority_prototype_create(nn, &registration.authority);
 	if (error)
 		goto out_registration;
-	error = nfsd_ffv2_object_register_fh(nn, &registration, &fhp,
-					     req->chunk_size,
-					     req->persisted_handle, req->store_uuid,
-					     req->binding_token, cred,
-					     !nfsd_ffv2_prototype_test_armed(),
-					     object_uuid, &outer_fh,
-					     &generation_id);
+	error = nfsd_ffv2_object_register_fhs(nn, &registration, work->fhps,
+					      work->persisted_handles, object_count,
+					      req->chunk_size, req->store_uuid,
+					      req->binding_token, cred,
+					      !nfsd_ffv2_prototype_test_armed(),
+					      source_uuid, work->object_uuids,
+					      work->outer_fhs, &generation_id);
+	fhs_live = false;
 	if (error)
 		goto out_registration;
+	if (!nfsd_ffv2_prototype_generation_matches(nn, source_uuid,
+						    generation_id)) {
+		error = -ESTALE;
+		goto out_published;
+	}
 
 	/*
 	 * The snapshot is taken now rather than earlier because a chunk
@@ -2229,33 +2325,33 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 * name until the object has been published.
 	 */
 	error = nfsd_ffv2_prototype_provider_build(nn, &path, cred,
-						   object_uuid,
-						   req->persisted_handle,
+						   work->object_uuids,
+						   work->persisted_handles,
+						   object_count,
 						   req->chunk_size,
 						   req->data_count,
 						   generation_id, &provider);
 	if (error)
 		goto out_published;
 	if (provider->store) {
-		struct nfsd_ffv2_store_admission admitted;
-
 		error = nfsd_ffv2_store_admit_writers(provider->store,
-						      req->writer_id, 1,
-						      &admitted);
+						      req->writer_id,
+						      object_count, work->admitted);
 		if (!error) {
-			provider->members[0].admission_id = admitted.id;
-			memcpy(provider->members[0].stateid, admitted.stateid,
-			       sizeof(provider->members[0].stateid));
-			memcpy(raw_stateid, admitted.stateid,
-			       sizeof(raw_stateid));
+			for (i = 0; i < object_count; i++) {
+				provider->members[i].admission_id = work->admitted[i].id;
+				memcpy(provider->members[i].stateid,
+				       work->admitted[i].stateid,
+				       sizeof(provider->members[i].stateid));
+			}
 		}
 	} else {
 		error = -EOPNOTSUPP;
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 		if (nfsd_ffv2_prototype_test_armed()) {
-			put_unaligned_be32(0x44324253, raw_stateid);
-			memcpy(raw_stateid + 4, "TATE", 4);
-			put_unaligned_be64(1, raw_stateid + 8);
+			put_unaligned_be32(0x44324253, work->admitted[0].stateid);
+			memcpy(work->admitted[0].stateid + 4, "TATE", 4);
+			put_unaligned_be64(1, work->admitted[0].stateid + 8);
 			error = 0;
 		}
 #endif
@@ -2267,10 +2363,17 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	if (error)
 		goto out_published;
 	installed = true;
-	error = nfsd_ffv2_prototype_trust(nn, object_uuid, req,
-					  raw_stateid, &stateid);
-	if (error)
-		goto out_published;
+	memset(staged, 0, sizeof(*staged));
+	for (i = 0; i < object_count; i++) {
+		stateid_t stateid;
+
+		error = nfsd_ffv2_prototype_trust(nn, work->object_uuids[i], req,
+						  work->admitted[i].stateid, &stateid);
+		if (error)
+			goto out_published;
+		memcpy(staged->objects[i].stateid, &stateid,
+		       sizeof(stateid));
+	}
 
 	/*
 	 * Staged in the record it belongs to rather than in the caller's
@@ -2280,14 +2383,21 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 * writing it and no replay can read it: a replay of a claimed
 	 * record is refused by the lookup.
 	 */
-	memset(staged, 0, sizeof(*staged));
-	memcpy(staged->source_uuid, object_uuid, sizeof(staged->source_uuid));
+	memcpy(staged->source_uuid, source_uuid, sizeof(staged->source_uuid));
 	get_random_bytes(staged->service_uuid, sizeof(staged->service_uuid));
 	get_random_bytes(staged->replay_uuid, sizeof(staged->replay_uuid));
 	staged->generation = generation_id;
-	memcpy(staged->stateid, &stateid, sizeof(staged->stateid));
-	memcpy(staged->handle, outer_fh.fh_raw, outer_fh.fh_size);
-	staged->handle_len = outer_fh.fh_size;
+	staged->object_count = object_count;
+	for (i = 0; i < object_count; i++) {
+		memcpy(staged->objects[i].handle, work->outer_fhs[i].fh_raw,
+		       work->outer_fhs[i].fh_size);
+		staged->objects[i].handle_len = work->outer_fhs[i].fh_size;
+	}
+	memcpy(staged->stateid, staged->objects[0].stateid,
+	       sizeof(staged->stateid));
+	memcpy(staged->handle, staged->objects[0].handle,
+	       staged->objects[0].handle_len);
+	staged->handle_len = staged->objects[0].handle_len;
 
 	/*
 	 * The single linearization point.  Until this store a mapping is
@@ -2299,7 +2409,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	spin_lock(&anchor->prototype_gate_lock);
 	/*
 	 * The state is checked again here, and not only when this
-	 * registration was admitted.  Everything between the two is
+	 * registration was work->admitted.  Everything between the two is
 	 * sleepable -- an export lookup, a publication, a whole object read
 	 * -- and a close owner may have claimed the gate during it.  If one
 	 * has, nothing is published: committing the nonce or storing READY
@@ -2319,17 +2429,17 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	proto->owns_generation = true;
 	memcpy(proto->source_uuid, staged->source_uuid,
 	       sizeof(proto->source_uuid));
-	nonce->committed = record;
+	nonce->committed = work->record;
 	nonce->state = NFSD_FFV2_NONCE_COMMITTED;
 	proto->state = NFSD_FFV2_PROTOTYPE_READY;
 	*bundle = *staged;
 	spin_unlock(&anchor->prototype_gate_lock);
 
 	nfsd_ffv2_registration_end(nn, &registration);
-	fh_put(&fhp);
 	path_put(&path);
 	nfsd_ffv2_prototype_nonce_release(nn, nonce);
 	nfsd_ffv2_prototype_user_put(nn);
+	kfree_sensitive(work);
 	return 0;
 
 out_published:
@@ -2350,12 +2460,18 @@ out_published:
 out_registration:
 	if (slot_open)
 		nfsd_ffv2_registration_end(nn, &registration);
-	fh_put(&fhp);
+	if (fhs_live)
+		for (i = 0; i < object_count; i++)
+			fh_put(&work->fhps[i]);
 out_put:
 	path_put(&path);
 	if (claimed)
 		nfsd_ffv2_prototype_nonce_release(nn, nonce);
 	nfsd_ffv2_prototype_user_put(nn);
+	kfree_sensitive(work);
+	return error;
+out_free:
+	kfree_sensitive(work);
 	return error;
 }
 

@@ -451,6 +451,35 @@ attribute-sets:
       -
         name: pnfs-clientid
         type: u64
+      -
+        name: objects
+        type: indexed-array
+        sub-type: nest
+        nested-attributes: ffv2-prototype-object
+
+  -
+    name: ffv2-prototype-object
+    attributes:
+      -
+        name: ordinary-handle
+        type: binary
+        checks:
+          max-len: 128
+      -
+        name: persisted-handle
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: mapped-handle
+        type: binary
+        checks:
+          max-len: 128
+      -
+        name: stateid
+        type: binary
+        checks:
+          exact-len: 16
 
 operations:
   list:
@@ -695,7 +724,7 @@ operations:
             - expires
     -
       name: ffv2-prototype-register
-      doc: publish the one object a prototype authority gate serves
+      doc: publish the object set a prototype authority gate serves
       attribute-set: ffv2-prototype
       flags: [admin-perm]
       do:
@@ -703,23 +732,21 @@ operations:
           attributes:
             - nonce
             - auth-domain
-            - handle
             - chunk-size
             - data-count
             - parity-count
             - store-uuid
             - binding-token
-            - persisted-handle
             - writer-id
             - pnfs-clientid
+            - objects
         reply:
           attributes:
             - source-uuid
             - service-uuid
             - replay-uuid
             - generation
-            - stateid
-            - mapped-handle
+            - objects
     -
       name: ffv2-prototype-unregister
       doc: retire the object a prototype authority gate published

@@ -15365,8 +15365,10 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 	static const u8 binding_token[32] = { 2 };
 	static const u8 persisted_handle[32] = { 3 };
 	u8 handle[NFS4_FHSIZE] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+	u8 object_attrs[256] = {};
+	u8 children[320] = {};
 	char buf[NFSD_FFV2_NL_BUF];
-	size_t off;
+	size_t child_off = 0, object_off = 0, off;
 	int error;
 
 	off = nfsd_ffv2_nl_proto_begin(nl, buf,
@@ -15378,10 +15380,6 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 		error = nfsd_ffv2_nl_put_str(buf, sizeof(buf), &off,
 					     NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN,
 					     a->domain);
-	if (!error)
-		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
-					 NFSD_A_FFV2_PROTOTYPE_HANDLE, handle,
-					 a->handle_len);
 	if (!error)
 		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
 					     NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE,
@@ -15403,10 +15401,29 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 					 NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN,
 					 binding_token, sizeof(binding_token));
 	if (!error)
-		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
-					 NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE,
+		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+					     NFSD_A_FFV2_PROTOTYPE_WRITER_ID, 7);
+	if (!error)
+		error = nfsd_ffv2_nl_put_u64(buf, sizeof(buf), &off,
+					     NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID, 0);
+	if (!error)
+		error = nfsd_ffv2_nl_put(object_attrs, sizeof(object_attrs),
+					 &object_off,
+					 NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE,
+					 handle, a->handle_len);
+	if (!error)
+		error = nfsd_ffv2_nl_put(object_attrs, sizeof(object_attrs),
+					 &object_off,
+					 NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE,
 					 persisted_handle,
 					 sizeof(persisted_handle));
+	if (!error)
+		error = nfsd_ffv2_nl_put(children, sizeof(children), &child_off,
+					 NLA_F_NESTED, object_attrs, object_off);
+	if (!error)
+		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+					 NFSD_A_FFV2_PROTOTYPE_OBJECTS |
+					 NLA_F_NESTED, children, child_off);
 	if (!error && a->unknown_attr)
 		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
 					     a->unknown_attr, 0);

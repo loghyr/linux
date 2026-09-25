@@ -138,6 +138,27 @@ static void nl_put_str(struct ffv2_nl *nl, uint16_t type, const char *value)
 	nl_put(nl, type, value, (uint16_t)(strlen(value) + 1));
 }
 
+static struct nlattr *nl_nest_start(struct ffv2_nl *nl, uint16_t type)
+{
+	struct nlmsghdr *nlh = (struct nlmsghdr *)nl->buf;
+	struct nlattr *nla;
+
+	if (NLMSG_ALIGN(nlh->nlmsg_len) + NLA_HDRLEN > sizeof(nl->buf))
+		die("netlink request too large");
+	nla = (struct nlattr *)(nl->buf + NLMSG_ALIGN(nlh->nlmsg_len));
+	nla->nla_type = type | NLA_F_NESTED;
+	nla->nla_len = NLA_HDRLEN;
+	nlh->nlmsg_len = NLMSG_ALIGN(nlh->nlmsg_len) + NLA_ALIGN(NLA_HDRLEN);
+	return nla;
+}
+
+static void nl_nest_end(struct ffv2_nl *nl, struct nlattr *nla)
+{
+	struct nlmsghdr *nlh = (struct nlmsghdr *)nl->buf;
+
+	nla->nla_len = (uint8_t *)nl->buf + nlh->nlmsg_len - (uint8_t *)nla;
+}
+
 /*
  * Send the staged message and collect the reply.  A DONE or an ACK ends the
  * exchange; an error reply is reported with the errno the kernel chose, so
@@ -297,9 +318,11 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	uint8_t wire[16];
 	const struct nlattr *nla;
 	size_t handle_len, len, attrlen;
+	size_t object_len;
 	size_t mapped_len = 0, uuid_len = 0;
 	uint8_t mapped[128], uuid[16];
 	const void *value;
+	const void *object_data;
 	uint64_t generation;
 	uint32_t seqid;
 	FILE *bundle = NULL;
@@ -330,8 +353,6 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	nl_start(nl, nl->family, NFSD_CMD_FFV2_PROTOTYPE_REGISTER);
 	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_NONCE, nonce, sizeof(nonce));
 	nl_put_str(nl, NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN, domain);
-	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_HANDLE, handle,
-	       (uint16_t)handle_len);
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE, chunk_size);
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_DATA_COUNT, data_count);
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT, 0);
@@ -339,10 +360,20 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	       sizeof(store_uuid));
 	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN, binding_token,
 	       sizeof(binding_token));
-	nl_put(nl, NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE, persisted_handle,
-	       sizeof(persisted_handle));
 	nl_put_u32(nl, NFSD_A_FFV2_PROTOTYPE_WRITER_ID, writer_id);
 	nl_put_u64(nl, NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID, pnfs_clientid);
+	{
+		struct nlattr *objects, *object;
+
+		objects = nl_nest_start(nl, NFSD_A_FFV2_PROTOTYPE_OBJECTS);
+		object = nl_nest_start(nl, 0);
+		nl_put(nl, NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE,
+		       handle, (uint16_t)handle_len);
+		nl_put(nl, NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE,
+		       persisted_handle, sizeof(persisted_handle));
+		nl_nest_end(nl, object);
+		nl_nest_end(nl, objects);
+	}
 	len = nl_talk(nl, reply, sizeof(reply));
 
 	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID);
@@ -374,7 +405,16 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	memcpy(&generation, value, sizeof(generation));
 	printf("PROTO-GENERATION=%llu\n", (unsigned long long)generation);
 
-	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_STATEID);
+	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_OBJECTS);
+	if (!nla)
+		die("registration returned no object array");
+	value = nl_data(nla, &attrlen);
+	nla = nl_find(value, attrlen, 0);
+	if (!nla)
+		die("registration returned no object zero");
+	object_data = nl_data(nla, &object_len);
+	nla = nl_find(object_data, object_len,
+		      NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID);
 	if (!nla)
 		die("registration returned no stateid");
 	value = nl_data(nla, &attrlen);
@@ -388,7 +428,8 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	       sizeof(wire) - sizeof(seqid));
 	print_hex("PROTO-STATEID", wire, sizeof(wire));
 
-	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_MAPPED_HANDLE);
+	nla = nl_find(object_data, object_len,
+		      NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE);
 	if (!nla)
 		die("registration returned no mapped handle");
 	value = nl_data(nla, &attrlen);
