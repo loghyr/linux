@@ -445,6 +445,17 @@ attribute-sets:
         type: binary
         checks:
           exact-len: 32
+      -
+        name: persisted-handle
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: writer-id
+        type: u32
+      -
+        name: pnfs-clientid
+        type: u64
 
 operations:
   list:
@@ -704,6 +715,9 @@ operations:
             - parity-count
             - store-uuid
             - binding-token
+            - persisted-handle
+            - writer-id
+            - pnfs-clientid
         reply:
           attributes:
             - source-uuid
