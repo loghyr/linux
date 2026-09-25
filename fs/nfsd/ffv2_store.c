@@ -701,6 +701,7 @@ int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 	postcond_present = ffv2_get_u8(&cursor);
 	record->postcond_id = ffv2_get_u64(&cursor);
 	record->payload_object_id = ffv2_get_u64(&cursor);
+	record->writer_payload_id = ffv2_get_u32(&cursor);
 	record->payload_object_offset = ffv2_get_u64(&cursor);
 	record->payload_content_len = ffv2_get_u32(&cursor);
 	record->extent_kind = ffv2_get_u32(&cursor);
@@ -739,6 +740,7 @@ int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 			   sizeof(record->result_checksum) -
 				     record->result_checksum_len) ||
 	    (!record->payload_object_id && record->payload_object_offset) ||
+	    (!record->payload_object_id && record->writer_payload_id) ||
 	    (record->payload_object_id &&
 	     (!(record->payload_object_id >> 40) ||
 	      (record->payload_object_id >> 40) > header->ds_incarnation ||
@@ -1056,8 +1058,10 @@ struct ffv2_transaction {
 	u64 predecessor_object_id;
 	u32 predecessor_generation;
 	u64 payload_object_id;
+	u32 writer_payload_id;
 	u64 payload_object_offset;
 	u32 content_len;
+	u32 content_crc32c;
 	u32 checksum_algorithm;
 	u32 checksum_len;
 	u8 checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
@@ -1751,8 +1755,10 @@ static int ffv2_replay_visible_entry(
 		transaction->predecessor_generation =
 						entry->predecessor_generation;
 		transaction->payload_object_id = entry->payload_object_id;
+		transaction->writer_payload_id = entry->writer_payload_id;
 		transaction->payload_object_offset = entry->payload_object_offset;
 		transaction->content_len = entry->payload_content_len;
+		transaction->content_crc32c = payload->content_crc32c;
 		transaction->checksum_algorithm = payload->checksum_algorithm;
 		transaction->checksum_len = payload->checksum_len;
 		memcpy(transaction->checksum, payload->checksum,
@@ -1950,9 +1956,11 @@ int nfsd_ffv2_store_test_visible_replay(
 			chunk->version_object_id = version->version_object_id;
 			chunk->version_generation = version->version_generation;
 			chunk->payload_object_id = version->payload_object_id;
+			chunk->writer_payload_id = version->writer_payload_id;
 			chunk->payload_object_offset =
 						version->payload_object_offset;
 			chunk->content_len = version->content_len;
+			chunk->content_crc32c = version->content_crc32c;
 			chunk->checksum_algorithm = version->checksum_algorithm;
 			chunk->checksum_len = version->checksum_len;
 			memcpy(chunk->checksum, version->checksum,
@@ -2576,8 +2584,10 @@ int nfsd_ffv2_store_visible_chunk(struct nfsd_ffv2_store *store,
 	chunk->version_object_id = version->version_object_id;
 	chunk->version_generation = version->version_generation;
 	chunk->payload_object_id = version->payload_object_id;
+	chunk->writer_payload_id = version->writer_payload_id;
 	chunk->payload_object_offset = version->payload_object_offset;
 	chunk->content_len = version->content_len;
+	chunk->content_crc32c = version->content_crc32c;
 	chunk->checksum_algorithm = version->checksum_algorithm;
 	chunk->checksum_len = version->checksum_len;
 	memcpy(chunk->checksum, version->checksum, sizeof(chunk->checksum));
@@ -2743,9 +2753,11 @@ int nfsd_ffv2_store_test_visible_snapshot(struct nfsd_ffv2_store *store,
 			entry->chunk.version_generation =
 						version->version_generation;
 			entry->chunk.payload_object_id = version->payload_object_id;
+			entry->chunk.writer_payload_id = version->writer_payload_id;
 			entry->chunk.payload_object_offset =
 						version->payload_object_offset;
 			entry->chunk.content_len = version->content_len;
+			entry->chunk.content_crc32c = version->content_crc32c;
 			entry->chunk.checksum_algorithm = version->checksum_algorithm;
 			entry->chunk.checksum_len = version->checksum_len;
 			memcpy(entry->chunk.checksum, version->checksum,

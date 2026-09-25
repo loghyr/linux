@@ -18,7 +18,7 @@ struct nfsd_ffv2_store;
 #define NFSD_FFV2_STORE_CHECKSUM_SHA256	4
 #define NFSD_FFV2_PAYLOAD_SEQUENCE_MASK	GENMASK_ULL(39, 0)
 
-#define NFSD_FFV2_FORMAT_VERSION		1
+#define NFSD_FFV2_FORMAT_VERSION		2
 #define NFSD_FFV2_PROLOGUE_SIZE		36
 #define NFSD_FFV2_WAL_HEADER_SIZE	72
 #define NFSD_FFV2_SUPER_RECORD_SIZE	360
@@ -28,15 +28,15 @@ struct nfsd_ffv2_store;
 #define NFSD_FFV2_CONTROL_PREFIX_SIZE	136
 #define NFSD_FFV2_FILE_REGISTER_BODY_SIZE 184
 #define NFSD_FFV2_FILE_REGISTER_RECORD_SIZE 396
-#define NFSD_FFV2_ENTRY_BODY_SIZE	460
-#define NFSD_FFV2_ENTRY_RECORD_SIZE	536
+#define NFSD_FFV2_ENTRY_BODY_SIZE	464
+#define NFSD_FFV2_ENTRY_RECORD_SIZE	540
 #define NFSD_FFV2_MAX_WAL_RECORD_SIZE	4236
 #define NFSD_FFV2_MAX_DAMAGED_TAIL_SIZE	(1024U * 1024U)
 #define NFSD_FFV2_PAYLOAD_HEADER_SIZE	80
 #define NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE 136
 #define NFSD_FFV2_PAYLOAD_ALIGN		4096
 
-#define NFSD_FFV2_MIN_WAL_SIZE		3352780ULL
+#define NFSD_FFV2_MIN_WAL_SIZE		3352972ULL
 #define NFSD_FFV2_MAX_INCARNATION	0x00ffffffULL
 #define NFSD_FFV2_MAX_OBJECTS		4U
 #define NFSD_FFV2_MAX_TRANSACTIONS	256U
@@ -203,6 +203,7 @@ struct nfsd_ffv2_entry_record {
 	bool postcond_present;
 	u64 postcond_id;
 	u64 payload_object_id;
+	u32 writer_payload_id;
 	u64 payload_object_offset;
 	u32 payload_content_len;
 	u32 extent_kind;
@@ -243,8 +244,10 @@ struct nfsd_ffv2_visible_chunk {
 	u64 version_object_id;
 	u32 version_generation;
 	u64 payload_object_id;
+	u32 writer_payload_id;
 	u64 payload_object_offset;
 	u32 content_len;
+	u32 content_crc32c;
 	u32 checksum_algorithm;
 	u32 checksum_len;
 	u8 checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
