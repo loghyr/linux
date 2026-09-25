@@ -841,10 +841,13 @@ struct nfsd4_copy_notify {
  * The provider dispatch seam needs the common file, range, and stateid
  * fields. Operation-specific decoders consume the remaining wire fields.
  */
+#define NFSD4_FFV2_CHECKSUM_MAX	64
+
 struct nfsd4_ffv2 {
 	stateid_t	stateid;
 	u64		offset;
 	u32		count;
+	u32		stable_how;
 	/*
 	 * Writer or repair-actor identity, retained so the authorization
 	 * gate can compare the caller a request names against the client the
@@ -859,6 +862,28 @@ struct nfsd4_ffv2 {
 	u32		owner_client_id;
 	u32		owner_id;
 	bool		owner_present;
+	u32		payload_id;
+	u32		flags;
+	bool		guard_check;
+	bool		guard_never_written;
+	u32		guard_generation;
+	u32		guard_writer;
+	u32		chunk_size;
+	u32		checksum_algorithm;
+	u32		checksum_len;
+	u8		checksum[NFSD4_FFV2_CHECKSUM_MAX];
+	u32		payload_len;
+	struct xdr_buf	payload;
+
+	/* Bounded ordinary mutation response. */
+	u32		result_count;
+	u32		result_stability;
+	nfs4_verifier	result_verifier;
+	__be32		result_status;
+	bool		result_activated;
+	u64		result_owner_cohort_id;
+	u32		result_owner_client_id;
+	u32		result_owner_id;
 	/* BULK_REVOKE_STATEID4args: the clientid whose state is revoked. */
 	clientid_t	target_clientid;
 	bool		target_present;

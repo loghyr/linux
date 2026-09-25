@@ -3719,12 +3719,13 @@ static void nfsd_ffv2_decoder_write_test(struct kunit *test)
 	nfsd_ffv2_xdr_u32(&w, 2);			/* stable_how4 */
 	nfsd_ffv2_xdr_u64(&w, 0xcafef00dd00dULL);	/* cohort id */
 	nfsd_ffv2_xdr_u32(&w, 0x5150);			/* client id */
-	nfsd_ffv2_xdr_u32(&w, 2);			/* co_ids<> count */
+	nfsd_ffv2_xdr_u32(&w, 1);			/* co_ids<> count */
 	nfsd_ffv2_xdr_u32(&w, 11);
-	nfsd_ffv2_xdr_u32(&w, 12);
 	nfsd_ffv2_xdr_u32(&w, 3);			/* payload id */
 	nfsd_ffv2_xdr_u32(&w, 4096);			/* chunk size */
-	nfsd_ffv2_xdr_u32(&w, 0);			/* checksums<> */
+	nfsd_ffv2_xdr_u32(&w, 1);			/* checksums<> */
+	nfsd_ffv2_xdr_u32(&w, 0);			/* CHECKSUM_NONE */
+	nfsd_ffv2_xdr_u32(&w, 0);			/* checksum length */
 	nfsd_ffv2_xdr_u32(&w, 0);			/* chunks<> */
 
 	KUNIT_EXPECT_EQ(test, nfs_ok,
@@ -3739,7 +3740,7 @@ static void nfsd_ffv2_decoder_write_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0xcafef00dd00dULL, u->ffv2.owner_cohort_id);
 	KUNIT_EXPECT_EQ(test, 0x5150U, u->ffv2.owner_client_id);
 	KUNIT_EXPECT_TRUE(test, u->ffv2.owner_present);
-	KUNIT_EXPECT_EQ(test, 0U, u->ffv2.owner_id);
+	KUNIT_EXPECT_EQ(test, 11U, u->ffv2.owner_id);
 
 	/*
 	 * An over-long co_ids array is refused rather than trusted.  The
@@ -3824,13 +3825,17 @@ static void nfsd_ffv2_decoder_chunk_write_test(struct kunit *test)
 	nfsd_ffv2_xdr_u32(&w, 1);			/* stable_how4 */
 	nfsd_ffv2_xdr_u64(&w, 0x1122334455667788ULL);	/* cohort id */
 	nfsd_ffv2_xdr_u32(&w, 0x2024);			/* client id */
-	nfsd_ffv2_xdr_u32(&w, 0);			/* co_ids<> empty */
+	nfsd_ffv2_xdr_u32(&w, 1);			/* co_ids<> */
+	nfsd_ffv2_xdr_u32(&w, 7);			/* co_id */
 	nfsd_ffv2_xdr_u32(&w, 9);			/* payload id */
 	nfsd_ffv2_xdr_u32(&w, 0);			/* flags */
 	nfsd_ffv2_xdr_u32(&w, 0);			/* cwg_check FALSE */
 	nfsd_ffv2_xdr_u32(&w, 4096);			/* chunk size */
-	nfsd_ffv2_xdr_u32(&w, 0);			/* checksums<> */
-	nfsd_ffv2_xdr_u32(&w, 0);			/* chunks<> */
+	nfsd_ffv2_xdr_u32(&w, 1);			/* checksums<> */
+	nfsd_ffv2_xdr_u32(&w, 0);			/* CHECKSUM_NONE */
+	nfsd_ffv2_xdr_u32(&w, 0);			/* checksum length */
+	nfsd_ffv2_xdr_u32(&w, 4);			/* chunks<> length */
+	nfsd_ffv2_xdr_u32(&w, 0xdeadbeef);		/* payload */
 
 	KUNIT_EXPECT_EQ(test, nfs_ok,
 			nfsd4_test_decode_op(rqstp, OP_CHUNK_WRITE, buf,
@@ -3839,6 +3844,9 @@ static void nfsd_ffv2_decoder_chunk_write_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_xdr_len(&w), consumed);
 	KUNIT_EXPECT_EQ(test, 0x1122334455667788ULL, u->ffv2.owner_cohort_id);
 	KUNIT_EXPECT_EQ(test, 0x2024U, u->ffv2.owner_client_id);
+	KUNIT_EXPECT_EQ(test, 7U, u->ffv2.owner_id);
+	KUNIT_EXPECT_EQ(test, 9U, u->ffv2.payload_id);
+	KUNIT_EXPECT_EQ(test, 4U, u->ffv2.payload_len);
 	KUNIT_EXPECT_TRUE(test, u->ffv2.owner_present);
 
 	/* cwg_check TRUE: two further words belong to the guard. */
@@ -3850,15 +3858,19 @@ static void nfsd_ffv2_decoder_chunk_write_test(struct kunit *test)
 	nfsd_ffv2_xdr_u32(&w, 1);
 	nfsd_ffv2_xdr_u64(&w, 0x1122334455667788ULL);
 	nfsd_ffv2_xdr_u32(&w, 0x2024);
-	nfsd_ffv2_xdr_u32(&w, 0);
+	nfsd_ffv2_xdr_u32(&w, 1);
+	nfsd_ffv2_xdr_u32(&w, 7);
 	nfsd_ffv2_xdr_u32(&w, 9);
 	nfsd_ffv2_xdr_u32(&w, 0);
 	nfsd_ffv2_xdr_u32(&w, 1);			/* cwg_check TRUE */
 	nfsd_ffv2_xdr_u32(&w, 0xaaaa);			/* cg_gen_id */
 	nfsd_ffv2_xdr_u32(&w, 0xbbbb);			/* cg_client_id */
 	nfsd_ffv2_xdr_u32(&w, 4096);
+	nfsd_ffv2_xdr_u32(&w, 1);
 	nfsd_ffv2_xdr_u32(&w, 0);
 	nfsd_ffv2_xdr_u32(&w, 0);
+	nfsd_ffv2_xdr_u32(&w, 4);
+	nfsd_ffv2_xdr_u32(&w, 0xdeadbeef);
 	guarded_len = nfsd_ffv2_xdr_len(&w);
 
 	KUNIT_EXPECT_EQ(test, nfs_ok,
@@ -3866,20 +3878,23 @@ static void nfsd_ffv2_decoder_chunk_write_test(struct kunit *test)
 					     guarded_len, u, &consumed));
 	KUNIT_EXPECT_EQ(test, guarded_len, consumed);
 	KUNIT_EXPECT_EQ(test, 0x2024U, u->ffv2.owner_client_id);
+	KUNIT_EXPECT_TRUE(test, u->ffv2.guard_check);
+	KUNIT_EXPECT_EQ(test, 0xaaaaU, u->ffv2.guard_generation);
+	KUNIT_EXPECT_EQ(test, 0xbbbbU, u->ffv2.guard_writer);
 
 	/* A guard discriminant outside the boolean range is refused. */
 	memset(u, 0, sizeof(*u));
-	buf[13] = cpu_to_be32(2);
+	buf[14] = cpu_to_be32(2);
 	KUNIT_EXPECT_NE(test, nfs_ok,
 			nfsd4_test_decode_op(rqstp, OP_CHUNK_WRITE, buf,
 					     guarded_len, u, &consumed));
-	buf[13] = cpu_to_be32(1);
+	buf[14] = cpu_to_be32(1);
 
 	/* Claiming a guard and then truncating it fails closed. */
 	memset(u, 0, sizeof(*u));
 	KUNIT_EXPECT_NE(test, nfs_ok,
 			nfsd4_test_decode_op(rqstp, OP_CHUNK_WRITE, buf,
-					     14 * XDR_UNIT, u, &consumed));
+					     15 * XDR_UNIT, u, &consumed));
 }
 
 /*
@@ -3908,15 +3923,14 @@ static void nfsd_ffv2_decoder_lifecycle_test(struct kunit *test)
 		struct nfsd_ffv2_xdr_writer w;
 		size_t consumed, full_len;
 
-		/* Two owners: the array is four words per element. */
+		/* The B3 slice retains one owner and one chunk range. */
 		w.base = buf;
 		w.p = buf;
 		nfsd_ffv2_xdr_stateid(&w, &sid);
 		nfsd_ffv2_xdr_u64(&w, 16384);		/* offset */
-		nfsd_ffv2_xdr_u32(&w, 2);		/* count */
-		nfsd_ffv2_xdr_u32(&w, 2);		/* chunks<> count */
+		nfsd_ffv2_xdr_u32(&w, 1);		/* count */
+		nfsd_ffv2_xdr_u32(&w, 1);		/* chunks<> count */
 		nfsd_ffv2_xdr_owner(&w, 0xdeadbeefULL, 0x1111, 0x2222);
-		nfsd_ffv2_xdr_owner(&w, 0xfeedfaceULL, 0x3333, 0x4444);
 		full_len = nfsd_ffv2_xdr_len(&w);
 
 		memset(u, 0, sizeof(*u));
@@ -3925,9 +3939,13 @@ static void nfsd_ffv2_decoder_lifecycle_test(struct kunit *test)
 						     full_len, u, &consumed));
 		KUNIT_EXPECT_EQ(test, full_len, consumed);
 		KUNIT_EXPECT_EQ(test, 16384ULL, u->ffv2.offset);
-		KUNIT_EXPECT_EQ(test, 2U, u->ffv2.count);
+		KUNIT_EXPECT_EQ(test, 1U, u->ffv2.count);
+		KUNIT_EXPECT_EQ(test, 0xdeadbeefULL,
+				u->ffv2.owner_cohort_id);
+		KUNIT_EXPECT_EQ(test, 0x1111U, u->ffv2.owner_client_id);
+		KUNIT_EXPECT_EQ(test, 0x2222U, u->ffv2.owner_id);
 
-		/* An empty array is permitted and consumes only its count. */
+		/* Batching remains outside B3, including an empty owner set. */
 		w.base = buf;
 		w.p = buf;
 		nfsd_ffv2_xdr_stateid(&w, &sid);
@@ -3935,11 +3953,10 @@ static void nfsd_ffv2_decoder_lifecycle_test(struct kunit *test)
 		nfsd_ffv2_xdr_u32(&w, 0);
 		nfsd_ffv2_xdr_u32(&w, 0);		/* chunks<> empty */
 		memset(u, 0, sizeof(*u));
-		KUNIT_EXPECT_EQ(test, nfs_ok,
+		KUNIT_EXPECT_EQ(test, nfserr_notsupp,
 				nfsd4_test_decode_op(rqstp, ops[i], buf,
 						     nfsd_ffv2_xdr_len(&w), u,
 						     &consumed));
-		KUNIT_EXPECT_EQ(test, nfsd_ffv2_xdr_len(&w), consumed);
 
 		/* A count larger than the bytes present fails closed. */
 		w.base = buf;
@@ -10764,6 +10781,85 @@ static u32 nfsd_ffv2_ro_word(struct xdr_buf *buf, u32 offset)
 	return be32_to_cpu(word);
 }
 
+static int
+nfsd_ffv2_mutation_encode(struct kunit *test, union nfsd4_op_u *u, u32 opnum,
+			  struct xdr_buf *buf)
+{
+	struct xdr_stream xdr;
+	__be32 *page;
+	__be32 status;
+
+	page = kunit_kzalloc(test, PAGE_SIZE, GFP_KERNEL);
+	if (!page)
+		return -ENOMEM;
+	memset(buf, 0, sizeof(*buf));
+	buf->head[0].iov_base = page;
+	buf->buflen = PAGE_SIZE;
+	xdr_init_encode(&xdr, buf, page, NULL);
+	switch (opnum) {
+	case OP_CHUNK_WRITE:
+		status = nfsd_ffv2_test_encode_chunk_write(&xdr, u);
+		break;
+	case OP_CHUNK_FINALIZE:
+		status = nfsd_ffv2_test_encode_chunk_finalize(&xdr, u);
+		break;
+	case OP_CHUNK_COMMIT:
+		status = nfsd_ffv2_test_encode_chunk_commit(&xdr, u);
+		break;
+	default:
+		return -EINVAL;
+	}
+	return status == nfs_ok ? buf->len : -EIO;
+}
+
+static void nfsd_ffv2_encode_mutation_test(struct kunit *test)
+{
+	static const u32 lifecycle_ops[] = {
+		OP_CHUNK_FINALIZE,
+		OP_CHUNK_COMMIT,
+	};
+	union nfsd4_op_u u = {};
+	struct nfsd4_ffv2 *ffv2 = &u.ffv2;
+	struct xdr_buf buf;
+	unsigned int i;
+	u8 verifier[8];
+	int len;
+
+	for (i = 0; i < sizeof(verifier); i++)
+		verifier[i] = i + 1;
+	ffv2->payload_len = 123;
+	ffv2->result_count = 1;
+	ffv2->result_stability = NFS_FILE_SYNC;
+	memcpy(ffv2->result_verifier.data, verifier, sizeof(verifier));
+	ffv2->result_status = nfs_ok;
+	ffv2->result_activated = true;
+	ffv2->result_owner_cohort_id = 0x1122334455667788ULL;
+	ffv2->result_owner_client_id = 0xaabbccdd;
+	ffv2->result_owner_id = 0x12345678;
+
+	len = nfsd_ffv2_mutation_encode(test, &u, OP_CHUNK_WRITE, &buf);
+	KUNIT_ASSERT_EQ(test, 52, len);
+	KUNIT_EXPECT_EQ(test, 123U, nfsd_ffv2_ro_word(&buf, 0));
+	KUNIT_EXPECT_EQ(test, (u32)NFS_FILE_SYNC,
+			nfsd_ffv2_ro_word(&buf, 4));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 16));
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_ro_word(&buf, 20));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 24));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 28));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 32));
+	KUNIT_EXPECT_EQ(test, 0x11223344U, nfsd_ffv2_ro_word(&buf, 36));
+	KUNIT_EXPECT_EQ(test, 0x55667788U, nfsd_ffv2_ro_word(&buf, 40));
+	KUNIT_EXPECT_EQ(test, 0xaabbccddU, nfsd_ffv2_ro_word(&buf, 44));
+	KUNIT_EXPECT_EQ(test, 0x12345678U, nfsd_ffv2_ro_word(&buf, 48));
+	for (i = 0; i < ARRAY_SIZE(lifecycle_ops); i++) {
+		len = nfsd_ffv2_mutation_encode(test, &u, lifecycle_ops[i],
+						&buf);
+		KUNIT_ASSERT_EQ(test, 16, len);
+		KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 8));
+		KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_ro_word(&buf, 12));
+	}
+}
+
 /*
  * Encode one reply into a buffer that has a page vector, not just a head,
  * and hand back its length.  A payload larger than a page has nowhere to
@@ -15765,6 +15861,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_provider_result_contract_test),
 	KUNIT_CASE(nfsd_ffv2_encode_read_test),
 	KUNIT_CASE(nfsd_ffv2_encode_large_payload_test),
+	KUNIT_CASE(nfsd_ffv2_encode_mutation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_unadmitted_test),
 	KUNIT_CASE(nfsd_ffv2_encode_header_test),
 	KUNIT_CASE(nfsd_ffv2_auth_cache_nl_parser_test),

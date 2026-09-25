@@ -2514,6 +2514,7 @@ nfsd4_decode_removexattr(struct nfsd4_compoundargs *argp,
 #define NFSD4_FFV2_MAX_HEADER_READ 1024U
 #define NFSD4_FFV2_LOCK_ADOPT	BIT(0)
 #define NFSD4_FFV2_LOCK_TAKEOVER	BIT(1)
+#define NFSD4_FFV2_WRITE_ACTIVATE_IF_EMPTY BIT(0)
 
 static __be32
 nfsd4_decode_ffv2_range(struct nfsd4_compoundargs *argp,
@@ -2575,28 +2576,18 @@ static __be32 nfsd4_decode_ffv2_owner(struct nfsd4_compoundargs *argp,
  * CHUNK_FINALIZE, or CHUNK_ROLLBACK must retain the identities first, or it
  * will act on owners it never read.
  */
-static __be32 nfsd4_decode_ffv2_owners(struct nfsd4_compoundargs *argp)
+static __be32
+nfsd4_decode_ffv2_owners(struct nfsd4_compoundargs *argp,
+			 struct nfsd4_ffv2 *ffv2)
 {
 	u32 count;
 
 	if (xdr_stream_decode_u32(argp->xdr, &count) < 0)
 		return nfserr_bad_xdr;
-	if (count > NFSD4_FFV2_MAX_ITEMS)
-		return nfserr_inval;
-	return xdr_inline_decode(argp->xdr, count * 4 * XDR_UNIT) ?
-		nfs_ok : nfserr_bad_xdr;
-}
-
-static __be32 nfsd4_decode_ffv2_u32s(struct nfsd4_compoundargs *argp)
-{
-	u32 count;
-
-	if (xdr_stream_decode_u32(argp->xdr, &count) < 0)
-		return nfserr_bad_xdr;
-	if (count > NFSD4_FFV2_MAX_ITEMS)
-		return nfserr_inval;
-	return xdr_inline_decode(argp->xdr, count * XDR_UNIT) ?
-		nfs_ok : nfserr_bad_xdr;
+	if (count != 1)
+		return count > NFSD4_FFV2_MAX_ITEMS ? nfserr_inval :
+						       nfserr_notsupp;
+	return nfsd4_decode_ffv2_owner(argp, ffv2);
 }
 
 static __be32 nfsd4_decode_ffv2_opaque(struct nfsd4_compoundargs *argp,
@@ -2628,36 +2619,6 @@ nfsd4_decode_ffv2_ignored_string(struct nfsd4_compoundargs *argp, u32 maxlen)
 	return nfsd4_decode_ffv2_opaque(argp, len);
 }
 
-static __be32 nfsd4_decode_ffv2_checksums(struct nfsd4_compoundargs *argp)
-{
-	u32 count;
-	__be32 status;
-
-	if (xdr_stream_decode_u32(argp->xdr, &count) < 0)
-		return nfserr_bad_xdr;
-	if (count > NFSD4_FFV2_MAX_ITEMS)
-		return nfserr_inval;
-	while (count--) {
-		if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
-			return nfserr_bad_xdr;
-		status = nfsd4_decode_ffv2_ignored_string(argp, 64);
-		if (status)
-			return status;
-	}
-	return nfs_ok;
-}
-
-static __be32 nfsd4_decode_ffv2_payload(struct nfsd4_compoundargs *argp)
-{
-	u32 len;
-
-	if (xdr_stream_decode_u32(argp->xdr, &len) < 0)
-		return nfserr_bad_xdr;
-	if (len > NFSD4_FFV2_MAX_PAYLOAD)
-		return nfserr_inval;
-	return nfsd4_decode_ffv2_opaque(argp, len);
-}
-
 static __be32
 nfsd4_decode_ffv2_lifecycle(struct nfsd4_compoundargs *argp,
 			    union nfsd4_op_u *u)
@@ -2667,7 +2628,7 @@ nfsd4_decode_ffv2_lifecycle(struct nfsd4_compoundargs *argp,
 	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
 	if (status)
 		return status;
-	return nfsd4_decode_ffv2_owners(argp);
+	return nfsd4_decode_ffv2_owners(argp, &u->ffv2);
 }
 
 static __be32
@@ -2767,7 +2728,10 @@ static __be32
 nfsd4_decode_chunk_write_common(struct nfsd4_compoundargs *argp,
 				union nfsd4_op_u *u, bool repair)
 {
-	u32 check;
+	struct nfsd4_ffv2 *ffv2 = &u->ffv2;
+	unsigned int checksum_offset;
+	u8 padding[XDR_UNIT - 1];
+	u32 check, count, pad;
 	__be32 status;
 
 	memset(&u->ffv2, 0, sizeof(u->ffv2));
@@ -2776,35 +2740,70 @@ nfsd4_decode_chunk_write_common(struct nfsd4_compoundargs *argp,
 		return status;
 	if (xdr_stream_decode_u64(argp->xdr, &u->ffv2.offset) < 0)
 		return nfserr_bad_xdr;
-	/* stable_how4, then the writer's cohort and client id. */
-	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->stable_how) < 0)
+		return nfserr_bad_xdr;
+	if (ffv2->stable_how > NFS_FILE_SYNC)
 		return nfserr_bad_xdr;
 	status = nfsd4_decode_ffv2_writer(argp, &u->ffv2);
 	if (status)
 		return status;
-	/* cwa_co_ids<> / cwra_co_ids<> */
-	status = nfsd4_decode_ffv2_u32s(argp);
-	if (status)
-		return status;
-	/* payload ID */
-	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
+	if (xdr_stream_decode_u32(argp->xdr, &count) < 0)
+		return nfserr_bad_xdr;
+	if (count != 1)
+		return count > NFSD4_FFV2_MAX_ITEMS ? nfserr_inval :
+						       nfserr_notsupp;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_id) < 0 ||
+	    xdr_stream_decode_u32(argp->xdr, &ffv2->payload_id) < 0)
 		return nfserr_bad_xdr;
 	if (!repair) {
-		/* flags and optional guard */
-		if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
+		if (xdr_stream_decode_u32(argp->xdr, &ffv2->flags) < 0)
 			return nfserr_bad_xdr;
+		if (ffv2->flags & ~NFSD4_FFV2_WRITE_ACTIVATE_IF_EMPTY)
+			return nfserr_inval;
 		if (xdr_stream_decode_u32(argp->xdr, &check) < 0 || check > 1)
 			return nfserr_bad_xdr;
-		if (check && !xdr_inline_decode(argp->xdr, 2 * XDR_UNIT))
-			return nfserr_bad_xdr;
+		ffv2->guard_check = check;
+		if (check) {
+			if (xdr_stream_decode_u32(argp->xdr,
+						  &ffv2->guard_generation) < 0 ||
+			    xdr_stream_decode_u32(argp->xdr,
+						  &ffv2->guard_writer) < 0)
+				return nfserr_bad_xdr;
+			ffv2->guard_never_written = !ffv2->guard_generation &&
+						     !ffv2->guard_writer;
+		}
 	}
-	/* chunk size */
-	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->chunk_size) < 0 ||
+	    xdr_stream_decode_u32(argp->xdr, &count) < 0)
 		return nfserr_bad_xdr;
-	status = nfsd4_decode_ffv2_checksums(argp);
-	if (status)
-		return status;
-	return nfsd4_decode_ffv2_payload(argp);
+	if (count != 1)
+		return count > NFSD4_FFV2_MAX_ITEMS ? nfserr_inval :
+						       nfserr_notsupp;
+	if (xdr_stream_decode_u32(argp->xdr,
+				  &ffv2->checksum_algorithm) < 0 ||
+	    xdr_stream_decode_u32(argp->xdr, &ffv2->checksum_len) < 0)
+		return nfserr_bad_xdr;
+	if (ffv2->checksum_len > sizeof(ffv2->checksum))
+		return nfserr_bad_xdr;
+	checksum_offset = xdr_stream_pos(argp->xdr);
+	if (!xdr_inline_decode(argp->xdr, ffv2->checksum_len) ||
+	    read_bytes_from_xdr_buf(argp->xdr->buf, checksum_offset,
+				    ffv2->checksum, ffv2->checksum_len))
+		return nfserr_bad_xdr;
+	pad = -ffv2->checksum_len & (XDR_UNIT - 1);
+	if (pad &&
+	    (read_bytes_from_xdr_buf(argp->xdr->buf,
+				     checksum_offset + ffv2->checksum_len,
+				     padding, pad) || memchr_inv(padding, 0, pad)))
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->payload_len) < 0)
+		return nfserr_bad_xdr;
+	if (ffv2->payload_len > NFSD4_FFV2_MAX_PAYLOAD)
+		return nfserr_inval;
+	if (!xdr_stream_subsegment(argp->xdr, &ffv2->payload,
+				   ffv2->payload_len))
+		return nfserr_bad_xdr;
+	return nfs_ok;
 }
 
 static __be32
@@ -6624,6 +6623,73 @@ nfsd4_encode_chunk_header_read(struct nfsd4_compoundres *resp, __be32 nfserr,
 	return nfs_ok;
 }
 
+static __be32
+nfsd4_encode_ffv2_mutation_owner(struct xdr_stream *xdr,
+				 const struct nfsd4_ffv2 *ffv2)
+{
+	struct nfsd_ffv2_chunk_owner owner = {
+		.co_cohort_id = ffv2->result_owner_cohort_id,
+		.co_client_id = ffv2->result_owner_client_id,
+		.co_id = ffv2->result_owner_id,
+	};
+
+	return nfsd4_encode_chunk_owner4(xdr, &owner);
+}
+
+static __be32
+nfsd4_encode_chunk_write(struct nfsd4_compoundres *resp, __be32 nfserr,
+			 union nfsd4_op_u *u)
+{
+	struct nfsd4_ffv2 *ffv2 = &u->ffv2;
+	struct xdr_stream *xdr = resp->xdr;
+
+	if (nfserr || ffv2->result_count != 1)
+		return nfserr ?: nfserr_serverfault;
+	if (nfsd4_encode_uint32_t(xdr, ffv2->payload_len) != nfs_ok ||
+	    nfsd4_encode_uint32_t(xdr, ffv2->result_stability) != nfs_ok ||
+	    nfsd4_encode_verifier4(xdr, &ffv2->result_verifier) != nfs_ok ||
+	    nfsd4_encode_uint32_t(xdr, 1) != nfs_ok ||
+	    nfsd4_encode_uint32_t(xdr,
+				  be32_to_cpu(ffv2->result_status)) != nfs_ok ||
+	    nfsd4_encode_uint32_t(xdr, 1) != nfs_ok ||
+	    nfsd4_encode_uint32_t(xdr, ffv2->result_activated) != nfs_ok ||
+	    nfsd4_encode_uint32_t(xdr, 1) != nfs_ok)
+		return nfserr_resource;
+	return nfsd4_encode_ffv2_mutation_owner(xdr, ffv2);
+}
+
+static __be32
+nfsd4_encode_ffv2_lifecycle(struct nfsd4_compoundres *resp, __be32 nfserr,
+			    union nfsd4_op_u *u)
+{
+	struct nfsd4_ffv2 *ffv2 = &u->ffv2;
+	struct xdr_stream *xdr = resp->xdr;
+	__be32 status;
+
+	if (nfserr || ffv2->result_count != 1)
+		return nfserr ?: nfserr_serverfault;
+	status = nfsd4_encode_verifier4(xdr, &ffv2->result_verifier);
+	if (status != nfs_ok || nfsd4_encode_uint32_t(xdr, 1) != nfs_ok ||
+	    nfsd4_encode_uint32_t(xdr,
+				  be32_to_cpu(ffv2->result_status)) != nfs_ok)
+		return nfserr_resource;
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_encode_chunk_finalize(struct nfsd4_compoundres *resp, __be32 nfserr,
+			    union nfsd4_op_u *u)
+{
+	return nfsd4_encode_ffv2_lifecycle(resp, nfserr, u);
+}
+
+static __be32
+nfsd4_encode_chunk_commit(struct nfsd4_compoundres *resp, __be32 nfserr,
+			  union nfsd4_op_u *u)
+{
+	return nfsd4_encode_ffv2_lifecycle(resp, nfserr, u);
+}
+
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 /*
  * Encode a read reply straight into @xdr, without the compound the ordinary
@@ -6644,6 +6710,30 @@ __be32 nfsd_ffv2_test_encode_chunk_header_read(struct xdr_stream *xdr,
 	struct nfsd4_compoundres resp = { .xdr = xdr };
 
 	return nfsd4_encode_chunk_header_read(&resp, nfs_ok, u);
+}
+
+__be32 nfsd_ffv2_test_encode_chunk_write(struct xdr_stream *xdr,
+					 union nfsd4_op_u *u)
+{
+	struct nfsd4_compoundres resp = { .xdr = xdr };
+
+	return nfsd4_encode_chunk_write(&resp, nfs_ok, u);
+}
+
+__be32 nfsd_ffv2_test_encode_chunk_finalize(struct xdr_stream *xdr,
+					    union nfsd4_op_u *u)
+{
+	struct nfsd4_compoundres resp = { .xdr = xdr };
+
+	return nfsd4_encode_chunk_finalize(&resp, nfs_ok, u);
+}
+
+__be32 nfsd_ffv2_test_encode_chunk_commit(struct xdr_stream *xdr,
+					  union nfsd4_op_u *u)
+{
+	struct nfsd4_compoundres resp = { .xdr = xdr };
+
+	return nfsd4_encode_chunk_commit(&resp, nfs_ok, u);
 }
 #endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
 
@@ -6976,16 +7066,16 @@ static const nfsd4_enc nfsd4_enc_ops[] = {
 	[OP_REMOVEXATTR]	= nfsd4_encode_removexattr,
 
 	/* Flex Files v2 data-server operations */
-	[OP_CHUNK_COMMIT]	= nfsd4_encode_noop,
+	[OP_CHUNK_COMMIT]	= nfsd4_encode_chunk_commit,
 	[OP_CHUNK_ERROR]	= nfsd4_encode_noop,
-	[OP_CHUNK_FINALIZE]	= nfsd4_encode_noop,
+	[OP_CHUNK_FINALIZE]	= nfsd4_encode_chunk_finalize,
 	[OP_CHUNK_HEADER_READ]	= nfsd4_encode_chunk_header_read,
 	[OP_CHUNK_LOCK]		= nfsd4_encode_noop,
 	[OP_CHUNK_READ]		= nfsd4_encode_chunk_read,
 	[OP_CHUNK_REPAIRED]	= nfsd4_encode_noop,
 	[OP_CHUNK_ROLLBACK]	= nfsd4_encode_noop,
 	[OP_CHUNK_UNLOCK]	= nfsd4_encode_noop,
-	[OP_CHUNK_WRITE]	= nfsd4_encode_noop,
+	[OP_CHUNK_WRITE]	= nfsd4_encode_chunk_write,
 	[OP_CHUNK_WRITE_REPAIR] = nfsd4_encode_noop,
 	[OP_TRUST_STATEID]	= nfsd4_encode_noop,
 	[OP_REVOKE_STATEID]	= nfsd4_encode_noop,

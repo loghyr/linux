@@ -756,6 +756,12 @@ __be32 nfsd_ffv2_test_encode_chunk_read(struct xdr_stream *xdr,
 					union nfsd4_op_u *u);
 __be32 nfsd_ffv2_test_encode_chunk_header_read(struct xdr_stream *xdr,
 					       union nfsd4_op_u *u);
+__be32 nfsd_ffv2_test_encode_chunk_write(struct xdr_stream *xdr,
+					 union nfsd4_op_u *u);
+__be32 nfsd_ffv2_test_encode_chunk_finalize(struct xdr_stream *xdr,
+					    union nfsd4_op_u *u);
+__be32 nfsd_ffv2_test_encode_chunk_commit(struct xdr_stream *xdr,
+					  union nfsd4_op_u *u);
 
 /*
  * Run and release one operation through its own table entry, so a test can
