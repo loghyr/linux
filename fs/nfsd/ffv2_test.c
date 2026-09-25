@@ -9383,11 +9383,38 @@ static void nfsd_ffv2_provider_result_contract_test(struct kunit *test)
 	f.provider->chunks[0].cr_status = cpu_to_be32(19998);
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
 
-	/* EMPTY needs a synthetic payload this slice cannot verify. */
+	/* EMPTY carries authenticated synthetic zeroes and zero metadata. */
 	f.provider->chunks[0].cr_status = nfserr_noent;
+	f.provider->chunks[0].cr_effective_len = NFSD_FFV2_RO_CHUNK_SIZE;
+	memset(f.provider->data[0], 0, NFSD_FFV2_RO_CHUNK_SIZE);
+	memset(&f.provider->chunks[0].cr_owner, 0,
+	       sizeof(f.provider->chunks[0].cr_owner));
+	memset(&f.provider->chunks[0].cr_guard, 0,
+	       sizeof(f.provider->chunks[0].cr_guard));
+	f.provider->chunks[0].cr_payload_id = 0;
+	put_unaligned_be32(crc32_le(~0U, f.provider->data[0],
+				    NFSD_FFV2_RO_CHUNK_SIZE) ^ ~0U,
+			   f.provider->chunks[0].cr_checksum.cs_value);
+	KUNIT_EXPECT_EQ(test, nfs_ok, RO_READ());
+	f.provider->data[0][0] = 1;
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->data[0][0] = 0;
+	f.provider->chunks[0].cr_owner.co_client_id = 1;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_owner.co_client_id = 0;
+	f.provider->chunks[0].cr_payload_id = 1;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_payload_id = 0;
+	f.provider->chunks[0].cr_locked = true;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_locked = false;
 	f.provider->chunks[0].cr_status = nfs_ok;
 	f.provider->chunks[0].cr_effective_len = NFSD_FFV2_RO_CHUNK_SIZE;
+	memset(f.provider->data[0], 0x40, NFSD_FFV2_RO_CHUNK_SIZE);
+	f.provider->chunks[0].cr_owner = f.provider->owners[0];
+	f.provider->chunks[0].cr_guard = f.provider->guards[0];
+	f.provider->chunks[0].cr_payload_id = 0x100;
+	memset(f.provider->chunks[0].cr_checksum.cs_value, 0x5a, 4);
 
 	/* Lock state is reported beside the status, never inside it. */
 	f.provider->status[0] = nfserr_chunk_locked;
@@ -9642,6 +9669,209 @@ static __be32 nfsd_ffv2_ro_operation_hold(struct nfsd_ffv2_ro_fixture *f,
 		return status;
 	return nfsd_ffv2_provider_probe(f->rqstp, f->mapped, opnum, req,
 					result, U32_MAX, admission);
+}
+
+struct nfsd_ffv2_store_dispatch_ctx {
+	struct nfsd_ffv2_store_file file;
+	const struct nfsd_ffv2_object *object;
+	u8 payload[NFSD_FFV2_RO_CHUNK_SIZE];
+	atomic_t releases;
+};
+
+struct nfsd_ffv2_store_dispatch_release {
+	void *private;
+	void (*release)(void *private);
+	atomic_t *releases;
+};
+
+static int nfsd_ffv2_store_dispatch_visible(void *opaque,
+					    const u8 file_key[32], u64 index,
+					    struct nfsd_ffv2_visible_chunk *chunk)
+{
+	struct nfsd_ffv2_store_dispatch_ctx *ctx = opaque;
+	u32 crc;
+
+	if (memcmp(file_key, ctx->file.file_key, sizeof(ctx->file.file_key)) ||
+	    index)
+		return -EINVAL;
+	memset(chunk, 0, sizeof(*chunk));
+	crc = crc32c(~0U, ctx->payload, sizeof(ctx->payload)) ^ ~0U;
+	chunk->payload_object_id = (1ULL << 40) | 9;
+	chunk->writer_payload_id = 0x76543210;
+	chunk->payload_object_offset = NFSD_FFV2_PAYLOAD_ALIGN;
+	chunk->content_len = sizeof(ctx->payload);
+	chunk->content_crc32c = crc;
+	chunk->checksum_algorithm = NFSD_FFV2_STORE_CHECKSUM_CRC32C;
+	chunk->checksum_len = sizeof(__be32);
+	put_unaligned_be32(crc, chunk->checksum);
+	chunk->file_eof = sizeof(ctx->payload);
+	chunk->owner_cohort = 1;
+	chunk->owner_client_id = 2;
+	chunk->owner_co_id = 3;
+	chunk->guard_generation = 4;
+	chunk->guard_writer = 2;
+	return 0;
+}
+
+static int nfsd_ffv2_store_dispatch_read(void *opaque, void *data, size_t len,
+					 loff_t offset)
+{
+	struct nfsd_ffv2_store_dispatch_ctx *ctx = opaque;
+
+	if (offset != NFSD_FFV2_PAYLOAD_ALIGN +
+				NFSD_FFV2_PAYLOAD_DATA_HEADER_SIZE ||
+	    len != sizeof(ctx->payload))
+		return -EINVAL;
+	memcpy(data, ctx->payload, len);
+	return 0;
+}
+
+static const struct nfsd_ffv2_prototype_test_store_ops
+nfsd_ffv2_store_dispatch_store_ops = {
+	.visible = nfsd_ffv2_store_dispatch_visible,
+	.read = nfsd_ffv2_store_dispatch_read,
+};
+
+static void nfsd_ffv2_store_dispatch_release(void *opaque)
+{
+	struct nfsd_ffv2_store_dispatch_release *release = opaque;
+
+	release->release(release->private);
+	atomic_inc(release->releases);
+	kfree(release);
+}
+
+static __be32
+nfsd_ffv2_store_dispatch_chunk_read(void *opaque,
+				    const struct nfsd_ffv2_object *object,
+				    const struct nfsd_ffv2_chunk_request *request,
+				    struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_store_dispatch_ctx *ctx = opaque;
+	struct nfsd_ffv2_store_dispatch_release *release;
+	__be32 status;
+
+	if (object != ctx->object)
+		return nfserr_stale;
+	status = nfsd_ffv2_prototype_test_store_read(&ctx->file,
+						     &nfsd_ffv2_store_dispatch_store_ops, ctx,
+				false, request, result);
+	if (status)
+		return status;
+	release = kmalloc_obj(*release, GFP_KERNEL);
+	if (!release) {
+		result->release(result->private);
+		memset(result, 0, sizeof(*result));
+		return nfserr_jukebox;
+	}
+	release->private = result->private;
+	release->release = result->release;
+	release->releases = &ctx->releases;
+	result->private = release;
+	result->release = nfsd_ffv2_store_dispatch_release;
+	return nfs_ok;
+}
+
+static __be32
+nfsd_ffv2_store_dispatch_header_read(void *opaque,
+				     const struct nfsd_ffv2_object *object,
+				     const struct nfsd_ffv2_chunk_request *request,
+				     struct nfsd_ffv2_chunk_result *result)
+{
+	(void)opaque;
+	(void)object;
+	(void)request;
+	(void)result;
+	return nfserr_notsupp;
+}
+
+static const struct nfsd_ffv2_provider_ops nfsd_ffv2_store_dispatch_ops = {
+	.chunk_read = nfsd_ffv2_store_dispatch_chunk_read,
+	.chunk_header_read = nfsd_ffv2_store_dispatch_header_read,
+};
+
+static void nfsd_ffv2_store_dispatch_lifetime_test(struct kunit *test)
+{
+	const struct nfsd_ffv2_chunk_request req = { .count = 1 };
+	struct nfsd_ffv2_store_dispatch_ctx *ctx;
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_ro_remove_ctx remove;
+	struct task_struct *remove_task = NULL;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_ro_fixture f;
+	bool held = false;
+	int error;
+
+	if (!nfsd_ffv2_ro_fixture_init(test, &f))
+		goto out;
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	if (!ctx) {
+		KUNIT_FAIL(test, "failed to allocate store dispatch context");
+		goto out;
+	}
+	memset(ctx->file.file_key, 0x6a, sizeof(ctx->file.file_key));
+	memset(ctx->payload, 0x7b, sizeof(ctx->payload));
+	ctx->file.chunk_bytes = sizeof(ctx->payload);
+	ctx->file.max_chunks = 1;
+	ctx->file.logical_eof = sizeof(ctx->payload);
+	ctx->object = f.provider->object;
+	atomic_set(&ctx->releases, 0);
+
+	nfsd_ffv2_test_provider_remove(f.nn);
+	f.provider_installed = false;
+	error = nfsd_ffv2_test_provider_install(f.nn,
+						&nfsd_ffv2_store_dispatch_ops, ctx,
+					sizeof(ctx->payload));
+	if (error) {
+		KUNIT_FAIL(test, "failed to install store dispatch provider");
+		goto out;
+	}
+	f.provider_installed = true;
+	if (nfsd_ffv2_ro_operation_hold(&f, OP_CHUNK_READ, &req, &result,
+					&admission) != nfs_ok) {
+		KUNIT_FAIL(test, "store dispatch read failed");
+		goto out;
+	}
+	held = true;
+	if (!result.read.chunks) {
+		KUNIT_FAIL(test, "store dispatch returned no chunks");
+		goto out;
+	}
+	KUNIT_EXPECT_EQ(test, 0x76543210U,
+			result.read.chunks[0].cr_payload_id);
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&ctx->releases));
+
+	remove.nn = f.nn;
+	init_completion(&remove.done);
+	remove_task = kthread_run(nfsd_ffv2_ro_remove_thread, &remove,
+				  "nfsd-ffv2-store-remove");
+	if (IS_ERR(remove_task)) {
+		KUNIT_FAIL(test, "failed to start removal thread: %ld",
+			   PTR_ERR(remove_task));
+		remove_task = NULL;
+		goto out;
+	}
+	KUNIT_EXPECT_EQ(test, wait_for_completion_timeout(&remove.done, HZ / 2),
+			0UL);
+	KUNIT_EXPECT_EQ(test, 0, atomic_read(&ctx->releases));
+
+	nfsd_ffv2_complete(&admission);
+	held = false;
+	KUNIT_EXPECT_EQ(test, 1, atomic_read(&ctx->releases));
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&remove.done, 5 * HZ),
+			0UL);
+	kthread_stop(remove_task);
+	remove_task = NULL;
+	f.provider_installed = false;
+out:
+	if (held)
+		nfsd_ffv2_complete(&admission);
+	if (remove_task) {
+		wait_for_completion_timeout(&remove.done, 5 * HZ);
+		kthread_stop(remove_task);
+		f.provider_installed = false;
+	}
+	nfsd_ffv2_ro_fixture_exit(test, &f);
 }
 
 /*
@@ -12489,6 +12719,14 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
 						     replay));
 	req.chunk_size = NFSD_FFV2_PROTO_CHUNK_SIZE;
+	memcpy(wrong_persisted_handle, req.persisted_handle,
+	       sizeof(wrong_persisted_handle));
+	wrong_persisted_handle[16] ^= 1;
+	req.persisted_handle = wrong_persisted_handle;
+	KUNIT_EXPECT_EQ(test, -EEXIST,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
+						     replay));
+	nfsd_ffv2_proto_request(&req, spent);
 
 	/*
 	 * A challenge is still issued while a registration is published --
@@ -15219,7 +15457,8 @@ struct nfsd_ffv2_store_read_mock {
 	int		read_error;
 	bool		malformed_checksum;
 	bool		malformed_geometry;
-	bool		malformed_payload_id;
+	bool		checksum_none;
+	bool		malformed_content_crc;
 	atomic_t	reads;
 };
 
@@ -15241,17 +15480,20 @@ static int nfsd_ffv2_store_read_mock_visible(void *opaque,
 		return -ERANGE;
 
 	memset(chunk, 0, sizeof(*chunk));
-	chunk->payload_object_id = 1ULL << 40;
-	chunk->payload_object_id |= mock->malformed_payload_id ?
-				    (u64)U32_MAX + 1 : 17;
+	chunk->payload_object_id = (1ULL << 40) | 17;
+	chunk->writer_payload_id = 0x4242;
 	chunk->payload_object_offset = 4096;
 	chunk->content_len = mock->malformed_geometry ? 15 : 16;
-	chunk->checksum_algorithm = mock->malformed_checksum ?
+	chunk->checksum_algorithm = mock->malformed_checksum ||
+				    mock->checksum_none ?
 		NFSD_FFV2_STORE_CHECKSUM_NONE :
 		NFSD_FFV2_STORE_CHECKSUM_CRC32C;
-	chunk->checksum_len = NFSD_FFV2_CHECKSUM_CRC32_LEN;
+	chunk->checksum_len = mock->checksum_none ? 0 :
+			      NFSD_FFV2_CHECKSUM_CRC32_LEN;
 	crc = crc32c(~0U, mock->payload, sizeof(mock->payload)) ^ ~0U;
-	put_unaligned_be32(crc, chunk->checksum);
+	chunk->content_crc32c = mock->malformed_content_crc ? crc ^ 1 : crc;
+	if (!mock->checksum_none)
+		put_unaligned_be32(crc, chunk->checksum);
 	chunk->file_eof = 24;
 	chunk->owner_cohort = 23;
 	chunk->owner_client_id = 29;
@@ -15342,9 +15584,23 @@ static void nfsd_ffv2_store_backed_read_test(struct kunit *test)
 			result.read.chunks[0].cr_guard.cg_gen_id);
 	KUNIT_EXPECT_EQ(test, 41U,
 			result.read.chunks[0].cr_guard.cg_client_id);
-	KUNIT_EXPECT_EQ(test, 17U, result.read.chunks[0].cr_payload_id);
+	KUNIT_EXPECT_EQ(test, 0x4242U,
+			result.read.chunks[0].cr_payload_id);
 	KUNIT_EXPECT_EQ(test, 8U,
 			result.read.chunks[1].cr_effective_len);
+	KUNIT_EXPECT_EQ(test, nfserr_noent,
+			result.read.chunks[1].cr_status);
+	KUNIT_EXPECT_EQ(test, 0ULL,
+			result.read.chunks[1].cr_owner.co_cohort_id);
+	KUNIT_EXPECT_EQ(test, 0U,
+			result.read.chunks[1].cr_owner.co_client_id);
+	KUNIT_EXPECT_EQ(test, 0U, result.read.chunks[1].cr_owner.co_id);
+	KUNIT_EXPECT_EQ(test, 0U,
+			result.read.chunks[1].cr_guard.cg_gen_id);
+	KUNIT_EXPECT_EQ(test, NFSD_FFV2_GUARD_CLIENT_ID_NONE,
+			result.read.chunks[1].cr_guard.cg_client_id);
+	KUNIT_EXPECT_EQ(test, 0U,
+			result.read.chunks[1].cr_payload_id);
 	KUNIT_EXPECT_MEMEQ(test, result.read.chunks[1].cr_chunk,
 			   zeroes, sizeof(zeroes));
 	nfsd_ffv2_prototype_test_result_release(&result);
@@ -15379,17 +15635,18 @@ static void nfsd_ffv2_store_backed_read_negative_test(struct kunit *test)
 			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
 						       &result));
 	mock.malformed_checksum = false;
+	mock.checksum_none = true;
+	mock.malformed_content_crc = true;
+	KUNIT_EXPECT_EQ(test, nfserr_io,
+			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
+						       &result));
+	mock.checksum_none = false;
+	mock.malformed_content_crc = false;
 	mock.malformed_geometry = true;
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
 			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
 						       &result));
 	mock.malformed_geometry = false;
-	mock.malformed_payload_id = true;
-	KUNIT_EXPECT_EQ(test, nfserr_serverfault,
-			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
-						       &result));
-
-	mock.malformed_payload_id = false;
 	file.file_key[0] ^= 1;
 	KUNIT_EXPECT_EQ(test, nfserr_io,
 			nfsd_ffv2_store_read_mock_call(&mock, &file, false, 1,
@@ -15505,6 +15762,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE_SLOW(nfsd_ffv2_encoder_drain_wait_test),
 	KUNIT_CASE(nfsd_ffv2_provider_retired_generation_test),
 	KUNIT_CASE(nfsd_ffv2_provider_result_lifetime_test),
+	KUNIT_CASE(nfsd_ffv2_store_dispatch_lifetime_test),
 	KUNIT_CASE(nfsd_ffv2_provider_netns_fence_test),
 	KUNIT_CASE(nfsd_ffv2_provider_concurrent_results_test),
 	KUNIT_CASE(nfsd_ffv2_provider_pinned_reference_test),

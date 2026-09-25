@@ -1683,14 +1683,9 @@ static bool nfsd_ffv2_binding_current(struct nfsd_net *nn,
 /* Statuses a CHUNK_READ result may report per chunk. */
 static bool nfsd_ffv2_read_status_valid(__be32 status)
 {
-	/*
-	 * NFS4ERR_NOENT is excluded rather than absent from the protocol: an
-	 * EMPTY chunk must be returned as a synthetic payload zero-filled to
-	 * the layout's chunk size, and no chunk size reaches this boundary,
-	 * so neither the length nor the fill can be checked here.
-	 */
 	return status == nfs_ok ||
 	       status == nfserr_payload_not_atomic ||
+	       status == nfserr_noent ||
 	       status == nfserr_payload_lost;
 }
 
@@ -1733,7 +1728,29 @@ static bool nfsd_ffv2_read_chunks_valid(u32 count, u32 chunk_size,
 			return false;
 		if (!nfsd_ffv2_checksum_valid(&chunk->cr_checksum))
 			return false;
-		/* Only a committed chunk carries bytes. */
+		if (chunk->cr_status == nfserr_noent) {
+			u32 crc;
+
+			if (!chunk->cr_effective_len ||
+			    chunk->cr_effective_len > chunk_size ||
+			    !chunk->cr_chunk ||
+			    memchr_inv(chunk->cr_chunk, 0,
+				       chunk->cr_effective_len) ||
+			    chunk->cr_owner.co_cohort_id ||
+			    chunk->cr_owner.co_client_id ||
+			    chunk->cr_owner.co_id || chunk->cr_guard.cg_gen_id ||
+			    chunk->cr_guard.cg_client_id !=
+						NFSD_FFV2_GUARD_CLIENT_ID_NONE ||
+			    chunk->cr_payload_id || chunk->cr_locked)
+				return false;
+			crc = crc32_le(~0U, chunk->cr_chunk,
+				       chunk->cr_effective_len) ^ ~0U;
+			if (get_unaligned_be32(chunk->cr_checksum.cs_value) != crc)
+				return false;
+			total += chunk->cr_effective_len;
+			continue;
+		}
+		/* Only committed and EMPTY chunks carry bytes. */
 		if (chunk->cr_status != nfs_ok) {
 			if (chunk->cr_effective_len)
 				return false;

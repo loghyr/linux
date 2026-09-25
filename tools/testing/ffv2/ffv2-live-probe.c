@@ -80,6 +80,7 @@ enum terminal_op {
 
 /* The statuses this matrix requires, named where they are asserted. */
 #define NFS4_OK			0
+#define NFS4ERR_NOENT		2
 #define NFS4ERR_STALE		70
 #define NFS4ERR_NOTSUPP		10004
 #define NFS4ERR_BAD_STATEID	10025
@@ -110,7 +111,11 @@ struct probe_expect {
 	const uint8_t	*data;
 	size_t		len;
 	uint32_t	chunk_size;
+	uint32_t	payload_id_base;
+	uint64_t	sparse_index;
 	bool		requested;
+	bool		payload_ids;
+	bool		sparse;
 };
 
 static struct probe_expect probe_expect;
@@ -919,7 +924,11 @@ static void decode_chunk_read(struct xcur *c, uint64_t offset, uint32_t count)
 	for (i = 0; i < chunks && !c->bad; i++) {
 		const uint8_t *checksum, *payload, *want;
 		size_t checksum_len, payload_len, want_len;
+		uint64_t owner_cohort, index;
 		uint32_t algorithm, effective, claimed, computed;
+		uint32_t owner_client, owner_id, guard_gen, guard_client;
+		uint32_t payload_id, locked, status;
+		bool sparse_zero = true;
 
 		algorithm = gu32(c);
 		checksum = gopaque(c, &checksum_len);
@@ -928,11 +937,21 @@ static void decode_chunk_read(struct xcur *c, uint64_t offset, uint32_t count)
 			print_hex("READ-CHECKSUM", checksum, checksum_len);
 		effective = gu32(c);
 		printf("READ-EFFECTIVE-LEN[%u]=%u\n", i, effective);
-		get_owner(c, "READ-OWNER", i);
-		get_guard(c, "READ-GUARD", i);
-		printf("READ-PAYLOAD-ID[%u]=%u\n", i, gu32(c));
-		printf("READ-LOCKED[%u]=%u\n", i, gu32(c));
-		printf("READ-STATUS[%u]=%u\n", i, gu32(c));
+		owner_cohort = gu64(c);
+		owner_client = gu32(c);
+		owner_id = gu32(c);
+		printf("READ-OWNER[%u]=cohort:%llu client:%u id:%u\n", i,
+		       (unsigned long long)owner_cohort, owner_client, owner_id);
+		guard_gen = gu32(c);
+		guard_client = gu32(c);
+		printf("READ-GUARD[%u]=generation:%u client:%u\n", i,
+		       guard_gen, guard_client);
+		payload_id = gu32(c);
+		locked = gu32(c);
+		status = gu32(c);
+		printf("READ-PAYLOAD-ID[%u]=%u\n", i, payload_id);
+		printf("READ-LOCKED[%u]=%u\n", i, locked);
+		printf("READ-STATUS[%u]=%u\n", i, status);
 		payload = gopaque(c, &payload_len);
 		printf("READ-PAYLOAD-LEN[%u]=%zu\n", i, payload_len);
 		if (c->bad || !payload) {
@@ -968,6 +987,44 @@ static void decode_chunk_read(struct xcur *c, uint64_t offset, uint32_t count)
 			continue;
 		}
 		printf("READ-CRC32-MATCH[%u]=yes\n", i);
+		if ((uint64_t)i > UINT64_MAX - offset) {
+			fail("chunk %u is at index %llu + %u, past the end of the index space",
+			     i, (unsigned long long)offset, i);
+			continue;
+		}
+		index = offset + i;
+		if (probe_expect.sparse && index == probe_expect.sparse_index) {
+			if (status != NFS4ERR_NOENT || owner_cohort || owner_client ||
+			    owner_id || guard_gen || guard_client || payload_id) {
+				fail("sparse chunk %llu did not carry NOENT and zero metadata",
+				     (unsigned long long)index);
+				continue;
+			}
+			for (size_t n = 0; n < payload_len; n++)
+				if (payload[n]) {
+					fail("sparse chunk %llu carried nonzero payload bytes",
+					     (unsigned long long)index);
+					sparse_zero = false;
+					break;
+				}
+			if (sparse_zero)
+				printf("READ-SPARSE-ZERO[%u]=yes\n", i);
+		} else {
+			if (status != NFS4_OK) {
+				fail("committed chunk %llu returned NFS4ERR %u",
+				     (unsigned long long)index, status);
+				continue;
+			}
+			if (probe_expect.payload_ids &&
+			    payload_id != probe_expect.payload_id_base + index) {
+				fail("chunk %llu returned payload ID %u, expected %u",
+				     (unsigned long long)index, payload_id,
+				     probe_expect.payload_id_base + (uint32_t)index);
+				continue;
+			}
+			if (probe_expect.payload_ids)
+				printf("READ-PAYLOAD-ID-MATCH[%u]=yes\n", i);
+		}
 
 		if (!probe_expect.requested)
 			continue;
@@ -979,12 +1036,7 @@ static void decode_chunk_read(struct xcur *c, uint64_t offset, uint32_t count)
 		 * carrying.  expected_chunk() checks the index it is given,
 		 * which is too late to catch a wrap that has happened.
 		 */
-		if ((uint64_t)i > UINT64_MAX - offset) {
-			fail("chunk %u is at index %llu + %u, past the end of the index space",
-			     i, (unsigned long long)offset, i);
-			continue;
-		}
-		want_len = expected_chunk(offset + i, &want);
+		want_len = expected_chunk(index, &want);
 		if (payload_len != want_len) {
 			fail("chunk %u carries %zu bytes, not the %zu the object holds",
 			     i, payload_len, want_len);
@@ -992,7 +1044,7 @@ static void decode_chunk_read(struct xcur *c, uint64_t offset, uint32_t count)
 		}
 		if (!want || memcmp(payload, want, want_len)) {
 			fail("chunk %u carries bytes the object does not hold at index %llu",
-			     i, (unsigned long long)(offset + i));
+			     i, (unsigned long long)index);
 			continue;
 		}
 		printf("READ-CONTENT-MATCH[%u]=yes\n", i);
@@ -1449,6 +1501,8 @@ static void usage(void)
 		"                       [--expect <file>] [--wait <seconds>]\n"
 		"                       [--read-count <chunks>]\n"
 		"                       [--read-index <index>] [--interleave]\n"
+		"                       [--expect-payload-id-base <id>]\n"
+		"                       [--expect-sparse-index <index>]\n"
 		"                       [--read-only-profile]\n"
 		"                       [--no-retirement] [--mutate-ordinary]\n"
 		"                       [--mutate-sequence]\n");
@@ -1496,7 +1550,17 @@ int main(int argc, char **argv)
 			read_count = (uint32_t)strtoul(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--read-index") && i + 1 < argc)
 			read_index = (uint64_t)strtoull(argv[++i], NULL, 0);
-		else if (!strcmp(argv[i], "--interleave"))
+		else if (!strcmp(argv[i], "--expect-payload-id-base") &&
+			 i + 1 < argc) {
+			probe_expect.payload_id_base =
+				(uint32_t)strtoul(argv[++i], NULL, 0);
+			probe_expect.payload_ids = true;
+		} else if (!strcmp(argv[i], "--expect-sparse-index") &&
+			   i + 1 < argc) {
+			probe_expect.sparse_index =
+				(uint64_t)strtoull(argv[++i], NULL, 0);
+			probe_expect.sparse = true;
+		} else if (!strcmp(argv[i], "--interleave"))
 			interleave = true;
 		else if (!strcmp(argv[i], "--read-only-profile"))
 			read_only_profile = true;

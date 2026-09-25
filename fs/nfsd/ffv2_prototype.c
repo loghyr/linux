@@ -72,6 +72,7 @@ struct nfsd_ffv2_prototype_committed {
 	u32	parity_count;
 	u8	store_uuid[16];
 	u8	binding_token[32];
+	u8	persisted_handle[32];
 };
 
 struct nfsd_ffv2_prototype_nonce {
@@ -1347,7 +1348,7 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 		struct nfsd_ffv2_read_chunk *chunk = &owned->chunks[i];
 		u8 *data =
 			owned->bytes + (size_t)i * provider->file.chunk_bytes;
-		u64 index = req->offset + i, payload_offset, payload_sequence;
+		u64 index = req->offset + i, payload_offset;
 		u32 crc, len = provider->file.chunk_bytes;
 		bool checksum_valid;
 		int error;
@@ -1362,17 +1363,9 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 					  provider->file.file_key, index,
 					  &visible);
 		if (!error) {
-			/*
-			 * The store identity is incarnation:sequence.  The wire field
-			 * carries the allocation sequence, and has only 32 bits.  Do
-			 * not silently truncate a sequence the wire cannot represent.
-			 */
-			payload_sequence = visible.payload_object_id &
-					   NFSD_FFV2_PAYLOAD_SEQUENCE_MASK;
 			if (visible.file_eof != provider->file.logical_eof ||
 			    visible.content_len != len ||
 			    !visible.payload_object_id ||
-			    payload_sequence > U32_MAX ||
 			    visible.guard_never_written) {
 				nfsd_ffv2_store_read_result_free(owned);
 				return nfserr_serverfault;
@@ -1393,7 +1386,9 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 			}
 			checksum_valid =
 				nfsd_ffv2_prototype_checksum_valid(&visible, data, len);
-			if (!checksum_valid) {
+			if (!checksum_valid ||
+			    visible.content_crc32c !=
+						(~crc32c(~0U, data, len))) {
 				nfsd_ffv2_store_read_result_free(owned);
 				return nfserr_io;
 			}
@@ -1402,7 +1397,7 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 			chunk->cr_owner.co_id = visible.owner_co_id;
 			chunk->cr_guard.cg_gen_id = visible.guard_generation;
 			chunk->cr_guard.cg_client_id = visible.guard_writer;
-			chunk->cr_payload_id = payload_sequence;
+			chunk->cr_payload_id = visible.writer_payload_id;
 		} else if (error != -ENOENT) {
 			nfsd_ffv2_store_read_result_free(owned);
 			return error == -ENOMEM ? nfserr_jukebox : nfserr_io;
@@ -1412,7 +1407,7 @@ nfsd_ffv2_prototype_store_chunk_read(void *opaque,
 		chunk->cr_checksum.cs_len = NFSD_FFV2_CHECKSUM_CRC32_LEN;
 		put_unaligned_be32(crc, chunk->cr_checksum.cs_value);
 		chunk->cr_effective_len = len;
-		chunk->cr_status = nfs_ok;
+		chunk->cr_status = error == -ENOENT ? nfserr_noent : nfs_ok;
 		chunk->cr_chunk = data;
 	}
 	result->count = count;
@@ -1800,6 +1795,8 @@ nfsd_ffv2_prototype_commit_record(struct nfsd_ffv2_prototype_committed *rec,
 	memcpy(rec->store_uuid, req->store_uuid, sizeof(rec->store_uuid));
 	memcpy(rec->binding_token, req->binding_token,
 	       sizeof(rec->binding_token));
+	memcpy(rec->persisted_handle, req->persisted_handle,
+	       sizeof(rec->persisted_handle));
 }
 
 /*
@@ -1879,7 +1876,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 */
 	if (!req->handle_len || req->handle_len > NFS4_FHSIZE ||
 	    !req->chunk_size || !req->data_count || req->parity_count ||
-	    !req->store_uuid || !req->binding_token ||
+	    !req->store_uuid || !req->binding_token || !req->persisted_handle ||
 	    req->chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES ||
 	    (u64)req->chunk_size * req->data_count > NFSD_FFV2_MAX_PAYLOAD_BYTES)
 		return -EINVAL;

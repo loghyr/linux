@@ -308,7 +308,7 @@ static void ffv2_semantic_record_vectors_test(struct kunit *test)
 	memcpy(bytes + 144, session, sizeof(session));
 	put_unaligned_be32(1, bytes + 164);
 	ffv2_test_operation_key(session, 0, 1, 0, bytes + 172);
-	put_unaligned_be32(1, bytes + 402);
+	put_unaligned_be32(1, bytes + 406);
 	ffv2_test_crc("FFV2-D2-WAL-v1", bytes,
 		      NFSD_FFV2_ENTRY_RECORD_SIZE);
 	KUNIT_ASSERT_EQ(test,
@@ -316,7 +316,7 @@ static void ffv2_semantic_record_vectors_test(struct kunit *test)
 					       store_uuid, wal_uuid, &header, &entry),
 			0);
 	KUNIT_EXPECT_EQ(test, entry.transition, (u32)NFSD_FFV2_REFUSED);
-	bytes[523] = 2;
+	bytes[527] = 2;
 	ffv2_test_crc("FFV2-D2-WAL-v1", bytes,
 		      NFSD_FFV2_ENTRY_RECORD_SIZE);
 	KUNIT_EXPECT_EQ(test,
