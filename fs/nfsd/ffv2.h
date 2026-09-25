@@ -17,6 +17,7 @@ struct auth_domain;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
 struct nfsd_ffv2_object;
+const u8 *nfsd_ffv2_object_uuid(const struct nfsd_ffv2_object *object);
 struct nfsd_ffv2_binding;
 struct nfsd_ffv2_reservation;
 struct nfsd_ffv2_service_context;

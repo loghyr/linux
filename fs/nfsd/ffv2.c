@@ -98,6 +98,11 @@ struct nfsd_ffv2_object_set {
 	struct nfsd_ffv2_object	*objects[NFSD_FFV2_MAX_OBJECTS];
 };
 
+const u8 *nfsd_ffv2_object_uuid(const struct nfsd_ffv2_object *object)
+{
+	return object->object_uuid;
+}
+
 struct nfsd_ffv2_binding {
 	refcount_t		ref;
 	struct net		*net;

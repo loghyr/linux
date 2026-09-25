@@ -1194,6 +1194,9 @@ struct ffv2_admission {
 	bool object_known;
 };
 
+static int ffv2_store_admission_file(const struct ffv2_admission *admission,
+				     const u8 file_key[32], bool require);
+
 struct ffv2_transaction {
 	struct list_head node;
 	struct list_head owner_node;
@@ -2203,12 +2206,8 @@ static int ffv2_replay_entry(struct nfsd_ffv2_store *store,
 			  sizeof(entry->admission)) ||
 		   (entry->payload_object_id &&
 		    !(admission->authority.rights & NFSD_FFV2_RIGHT_WRITE)) ||
-		   (admission->object_known &&
-		    memcmp(admission->file_key, entry->file_key, 32))) {
+		   ffv2_store_admission_file(admission, entry->file_key, false)) {
 		return -EBADMSG;
-	} else if (!admission->object_known) {
-		memcpy(admission->file_key, entry->file_key, 32);
-		admission->object_known = true;
 	}
 	if (entry->transition == NFSD_FFV2_REFUSED ||
 	    entry->transition == NFSD_FFV2_ABORTED)
@@ -2233,6 +2232,10 @@ static int ffv2_replay_entry(struct nfsd_ffv2_store *store,
 	if (error)
 		return error;
 	error = ffv2_replay_receipt_add(store, entry, NULL);
+	if (!error && !admission->object_known) {
+		memcpy(admission->file_key, entry->file_key, 32);
+		admission->object_known = true;
+	}
 	if (error)
 		return error;
 	if (entry->payload_object_id) {
@@ -2802,8 +2805,10 @@ static void ffv2_store_control_operation(struct nfsd_ffv2_store *store,
 	sha256(body, body_len, op->request_digest);
 }
 
-int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
-				 u8 stateid[16])
+static int
+ffv2_store_admit_writer_locked(struct nfsd_ffv2_store *store, u32 writer,
+			       bool reuse,
+			       struct nfsd_ffv2_store_admission *result)
 {
 	struct nfsd_ffv2_store_operation operation;
 	struct nfsd_ffv2_wal_header header = {
@@ -2818,50 +2823,48 @@ int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
 	u32 sequence;
 	int error;
 
-	if (!store || !stateid || !writer || writer == U32_MAX)
-		return -EINVAL;
-	error = nfsd_ffv2_reservation_store_begin(store->reservation);
-	if (error)
-		return error;
-	mutex_lock(&store->lock);
-	list_for_each_entry(admission, &store->admissions, node) {
-		if (admission->incarnation == store->super.ds_incarnation &&
-		    admission->authority_seen &&
-		    admission->authority.writer == writer &&
-		    (admission->authority.rights & (NFSD_FFV2_RIGHT_READ |
-						 NFSD_FFV2_RIGHT_WRITE)) ==
-					       (NFSD_FFV2_RIGHT_READ |
-						 NFSD_FFV2_RIGHT_WRITE)) {
-			ffv2_store_admission_stateid(admission->id, stateid);
-			error = 0;
-			goto out_unlock;
+	lockdep_assert_held(&store->lock);
+	if (reuse) {
+		list_for_each_entry(admission, &store->admissions, node) {
+			if (admission->incarnation == store->super.ds_incarnation &&
+			    admission->authority_seen &&
+			    admission->authority.writer == writer &&
+			    (admission->authority.rights &
+			     (NFSD_FFV2_RIGHT_READ | NFSD_FFV2_RIGHT_WRITE)) ==
+			    (NFSD_FFV2_RIGHT_READ | NFSD_FFV2_RIGHT_WRITE)) {
+				ffv2_store_admission_stateid(admission->id, result->stateid);
+				result->id = admission->id;
+				error = 0;
+				goto out;
+			}
 		}
 	}
 	if (store->next_admission_id == U64_MAX ||
 	    store->next_admission_id > U32_MAX / 2 ||
 	    store->admission_count == NFSD_FFV2_MAX_ADMISSIONS) {
 		error = -ENOSPC;
-		goto out_unlock;
+		goto out;
 	}
 	error = ffv2_store_wal_fits(store, sizeof(trust) + sizeof(authority), 0);
 	if (error)
-		goto out_unlock;
+		goto out;
 	new_admission = kzalloc_obj(*new_admission, GFP_KERNEL);
 	if (!new_admission) {
 		error = -ENOMEM;
-		goto out_unlock;
+		goto out;
 	}
 	id = store->next_admission_id;
 	epoch = store->super.ds_incarnation;
 	sequence = (u32)(id * 2 - 1);
-	ffv2_store_admission_stateid(id, stateid);
+	ffv2_store_admission_stateid(id, result->stateid);
+	result->id = id;
 
 	cursor = (struct ffv2_cursor){
 		.data = trust_body,
 		.capacity = sizeof(trust_body),
 	};
 	ffv2_put_u32(&cursor, 0x44324253);
-	ffv2_put_bytes(&cursor, stateid + 4, 12);
+	ffv2_put_bytes(&cursor, result->stateid + 4, 12);
 	ffv2_put_u64(&cursor, epoch);
 	ffv2_put_u64(&cursor, 1);
 	ffv2_put_u32(&cursor, NFSD_FFV2_RIGHT_READ |
@@ -2874,7 +2877,7 @@ int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
 				 NFSD_FFV2_RIGHT_WRITE);
 	if (cursor.failed || cursor.offset != sizeof(trust_body)) {
 		error = -EOVERFLOW;
-		goto out_unlock;
+		goto out;
 	}
 	ffv2_store_control_operation(store, sequence, trust_body,
 				     sizeof(trust_body), &operation);
@@ -2887,10 +2890,10 @@ int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
 				    id, trust_body, sizeof(trust_body), trust,
 				    sizeof(trust));
 	if (error)
-		goto out_unlock;
+		goto out;
 	error = ffv2_store_append_wal_locked(store, trust, sizeof(trust));
 	if (error)
-		goto out_unlock;
+		goto out;
 	error = ffv2_replay_control(store, trust, sizeof(trust), &header,
 				    new_admission);
 	if (error)
@@ -2904,7 +2907,7 @@ int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
 	ffv2_put_bytes(&cursor, store->super.store_uuid, 16);
 	ffv2_put_u64(&cursor, epoch);
 	ffv2_put_u32(&cursor, 1);
-	ffv2_put_bytes(&cursor, stateid, 16);
+	ffv2_put_bytes(&cursor, result->stateid, 16);
 	if (cursor.failed || cursor.offset != sizeof(authority_body)) {
 		error = -EOVERFLOW;
 		goto out_failed;
@@ -2921,17 +2924,72 @@ int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
 	error = ffv2_store_append_wal_locked(store, authority,
 					     sizeof(authority));
 	if (error)
-		goto out_unlock;
+		goto out;
 	error = ffv2_replay_control(store, authority, sizeof(authority),
 				    &header, NULL);
 	if (error)
 		goto out_failed;
 	store->next_admission_id++;
-	goto out_unlock;
+	goto out;
 out_failed:
 	store->failed = true;
-out_unlock:
+out:
 	kfree(new_admission);
+	return error;
+}
+
+int nfsd_ffv2_store_admit_writers(struct nfsd_ffv2_store *store, u32 writer,
+				  u32 count,
+				  struct nfsd_ffv2_store_admission *result)
+{
+	u64 append;
+	u32 i;
+	int error;
+
+	if (!store || !result || !count || count > NFSD_FFV2_MAX_OBJECTS ||
+	    !writer || writer == U32_MAX)
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	if (check_mul_overflow((u64)count, (u64)(296 + 256), &append) ||
+	    store->admission_count > NFSD_FFV2_MAX_ADMISSIONS - count ||
+	    store->next_admission_id > U32_MAX / 2 - count + 1) {
+		error = -ENOSPC;
+		goto out_unlock;
+	}
+	error = ffv2_store_wal_fits(store, append, 0);
+	if (error)
+		goto out_unlock;
+	for (i = 0; i < count; i++) {
+		struct nfsd_ffv2_store_admission *admitted = &result[i];
+
+		error = ffv2_store_admit_writer_locked(store, writer, false, admitted);
+		if (error)
+			break;
+	}
+out_unlock:
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
+				 u8 stateid[16])
+{
+	struct nfsd_ffv2_store_admission admitted;
+	int error;
+
+	if (!store || !stateid || !writer || writer == U32_MAX)
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_admit_writer_locked(store, writer, true, &admitted);
+	if (!error)
+		memcpy(stateid, admitted.stateid, sizeof(admitted.stateid));
 	mutex_unlock(&store->lock);
 	nfsd_ffv2_reservation_store_end(store->reservation);
 	return error;
@@ -3178,17 +3236,26 @@ ffv2_store_replay_result(struct nfsd_ffv2_store *store,
 }
 
 static struct ffv2_admission *
-ffv2_store_writer_admission(struct nfsd_ffv2_store *store, u32 writer)
+ffv2_store_writer_admission(struct nfsd_ffv2_store *store, u32 id, u32 writer)
 {
 	struct ffv2_admission *admission;
 
 	list_for_each_entry(admission, &store->admissions, node)
-		if (admission->incarnation == store->super.ds_incarnation &&
+		if (admission->id == id &&
+		    admission->incarnation == store->super.ds_incarnation &&
 		    admission->authority_seen &&
 		    admission->authority.writer == writer &&
 		    (admission->authority.rights & NFSD_FFV2_RIGHT_WRITE))
 			return admission;
 	return NULL;
+}
+
+static int ffv2_store_admission_file(const struct ffv2_admission *admission,
+				     const u8 file_key[32], bool require)
+{
+	if (!admission->object_known)
+		return require ? -EINVAL : 0;
+	return memcmp(admission->file_key, file_key, 32) ? -EINVAL : 0;
 }
 
 static int ffv2_store_extent(const struct nfsd_ffv2_store *store,
@@ -3332,9 +3399,10 @@ int nfsd_ffv2_store_write(struct nfsd_ffv2_store *store,
 	if (error || replayed)
 		goto out_unlock;
 	registration = ffv2_replay_file(store, file_key);
-	admission = ffv2_store_writer_admission(store,
+	admission = ffv2_store_writer_admission(store, request->admission_id,
 						request->owner_client_id);
 	if (!registration || !admission ||
+	    ffv2_store_admission_file(admission, file_key, false) ||
 	    !nfsd_ffv2_payload_geometry_valid(request->chunk_index,
 					      request->content_len,
 					      registration->chunk_bytes,
@@ -3468,6 +3536,10 @@ int nfsd_ffv2_store_write(struct nfsd_ffv2_store *store,
 	receipt = NULL;
 	if (error)
 		goto out_unlock;
+	if (!admission->object_known) {
+		memcpy(admission->file_key, file_key, 32);
+		admission->object_known = true;
+	}
 	store->next_txn_id++;
 	store->next_version_id++;
 	store->next_payload_sequence++;
@@ -3520,12 +3592,13 @@ ffv2_store_lifecycle(struct nfsd_ffv2_store *store, const u8 file_key[32],
 	if (error || replayed)
 		goto out_unlock;
 	registration = ffv2_replay_file(store, file_key);
-	admission = ffv2_store_writer_admission(store,
+	admission = ffv2_store_writer_admission(store, request->admission_id,
 						request->owner_client_id);
 	transaction = ffv2_replay_owner(store, request->owner_cohort,
 					request->owner_client_id,
 					request->owner_co_id);
-	if (!registration || !admission || !transaction ||
+	if (!registration || !admission ||
+	    ffv2_store_admission_file(admission, file_key, true) || !transaction ||
 	    transaction->chunk_index != request->chunk_index ||
 	    transaction->admission_id != admission->id ||
 	    registration->pending[request->chunk_index] != transaction ||

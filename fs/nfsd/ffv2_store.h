@@ -283,6 +283,7 @@ struct nfsd_ffv2_store_operation {
 
 struct nfsd_ffv2_store_write {
 	struct nfsd_ffv2_store_operation operation;
+	u32 admission_id;
 	u64 chunk_index;
 	u32 stability;
 	u64 owner_cohort;
@@ -303,6 +304,7 @@ struct nfsd_ffv2_store_write {
 
 struct nfsd_ffv2_store_lifecycle {
 	struct nfsd_ffv2_store_operation operation;
+	u32 admission_id;
 	u64 chunk_index;
 	u64 owner_cohort;
 	u32 owner_client_id;
@@ -376,6 +378,14 @@ int nfsd_ffv2_store_lookup_file(struct nfsd_ffv2_store *store,
 				struct nfsd_ffv2_store_file *file);
 int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
 				 u8 stateid[16]);
+struct nfsd_ffv2_store_admission {
+	u32 id;
+	u8 stateid[16];
+};
+
+int nfsd_ffv2_store_admit_writers(struct nfsd_ffv2_store *store, u32 writer,
+				  u32 count,
+				  struct nfsd_ffv2_store_admission *result);
 int nfsd_ffv2_store_visible_chunk(struct nfsd_ffv2_store *store,
 				  const u8 file_key[32], u64 chunk_index,
 				  struct nfsd_ffv2_visible_chunk *chunk);
