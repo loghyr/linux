@@ -15,6 +15,7 @@
 #include <linux/fs.h>
 #include <linux/ktime.h>
 #include <linux/list.h>
+#include <linux/overflow.h>
 #include <linux/random.h>
 #include <linux/sunrpc/svcauth.h>
 #include <linux/unaligned.h>
@@ -2119,7 +2120,7 @@ static int nfsd_ffv2_prototype_trust(struct nfsd_net *nn,
 }
 
 /**
- * nfsd_ffv2_prototype_register - publish the one object this gate serves
+ * nfsd_ffv2_prototype_register - publish the object set this gate serves
  * @nn: the nfsd namespace
  * @net: the caller's network namespace
  * @req: nonce, client name, ordinary filehandle and layout parameters
@@ -2156,7 +2157,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	u64 generation_id = 0;
 	u8 source_uuid[16], digest[SHA256_DIGEST_SIZE];
 	struct path path = {};
-	u32 object_count, i;
+	u32 object_count, total_count, i;
 	u32 secid = 0;
 	int error = 0;
 
@@ -2166,13 +2167,15 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	 * The layout is checked before the gate is even entered: a request
 	 * that cannot describe an object must not consume a nonce.
 	 */
+	if (check_add_overflow(req->data_count, req->parity_count,
+			       &total_count))
+		return -EINVAL;
 	object_count = req->object_count ?: 1;
 	if (!req->chunk_size || !req->data_count ||
 	    !req->store_uuid || !req->binding_token ||
 	    !req->writer_id || req->writer_id == U32_MAX ||
 	    object_count > NFSD_FFV2_PROTOTYPE_OBJECT_MAX ||
-	    (req->object_count &&
-	     object_count != req->data_count + req->parity_count) ||
+	    (req->object_count && object_count != total_count) ||
 	    (req->object_count && !req->parity_count && object_count != 1) ||
 	    (!req->object_count && req->parity_count) ||
 	    req->chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES)
@@ -2409,7 +2412,7 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	spin_lock(&anchor->prototype_gate_lock);
 	/*
 	 * The state is checked again here, and not only when this
-	 * registration was work->admitted.  Everything between the two is
+	 * registration was admitted.  Everything between the two is
 	 * sleepable -- an export lookup, a publication, a whole object read
 	 * -- and a close owner may have claimed the gate during it.  If one
 	 * has, nothing is published: committing the nonce or storing READY
@@ -2451,6 +2454,7 @@ out_published:
 	 * none of the ownership bits were set, so it will find nothing of
 	 * this registration left to remove.
 	 */
+	memzero_explicit(staged, sizeof(*staged));
 	if (installed)
 		nfsd_ffv2_provider_remove(nn);
 	mutex_lock(&nfsd_mutex);
@@ -2476,13 +2480,13 @@ out_free:
 }
 
 /**
- * nfsd_ffv2_prototype_unregister - retire the object this gate published
+ * nfsd_ffv2_prototype_unregister - retire the object set this gate published
  * @nn: the nfsd namespace
  * @net: the caller's network namespace
  * @source_uuid: the identifier the registration returned
  * @generation: the generation the registration returned
  *
- * This closes the gate.  Retiring the one object a gate serves and closing
+ * This closes the gate.  Retiring the object set a gate serves and closing
  * that gate are the same teardown, and giving them two implementations was
  * how the second one came to run outside the close owner's fence: it could
  * remove a provider while a replay was still being answered, and retire a

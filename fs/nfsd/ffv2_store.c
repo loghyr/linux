@@ -2818,7 +2818,8 @@ ffv2_store_admit_writer_locked(struct nfsd_ffv2_store *store, u32 writer,
 	struct ffv2_admission *new_admission = NULL;
 	struct ffv2_cursor cursor;
 	u8 trust_body[84], authority_body[44];
-	u8 trust[296], authority[256];
+	u8 trust[NFSD_FFV2_TRUST_STATEID_RECORD_SIZE];
+	u8 authority[NFSD_FFV2_AUTHORITY_ADMIT_RECORD_SIZE];
 	u64 id, epoch;
 	u32 sequence;
 	int error;
@@ -2953,7 +2954,10 @@ int nfsd_ffv2_store_admit_writers(struct nfsd_ffv2_store *store, u32 writer,
 	if (error)
 		return error;
 	mutex_lock(&store->lock);
-	if (check_mul_overflow((u64)count, (u64)(296 + 256), &append) ||
+	if (check_mul_overflow((u64)count,
+			       (u64)(NFSD_FFV2_TRUST_STATEID_RECORD_SIZE +
+				     NFSD_FFV2_AUTHORITY_ADMIT_RECORD_SIZE),
+			       &append) ||
 	    store->admission_count > NFSD_FFV2_MAX_ADMISSIONS - count ||
 	    store->next_admission_id > U32_MAX / 2 - count + 1) {
 		error = -ENOSPC;

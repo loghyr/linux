@@ -511,6 +511,7 @@ static int nfsd_ffv2_store_write_test(const char *name,
 	if (error)
 		goto out_content;
 	write.admission_id = get_unaligned_be64(stateid + 8);
+	lifecycle.admission_id = write.admission_id;
 	nfsd_ffv2_store_test_operation(&write.operation, 1, 0x11);
 	payload_size = nfsd_ffv2_store_test_payload_size(store);
 	nfsd_ffv2_store_test_fail_next_alloc(store);

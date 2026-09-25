@@ -4964,6 +4964,10 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 	}
 
 	context = generation->payload;
+	/*
+	 * B4 has no member selector for filehandle-less control operations.
+	 * Keep a multi-member set fail-closed instead of choosing member zero.
+	 */
 	object = binding ? binding->object :
 		 context && context->objects.count == 1 ?
 		 context->objects.objects[0] : NULL;
@@ -5272,7 +5276,9 @@ int nfsd_ffv2_object_register_fhs(struct nfsd_net *nn,
 	u32 i, j;
 	int error = -EINVAL;
 
-	if (!nn || !registration || !fhps || !persisted_handles || !count ||
+	if (!fhps)
+		return -EINVAL;
+	if (!nn || !registration || !persisted_handles || !count ||
 	    count > NFSD_FFV2_MAX_OBJECTS || !chunk_size ||
 	    chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES || !store_uuid ||
 	    !binding_token || !cred || !unregister_uuid || !object_uuids ||

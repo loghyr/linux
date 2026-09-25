@@ -2688,7 +2688,7 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 					 struct genl_info *info)
 {
 	struct nfsd_ffv2_prototype_request request = {};
-	struct nfsd_ffv2_prototype_bundle bundle;
+	struct nfsd_ffv2_prototype_bundle *bundle;
 	struct nlattr **attrs = info->attrs;
 	struct nlattr *objects;
 	struct net *net = genl_info_net(info);
@@ -2737,28 +2737,33 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 	error = nfsd_ffv2_prototype_objects_parse(objects, &request);
 	if (error)
 		return error;
+	bundle = kzalloc_obj(*bundle, GFP_KERNEL);
+	if (!bundle)
+		return -ENOMEM;
 
 	error = nfsd_ffv2_prototype_register(net_generic(net, nfsd_net_id),
-					     net, &request, &bundle);
+					     net, &request, bundle);
 	if (error)
-		return error;
+		goto out_bundle;
 
 	skb = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
-	if (!skb)
-		return -ENOMEM;
+	if (!skb) {
+		error = -ENOMEM;
+		goto out_bundle;
+	}
 	hdr = genlmsg_iput(skb, info);
 	if (!hdr) {
 		error = -EMSGSIZE;
 		goto out_free;
 	}
 	if (nla_put(skb, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID,
-		    sizeof(bundle.source_uuid), bundle.source_uuid) ||
+		    sizeof(bundle->source_uuid), bundle->source_uuid) ||
 	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_SERVICE_UUID,
-		    sizeof(bundle.service_uuid), bundle.service_uuid) ||
+		    sizeof(bundle->service_uuid), bundle->service_uuid) ||
 	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_REPLAY_UUID,
-		    sizeof(bundle.replay_uuid), bundle.replay_uuid) ||
+		    sizeof(bundle->replay_uuid), bundle->replay_uuid) ||
 	    nla_put_u64_64bit(skb, NFSD_A_FFV2_PROTOTYPE_GENERATION,
-			      bundle.generation, 0)) {
+			      bundle->generation, 0)) {
 		error = -EMSGSIZE;
 		goto out_free;
 	}
@@ -2771,17 +2776,17 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 			error = -EMSGSIZE;
 			goto out_free;
 		}
-		for (i = 0; i < bundle.object_count; i++) {
+		for (i = 0; i < bundle->object_count; i++) {
 			struct nlattr *child = nla_nest_start(skb, i);
 
 			if (!child ||
 			    nla_put(skb,
 				    NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE,
-				    bundle.objects[i].handle_len,
-				    bundle.objects[i].handle) ||
+				    bundle->objects[i].handle_len,
+				    bundle->objects[i].handle) ||
 			    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID,
-				    sizeof(bundle.objects[i].stateid),
-				    bundle.objects[i].stateid)) {
+				    sizeof(bundle->objects[i].stateid),
+				    bundle->objects[i].stateid)) {
 				error = -EMSGSIZE;
 				goto out_free;
 			}
@@ -2795,10 +2800,14 @@ int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
 	 * named it is committed, so the administrator repeats the same
 	 * request and is handed the same bundle.
 	 */
-	return genlmsg_reply(skb, info);
+	error = genlmsg_reply(skb, info);
+	kfree_sensitive(bundle);
+	return error;
 
 out_free:
 	nlmsg_free(skb);
+out_bundle:
+	kfree_sensitive(bundle);
 	return error;
 }
 
