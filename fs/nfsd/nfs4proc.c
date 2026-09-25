@@ -3773,15 +3773,16 @@ nfsd4_ffv2_mutation_operation(struct svc_rqst *rqstp,
 			      struct nfsd_ffv2_mutation_operation *operation)
 {
 	struct nfsd4_compoundargs *args = rqstp->rq_argp;
+	struct nfsd4_compoundres *resp = rqstp->rq_resp;
 
 	if (!cstate->session || !cstate->slot || !args ||
-	    !args->ffv2_digest_valid)
+	    !resp || !resp->opcnt || !args->ffv2_digest_valid)
 		return -EINVAL;
 	memcpy(operation->session, &cstate->session->se_sessionid,
 	       sizeof(operation->session));
 	operation->slot = cstate->slot->sl_index;
 	operation->sequence = cstate->slot->sl_seqid;
-	operation->ordinal = 0;
+	operation->ordinal = resp->opcnt - 1;
 	memcpy(operation->request_digest, args->ffv2_digest,
 	       sizeof(operation->request_digest));
 	return 0;
@@ -3932,8 +3933,8 @@ nfsd4_ffv2_chunk_commit(struct svc_rqst *rqstp,
 /*
  * One handler per operation, so each names its own operation number and
  * the argument member carrying its stateid.  Control operations present
- * theirs in the shared FFv2 argument; the two read operations have their
- * own argument structures.
+ * theirs in the shared FFv2 argument; operations with dedicated request
+ * structures are handled above.
  */
 #define NFSD4_FFV2_OP(name, opnum, stateid_expr)			\
 static __be32								\
@@ -4355,6 +4356,18 @@ static u32 nfsd4_chunk_header_read_rsize(const struct svc_rqst *rqstp,
 		    NFSD4_FFV2_HEADER_ENT_MAX_WORDS;
 
 	return min_t(u32, nfsd4_ffv2_bytes(words), nfsd4_max_payload(rqstp));
+}
+
+static u32 nfsd4_chunk_write_rsize(const struct svc_rqst *rqstp,
+				   const struct nfsd4_op *op)
+{
+	return (op_encode_hdr_size + 13) * sizeof(__be32);
+}
+
+static u32 nfsd4_chunk_lifecycle_rsize(const struct svc_rqst *rqstp,
+				       const struct nfsd4_op *op)
+{
+	return (op_encode_hdr_size + 4) * sizeof(__be32);
 }
 
 static const struct nfsd4_operation nfsd4_ops[] = {
@@ -4780,7 +4793,7 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_func = nfsd4_ffv2_chunk_commit,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_COMMIT",
-		.op_rsize_bop = nfsd4_only_status_rsize,
+		.op_rsize_bop = nfsd4_chunk_lifecycle_rsize,
 	},
 	[OP_CHUNK_ERROR] = {
 		.op_func = nfsd4_ffv2_chunk_error,
@@ -4792,7 +4805,7 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_func = nfsd4_ffv2_chunk_finalize,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_FINALIZE",
-		.op_rsize_bop = nfsd4_only_status_rsize,
+		.op_rsize_bop = nfsd4_chunk_lifecycle_rsize,
 	},
 	[OP_CHUNK_HEADER_READ] = {
 		.op_func = nfsd4_ffv2_chunk_header_read_op,
@@ -4834,7 +4847,7 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_func = nfsd4_ffv2_chunk_write,
 		.op_flags = OP_MODIFIES_SOMETHING,
 		.op_name = "OP_CHUNK_WRITE",
-		.op_rsize_bop = nfsd4_only_status_rsize,
+		.op_rsize_bop = nfsd4_chunk_write_rsize,
 	},
 	[OP_CHUNK_WRITE_REPAIR] = {
 		.op_func = nfsd4_ffv2_chunk_write_repair,

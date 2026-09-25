@@ -119,7 +119,7 @@ static struct nfsd_ffv2_provider_probe_counters nfsd_ffv2_probe_counters;
 static atomic64_t nfsd_ffv2_provider_fenced = ATOMIC64_INIT(0);
 
 /*
- * A published read-only provider: the callbacks and the opaque state they
+ * A published provider: the callbacks and the opaque state they
  * run against, held in one object so a request can never pair one with the
  * other's replacement.  The reference count protects this container, which
  * is what lets removal know when the last callback has left; the installer
@@ -127,9 +127,8 @@ static atomic64_t nfsd_ffv2_provider_fenced = ATOMIC64_INIT(0);
  * alive until removal returns.
  *
  * One of these is published per namespace, in nn->ffv2.provider.  There is
- * no way to install one outside a KUnit build, so in an ordinary build
- * every namespace has none and every mapped request still terminates in
- * NFS4ERR_NOTSUPP.
+ * no provider unless a compiled-in profile installs one, so an unconfigured
+ * namespace still terminates every mapped request in NFS4ERR_NOTSUPP.
  */
 struct nfsd_ffv2_provider {
 	const struct nfsd_ffv2_provider_ops	*ops;
@@ -1975,9 +1974,9 @@ static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) || \
 	IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
 /**
- * nfsd_ffv2_provider_install - install a namespace's read-only provider
+ * nfsd_ffv2_provider_install - install a namespace's provider
  * @nn: the namespace the provider serves
- * @ops: read-only callbacks, which must both be supplied
+ * @ops: provider callbacks; both read callbacks must be supplied
  * @data: opaque provider state passed back to each callback
  * @chunk_size: bytes in one chunk of every object this provider serves
  *
@@ -2044,7 +2043,7 @@ int nfsd_ffv2_provider_install(struct nfsd_net *nn,
 }
 
 /**
- * nfsd_ffv2_provider_remove - remove @nn's read-only provider
+ * nfsd_ffv2_provider_remove - remove @nn's provider
  * @nn: the namespace whose boundary is being closed
  *
  * Takes the provider out of the registry, then waits for the callbacks and
@@ -2060,7 +2059,7 @@ void nfsd_ffv2_provider_remove(struct nfsd_net *nn)
 #endif
 
 /*
- * Run the read-only provider installed for @nn, if one exists.  The
+ * Run a read callback on the provider installed for @nn, if one exists.  The
  * published provider is looked up under RCU and a reference on it is taken
  * there and held across the callback, so removal cannot free the container
  * a request is still inside, and cannot return while the installer's
@@ -2222,9 +2221,8 @@ nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
  * revalidates the binding against the currently active generation and then
  * consults the provider.
  *
- * What remains missing for a full provider is durable logical identity,
- * the store and write-ahead log behind mutating operations, and escrow
- * ownership; no mutating entry point exists here.
+ * This read entry point does not perform mutation.  Mutation uses the same
+ * provider lifetime and admission rules through nfsd_ffv2_provider_mutate().
  *
  * Return: the provider's status, NFS4ERR_STALE when the binding no longer
  * names the active generation, NFS4ERR_NOTSUPP when no provider is
@@ -2583,8 +2581,11 @@ __be32 nfsd4_ffv2_export_policy_check(struct svc_export *exp, u32 opnum)
 	case OP_PUTPUBFH:
 	case OP_SAVEFH:
 	case OP_RESTOREFH:
+	case OP_CHUNK_COMMIT:
+	case OP_CHUNK_FINALIZE:
 	case OP_CHUNK_HEADER_READ:
 	case OP_CHUNK_READ:
+	case OP_CHUNK_WRITE:
 		return nfs_ok;
 	default:
 		return nfserr_notsupp;

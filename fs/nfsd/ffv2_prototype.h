@@ -32,7 +32,7 @@ struct nfsd_ffv2_visible_chunk;
  * exists.  It is deliberately not a production shape: it is compiled out
  * by default, it claims the namespace's single authority source so no
  * metadata server can share the namespace with it, and it admits only the
- * two read operations.
+ * two read operations and the bounded ordinary write lifecycle.
  *
  * The gate is a state machine, and every transition is decided under
  * anchor->prototype_gate_lock, which is taken after nfsd_mutex and never

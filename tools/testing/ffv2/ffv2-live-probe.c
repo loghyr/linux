@@ -45,8 +45,10 @@
 #define OP_SEQUENCE		53
 #define OP_DESTROY_CLIENTID	57
 #define OP_CHUNK_COMMIT		78
+#define OP_CHUNK_FINALIZE	80
 #define OP_CHUNK_HEADER_READ	81
 #define OP_CHUNK_READ		83
+#define OP_CHUNK_WRITE		87
 
 #define NFS4_FHSIZE		128
 #define NFS4_STATEID_SIZE	16
@@ -137,6 +139,9 @@ struct nfs4_client {
  * be evidence of nothing.
  */
 static unsigned int probe_failures;
+
+static void connect_server(struct nfs4_client *c, const char *server,
+			   uint16_t port);
 
 static void fail(const char *fmt, ...)
 {
@@ -468,6 +473,16 @@ static void put_sequence(struct xbuf *x, struct nfs4_client *c)
 	xu32(x, 0);			/* do not cache this */
 }
 
+static void put_sequence_cached(struct xbuf *x, struct nfs4_client *c)
+{
+	xu32(x, OP_SEQUENCE);
+	xput(x, c->sessionid, sizeof(c->sessionid));
+	xu32(x, ++c->seq_seqid);
+	xu32(x, 0);
+	xu32(x, 0);
+	xu32(x, 1);
+}
+
 /* Consume a SEQUENCE result and report its status. */
 static uint32_t get_sequence(struct xcur *c)
 {
@@ -784,6 +799,14 @@ static void put_chunk_args(struct xbuf *x, uint32_t opnum,
 	put_stateid(x, stateid);
 	xu64(x, offset);
 	xu32(x, count);
+}
+
+static void put_owner(struct xbuf *x, uint64_t cohort, uint32_t client,
+		      uint32_t id)
+{
+	xu64(x, cohort);
+	xu32(x, client);
+	xu32(x, id);
 }
 
 /* chunk_owner4 */
@@ -1183,6 +1206,148 @@ out:
 		     want);
 }
 
+static void decode_mutation_reply(const uint8_t *reply, size_t reply_len,
+				  const char *label, uint32_t opnum,
+				  size_t payload_len, uint32_t stable,
+				  bool activated, uint64_t cohort,
+				  uint32_t client, uint32_t owner)
+{
+	struct xcur cur = { .b = reply, .len = reply_len };
+	uint32_t compound, nres, status, results = 0;
+	const uint8_t *verifier;
+
+	compound = rpc_reply_open(&cur, &nres);
+	status = get_sequence(&cur);
+	results++;
+	if (status)
+		goto out;
+	status = op_result(&cur, OP_PUTFH);
+	results++;
+	if (status)
+		goto out;
+	status = op_result(&cur, opnum);
+	results++;
+	printf("%s-STATUS=%u\n", label, status);
+	if (status)
+		goto out;
+	if (opnum == OP_CHUNK_WRITE) {
+		uint32_t count = gu32(&cur);
+		uint32_t committed = gu32(&cur);
+		uint32_t statuses;
+		uint32_t activations;
+		uint32_t owners;
+
+		verifier = gbytes(&cur, NFS4_VERIFIER_SIZE);
+		statuses = gu32(&cur);
+		if (count != payload_len)
+			fail("%s accepted %u bytes, expected %zu", label, count,
+			     payload_len);
+		if (committed != stable)
+			fail("%s returned stability %u, expected %u", label,
+			     committed, stable);
+		if (!verifier)
+			fail("%s returned no write verifier", label);
+		if (statuses != 1 || gu32(&cur) != NFS4_OK)
+			fail("%s returned a non-success chunk status", label);
+		activations = gu32(&cur);
+		if (activations != 1 || !!gu32(&cur) != activated)
+			fail("%s activation result disagrees with the request", label);
+		owners = gu32(&cur);
+		if (owners != 1 || gu64(&cur) != cohort ||
+		    gu32(&cur) != client || gu32(&cur) != owner)
+			fail("%s returned the wrong owner", label);
+	} else {
+		uint32_t statuses;
+
+		verifier = gbytes(&cur, NFS4_VERIFIER_SIZE);
+		statuses = gu32(&cur);
+		if (!verifier)
+			fail("%s returned no write verifier", label);
+		if (statuses != 1 || gu32(&cur) != NFS4_OK)
+			fail("%s returned a non-success chunk status", label);
+	}
+out:
+	reply_complete(&cur, label, nres, results, compound, status);
+	if (status)
+		fail("%s ended with NFS4ERR %u", label, status);
+}
+
+static void mutation_case(struct nfs4_client *c, const char *label,
+			  const char *server, uint16_t port, bool lose_reply,
+			  uint32_t opnum, const uint8_t *fh, size_t fh_len,
+			  const uint8_t *stateid, uint64_t index,
+			  uint32_t stable, uint64_t cohort, uint32_t client,
+			  uint32_t owner, uint32_t payload_id, bool activate,
+			  const uint8_t *payload, size_t payload_len,
+			  uint32_t chunk_size, bool replay, uint8_t *buf,
+			  size_t cap)
+{
+	struct xbuf x = { .b = buf, .cap = cap };
+	uint8_t reply[MAX_MSG];
+	char name[96];
+	size_t reply_len;
+
+	rpc_start(&x, c, 3);
+	put_sequence_cached(&x, c);
+	put_putfh(&x, fh, fh_len);
+	xu32(&x, opnum);
+	put_stateid(&x, stateid);
+	xu64(&x, index);
+	if (opnum == OP_CHUNK_WRITE) {
+		uint32_t crc = crc32_zlib(payload, payload_len);
+
+		xu32(&x, stable);
+		xu64(&x, cohort);
+		xu32(&x, client);
+		xu32(&x, 1);
+		xu32(&x, owner);
+		xu32(&x, payload_id);
+		xu32(&x, activate);
+		xu32(&x, activate);
+		if (activate) {
+			xu32(&x, 0);
+			xu32(&x, 0);
+		}
+		xu32(&x, chunk_size);
+		xu32(&x, 1);
+		xu32(&x, FFV2_CHECKSUM_ALG_CRC32);
+		xopaque(&x, &((uint32_t){ htonl(crc) }), sizeof(crc));
+		xopaque(&x, payload, payload_len);
+	} else {
+		xu32(&x, 1);
+		xu32(&x, 1);
+		put_owner(&x, cohort, client, owner);
+	}
+	snprintf(name, sizeof(name), "REQ-%s", label);
+	rpc_send(c, &x, name);
+	if (lose_reply) {
+		usleep(100000);
+		close(c->fd);
+		connect_server(c, server, port);
+		rpc_send(c, &x, "REQ-LOST-REPLY-RETRY");
+		reply_len = rpc_recv(c, reply, sizeof(reply),
+				     "REP-LOST-REPLY-RETRY");
+		decode_mutation_reply(reply, reply_len, "LOST-REPLY-RETRY",
+				      opnum, payload_len, stable, activate,
+				      cohort, client, owner);
+		goto exact_replay;
+	}
+	snprintf(name, sizeof(name), "REP-%s", label);
+	reply_len = rpc_recv(c, reply, sizeof(reply), name);
+	decode_mutation_reply(reply, reply_len, label, opnum, payload_len,
+			      stable, activate, cohort, client, owner);
+	if (!replay)
+		return;
+exact_replay:
+	if (!replay)
+		return;
+	rpc_send(c, &x, "REQ-EXACT-REPLAY");
+	reply_len = rpc_recv(c, reply, sizeof(reply), "REP-EXACT-REPLAY");
+	decode_mutation_reply(reply, reply_len, "EXACT-REPLAY", opnum,
+			      payload_len, stable, activate, cohort, client,
+			      owner);
+}
+
 /* Hand one value to the other side of the harness. */
 static void publish(const char *dir, const char *name, const char *value)
 {
@@ -1197,6 +1362,22 @@ static void publish(const char *dir, const char *name, const char *value)
 		die("cannot write %s: %s", path, strerror(errno));
 	fprintf(f, "%s\n", value);
 	fclose(f);
+}
+
+static void publish_bytes(const char *dir, const char *name,
+			  const void *data, size_t len)
+{
+	char path[512];
+	FILE *f;
+
+	if (!dir)
+		return;
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	f = fopen(path, "wb");
+	if (!f)
+		die("cannot write %s: %s", path, strerror(errno));
+	if (fwrite(data, 1, len, f) != len || fclose(f))
+		die("cannot publish %s", path);
 }
 
 /*
@@ -1504,6 +1685,8 @@ static void usage(void)
 		"                       [--read-index <index>] [--interleave]\n"
 		"                       [--expect-payload-id-base <id>]\n"
 		"                       [--expect-sparse-index <index>]\n"
+		"                       [--write-lifecycle] [--writer-id <id>]\n"
+		"                       [--store-profile]\n"
 		"                       [--read-only-profile]\n"
 		"                       [--no-retirement] [--mutate-ordinary]\n"
 		"                       [--mutate-sequence]\n");
@@ -1527,8 +1710,10 @@ int main(int argc, char **argv)
 	char value[1024];
 	char run[64];
 	bool interleave = false, retirement = true, mutate_ordinary = false;
-	bool read_only_profile = false;
+	bool read_only_profile = false, store_profile = false;
 	bool mutate_sequence = false;
+	bool write_lifecycle = false;
+	uint32_t writer_id = 0x5150;
 	uint32_t read_count = 1;
 	uint64_t read_index = 0;
 	uint16_t port = 2049;
@@ -1563,6 +1748,12 @@ int main(int argc, char **argv)
 			probe_expect.sparse = true;
 		} else if (!strcmp(argv[i], "--interleave"))
 			interleave = true;
+		else if (!strcmp(argv[i], "--write-lifecycle"))
+			write_lifecycle = true;
+		else if (!strcmp(argv[i], "--writer-id") && i + 1 < argc)
+			writer_id = (uint32_t)strtoul(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--store-profile"))
+			store_profile = true;
 		else if (!strcmp(argv[i], "--read-only-profile"))
 			read_only_profile = true;
 		else if (!strcmp(argv[i], "--no-retirement"))
@@ -1574,8 +1765,10 @@ int main(int argc, char **argv)
 		else
 			usage();
 	}
-	if (!server || !file || !read_count)
+	if (!server || !file || !read_count || !writer_id)
 		usage();
+	if (write_lifecycle && !expect)
+		die("--write-lifecycle requires --expect");
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	snprintf(run, sizeof(run), "%u-%llu", (unsigned int)getpid(),
 		 (unsigned long long)time(NULL));
@@ -1596,13 +1789,15 @@ int main(int argc, char **argv)
 	lookup_ordinary(&c, file, request, sizeof(request));
 
 	if (xchg) {
-		char handoff[2 * NFS4_FHSIZE + sizeof(run) + 16];
+		char handoff[2 * NFS4_FHSIZE + sizeof(run) + 64];
 		char hex[2 * NFS4_FHSIZE + 1];
 		size_t n;
 
 		for (n = 0; n < c.fh_len; n++)
 			snprintf(hex + 2 * n, 3, "%02x", c.fh[n]);
-		snprintf(handoff, sizeof(handoff), "RUN=%s\nFH=%s", run, hex);
+		snprintf(handoff, sizeof(handoff),
+			 "RUN=%s\nFH=%s\nCLIENTID=%llu", run, hex,
+			 (unsigned long long)c.clientid);
 		publish(xchg, "ordinary-fh.hex", handoff);
 		printf("PROBE-PUBLISHED-FH=%s\n", hex);
 		printf("PROBE-RUN=%s\n", run);
@@ -1681,7 +1876,7 @@ int main(int argc, char **argv)
 	 * A chunk is the slice of the object the registration's chunk size
 	 * names, so the payload comparison cannot be made without it.
 	 */
-	if (probe_expect.requested) {
+	if (probe_expect.requested || write_lifecycle) {
 		if (!bundle_value(&bundle, "CHUNK_SIZE", value,
 				  sizeof(value)))
 			die("registration published no chunk size");
@@ -1692,6 +1887,46 @@ int main(int argc, char **argv)
 	}
 	print_hex("PROBE-MAPPED-HANDLE", mapped, mapped_len);
 	print_hex("PROBE-STATEID", stateid, sizeof(stateid));
+	if (write_lifecycle) {
+		static const uint64_t cohort = 0x4233000000000001ULL;
+		size_t n;
+
+		if (probe_expect.chunk_size > sizeof(content) / 2)
+			die("write lifecycle chunk size is too large");
+		for (n = 0; n < probe_expect.chunk_size; n++) {
+			content[n] = (uint8_t)(0xa5 ^ n);
+			content[probe_expect.chunk_size + n] =
+				(uint8_t)(0x5a ^ n);
+		}
+		mutation_case(&c, "WRITE-PREPARED", server, port, true,
+			      OP_CHUNK_WRITE, mapped,
+			      mapped_len, stateid, 0, 0, cohort, writer_id,
+			      0x100, 0x42420000, false, content,
+			      probe_expect.chunk_size, probe_expect.chunk_size,
+			      true, request, sizeof(request));
+		mutation_case(&c, "FINALIZE", server, port, false,
+			      OP_CHUNK_FINALIZE, mapped,
+			      mapped_len, stateid, 0, 0, cohort, writer_id,
+			      0x100, 0, false, NULL, 0,
+			      probe_expect.chunk_size, false, request,
+			      sizeof(request));
+		mutation_case(&c, "COMMIT", server, port, false,
+			      OP_CHUNK_COMMIT, mapped,
+			      mapped_len, stateid, 0, 0, cohort, writer_id,
+			      0x100, 0, false, NULL, 0,
+			      probe_expect.chunk_size, false, request,
+			      sizeof(request));
+		mutation_case(&c, "WRITE-ACTIVATE", server, port, false,
+			      OP_CHUNK_WRITE, mapped,
+			      mapped_len, stateid, 1, 2, cohort, writer_id,
+			      0x101, 0x42420001, true,
+			      content + probe_expect.chunk_size,
+			      probe_expect.chunk_size, probe_expect.chunk_size,
+			      false, request, sizeof(request));
+		publish_bytes(xchg, "committed-content.bin", content,
+			      probe_expect.len);
+		printf("PROBE-WRITE-LIFECYCLE=complete\n");
+	}
 
 	/*
 	 * The index is a knob for the same reason the count is: a control
@@ -1701,7 +1936,8 @@ int main(int argc, char **argv)
 	 */
 	chunk_case(&c, "CASE1-HEADER-READ", OP_CHUNK_HEADER_READ, mapped,
 		   mapped_len, stateid, read_index, read_count, TERM_FFV2,
-		   read_only_profile ? NFS4ERR_NOTSUPP : NFS4_OK,
+		   read_only_profile || store_profile ? NFS4ERR_NOTSUPP :
+							   NFS4_OK,
 		   request, sizeof(request));
 	/*
 	 * The interleaving harness retires the registration while that read
@@ -1723,9 +1959,10 @@ int main(int argc, char **argv)
 	chunk_case(&c, "CASE3-ORDINARY-AFTER-PUTFH", OP_CHUNK_READ, c.fh,
 		   c.fh_len, stateid, 0, 1, TERM_PUTFH, NFS4ERR_STALE,
 		   request, sizeof(request));
-	chunk_case(&c, "CASE4-EXCLUDED-COMMIT", OP_CHUNK_COMMIT, mapped,
-		   mapped_len, stateid, 0, 1, TERM_FFV2, NFS4ERR_NOTSUPP,
-		   request, sizeof(request));
+	if (!write_lifecycle)
+		chunk_case(&c, "CASE4-EXCLUDED-COMMIT", OP_CHUNK_COMMIT,
+			   mapped, mapped_len, stateid, 0, 1, TERM_FFV2,
+			   NFS4ERR_NOTSUPP, request, sizeof(request));
 
 	memcpy(wrong_stateid, stateid, sizeof(wrong_stateid));
 	wrong_stateid[NFS4_STATEID_SIZE - 1] ^= 0xff;

@@ -1188,12 +1188,10 @@ static inline bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp)
  * simplest thing that is both is a snapshot: the registered object is read
  * once, here, and every reply is served from those bytes.
  *
- * That is honest for a demonstrator and would be dishonest for a store.
- * This profile registers one read-only object, gates I/O on its superblock
- * for the life of the registration, and has no mutating entry point at
- * all, so nothing can change the file underneath the snapshot through this
- * server.  A real provider has to answer from the file, which means
- * per-operation storage with a lifetime it can hold against the admission.
+ * That immutable snapshot remains the fallback for the original KUnit
+ * provider.  A file-backed registration instead reads visible payloads from
+ * its store and implements the bounded ordinary write lifecycle, using
+ * per-operation result storage held until the admission is released.
  */
 struct nfsd_ffv2_prototype_provider {
 	u32				chunk_size;
@@ -2000,8 +1998,10 @@ static int nfsd_ffv2_prototype_trust(struct nfsd_net *nn,
 	req.stateid = *stateid;
 	req.object_uuid = object_uuid;
 	req.actor = NFSD_FFV2_CALLER_DATA_CLIENT;
-	req.pnfs_clientid.cl_boot = upper_32_bits(request->pnfs_clientid);
-	req.pnfs_clientid.cl_id = lower_32_bits(request->pnfs_clientid);
+	req.pnfs_clientid.cl_boot =
+		be32_to_cpu((__force __be32)upper_32_bits(request->pnfs_clientid));
+	req.pnfs_clientid.cl_id =
+		be32_to_cpu((__force __be32)lower_32_bits(request->pnfs_clientid));
 	req.client_id = request->writer_id;
 	req.iomode = IOMODE_RW;
 	req.profile_mask = NFSD_FFV2_PROFILE_READ_DATA |

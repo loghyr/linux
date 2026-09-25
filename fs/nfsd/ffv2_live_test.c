@@ -437,6 +437,176 @@ out_abort:
 	return error;
 }
 
+static void nfsd_ffv2_store_test_operation(struct nfsd_ffv2_store_operation *op,
+					   u32 sequence, u8 digest)
+{
+	memset(op, 0, sizeof(*op));
+	memset(op->session, 0x33, sizeof(op->session));
+	op->slot = 1;
+	op->sequence = sequence;
+	memset(op->request_digest, digest, sizeof(op->request_digest));
+}
+
+static int nfsd_ffv2_store_write_test(const char *name,
+				      const u8 store_uuid[16],
+				      const u8 export_uuid[16],
+				      const u8 binding_token[32],
+				      const u8 persisted_handle[32],
+				      u64 *generation)
+{
+	struct nfsd_net *nn = net_generic(&init_net, nfsd_net_id);
+	struct nfsd_ffv2_reservation *reservation = NULL;
+	struct nfsd_ffv2_store_mutation_result first = {}, replay = {};
+	struct nfsd_ffv2_store_lifecycle lifecycle = {
+		.chunk_index = 0,
+		.owner_cohort = 0x4233000000000001ULL,
+		.owner_client_id = 0x5150,
+		.owner_co_id = 0x100,
+	};
+	struct nfsd_ffv2_store_write write = {
+		.chunk_index = 0,
+		.owner_cohort = 0x4233000000000001ULL,
+		.owner_client_id = 0x5150,
+		.owner_co_id = 0x100,
+		.writer_payload_id = 0x42420000,
+		.checksum_algorithm = NFSD_FFV2_STORE_CHECKSUM_CRC32,
+		.checksum_len = sizeof(__be32),
+	};
+	struct nfsd_ffv2_visible_chunk visible;
+	struct nfsd_ffv2_store_file file;
+	struct nfsd_ffv2_store *store = NULL;
+	struct nfsd_ffv2_super_record super;
+	struct path root;
+	u8 stateid[16];
+	u8 *content;
+	u64 payload_size;
+	int error;
+
+	error = kern_path(name, LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &root);
+	if (error)
+		return error;
+	error = nfsd_ffv2_reservation_claim(nn, &root, store_uuid, export_uuid,
+					    binding_token, &reservation);
+	path_put(&root);
+	if (error)
+		return error;
+	error = nfsd_ffv2_store_open(reservation, &store);
+	if (error)
+		goto out_abort;
+	error = nfsd_ffv2_store_lookup_file(store, persisted_handle, &file);
+	if (error)
+		goto out_close;
+	content = kvmalloc(file.chunk_bytes, GFP_KERNEL);
+	if (!content) {
+		error = -ENOMEM;
+		goto out_close;
+	}
+	memset(content, 0xa5, file.chunk_bytes);
+	write.content = content;
+	write.content_len = file.chunk_bytes;
+	put_unaligned_be32(~crc32_le(~0, content, file.chunk_bytes),
+			   write.checksum);
+	error = nfsd_ffv2_store_admit_writer(store, write.owner_client_id,
+					     stateid);
+	if (error)
+		goto out_content;
+	nfsd_ffv2_store_test_operation(&write.operation, 1, 0x11);
+	payload_size = nfsd_ffv2_store_test_payload_size(store);
+	nfsd_ffv2_store_test_fail_next_alloc(store);
+	error = nfsd_ffv2_store_write(store, file.file_key, &write, &first);
+	pr_info("FFv2 store live allocation failure result=%d\n", error);
+	if (error != -ENOMEM ||
+	    payload_size != nfsd_ffv2_store_test_payload_size(store)) {
+		error = error ?: -EBADMSG;
+		goto out_content;
+	}
+	error = nfsd_ffv2_store_write(store, file.file_key, &write, &first);
+	pr_info("FFv2 store live initial write result=%d\n", error);
+	if (error)
+		goto out_content;
+	payload_size = nfsd_ffv2_store_test_payload_size(store);
+	error = nfsd_ffv2_store_write(store, file.file_key, &write, &replay);
+	pr_info("FFv2 store live exact replay result=%d\n", error);
+	if (error || memcmp(&first, &replay, sizeof(first)) ||
+	    payload_size != nfsd_ffv2_store_test_payload_size(store)) {
+		error = error ?: -EBADMSG;
+		goto out_content;
+	}
+	write.operation.request_digest[0] ^= 1;
+	error = nfsd_ffv2_store_write(store, file.file_key, &write, &replay);
+	pr_info("FFv2 store live altered replay result=%d\n", error);
+	if (error != -EEXIST) {
+		error = error ?: -EBADMSG;
+		goto out_content;
+	}
+	error = 0;
+	nfsd_ffv2_store_test_operation(&lifecycle.operation, 2, 0x22);
+	error = nfsd_ffv2_store_finalize(store, file.file_key, &lifecycle,
+					 &replay);
+	pr_info("FFv2 store live finalize result=%d\n", error);
+	if (error)
+		goto out_content;
+	nfsd_ffv2_store_test_operation(&lifecycle.operation, 3, 0x33);
+	error = nfsd_ffv2_store_commit(store, file.file_key, &lifecycle,
+				       &replay);
+	pr_info("FFv2 store live commit result=%d\n", error);
+	if (error)
+		goto out_content;
+	error = nfsd_ffv2_store_visible_chunk(store, file.file_key, 0,
+					      &visible);
+	if (error || visible.writer_payload_id != write.writer_payload_id ||
+	    visible.content_len != write.content_len) {
+		error = error ?: -EBADMSG;
+		goto out_content;
+	}
+	nfsd_ffv2_store_close(store);
+	store = NULL;
+	error = nfsd_ffv2_store_open(reservation, &store);
+	if (error)
+		goto out_content;
+	error = nfsd_ffv2_store_lookup_file(store, persisted_handle, &file);
+	if (!error)
+		error = nfsd_ffv2_store_visible_chunk(store, file.file_key, 0,
+						      &visible);
+	if (!error && (visible.writer_payload_id != write.writer_payload_id ||
+		       visible.content_len != write.content_len))
+		error = -EBADMSG;
+	if (error)
+		goto out_content;
+	error = nfsd_ffv2_store_admit_writer(store, write.owner_client_id,
+					     stateid);
+	if (error)
+		goto out_content;
+	payload_size = nfsd_ffv2_store_test_payload_size(store);
+	write.chunk_index = 1;
+	write.owner_co_id++;
+	write.writer_payload_id++;
+	nfsd_ffv2_store_test_operation(&write.operation, 4, 0x44);
+	nfsd_ffv2_store_test_fail_next_io(store);
+	error = nfsd_ffv2_store_write(store, file.file_key, &write, &replay);
+	pr_info("FFv2 store live I/O failure result=%d\n", error);
+	if (error != -EIO) {
+		error = error ?: -EBADMSG;
+		goto out_content;
+	}
+	nfsd_ffv2_store_close(store);
+	store = NULL;
+	error = nfsd_ffv2_store_open(reservation, &store);
+	if (!error && nfsd_ffv2_store_test_payload_size(store) != payload_size)
+		error = -EBADMSG;
+	if (!error)
+		error = nfsd_ffv2_store_get_super(store, &super);
+	if (!error)
+		*generation = super.generation;
+out_content:
+	kvfree(content);
+out_close:
+	nfsd_ffv2_store_close(store);
+out_abort:
+	nfsd_ffv2_reservation_abort(reservation);
+	return error;
+}
+
 static int ffv2_store_raw_checkpoint_test(const char *name,
 					  const u8 store_uuid[16],
 					  const u8 export_uuid[16],
@@ -524,6 +694,7 @@ static ssize_t nfsd_ffv2_store_test_write(struct file *file,
 	char *input;
 	char *path, *store, *export, *token, *mode;
 	u8 store_uuid[16], export_uuid[16], binding_token[32];
+	u8 persisted_handle[32];
 	u64 generation = 0;
 	int error;
 
@@ -568,7 +739,18 @@ static ssize_t nfsd_ffv2_store_test_write(struct file *file,
 	error = hex2bin(binding_token, token, sizeof(binding_token));
 	if (error)
 		goto out;
-	if (mode && !strcmp(mode, "fail"))
+	if (mode && !strncmp(mode, "write=", 6)) {
+		if (strlen(mode + 6) != 64 ||
+		    hex2bin(persisted_handle, mode + 6,
+			    sizeof(persisted_handle))) {
+			error = -EINVAL;
+			goto record;
+		}
+		error = nfsd_ffv2_store_write_test(path, store_uuid,
+						   export_uuid, binding_token,
+						   persisted_handle,
+						   &generation);
+	} else if (mode && !strcmp(mode, "fail"))
 		error = nfsd_ffv2_store_failure_test(path, store_uuid,
 						     export_uuid, binding_token);
 	else if (mode && !strcmp(mode, "raw"))
@@ -579,6 +761,7 @@ static ssize_t nfsd_ffv2_store_test_write(struct file *file,
 						    binding_token, &generation);
 	else
 		error = -EINVAL;
+record:
 	mutex_lock(&state->lock);
 	state->result = error;
 	state->generation = generation;

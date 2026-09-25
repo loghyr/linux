@@ -407,6 +407,7 @@ int nfsd_ffv2_store_read_wal(struct nfsd_ffv2_store *store, void *data,
 int nfsd_ffv2_store_checkpoint(struct nfsd_ffv2_store *store,
 			       const struct nfsd_ffv2_super_record *record);
 #ifdef CONFIG_NFSD_FFV2_LIVE_TEST
+void nfsd_ffv2_store_test_fail_next_alloc(struct nfsd_ffv2_store *store);
 void nfsd_ffv2_store_test_fail_next_io(struct nfsd_ffv2_store *store);
 u64 nfsd_ffv2_store_test_payload_size(struct nfsd_ffv2_store *store);
 int nfsd_ffv2_store_test_visible_snapshot(struct nfsd_ffv2_store *store,

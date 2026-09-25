@@ -1157,6 +1157,7 @@ struct nfsd_ffv2_store {
 	bool failed;
 #ifdef CONFIG_NFSD_FFV2_LIVE_TEST
 	bool fail_next_io;
+	bool fail_next_alloc;
 #endif
 };
 
@@ -2091,6 +2092,7 @@ int nfsd_ffv2_store_test_visible_replay(
 	INIT_LIST_HEAD(&store.transactions);
 	INIT_LIST_HEAD(&store.owners);
 	INIT_LIST_HEAD(&store.admissions);
+	INIT_LIST_HEAD(&store.receipts);
 	registration = kzalloc_obj(*registration, GFP_KERNEL);
 	if (!registration)
 		return -ENOMEM;
@@ -3387,6 +3389,13 @@ int nfsd_ffv2_store_write(struct nfsd_ffv2_store *store,
 				    2 * NFSD_FFV2_ENTRY_RECORD_SIZE);
 	if (error)
 		goto out_unlock;
+#ifdef CONFIG_NFSD_FFV2_LIVE_TEST
+	if (store->fail_next_alloc) {
+		store->fail_next_alloc = false;
+		error = -ENOMEM;
+		goto out_unlock;
+	}
+#endif
 	transaction = kzalloc_obj(*transaction, GFP_KERNEL);
 	receipt = kmalloc_obj(*receipt, GFP_KERNEL);
 	if (!transaction || !receipt) {
@@ -3689,6 +3698,13 @@ void nfsd_ffv2_store_test_fail_next_io(struct nfsd_ffv2_store *store)
 {
 	mutex_lock(&store->lock);
 	store->fail_next_io = true;
+	mutex_unlock(&store->lock);
+}
+
+void nfsd_ffv2_store_test_fail_next_alloc(struct nfsd_ffv2_store *store)
+{
+	mutex_lock(&store->lock);
+	store->fail_next_alloc = true;
 	mutex_unlock(&store->lock);
 }
 

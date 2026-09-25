@@ -140,7 +140,7 @@ struct nfsd_ffv2_anchor {
 	/* Keeps the embedded anchor alive across admitted callbacks. */
 	refcount_t			ref;
 	/*
-	 * The read-only provider installed for this namespace, if any.
+	 * The provider installed for this namespace, if any.
 	 * FFv2 generation, binding, and authority state is per-namespace, so
 	 * provider selection is too: a request is served only by the
 	 * provider installed for the namespace its binding belongs to.
@@ -487,11 +487,10 @@ struct nfsd_ffv2_mutation_result {
 };
 
 /*
- * The read-only half of the provider boundary.  A callback runs only after
+ * The synchronous provider boundary.  A callback runs only after
  * the ordered gate has authorized the request and taken an execution
- * admission, and only for an operation whose profile names it.  No
- * mutating entry point exists yet, and no provider is installed in an
- * ordinary build.
+ * admission, and only for an operation whose profile names it.  No provider
+ * is installed unless a compiled-in profile publishes one.
  *
  * Callbacks are synchronous and may sleep.  @object, @request and @result
  * are the caller's, valid only for the duration of the call: a provider
@@ -695,7 +694,7 @@ void nfsd_ffv2_test_authority_admissions_close(struct nfsd_net *nn);
 bool nfsd_ffv2_test_authority_admissions_idle(struct nfsd_net *nn);
 
 /*
- * Install or remove @nn's read-only provider.  Both are defined inside the
+ * Install or remove @nn's provider.  Both are defined inside the
  * CONFIG_NFSD_FFV2_KUNIT_TEST guard in ffv2.c, so neither symbol exists in
  * ffv2.o in an ordinary build, and there is no netlink, debugfs, or
  * syscall path to them in any build.  Removal takes the provider out of the
