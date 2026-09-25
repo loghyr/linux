@@ -9402,9 +9402,19 @@ static void nfsd_ffv2_provider_result_contract_test(struct kunit *test)
 	f.provider->chunks[0].cr_owner.co_client_id = 1;
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
 	f.provider->chunks[0].cr_owner.co_client_id = 0;
+	f.provider->chunks[0].cr_guard.cg_gen_id = 1;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_guard.cg_gen_id = 0;
+	f.provider->chunks[0].cr_guard.cg_client_id = 1;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_guard.cg_client_id =
+		NFSD_FFV2_GUARD_CLIENT_ID_NONE;
 	f.provider->chunks[0].cr_payload_id = 1;
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
 	f.provider->chunks[0].cr_payload_id = 0;
+	f.provider->chunks[0].cr_checksum.cs_value[0] ^= 1;
+	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
+	f.provider->chunks[0].cr_checksum.cs_value[0] ^= 1;
 	f.provider->chunks[0].cr_locked = true;
 	KUNIT_EXPECT_EQ(test, nfserr_serverfault, RO_READ());
 	f.provider->chunks[0].cr_locked = false;
@@ -9676,12 +9686,14 @@ struct nfsd_ffv2_store_dispatch_ctx {
 	const struct nfsd_ffv2_object *object;
 	u8 payload[NFSD_FFV2_RO_CHUNK_SIZE];
 	atomic_t releases;
+	u64 provider_releases_at_result_release;
 };
 
 struct nfsd_ffv2_store_dispatch_release {
 	void *private;
 	void (*release)(void *private);
 	atomic_t *releases;
+	struct nfsd_ffv2_store_dispatch_ctx *ctx;
 };
 
 static int nfsd_ffv2_store_dispatch_visible(void *opaque,
@@ -9735,9 +9747,13 @@ nfsd_ffv2_store_dispatch_store_ops = {
 static void nfsd_ffv2_store_dispatch_release(void *opaque)
 {
 	struct nfsd_ffv2_store_dispatch_release *release = opaque;
+	struct nfsd_ffv2_store_dispatch_ctx *ctx = release->ctx;
+	u64 provider_releases;
 
 	release->release(release->private);
 	atomic_inc(release->releases);
+	nfsd_ffv2_test_release_counters(NULL, &provider_releases);
+	ctx->provider_releases_at_result_release = provider_releases;
 	kfree(release);
 }
 
@@ -9767,6 +9783,7 @@ nfsd_ffv2_store_dispatch_chunk_read(void *opaque,
 	release->private = result->private;
 	release->release = result->release;
 	release->releases = &ctx->releases;
+	release->ctx = ctx;
 	result->private = release;
 	result->release = nfsd_ffv2_store_dispatch_release;
 	return nfs_ok;
@@ -9800,6 +9817,7 @@ static void nfsd_ffv2_store_dispatch_lifetime_test(struct kunit *test)
 	struct nfsd_ffv2_chunk_result result;
 	struct nfsd_ffv2_ro_fixture f;
 	bool held = false;
+	u64 provider_releases;
 	int error;
 
 	if (!nfsd_ffv2_ro_fixture_init(test, &f))
@@ -9827,6 +9845,7 @@ static void nfsd_ffv2_store_dispatch_lifetime_test(struct kunit *test)
 		goto out;
 	}
 	f.provider_installed = true;
+	nfsd_ffv2_test_release_counters(NULL, &provider_releases);
 	if (nfsd_ffv2_ro_operation_hold(&f, OP_CHUNK_READ, &req, &result,
 					&admission) != nfs_ok) {
 		KUNIT_FAIL(test, "store dispatch read failed");
@@ -9858,10 +9877,16 @@ static void nfsd_ffv2_store_dispatch_lifetime_test(struct kunit *test)
 	nfsd_ffv2_complete(&admission);
 	held = false;
 	KUNIT_EXPECT_EQ(test, 1, atomic_read(&ctx->releases));
+	KUNIT_EXPECT_EQ(test, provider_releases + 1,
+			ctx->provider_releases_at_result_release);
 	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&remove.done, 5 * HZ),
 			0UL);
 	kthread_stop(remove_task);
 	remove_task = NULL;
+	nfsd_ffv2_test_release_counters(NULL,
+					&ctx->provider_releases_at_result_release);
+	KUNIT_EXPECT_EQ(test, provider_releases + 2,
+			ctx->provider_releases_at_result_release);
 	f.provider_installed = false;
 out:
 	if (held)

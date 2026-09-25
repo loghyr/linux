@@ -995,7 +995,8 @@ static void decode_chunk_read(struct xcur *c, uint64_t offset, uint32_t count)
 		index = offset + i;
 		if (probe_expect.sparse && index == probe_expect.sparse_index) {
 			if (status != NFS4ERR_NOENT || owner_cohort || owner_client ||
-			    owner_id || guard_gen || guard_client || payload_id) {
+			    owner_id || guard_gen || guard_client || payload_id ||
+			    locked) {
 				fail("sparse chunk %llu did not carry NOENT and zero metadata",
 				     (unsigned long long)index);
 				continue;
