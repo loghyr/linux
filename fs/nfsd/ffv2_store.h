@@ -189,6 +189,12 @@ struct nfsd_ffv2_entry_record {
 	u32 stability;
 	u32 batch_ordinal;
 	u32 batch_count;
+	u8 session[16];
+	u32 slot;
+	u32 sequence;
+	u32 ordinal;
+	u8 operation_key[32];
+	u8 request_digest[32];
 	u8 file_key[32];
 	u64 chunk_index;
 	u64 txn_id;
@@ -267,6 +273,54 @@ struct nfsd_ffv2_store_file {
 	u64 logical_eof;
 };
 
+struct nfsd_ffv2_store_operation {
+	u8 session[16];
+	u32 slot;
+	u32 sequence;
+	u32 ordinal;
+	u8 request_digest[32];
+};
+
+struct nfsd_ffv2_store_write {
+	struct nfsd_ffv2_store_operation operation;
+	u64 chunk_index;
+	u32 stability;
+	u64 owner_cohort;
+	u32 owner_client_id;
+	u32 owner_co_id;
+	u32 writer_payload_id;
+	bool guard_check;
+	bool guard_never_written;
+	u32 guard_generation;
+	u32 guard_writer;
+	bool activate_if_empty;
+	u32 checksum_algorithm;
+	u32 checksum_len;
+	u8 checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
+	const u8 *content;
+	u32 content_len;
+};
+
+struct nfsd_ffv2_store_lifecycle {
+	struct nfsd_ffv2_store_operation operation;
+	u64 chunk_index;
+	u64 owner_cohort;
+	u32 owner_client_id;
+	u32 owner_co_id;
+};
+
+struct nfsd_ffv2_store_mutation_result {
+	u32 status;
+	u32 stability;
+	bool activated;
+	u8 verifier[8];
+	struct {
+		u64 cohort;
+		u32 client_id;
+		u32 co_id;
+	} owner;
+};
+
 int nfsd_ffv2_super_encode(const struct nfsd_ffv2_super_record *record,
 			   u8 out[NFSD_FFV2_SUPER_SLOT_SIZE]);
 int nfsd_ffv2_super_decode(const u8 in[NFSD_FFV2_SUPER_SLOT_SIZE],
@@ -320,9 +374,23 @@ int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store,
 int nfsd_ffv2_store_lookup_file(struct nfsd_ffv2_store *store,
 				const u8 handle[32],
 				struct nfsd_ffv2_store_file *file);
+int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
+				 u8 stateid[16]);
 int nfsd_ffv2_store_visible_chunk(struct nfsd_ffv2_store *store,
 				  const u8 file_key[32], u64 chunk_index,
 				  struct nfsd_ffv2_visible_chunk *chunk);
+int nfsd_ffv2_store_write(struct nfsd_ffv2_store *store,
+			  const u8 file_key[32],
+			  const struct nfsd_ffv2_store_write *request,
+			  struct nfsd_ffv2_store_mutation_result *result);
+int nfsd_ffv2_store_finalize(struct nfsd_ffv2_store *store,
+			     const u8 file_key[32],
+			     const struct nfsd_ffv2_store_lifecycle *request,
+			     struct nfsd_ffv2_store_mutation_result *result);
+int nfsd_ffv2_store_commit(struct nfsd_ffv2_store *store,
+			   const u8 file_key[32],
+			   const struct nfsd_ffv2_store_lifecycle *request,
+			   struct nfsd_ffv2_store_mutation_result *result);
 #ifdef CONFIG_KUNIT
 int nfsd_ffv2_store_test_visible_replay(
 	const struct nfsd_ffv2_entry_record *entries, size_t count,

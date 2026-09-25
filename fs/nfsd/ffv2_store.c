@@ -517,6 +517,22 @@ static bool ffv2_operation_key_valid(const u8 operation_key[32],
 	return !memcmp(operation_key, expected, sizeof(expected));
 }
 
+static void ffv2_operation_key(const u8 session[16], u32 slot, u32 sequence,
+			       u32 ordinal, u8 operation_key[32])
+{
+	u8 input[sizeof("FFV2-D2-OPKEY-v1") - 1 + 28];
+	u8 *at = input;
+
+	memcpy(at, "FFV2-D2-OPKEY-v1", sizeof("FFV2-D2-OPKEY-v1") - 1);
+	at += sizeof("FFV2-D2-OPKEY-v1") - 1;
+	memcpy(at, session, 16);
+	at += 16;
+	put_unaligned_be32(slot, at);
+	put_unaligned_be32(sequence, at + 4);
+	put_unaligned_be32(ordinal, at + 8);
+	sha256(input, sizeof(input), operation_key);
+}
+
 int nfsd_ffv2_control_decode(const u8 *in, size_t len,
 			     const u8 *expected_store, const u8 *expected_wal,
 			     struct nfsd_ffv2_wal_header *header,
@@ -561,6 +577,44 @@ int nfsd_ffv2_control_decode(const u8 *in, size_t len,
 	    record->transition != NFSD_FFV2_COMMITTED || record->status != 1)
 		return -EBADMSG;
 	return 0;
+}
+
+static int
+ffv2_control_encode(const struct nfsd_ffv2_wal_header *header, u32 subtype,
+		    const struct nfsd_ffv2_store_operation *operation,
+		    const u8 issuer[16], u64 authority_epoch, u64 client_id,
+		    const u8 *body, u32 body_len, u8 *out, size_t capacity)
+{
+	struct ffv2_cursor cursor = { .data = out, .capacity = capacity };
+	u8 operation_key[32];
+	u32 total;
+
+	if (check_add_overflow((u32)(NFSD_FFV2_WAL_HEADER_SIZE +
+				       NFSD_FFV2_CONTROL_PREFIX_SIZE + 4),
+			       body_len, &total) || total != capacity)
+		return -EOVERFLOW;
+	ffv2_operation_key(operation->session, operation->slot,
+			   operation->sequence, operation->ordinal,
+			   operation_key);
+	ffv2_put_wal_header(&cursor, header, total);
+	ffv2_put_u32(&cursor, subtype);
+	ffv2_put_u32(&cursor, NFSD_FFV2_COMMITTED);
+	ffv2_put_u32(&cursor, 1);
+	ffv2_put_bytes(&cursor, operation_key, sizeof(operation_key));
+	ffv2_put_bytes(&cursor, operation->request_digest,
+		       sizeof(operation->request_digest));
+	ffv2_put_bytes(&cursor, operation->session, sizeof(operation->session));
+	ffv2_put_u32(&cursor, operation->slot);
+	ffv2_put_u32(&cursor, operation->sequence);
+	ffv2_put_u32(&cursor, operation->ordinal);
+	ffv2_put_bytes(&cursor, issuer, 16);
+	ffv2_put_u64(&cursor, authority_epoch);
+	ffv2_put_u64(&cursor, client_id);
+	ffv2_put_bytes(&cursor, body, body_len);
+	if (cursor.failed || cursor.offset != total - 4)
+		return -EOVERFLOW;
+	ffv2_put_crc(&cursor, ffv2_wal_domain, out, cursor.offset);
+	return cursor.failed ? -EOVERFLOW : 0;
 }
 
 int nfsd_ffv2_file_register_decode(const u8 *in, size_t len,
@@ -643,16 +697,96 @@ static bool ffv2_entry_pair_valid(u32 transition, u32 status)
 		status == 6 || status == 7 || status == 8 || status == 9);
 }
 
+static int
+ffv2_entry_encode(const struct nfsd_ffv2_wal_header *header,
+		  const struct nfsd_ffv2_entry_record *record,
+		  u8 out[NFSD_FFV2_ENTRY_RECORD_SIZE])
+{
+	struct ffv2_cursor cursor = {
+		.data = out,
+		.capacity = NFSD_FFV2_ENTRY_RECORD_SIZE,
+	};
+
+	if (!header || !record || !out ||
+	    header->family != NFSD_FFV2_WAL_ENTRY || !header->lsn ||
+	    !ffv2_entry_pair_valid(record->transition, record->status))
+		return -EINVAL;
+	ffv2_put_wal_header(&cursor, header, NFSD_FFV2_ENTRY_RECORD_SIZE);
+	ffv2_put_u32(&cursor, record->transition);
+	ffv2_put_u32(&cursor, record->status);
+	ffv2_put_u32(&cursor, record->disposition);
+	ffv2_put_u32(&cursor, record->stability);
+	ffv2_put_u32(&cursor, record->batch_ordinal);
+	ffv2_put_u32(&cursor, record->batch_count);
+	ffv2_put_bytes(&cursor, record->file_key, sizeof(record->file_key));
+	ffv2_put_u64(&cursor, record->chunk_index);
+	ffv2_put_u64(&cursor, record->txn_id);
+	ffv2_put_bytes(&cursor, record->session, sizeof(record->session));
+	ffv2_put_u32(&cursor, record->slot);
+	ffv2_put_u32(&cursor, record->sequence);
+	ffv2_put_u32(&cursor, record->ordinal);
+	ffv2_put_bytes(&cursor, record->operation_key,
+		       sizeof(record->operation_key));
+	ffv2_put_bytes(&cursor, record->request_digest,
+		       sizeof(record->request_digest));
+	ffv2_put_bytes(&cursor, record->admission.session,
+		       sizeof(record->admission.session));
+	ffv2_put_bytes(&cursor, record->admission.principal,
+		       sizeof(record->admission.principal));
+	ffv2_put_bytes(&cursor, record->admission.issuer,
+		       sizeof(record->admission.issuer));
+	ffv2_put_u64(&cursor, record->admission.authority_epoch);
+	ffv2_put_u64(&cursor, record->admission.fence_sequence);
+	ffv2_put_u64(&cursor, record->admission.lease_epoch);
+	ffv2_put_u64(&cursor, record->admission.client_id);
+	ffv2_put_u32(&cursor, record->admission.stateid_seqid);
+	ffv2_put_bytes(&cursor, record->admission.stateid_other,
+		       sizeof(record->admission.stateid_other));
+	ffv2_put_u32(&cursor, record->admission.writer);
+	ffv2_put_u32(&cursor, record->admission.rights);
+	ffv2_put_u64(&cursor, record->owner_cohort);
+	ffv2_put_u32(&cursor, record->owner_client_id);
+	ffv2_put_u32(&cursor, record->owner_co_id);
+	ffv2_put_u32(&cursor, record->generation);
+	ffv2_put_u8(&cursor, record->predecessor_present);
+	ffv2_put_u64(&cursor, record->predecessor_object_id);
+	ffv2_put_u32(&cursor, record->predecessor_generation);
+	ffv2_put_u8(&cursor, record->postcond_present);
+	ffv2_put_u64(&cursor, record->postcond_id);
+	ffv2_put_u64(&cursor, record->payload_object_id);
+	ffv2_put_u32(&cursor, record->writer_payload_id);
+	ffv2_put_u64(&cursor, record->payload_object_offset);
+	ffv2_put_u32(&cursor, record->payload_content_len);
+	ffv2_put_u32(&cursor, record->extent_kind);
+	ffv2_put_u64(&cursor, record->extent_high_water);
+	ffv2_put_u64(&cursor, record->extent_highest_index);
+	ffv2_put_u64(&cursor, record->index_generation);
+	ffv2_put_bytes(&cursor, record->result_verifier,
+		       sizeof(record->result_verifier));
+	ffv2_put_u8(&cursor, record->result_activated);
+	ffv2_put_u64(&cursor, record->result_visible_object_id);
+	ffv2_put_u32(&cursor, record->result_effective_len);
+	ffv2_put_u32(&cursor, record->result_checksum_algorithm);
+	ffv2_put_u32(&cursor, record->result_checksum_len);
+	ffv2_put_bytes(&cursor, record->result_checksum,
+		       sizeof(record->result_checksum));
+	ffv2_put_u8(&cursor, record->result_guard_never_written);
+	ffv2_put_u32(&cursor, record->result_guard_generation);
+	ffv2_put_u32(&cursor, record->result_guard_writer);
+	if (cursor.failed || cursor.offset != NFSD_FFV2_ENTRY_RECORD_SIZE - 4)
+		return -EOVERFLOW;
+	ffv2_put_crc(&cursor, ffv2_wal_domain, out, cursor.offset);
+	return cursor.failed ? -EOVERFLOW : 0;
+}
+
 int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 			   const u8 *expected_store, const u8 *expected_wal,
 			   struct nfsd_ffv2_wal_header *header,
 			   struct nfsd_ffv2_entry_record *record)
 {
 	struct ffv2_cursor cursor = { .data = (u8 *)in, .capacity = len };
-	u8 operation_key[32], request_digest[32], session[16];
 	u8 predecessor_present, postcond_present, result_activated;
 	u8 result_guard_never_written;
-	u32 slot, sequence, ordinal;
 	int error;
 
 	if (!in || !header || !record || len < NFSD_FFV2_ENTRY_RECORD_SIZE)
@@ -674,12 +808,14 @@ int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 	ffv2_get_bytes(&cursor, record->file_key, sizeof(record->file_key));
 	record->chunk_index = ffv2_get_u64(&cursor);
 	record->txn_id = ffv2_get_u64(&cursor);
-	ffv2_get_bytes(&cursor, session, sizeof(session));
-	slot = ffv2_get_u32(&cursor);
-	sequence = ffv2_get_u32(&cursor);
-	ordinal = ffv2_get_u32(&cursor);
-	ffv2_get_bytes(&cursor, operation_key, sizeof(operation_key));
-	ffv2_get_bytes(&cursor, request_digest, sizeof(request_digest));
+	ffv2_get_bytes(&cursor, record->session, sizeof(record->session));
+	record->slot = ffv2_get_u32(&cursor);
+	record->sequence = ffv2_get_u32(&cursor);
+	record->ordinal = ffv2_get_u32(&cursor);
+	ffv2_get_bytes(&cursor, record->operation_key,
+		       sizeof(record->operation_key));
+	ffv2_get_bytes(&cursor, record->request_digest,
+		       sizeof(record->request_digest));
 	ffv2_get_bytes(&cursor, record->admission.session, 16);
 	ffv2_get_bytes(&cursor, record->admission.principal, 16);
 	ffv2_get_bytes(&cursor, record->admission.issuer, 16);
@@ -721,8 +857,9 @@ int nfsd_ffv2_entry_decode(const u8 *in, size_t len,
 	record->result_guard_generation = ffv2_get_u32(&cursor);
 	record->result_guard_writer = ffv2_get_u32(&cursor);
 	if (cursor.failed || cursor.offset != NFSD_FFV2_ENTRY_RECORD_SIZE - 4 ||
-	    !ffv2_operation_key_valid(operation_key, session, slot, sequence,
-				      ordinal) ||
+	    !ffv2_operation_key_valid(record->operation_key, record->session,
+				      record->slot, record->sequence,
+				      record->ordinal) ||
 	    record->batch_count < 1 || record->batch_count > 16 ||
 	    record->batch_ordinal >= record->batch_count ||
 	    !ffv2_entry_pair_valid(record->transition, record->status) ||
@@ -1005,10 +1142,15 @@ struct nfsd_ffv2_store {
 	u64 wal_payload_cursor;
 	u64 next_lsn;
 	u64 index_generation;
+	u64 next_txn_id;
+	u64 next_version_id;
+	u64 next_payload_sequence;
+	u64 next_admission_id;
 	struct list_head registrations;
 	struct list_head transactions;
 	struct list_head owners;
 	struct list_head admissions;
+	struct list_head receipts;
 	u32 registration_count;
 	u32 transaction_count;
 	u32 admission_count;
@@ -1019,6 +1161,11 @@ struct nfsd_ffv2_store {
 };
 
 struct ffv2_transaction;
+
+struct ffv2_receipt {
+	struct list_head node;
+	struct nfsd_ffv2_entry_record entry;
+};
 
 struct ffv2_registration {
 	struct list_head node;
@@ -1088,11 +1235,17 @@ struct ffv2_scan_result {
 	bool nonzero_tail;
 };
 
+static int ffv2_store_append_wal_locked(struct nfsd_ffv2_store *store,
+					const u8 *data, size_t len);
+static int ffv2_store_wal_fits(struct nfsd_ffv2_store *store,
+			       u64 append, u64 additional_reserve);
+
 static void ffv2_store_replay_free(struct nfsd_ffv2_store *store)
 {
 	struct ffv2_registration *registration, *next_registration;
 	struct ffv2_transaction *transaction, *next_transaction;
 	struct ffv2_admission *admission, *next_admission;
+	struct ffv2_receipt *receipt, *next_receipt;
 
 	list_for_each_entry_safe(registration, next_registration,
 				 &store->registrations, node) {
@@ -1108,6 +1261,10 @@ static void ffv2_store_replay_free(struct nfsd_ffv2_store *store)
 				 &store->admissions, node) {
 		list_del(&admission->node);
 		kfree(admission);
+	}
+	list_for_each_entry_safe(receipt, next_receipt, &store->receipts, node) {
+		list_del(&receipt->node);
+		kfree(receipt);
 	}
 }
 
@@ -1380,7 +1537,8 @@ static bool ffv2_stateid_valid(u64 id, u32 seqid, const u8 other[12])
 
 static int ffv2_replay_trust(struct nfsd_ffv2_store *store,
 			     const struct nfsd_ffv2_wal_header *header,
-			     const struct nfsd_ffv2_control_record *record)
+			     const struct nfsd_ffv2_control_record *record,
+			     struct ffv2_admission *new_admission)
 {
 	struct ffv2_cursor cursor = {
 		.data = (u8 *)record->body,
@@ -1422,9 +1580,12 @@ static int ffv2_replay_trust(struct nfsd_ffv2_store *store,
 	     memcmp(actor->authority.issuer, authority.issuer, 16) ||
 	     actor->authority.authority_epoch != authority.authority_epoch))
 		return -EBADMSG;
-	admission = kzalloc_obj(*admission, GFP_KERNEL);
-	if (!admission)
-		return -ENOMEM;
+	admission = new_admission;
+	if (!admission) {
+		admission = kzalloc_obj(*admission, GFP_KERNEL);
+		if (!admission)
+			return -ENOMEM;
+	}
 	admission->id = beneficiary;
 	admission->incarnation = header->ds_incarnation;
 	admission->authority = authority;
@@ -1515,6 +1676,34 @@ ffv2_replay_owner(struct nfsd_ffv2_store *store, u64 cohort, u32 client_id,
 		    transaction->owner_co_id == co_id)
 			return transaction;
 	return NULL;
+}
+
+static struct ffv2_receipt *
+ffv2_replay_receipt(struct nfsd_ffv2_store *store, const u8 operation_key[32])
+{
+	struct ffv2_receipt *receipt;
+
+	list_for_each_entry(receipt, &store->receipts, node)
+		if (!memcmp(receipt->entry.operation_key, operation_key, 32))
+			return receipt;
+	return NULL;
+}
+
+static int
+ffv2_replay_receipt_add(struct nfsd_ffv2_store *store,
+			const struct nfsd_ffv2_entry_record *entry,
+			struct ffv2_receipt *receipt)
+{
+	if (ffv2_replay_receipt(store, entry->operation_key))
+		return -EBADMSG;
+	if (!receipt) {
+		receipt = kmalloc_obj(*receipt, GFP_KERNEL);
+		if (!receipt)
+			return -ENOMEM;
+	}
+	receipt->entry = *entry;
+	list_add_tail(&receipt->node, &store->receipts);
+	return 0;
 }
 
 static int ffv2_replay_payload(struct nfsd_ffv2_store *store,
@@ -1688,7 +1877,8 @@ static int ffv2_replay_visible_entry(
 	struct ffv2_registration *registration,
 	const struct nfsd_ffv2_wal_header *header,
 	const struct nfsd_ffv2_entry_record *entry,
-	const struct nfsd_ffv2_payload_record *payload, u64 object_end)
+	const struct nfsd_ffv2_payload_record *payload, u64 object_end,
+	struct ffv2_transaction *new_transaction)
 {
 	struct ffv2_transaction *transaction, *predecessor;
 	u64 prior_eof;
@@ -1740,9 +1930,12 @@ static int ffv2_replay_visible_entry(
 		}
 		if (entry->result_guard_writer != entry->admission.writer)
 			return -EBADMSG;
-		transaction = kzalloc_obj(*transaction, GFP_KERNEL);
-		if (!transaction)
-			return -ENOMEM;
+		transaction = new_transaction;
+		if (!transaction) {
+			transaction = kzalloc_obj(*transaction, GFP_KERNEL);
+			if (!transaction)
+				return -ENOMEM;
+		}
 		memcpy(transaction->file_key, entry->file_key, 32);
 		transaction->chunk_index = entry->chunk_index;
 		transaction->txn_id = entry->txn_id;
@@ -1937,7 +2130,7 @@ int nfsd_ffv2_store_test_visible_replay(
 		}
 		error = ffv2_replay_visible_entry(&store, registration, &header,
 						  &entries[i], &payload,
-						  object_end);
+						  object_end, NULL);
 		if (error)
 			break;
 	}
@@ -2034,7 +2227,10 @@ static int ffv2_replay_entry(struct nfsd_ffv2_store *store,
 	    entry->payload_object_id <= *highest_payload_id)
 		return -EBADMSG;
 	error = ffv2_replay_visible_entry(store, registration, header, entry,
-					  &payload, object_end);
+					  &payload, object_end, NULL);
+	if (error)
+		return error;
+	error = ffv2_replay_receipt_add(store, entry, NULL);
 	if (error)
 		return error;
 	if (entry->payload_object_id) {
@@ -2090,7 +2286,8 @@ ffv2_store_decode_registration(struct nfsd_ffv2_store *store,
 
 static int ffv2_replay_control(struct nfsd_ffv2_store *store,
 			       const u8 *bytes, size_t len,
-			       struct nfsd_ffv2_wal_header *header)
+			       struct nfsd_ffv2_wal_header *header,
+			       struct ffv2_admission *new_admission)
 {
 	struct nfsd_ffv2_control_record record;
 	u32 subtype;
@@ -2111,7 +2308,7 @@ static int ffv2_replay_control(struct nfsd_ffv2_store *store,
 	if (error)
 		return error;
 	if (record.subtype == NFSD_FFV2_TRUST_STATEID)
-		return ffv2_replay_trust(store, header, &record);
+		return ffv2_replay_trust(store, header, &record, new_admission);
 	if (record.subtype == NFSD_FFV2_AUTHORITY_ADMIT)
 		return ffv2_replay_authority(store, &record);
 	return -EOPNOTSUPP;
@@ -2236,7 +2433,7 @@ static int ffv2_store_scan_wal(struct nfsd_ffv2_store *store,
 			} else if (!error &&
 				   header.family == NFSD_FFV2_WAL_CONTROL) {
 				error = ffv2_replay_control(store, record, total,
-							    &header);
+							    &header, NULL);
 			} else if (!error &&
 				   header.family == NFSD_FFV2_WAL_ENTRY) {
 				struct nfsd_ffv2_entry_record entry;
@@ -2278,6 +2475,31 @@ static int ffv2_store_scan_wal(struct nfsd_ffv2_store *store,
 	    (vfs_truncate(&store->payload_file->f_path, scan->payload_cursor) ||
 	     vfs_fsync(store->payload_file, 0)))
 		return -EIO;
+	return 0;
+}
+
+static int ffv2_store_next_ids(struct nfsd_ffv2_store *store)
+{
+	struct ffv2_transaction *transaction;
+	struct ffv2_admission *admission;
+	u64 txn = 0, version = 0;
+	u64 admission_id = 0;
+
+	list_for_each_entry(transaction, &store->transactions, node) {
+		if (transaction->txn_id > txn)
+			txn = transaction->txn_id;
+		if (transaction->version_object_id > version)
+			version = transaction->version_object_id;
+	}
+	list_for_each_entry(admission, &store->admissions, node)
+		if (admission->id > admission_id)
+			admission_id = admission->id;
+	if (txn == U64_MAX || version == U64_MAX || admission_id == U64_MAX)
+		return -EOVERFLOW;
+	store->next_txn_id = txn + 1;
+	store->next_version_id = version + 1;
+	store->next_payload_sequence = 1;
+	store->next_admission_id = admission_id + 1;
 	return 0;
 }
 
@@ -2445,6 +2667,7 @@ int nfsd_ffv2_store_open(struct nfsd_ffv2_reservation *reservation,
 	INIT_LIST_HEAD(&store->transactions);
 	INIT_LIST_HEAD(&store->owners);
 	INIT_LIST_HEAD(&store->admissions);
+	INIT_LIST_HEAD(&store->receipts);
 	store->super_file = ffv2_store_open_file(&root, "super");
 	if (IS_ERR(store->super_file)) {
 		error = PTR_ERR(store->super_file);
@@ -2471,6 +2694,9 @@ int nfsd_ffv2_store_open(struct nfsd_ffv2_reservation *reservation,
 	if (error)
 		goto out_store;
 	error = ffv2_store_scan_wal(store, &scan);
+	if (error)
+		goto out_store;
+	error = ffv2_store_next_ids(store);
 	if (error)
 		goto out_store;
 	error = ffv2_store_start(store, &scan);
@@ -2555,6 +2781,160 @@ int nfsd_ffv2_store_lookup_file(struct nfsd_ffv2_store *store,
 	return error;
 }
 
+static void ffv2_store_admission_stateid(u64 id, u8 stateid[16])
+{
+	put_unaligned_be32(0x44324253, stateid);
+	memcpy(stateid + 4, "TATE", 4);
+	put_unaligned_be64(id, stateid + 8);
+}
+
+static void ffv2_store_control_operation(struct nfsd_ffv2_store *store,
+					 u32 sequence, const u8 *body,
+					 u32 body_len,
+					 struct nfsd_ffv2_store_operation *op)
+{
+	memset(op, 0, sizeof(*op));
+	memcpy(op->session, store->super.store_uuid, sizeof(op->session));
+	op->session[0] ^= 0xa5;
+	op->sequence = sequence;
+	sha256(body, body_len, op->request_digest);
+}
+
+int nfsd_ffv2_store_admit_writer(struct nfsd_ffv2_store *store, u32 writer,
+				 u8 stateid[16])
+{
+	struct nfsd_ffv2_store_operation operation;
+	struct nfsd_ffv2_wal_header header = {
+		.family = NFSD_FFV2_WAL_CONTROL,
+	};
+	struct ffv2_admission *admission;
+	struct ffv2_admission *new_admission = NULL;
+	struct ffv2_cursor cursor;
+	u8 trust_body[84], authority_body[44];
+	u8 trust[296], authority[256];
+	u64 id, epoch;
+	u32 sequence;
+	int error;
+
+	if (!store || !stateid || !writer || writer == U32_MAX)
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	list_for_each_entry(admission, &store->admissions, node) {
+		if (admission->incarnation == store->super.ds_incarnation &&
+		    admission->authority_seen &&
+		    admission->authority.writer == writer &&
+		    (admission->authority.rights & (NFSD_FFV2_RIGHT_READ |
+						 NFSD_FFV2_RIGHT_WRITE)) ==
+					       (NFSD_FFV2_RIGHT_READ |
+						 NFSD_FFV2_RIGHT_WRITE)) {
+			ffv2_store_admission_stateid(admission->id, stateid);
+			error = 0;
+			goto out_unlock;
+		}
+	}
+	if (store->next_admission_id == U64_MAX ||
+	    store->next_admission_id > U32_MAX / 2 ||
+	    store->admission_count == NFSD_FFV2_MAX_ADMISSIONS) {
+		error = -ENOSPC;
+		goto out_unlock;
+	}
+	error = ffv2_store_wal_fits(store, sizeof(trust) + sizeof(authority), 0);
+	if (error)
+		goto out_unlock;
+	new_admission = kzalloc_obj(*new_admission, GFP_KERNEL);
+	if (!new_admission) {
+		error = -ENOMEM;
+		goto out_unlock;
+	}
+	id = store->next_admission_id;
+	epoch = store->super.ds_incarnation;
+	sequence = (u32)(id * 2 - 1);
+	ffv2_store_admission_stateid(id, stateid);
+
+	cursor = (struct ffv2_cursor){
+		.data = trust_body,
+		.capacity = sizeof(trust_body),
+	};
+	ffv2_put_u32(&cursor, 0x44324253);
+	ffv2_put_bytes(&cursor, stateid + 4, 12);
+	ffv2_put_u64(&cursor, epoch);
+	ffv2_put_u64(&cursor, 1);
+	ffv2_put_u32(&cursor, NFSD_FFV2_RIGHT_READ |
+				 NFSD_FFV2_RIGHT_WRITE);
+	ffv2_put_bytes(&cursor, store->super.store_uuid, 16);
+	ffv2_put_u64(&cursor, id);
+	ffv2_put_bytes(&cursor, store->super.export_uuid, 16);
+	ffv2_put_u32(&cursor, writer);
+	ffv2_put_u32(&cursor, NFSD_FFV2_RIGHT_READ |
+				 NFSD_FFV2_RIGHT_WRITE);
+	if (cursor.failed || cursor.offset != sizeof(trust_body)) {
+		error = -EOVERFLOW;
+		goto out_unlock;
+	}
+	ffv2_store_control_operation(store, sequence, trust_body,
+				     sizeof(trust_body), &operation);
+	header.lsn = store->next_lsn;
+	header.ds_incarnation = epoch;
+	memcpy(header.store_uuid, store->super.store_uuid, 16);
+	memcpy(header.wal_uuid, store->super.wal_uuid, 16);
+	error = ffv2_control_encode(&header, NFSD_FFV2_TRUST_STATEID,
+				    &operation, store->super.store_uuid, epoch,
+				    id, trust_body, sizeof(trust_body), trust,
+				    sizeof(trust));
+	if (error)
+		goto out_unlock;
+	error = ffv2_store_append_wal_locked(store, trust, sizeof(trust));
+	if (error)
+		goto out_unlock;
+	error = ffv2_replay_control(store, trust, sizeof(trust), &header,
+				    new_admission);
+	if (error)
+		goto out_failed;
+	new_admission = NULL;
+
+	cursor = (struct ffv2_cursor){
+		.data = authority_body,
+		.capacity = sizeof(authority_body),
+	};
+	ffv2_put_bytes(&cursor, store->super.store_uuid, 16);
+	ffv2_put_u64(&cursor, epoch);
+	ffv2_put_u32(&cursor, 1);
+	ffv2_put_bytes(&cursor, stateid, 16);
+	if (cursor.failed || cursor.offset != sizeof(authority_body)) {
+		error = -EOVERFLOW;
+		goto out_failed;
+	}
+	ffv2_store_control_operation(store, sequence + 1, authority_body,
+				     sizeof(authority_body), &operation);
+	header.lsn = store->next_lsn;
+	error = ffv2_control_encode(&header, NFSD_FFV2_AUTHORITY_ADMIT,
+				    &operation, store->super.store_uuid, epoch,
+				    id, authority_body, sizeof(authority_body),
+				    authority, sizeof(authority));
+	if (error)
+		goto out_failed;
+	error = ffv2_store_append_wal_locked(store, authority,
+					     sizeof(authority));
+	if (error)
+		goto out_unlock;
+	error = ffv2_replay_control(store, authority, sizeof(authority),
+				    &header, NULL);
+	if (error)
+		goto out_failed;
+	store->next_admission_id++;
+	goto out_unlock;
+out_failed:
+	store->failed = true;
+out_unlock:
+	kfree(new_admission);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
 int nfsd_ffv2_store_visible_chunk(struct nfsd_ffv2_store *store,
 				  const u8 file_key[32], u64 chunk_index,
 				  struct nfsd_ffv2_visible_chunk *chunk)
@@ -2631,34 +3011,49 @@ static int ffv2_store_write_range_valid(struct file *file, u64 capacity,
 	return 0;
 }
 
-int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data,
-				 size_t len, loff_t offset)
+static int ffv2_store_append_wal_locked(struct nfsd_ffv2_store *store,
+					const u8 *data, size_t len)
 {
 	int error;
 
-	error = nfsd_ffv2_reservation_store_begin(store->reservation);
-	if (error)
-		return error;
-	mutex_lock(&store->lock);
-	error = ffv2_store_read_range_valid(store->payload_file, len, offset);
+	if (store->failed || store->wal_cursor !=
+				 i_size_read(file_inode(store->wal_file))) {
+		store->failed = true;
+		return -EIO;
+	}
+	error = ffv2_store_write_range_valid(store->wal_file,
+					     store->super.capacity_wal_bytes,
+					     len, store->wal_cursor);
 	if (!error)
-		error = ffv2_store_read_all(store->payload_file, data, len, offset);
-	mutex_unlock(&store->lock);
-	nfsd_ffv2_reservation_store_end(store->reservation);
-	return error;
+		error = ffv2_store_write_all(store->wal_file, data, len,
+					     store->wal_cursor);
+#ifdef CONFIG_NFSD_FFV2_LIVE_TEST
+	if (!error && store->fail_next_io) {
+		store->fail_next_io = false;
+		error = -EIO;
+	}
+#endif
+	if (!error)
+		error = vfs_fsync(store->wal_file, 0);
+	if (error) {
+		store->failed = true;
+		return error;
+	}
+	store->wal_cursor += len;
+	store->wal_payload_cursor = store->payload_cursor;
+	store->next_lsn++;
+	return 0;
 }
 
-int nfsd_ffv2_store_append_payload(struct nfsd_ffv2_store *store,
-				   const struct nfsd_ffv2_payload_record *record,
-				   u64 *offset)
+static int
+ffv2_store_append_payload_locked(struct nfsd_ffv2_store *store,
+				 const struct nfsd_ffv2_payload_record *record,
+				 u64 *offset)
 {
 	size_t len, written;
 	u8 *data;
 	int error;
 
-	if (!store || !record || !offset ||
-	    memcmp(record->store_uuid, store->super.store_uuid, 16))
-		return -EINVAL;
 	len = nfsd_ffv2_payload_record_size(record->content_len);
 	if (!len)
 		return -EOVERFLOW;
@@ -2668,19 +3063,11 @@ int nfsd_ffv2_store_append_payload(struct nfsd_ffv2_store *store,
 	error = nfsd_ffv2_payload_encode(record, data, len, &written);
 	if (error)
 		goto out;
-	if (written != len) {
-		error = -EIO;
-		goto out;
-	}
-	error = nfsd_ffv2_reservation_store_begin(store->reservation);
-	if (error)
-		goto out;
-	mutex_lock(&store->lock);
-	if (store->failed || store->payload_cursor !=
+	if (written != len || store->failed || store->payload_cursor !=
 				 i_size_read(file_inode(store->payload_file))) {
 		store->failed = true;
 		error = -EIO;
-		goto out_unlock;
+		goto out;
 	}
 	error = ffv2_store_write_range_valid(store->payload_file,
 					     store->super.capacity_payload_bytes,
@@ -2702,12 +3089,516 @@ int nfsd_ffv2_store_append_payload(struct nfsd_ffv2_store *store,
 		*offset = store->payload_cursor;
 		store->payload_cursor += len;
 	}
-out_unlock:
-	mutex_unlock(&store->lock);
-	nfsd_ffv2_reservation_store_end(store->reservation);
 out:
 	kvfree(data);
 	return error;
+}
+
+int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data,
+				 size_t len, loff_t offset)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_read_range_valid(store->payload_file, len, offset);
+	if (!error)
+		error = ffv2_store_read_all(store->payload_file, data, len, offset);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_append_payload(struct nfsd_ffv2_store *store,
+				   const struct nfsd_ffv2_payload_record *record,
+				   u64 *offset)
+{
+	int error;
+
+	if (!store || !record || !offset ||
+	    memcmp(record->store_uuid, store->super.store_uuid, 16))
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_append_payload_locked(store, record, offset);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+static int
+ffv2_store_operation_key(const struct nfsd_ffv2_store_operation *operation,
+			 u8 key[32])
+{
+	if (!operation || ffv2_all_zero(operation->session, 16) ||
+	    !operation->sequence)
+		return -EINVAL;
+	ffv2_operation_key(operation->session, operation->slot,
+			   operation->sequence, operation->ordinal, key);
+	return 0;
+}
+
+static int
+ffv2_store_replay_result(struct nfsd_ffv2_store *store,
+			 const struct nfsd_ffv2_store_operation *operation,
+			 struct nfsd_ffv2_store_mutation_result *result,
+			 bool *replayed)
+{
+	struct ffv2_receipt *receipt;
+	u8 key[32];
+	int error;
+
+	*replayed = false;
+	error = ffv2_store_operation_key(operation, key);
+	if (error)
+		return error;
+	receipt = ffv2_replay_receipt(store, key);
+	if (!receipt)
+		return 0;
+	if (memcmp(receipt->entry.request_digest, operation->request_digest,
+		   sizeof(operation->request_digest)))
+		return -EEXIST;
+	memset(result, 0, sizeof(*result));
+	result->status = receipt->entry.status;
+	result->stability = receipt->entry.stability - 1;
+	result->activated = receipt->entry.result_activated;
+	memcpy(result->verifier, receipt->entry.result_verifier,
+	       sizeof(result->verifier));
+	result->owner.cohort = receipt->entry.owner_cohort;
+	result->owner.client_id = receipt->entry.owner_client_id;
+	result->owner.co_id = receipt->entry.owner_co_id;
+	*replayed = true;
+	return 0;
+}
+
+static struct ffv2_admission *
+ffv2_store_writer_admission(struct nfsd_ffv2_store *store, u32 writer)
+{
+	struct ffv2_admission *admission;
+
+	list_for_each_entry(admission, &store->admissions, node)
+		if (admission->incarnation == store->super.ds_incarnation &&
+		    admission->authority_seen &&
+		    admission->authority.writer == writer &&
+		    (admission->authority.rights & NFSD_FFV2_RIGHT_WRITE))
+			return admission;
+	return NULL;
+}
+
+static int ffv2_store_extent(const struct nfsd_ffv2_store *store,
+			     const struct ffv2_registration *registration,
+			     const struct ffv2_transaction *publish,
+			     struct nfsd_ffv2_entry_record *entry)
+{
+	u64 eof = 0, end, highest = 0, prior = registration->logical_eof;
+	bool any = false;
+	u32 i;
+
+	for (i = 0; i < ARRAY_SIZE(registration->visible); i++) {
+		const struct ffv2_transaction *version = registration->visible[i];
+
+		if (publish && publish->chunk_index == i)
+			version = publish;
+		if (!version)
+			continue;
+		if (check_mul_overflow((u64)i,
+				       (u64)registration->chunk_bytes, &end) ||
+		    check_add_overflow(end, (u64)version->content_len, &end))
+			return -EOVERFLOW;
+		if (end > eof)
+			eof = end;
+		if (!any || i > highest)
+			highest = i;
+		any = true;
+	}
+	entry->extent_kind = eof > prior ? 2 : eof < prior ? 3 : 1;
+	entry->extent_high_water = eof;
+	entry->extent_highest_index = any ? highest : 0;
+	entry->index_generation = store->index_generation + !!publish;
+	return 0;
+}
+
+static int ffv2_store_wal_fits(struct nfsd_ffv2_store *store,
+			       u64 append, u64 additional_reserve)
+{
+	struct ffv2_scan_result scan = {};
+	u64 required;
+	int error;
+
+	error = ffv2_replay_account(store, &scan);
+	if (error)
+		return error;
+	if (check_add_overflow(scan.live_wal_reserved, additional_reserve,
+			       &required) ||
+	    check_add_overflow(required, append, &required) ||
+	    check_add_overflow(required, (u64)NFSD_FFV2_START_RECORD_SIZE,
+			       &required) ||
+	    store->wal_cursor > store->super.capacity_wal_bytes ||
+	    required > store->super.capacity_wal_bytes - store->wal_cursor)
+		return -ENOSPC;
+	return 0;
+}
+
+static void
+ffv2_store_entry_operation(struct nfsd_ffv2_entry_record *entry,
+			   const struct nfsd_ffv2_store_operation *operation)
+{
+	memcpy(entry->session, operation->session, sizeof(entry->session));
+	entry->slot = operation->slot;
+	entry->sequence = operation->sequence;
+	entry->ordinal = operation->ordinal;
+	ffv2_operation_key(operation->session, operation->slot,
+			   operation->sequence, operation->ordinal,
+			   entry->operation_key);
+	memcpy(entry->request_digest, operation->request_digest,
+	       sizeof(entry->request_digest));
+}
+
+static int
+ffv2_store_append_entry_locked(struct nfsd_ffv2_store *store,
+			       struct nfsd_ffv2_entry_record *entry,
+	const struct nfsd_ffv2_payload_record *payload, u64 object_end,
+	struct ffv2_transaction *transaction, struct ffv2_receipt *receipt)
+{
+	struct nfsd_ffv2_wal_header header = {
+		.family = NFSD_FFV2_WAL_ENTRY,
+		.lsn = store->next_lsn,
+		.ds_incarnation = store->super.ds_incarnation,
+	};
+	struct ffv2_registration *registration;
+	u8 bytes[NFSD_FFV2_ENTRY_RECORD_SIZE];
+	int error;
+
+	memcpy(header.store_uuid, store->super.store_uuid, 16);
+	memcpy(header.wal_uuid, store->super.wal_uuid, 16);
+	error = ffv2_entry_encode(&header, entry, bytes);
+	if (error)
+		goto out_free;
+	error = ffv2_store_append_wal_locked(store, bytes, sizeof(bytes));
+	if (error)
+		goto out_free;
+	registration = ffv2_replay_file(store, entry->file_key);
+	error = ffv2_replay_visible_entry(store, registration, &header, entry,
+					  payload, object_end, transaction);
+	if (!error)
+		error = ffv2_replay_receipt_add(store, entry, receipt);
+	if (error)
+		store->failed = true;
+out_free:
+	if (transaction &&
+	    ffv2_replay_transaction(store, entry->txn_id) != transaction)
+		kfree(transaction);
+	if (receipt &&
+	    ffv2_replay_receipt(store, entry->operation_key) != receipt)
+		kfree(receipt);
+	return error;
+}
+
+int nfsd_ffv2_store_write(struct nfsd_ffv2_store *store,
+			  const u8 file_key[32],
+			  const struct nfsd_ffv2_store_write *request,
+			  struct nfsd_ffv2_store_mutation_result *result)
+{
+	struct nfsd_ffv2_payload_record payload = {};
+	struct nfsd_ffv2_entry_record entry = {
+		.status = 1,
+		.disposition = 1,
+		.batch_count = 1,
+	};
+	struct ffv2_registration *registration;
+	struct ffv2_transaction predicted = {};
+	struct ffv2_transaction *transaction = NULL;
+	struct ffv2_admission *admission;
+	struct ffv2_transaction *predecessor;
+	struct ffv2_receipt *receipt = NULL;
+	u64 payload_offset, object_end;
+	bool replayed, activate;
+	int error;
+
+	if (!store || !file_key || !request || !result || !request->content)
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_replay_result(store, &request->operation, result,
+					 &replayed);
+	if (error || replayed)
+		goto out_unlock;
+	registration = ffv2_replay_file(store, file_key);
+	admission = ffv2_store_writer_admission(store,
+						request->owner_client_id);
+	if (!registration || !admission ||
+	    !nfsd_ffv2_payload_geometry_valid(request->chunk_index,
+					      request->content_len,
+					      registration->chunk_bytes,
+					      registration->max_chunks) ||
+	    request->stability > 2 || request->checksum_len >
+						NFSD_FFV2_STORE_CHECKSUM_SIZE ||
+	    !nfsd_ffv2_store_checksum_valid(request->checksum_algorithm,
+					    request->checksum,
+					    request->checksum_len,
+					    request->content,
+					    request->content_len) ||
+	    ffv2_replay_owner(store, request->owner_cohort,
+			      request->owner_client_id, request->owner_co_id) ||
+	    registration->pending[request->chunk_index]) {
+		error = -EINVAL;
+		goto out_unlock;
+	}
+	if (request->guard_check) {
+		if (request->guard_never_written !=
+		    registration->guard[request->chunk_index].never_written ||
+		    (request->guard_never_written &&
+		     (request->guard_generation || request->guard_writer)) ||
+		    (!request->guard_never_written &&
+		     (request->guard_generation !=
+			registration->guard[request->chunk_index].generation ||
+		      request->guard_writer !=
+			registration->guard[request->chunk_index].writer))) {
+			error = -EAGAIN;
+			goto out_unlock;
+		}
+	}
+	if (store->next_txn_id == U64_MAX ||
+	    store->next_version_id == U64_MAX ||
+	    store->next_payload_sequence > NFSD_FFV2_PAYLOAD_SEQUENCE_MASK ||
+	    store->transaction_count == NFSD_FFV2_MAX_TRANSACTIONS ||
+	    (!registration->guard[request->chunk_index].never_written &&
+	     registration->guard[request->chunk_index].generation == U32_MAX)) {
+		error = -ENOSPC;
+		goto out_unlock;
+	}
+	activate = request->activate_if_empty && request->stability &&
+		   !registration->visible[request->chunk_index];
+	if (activate && store->index_generation == U64_MAX) {
+		error = -ENOSPC;
+		goto out_unlock;
+	}
+	error = ffv2_store_wal_fits(store, NFSD_FFV2_ENTRY_RECORD_SIZE,
+				    activate ? 0 :
+				    2 * NFSD_FFV2_ENTRY_RECORD_SIZE);
+	if (error)
+		goto out_unlock;
+	transaction = kzalloc_obj(*transaction, GFP_KERNEL);
+	receipt = kmalloc_obj(*receipt, GFP_KERNEL);
+	if (!transaction || !receipt) {
+		error = -ENOMEM;
+		goto out_free;
+	}
+	predecessor = registration->visible[request->chunk_index];
+	entry.transition = activate ? NFSD_FFV2_COMMITTED :
+				      NFSD_FFV2_PREPARED;
+	entry.stability = request->stability + 1;
+	memcpy(entry.file_key, file_key, sizeof(entry.file_key));
+	entry.chunk_index = request->chunk_index;
+	entry.txn_id = store->next_txn_id;
+	ffv2_store_entry_operation(&entry, &request->operation);
+	entry.admission = admission->authority;
+	entry.owner_cohort = request->owner_cohort;
+	entry.owner_client_id = request->owner_client_id;
+	entry.owner_co_id = request->owner_co_id;
+	entry.generation =
+		registration->guard[request->chunk_index].never_written ? 0 :
+		registration->guard[request->chunk_index].generation + 1;
+	entry.predecessor_present = !!predecessor;
+	if (predecessor) {
+		entry.predecessor_object_id = predecessor->version_object_id;
+		entry.predecessor_generation = predecessor->version_generation;
+	}
+	entry.payload_object_id =
+		(store->super.ds_incarnation << 40) |
+		store->next_payload_sequence;
+	entry.writer_payload_id = request->writer_payload_id;
+	entry.payload_content_len = request->content_len;
+	entry.result_activated = activate;
+	entry.result_visible_object_id = store->next_version_id;
+	entry.result_effective_len = request->content_len;
+	entry.result_checksum_algorithm = request->checksum_algorithm;
+	entry.result_checksum_len = request->checksum_len;
+	memcpy(entry.result_checksum, request->checksum,
+	       sizeof(entry.result_checksum));
+	entry.result_guard_generation = entry.generation;
+	entry.result_guard_writer = request->owner_client_id;
+	memcpy(entry.result_verifier, store->super.write_verifier,
+	       sizeof(entry.result_verifier));
+
+	memcpy(payload.store_uuid, store->super.store_uuid,
+	       sizeof(payload.store_uuid));
+	payload.object_id = entry.payload_object_id;
+	payload.checksum_algorithm = request->checksum_algorithm;
+	payload.checksum_len = request->checksum_len;
+	memcpy(payload.checksum, request->checksum, sizeof(payload.checksum));
+	payload.content_len = request->content_len;
+	payload.content = request->content;
+	payload.content_crc32c = ~crc32c(~0, request->content,
+					 request->content_len);
+	error = ffv2_store_append_payload_locked(store, &payload,
+						 &payload_offset);
+	if (error)
+		goto out_free;
+	entry.payload_object_offset = payload_offset;
+	object_end = payload_offset +
+		     nfsd_ffv2_payload_record_size(request->content_len);
+	predicted.chunk_index = request->chunk_index;
+	predicted.content_len = request->content_len;
+	error = ffv2_store_extent(store, registration,
+				  activate ? &predicted : NULL, &entry);
+	if (error)
+		goto out_free;
+	error = ffv2_store_append_entry_locked(store, &entry, &payload,
+					       object_end, transaction, receipt);
+	transaction = NULL;
+	receipt = NULL;
+	if (error)
+		goto out_unlock;
+	store->next_txn_id++;
+	store->next_version_id++;
+	store->next_payload_sequence++;
+	memset(result, 0, sizeof(*result));
+	result->status = 1;
+	result->stability = request->stability;
+	result->activated = activate;
+	memcpy(result->verifier, entry.result_verifier,
+	       sizeof(result->verifier));
+	result->owner.cohort = request->owner_cohort;
+	result->owner.client_id = request->owner_client_id;
+	result->owner.co_id = request->owner_co_id;
+	goto out_unlock;
+out_free:
+	kfree(receipt);
+	kfree(transaction);
+out_unlock:
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+static int
+ffv2_store_lifecycle(struct nfsd_ffv2_store *store, const u8 file_key[32],
+		     const struct nfsd_ffv2_store_lifecycle *request,
+		     struct nfsd_ffv2_store_mutation_result *result,
+		     u32 transition)
+{
+	struct nfsd_ffv2_entry_record entry = {
+		.status = 1,
+		.disposition = 1,
+		.stability = 3,
+		.batch_count = 1,
+	};
+	struct ffv2_registration *registration;
+	struct ffv2_transaction *transaction;
+	struct ffv2_admission *admission;
+	struct ffv2_receipt *receipt = NULL;
+	bool replayed;
+	int error;
+
+	if (!store || !file_key || !request || !result)
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_replay_result(store, &request->operation, result,
+					 &replayed);
+	if (error || replayed)
+		goto out_unlock;
+	registration = ffv2_replay_file(store, file_key);
+	admission = ffv2_store_writer_admission(store,
+						request->owner_client_id);
+	transaction = ffv2_replay_owner(store, request->owner_cohort,
+					request->owner_client_id,
+					request->owner_co_id);
+	if (!registration || !admission || !transaction ||
+	    transaction->chunk_index != request->chunk_index ||
+	    transaction->admission_id != admission->id ||
+	    registration->pending[request->chunk_index] != transaction ||
+	    (transition == NFSD_FFV2_FINALIZED &&
+	     transaction->phase != NFSD_FFV2_PREPARED) ||
+	    (transition == NFSD_FFV2_COMMITTED &&
+	     transaction->phase != NFSD_FFV2_FINALIZED)) {
+		error = -EINVAL;
+		goto out_unlock;
+	}
+	if (transition == NFSD_FFV2_COMMITTED &&
+	    store->index_generation == U64_MAX) {
+		error = -ENOSPC;
+		goto out_unlock;
+	}
+	error = ffv2_store_wal_fits(store, 0, 0);
+	if (error)
+		goto out_unlock;
+	receipt = kmalloc_obj(*receipt, GFP_KERNEL);
+	if (!receipt) {
+		error = -ENOMEM;
+		goto out_unlock;
+	}
+	entry.transition = transition;
+	memcpy(entry.file_key, file_key, sizeof(entry.file_key));
+	entry.chunk_index = request->chunk_index;
+	entry.txn_id = transaction->txn_id;
+	ffv2_store_entry_operation(&entry, &request->operation);
+	entry.admission = admission->authority;
+	entry.owner_cohort = transaction->owner_cohort;
+	entry.owner_client_id = transaction->owner_client_id;
+	entry.owner_co_id = transaction->owner_co_id;
+	entry.generation = transaction->version_generation;
+	entry.predecessor_present = transaction->predecessor_present;
+	entry.predecessor_object_id = transaction->predecessor_object_id;
+	entry.predecessor_generation = transaction->predecessor_generation;
+	entry.result_visible_object_id = transaction->version_object_id;
+	entry.result_guard_generation = transaction->guard_generation;
+	entry.result_guard_writer = transaction->guard_writer;
+	entry.result_guard_never_written = transaction->guard_never_written;
+	memcpy(entry.result_verifier, store->super.write_verifier,
+	       sizeof(entry.result_verifier));
+	error = ffv2_store_extent(store, registration,
+				  transition == NFSD_FFV2_COMMITTED ?
+				  transaction : NULL, &entry);
+	if (error)
+		goto out_free_receipt;
+	error = ffv2_store_append_entry_locked(store, &entry, NULL, 0, NULL,
+					       receipt);
+	receipt = NULL;
+	if (error)
+		goto out_unlock;
+	memset(result, 0, sizeof(*result));
+	result->status = 1;
+	result->stability = 2;
+	memcpy(result->verifier, entry.result_verifier,
+	       sizeof(result->verifier));
+	result->owner.cohort = transaction->owner_cohort;
+	result->owner.client_id = transaction->owner_client_id;
+	result->owner.co_id = transaction->owner_co_id;
+	goto out_unlock;
+out_free_receipt:
+	kfree(receipt);
+out_unlock:
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_finalize(struct nfsd_ffv2_store *store,
+			     const u8 file_key[32],
+			     const struct nfsd_ffv2_store_lifecycle *request,
+			     struct nfsd_ffv2_store_mutation_result *result)
+{
+	return ffv2_store_lifecycle(store, file_key, request, result,
+				    NFSD_FFV2_FINALIZED);
+}
+
+int nfsd_ffv2_store_commit(struct nfsd_ffv2_store *store,
+			   const u8 file_key[32],
+			   const struct nfsd_ffv2_store_lifecycle *request,
+			   struct nfsd_ffv2_store_mutation_result *result)
+{
+	return ffv2_store_lifecycle(store, file_key, request, result,
+				    NFSD_FFV2_COMMITTED);
 }
 
 #ifdef CONFIG_NFSD_FFV2_LIVE_TEST
