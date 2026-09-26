@@ -318,10 +318,10 @@ sunrpc_cache_update_exact(struct cache_detail *detail,
 	hlist_add_head_rcu(&tmp->cache_list, head);
 	detail->entries++;
 	cache_fresh_locked(tmp, new->expiry_time, detail);
-	cache_fresh_locked(old, 0, detail);
+	sunrpc_begin_cache_remove_entry(old, detail);
 	spin_unlock(&detail->hash_lock);
 	cache_fresh_unlocked(tmp, detail);
-	cache_fresh_unlocked(old, detail);
+	sunrpc_end_cache_remove_entry(old, detail);
 	return tmp;
 }
 EXPORT_SYMBOL_GPL(sunrpc_cache_update_exact);

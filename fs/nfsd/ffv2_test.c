@@ -1320,6 +1320,97 @@ static void nfsd_ffv2_init_test_export(struct svc_export *exp,
 	exp->ex_xprtsec_modes = NFSEXP_XPRTSEC_ALL;
 }
 
+static void nfsd_ffv2_exact_cache_replacement_test(struct kunit *test)
+{
+	struct svc_export *replacement = NULL, *published = NULL, *stale;
+	struct svc_export exp;
+	struct auth_domain *domain;
+	struct nfsd_net *nn;
+	struct path root;
+	struct net *net;
+	u8 uuid[16] = { 2 };
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "failed to create exact-cache netns: %ld",
+			   PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	domain = unix_domain_find("ffv2-exact-kunit");
+	if (!domain) {
+		KUNIT_FAIL(test, "failed to create exact-cache auth domain");
+		goto out_net;
+	}
+	get_fs_root(current->fs, &root);
+	nfsd_ffv2_init_test_export(&exp, nn, domain, &root);
+	exp.ex_uuid = kmemdup(uuid, sizeof(uuid), GFP_KERNEL);
+	if (!exp.ex_uuid) {
+		KUNIT_FAIL(test, "failed to allocate exact-cache UUID");
+		goto out_root;
+	}
+	published = nfsd_export_cache_update(&exp);
+	if (IS_ERR(published)) {
+		KUNIT_FAIL(test, "failed to seed exact-cache export: %ld",
+			   PTR_ERR(published));
+		kfree(exp.ex_uuid);
+		published = NULL;
+		goto out_root;
+	}
+	error = nfsd_ffv2_export_template_clone(&exp, published);
+	if (error) {
+		KUNIT_FAIL(test, "failed to clone exact-cache template: %d",
+			   error);
+		goto out_exports;
+	}
+	replacement = nfsd_ffv2_test_export_update_exact(&exp, published);
+	nfsd_ffv2_export_template_free(&exp);
+	if (IS_ERR(replacement)) {
+		KUNIT_FAIL(test, "exact-cache replacement failed: %ld",
+			   PTR_ERR(replacement));
+		replacement = NULL;
+		goto out_exports;
+	}
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_is_current(published));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_current(replacement));
+	error = nfsd_ffv2_export_template_clone(&exp, replacement);
+	if (error) {
+		KUNIT_FAIL(test, "failed to clone stale-cache template: %d",
+			   error);
+		goto out_exports;
+	}
+	stale = nfsd_ffv2_test_export_update_exact(&exp, published);
+	nfsd_ffv2_export_template_free(&exp);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(stale));
+	if (IS_ERR(stale))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(stale), -ESTALE);
+	else
+		exp_put(stale);
+
+	nfsd_export_unhash(replacement);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_is_current(published));
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 1u);
+	exp_put(replacement);
+	replacement = NULL;
+	exp_put(published);
+	published = NULL;
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 0u);
+
+out_exports:
+	if (replacement)
+		exp_put(replacement);
+	if (published)
+		exp_put(published);
+	nfsd_export_flush(net);
+out_root:
+	path_put(&root);
+	auth_domain_put(domain);
+out_net:
+	put_net(net);
+	net_ns_barrier();
+}
+
 static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 {
 	struct nfsd_ffv2_object_unregister_ctx retire_ctx = {};
@@ -1506,6 +1597,8 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		exp_put(published);
 		goto out_root;
 	}
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_is_current(published));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_current(replacement));
 	error = nfsd_ffv2_export_template_clone(&exp, replacement);
 	if (error) {
 		KUNIT_FAIL(test, "stale template clone failed: %d", error);
@@ -1520,12 +1613,15 @@ static void nfsd_ffv2_reservation_context_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, PTR_ERR(stale), -ESTALE);
 	else
 		exp_put(stale);
-	exp_put(replacement);
-	exp_put(published);
+	nfsd_export_unhash(replacement);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_is_current(published));
 	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 1U);
 	error = nfsd_ffv2_test_reservation_claim(nn2, &root, uuid, token,
 						 &reservation);
 	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	exp_put(replacement);
+	exp_put(published);
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 0U);
 	nfsd_export_flush(net);
 	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 0U);
 
@@ -16466,6 +16562,7 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_shutdown_start_failure_test),
 	KUNIT_CASE(nfsd_ffv2_listener_only_integration_test),
 	KUNIT_CASE(nfsd_ffv2_partial_start_cleanup_test),
+	KUNIT_CASE(nfsd_ffv2_exact_cache_replacement_test),
 	KUNIT_CASE(nfsd_ffv2_reservation_context_test),
 	KUNIT_CASE(nfsd_ffv2_export_update_stop_test),
 	KUNIT_CASE(nfsd_ffv2_filehandle_format_test),
