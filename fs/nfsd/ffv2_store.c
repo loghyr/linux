@@ -4116,14 +4116,6 @@ int nfsd_ffv2_store_test_alias_pending(struct nfsd_ffv2_store *store,
 	return error;
 }
 
-void nfsd_ffv2_store_test_advance_incarnation(
-	struct nfsd_ffv2_store *store)
-{
-	mutex_lock(&store->lock);
-	store->super.ds_incarnation++;
-	mutex_unlock(&store->lock);
-}
-
 void nfsd_ffv2_store_test_fail_visible_replay(struct nfsd_ffv2_store *store)
 {
 	mutex_lock(&store->lock);

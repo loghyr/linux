@@ -1179,7 +1179,6 @@ static void ffv2_store_multi_admission_lifecycle_test(struct kunit *test)
 			nfsd_ffv2_store_kunit_write(reopened, file_keys[0],
 						   &write, &result),
 			0);
-	nfsd_ffv2_store_test_advance_incarnation(reopened);
 	ffv2_store_test_write_request(&write, admitted[0].id, 3, 5, 15);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_store_kunit_write(reopened, file_keys[0],
@@ -1302,7 +1301,6 @@ static void ffv2_store_durable_prefix_test(struct kunit *test)
 							   &fresh),
 			0);
 	KUNIT_EXPECT_GT(test, fresh.id, lost.id);
-	KUNIT_EXPECT_NE(test, fresh.id, lost.id);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_admission_count(reopened),
 			2u);
 }

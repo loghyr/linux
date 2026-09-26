@@ -295,6 +295,8 @@ bool nfsd_ffv2_prototype_test_object_armed(void);
 int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 					 const struct net *net,
 					 const u8 *nonce);
+bool nfsd_ffv2_prototype_test_nonce_reusable(struct nfsd_net *nn,
+					     const u8 *nonce);
 void nfsd_ffv2_prototype_test_nonce_age(struct nfsd_net *nn, const u8 *nonce);
 unsigned int nfsd_ffv2_prototype_test_nonce_count(struct nfsd_net *nn);
 unsigned int nfsd_ffv2_prototype_test_close_waiters(struct nfsd_net *nn);

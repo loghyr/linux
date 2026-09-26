@@ -2742,6 +2742,33 @@ int nfsd_ffv2_prototype_test_nonce_check(struct nfsd_net *nn,
 	return error;
 }
 
+bool nfsd_ffv2_prototype_test_nonce_reusable(struct nfsd_net *nn,
+					     const u8 *nonce)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_prototype_ctx *ctx = nfsd_ffv2_prototype_ctx_of(nn);
+	struct nfsd_ffv2_prototype_nonce *record;
+	unsigned long index;
+	bool reusable = false;
+	u64 carried;
+
+	if (!ctx)
+		return false;
+	carried = get_unaligned_be64(nonce);
+	if (carried > (u64)ULONG_MAX)
+		return false;
+	index = carried;
+	spin_lock(&anchor->prototype_gate_lock);
+	record = xa_load(&ctx->nonces, index);
+	if (record &&
+	    !crypto_memneq(record->value, nonce,
+			   NFSD_FFV2_PROTOTYPE_NONCE_LEN) &&
+	    record->state == NFSD_FFV2_NONCE_ISSUED && !record->busy)
+		reusable = true;
+	spin_unlock(&anchor->prototype_gate_lock);
+	return reusable;
+}
+
 /* Backdate one challenge so its expiry can be reached without waiting. */
 void nfsd_ffv2_prototype_test_nonce_age(struct nfsd_net *nn, const u8 *nonce)
 {

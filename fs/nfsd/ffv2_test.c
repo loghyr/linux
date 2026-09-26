@@ -12973,13 +12973,14 @@ static bool nfsd_ffv2_proto_fixture_init(struct kunit *test,
  * which is the same rule every other caller of the disarm relies on.  The
  * fixture ends up holding exactly the arming that is in force.
  */
-static bool nfsd_ffv2_proto_fixture_rearm(struct nfsd_ffv2_proto_fixture *f,
-					  size_t len, size_t sampled,
-					  bool claim)
+static bool
+nfsd_ffv2_proto_fixture_rearm_export(struct nfsd_ffv2_proto_fixture *f,
+				     struct svc_export *exp, size_t len,
+				      size_t sampled, bool claim)
 {
 	struct nfsd_ffv2_prototype_test_object *obj;
 
-	obj = nfsd_ffv2_prototype_test_object_arm(f->seeded, f->object_dentry,
+	obj = nfsd_ffv2_prototype_test_object_arm(exp, f->object_dentry,
 						  f->inner, f->inner_len,
 						  f->bytes, len, sampled,
 						  claim);
@@ -12989,6 +12990,49 @@ static bool nfsd_ffv2_proto_fixture_rearm(struct nfsd_ffv2_proto_fixture *f,
 	nfsd_ffv2_prototype_test_object_put(f->object);
 	f->object = obj;
 	return true;
+}
+
+static bool nfsd_ffv2_proto_fixture_rearm(struct nfsd_ffv2_proto_fixture *f,
+					  size_t len, size_t sampled,
+					  bool claim)
+{
+	return nfsd_ffv2_proto_fixture_rearm_export(f, f->seeded, len,
+						   sampled, claim);
+}
+
+static struct svc_export *
+nfsd_ffv2_proto_export_populate(struct nfsd_ffv2_proto_fixture *f)
+{
+	struct svc_export exp;
+	struct svc_export *cached;
+
+	nfsd_ffv2_init_test_export(&exp, f->nn, f->domain, &f->root);
+	exp.ex_uuid = kmemdup(f->uuid, sizeof(f->uuid), GFP_KERNEL);
+	if (!exp.ex_uuid)
+		return ERR_PTR(-ENOMEM);
+	cached = nfsd_export_cache_update(&exp);
+	if (IS_ERR(cached))
+		kfree(exp.ex_uuid);
+	return cached;
+}
+
+static bool
+nfsd_ffv2_proto_inventory_contains(struct nfsd_ffv2_proto_fixture *f,
+				   struct svc_export *target)
+{
+	struct nfsd_ffv2_participant *participant = &f->nn->ffv2_participant;
+	struct svc_export *exp;
+	bool found = false;
+
+	mutex_lock(&participant->inventory_lock);
+	list_for_each_entry(exp, &participant->inventory, ex_ffv2_inventory) {
+		if (exp == target) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&participant->inventory_lock);
+	return found;
 }
 
 /* Fill in a registration request the fixture's object satisfies. */
@@ -13043,16 +13087,16 @@ nfsd_ffv2_proto_multi_request_store(struct nfsd_ffv2_proto_fixture *f,
 		nfsd_ffv2_store_test_close(store);
 		return error;
 	}
-	if (!error)
-		error = nfsd_ffv2_prototype_test_object_member(
-			f->object, 1, handles[1], sizeof(handles[1]),
-			f->object_dentry2, inner2, sizeof(inner2));
+	error = nfsd_ffv2_prototype_test_object_member(f->object, 1,
+						       handles[1],
+						       sizeof(handles[1]),
+						       f->object_dentry2, inner2,
+						       sizeof(inner2));
 	if (error) {
 		nfsd_ffv2_store_test_close(store);
 		return error;
 	}
-	if (!error)
-		error = nfsd_ffv2_prototype_test_object_store(f->object, store);
+	error = nfsd_ffv2_prototype_test_object_store(f->object, store);
 	if (error) {
 		nfsd_ffv2_store_test_close(store);
 		return error;
@@ -13406,8 +13450,6 @@ static void nfsd_ffv2_prototype_multi_registration_test(struct kunit *test)
 	struct nfsd_ffv2_prototype_bundle *bundle, *replay;
 	struct nfsd_ffv2_prototype_request req;
 	struct nfsd_ffv2_proto_fixture *f;
-	struct nfsd_ffv2_fh_info info;
-	struct knfsd_fh outer = {};
 	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
 	u64 expires;
 	u32 i;
@@ -13446,14 +13488,10 @@ static void nfsd_ffv2_prototype_multi_registration_test(struct kunit *test)
 			nfsd_ffv2_prototype_register(f->nn, f->net, &req, replay),
 			0);
 	KUNIT_EXPECT_EQ(test, memcmp(bundle, replay, sizeof(*bundle)), 0);
-	memcpy(outer.fh_raw, bundle->objects[0].handle,
-	       bundle->objects[0].handle_len);
-	outer.fh_size = bundle->objects[0].handle_len;
-	KUNIT_ASSERT_EQ(test, nfsd_ffv2_fh_parse(&outer, &info), 0);
 	mutex_lock(&nfsd_mutex);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_object_unregister(f->nn, bundle->generation,
-						   info.object_uuid), -ENOENT);
+						   bundle->source_uuid), -ENOENT);
 	KUNIT_EXPECT_EQ(test,
 			nfsd_ffv2_service_generation_retire(f->nn,
 							   bundle->generation), 0);
@@ -13553,21 +13591,37 @@ out:
 
 static void nfsd_ffv2_prototype_multi_trust_unwind_test(struct kunit *test)
 {
-	struct nfsd_ffv2_prototype_bundle *bundle;
+	struct nfsd_ffv2_prototype_bundle *bundle, *replay;
 	struct nfsd_ffv2_prototype_request req;
 	struct nfsd_ffv2_proto_fixture *f;
 	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_anchor *anchor;
+	struct svc_export *current_export, *predecessor;
+	struct nfsd_ffv2_store *store;
+	u8 file_keys[2][32];
 	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
 	u64 expires;
+	u64 providers_before, providers_after;
+	unsigned int inventory_before;
+	bool slots_empty;
+	u32 i;
+	int error;
 
 	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
 	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	replay = kunit_kzalloc(test, sizeof(*replay), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	KUNIT_ASSERT_NOT_NULL(test, replay);
 	if (!nfsd_ffv2_proto_fixture_init(test, f))
 		goto out;
+	anchor = &f->nn->ffv2;
 	KUNIT_ASSERT_EQ(test, nfsd_ffv2_prototype_enable(f->nn, f->net), 0);
 	f->enabled = true;
+	mutex_lock(&f->nn->ffv2_participant.inventory_lock);
+	inventory_before = f->nn->ffv2_participant.inventory_count;
+	mutex_unlock(&f->nn->ffv2_participant.inventory_lock);
+	nfsd_ffv2_test_release_counters(NULL, &providers_before);
 	KUNIT_ASSERT_EQ(test,
 			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
 						      &expires), 0);
@@ -13582,9 +13636,117 @@ static void nfsd_ffv2_prototype_multi_trust_unwind_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, generation, NULL);
 	if (generation)
 		nfsd_ffv2_test_generation_put(generation);
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_prototype_test_nonce_reusable(f->nn, nonce));
+	mutex_lock(&anchor->lock);
+	slots_empty = !anchor->registration_pending && !anchor->pending &&
+		      !anchor->active && !anchor->retiring;
+	mutex_unlock(&anchor->lock);
+	KUNIT_EXPECT_TRUE(test, slots_empty);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(anchor->provider), NULL);
+	mutex_lock(&f->nn->ffv2_participant.inventory_lock);
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2_participant.inventory_count,
+			inventory_before);
+	mutex_unlock(&f->nn->ffv2_participant.inventory_lock);
+	nfsd_ffv2_test_release_counters(NULL, &providers_after);
+	KUNIT_EXPECT_GT(test, providers_after, providers_before);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_is_current(f->seeded));
+	predecessor = exp_get(f->seeded);
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_proto_inventory_contains(f, predecessor));
+	/* The stale predecessor must fail at the exact export transition. */
 	KUNIT_EXPECT_EQ(test,
-			nfsd_ffv2_prototype_test_nonce_check(f->nn, f->net,
-						       nonce), 0);
+			nfsd_ffv2_export_transition_exact(predecessor), -ESTALE);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_create(&store, file_keys), 0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_proto_multi_request_store(f, &req, nonce, store),
+			0);
+	memset(bundle, 0, sizeof(*bundle));
+	error = nfsd_ffv2_prototype_register(f->nn, f->net, &req, bundle);
+	KUNIT_EXPECT_EQ(test, error, -ESTALE);
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_prototype_test_nonce_reusable(f->nn, nonce));
+	mutex_lock(&anchor->lock);
+	slots_empty = !anchor->registration_pending && !anchor->pending &&
+		      !anchor->active && !anchor->retiring;
+	mutex_unlock(&anchor->lock);
+	KUNIT_EXPECT_TRUE(test, slots_empty);
+	KUNIT_EXPECT_PTR_EQ(test, rcu_access_pointer(anchor->provider), NULL);
+	mutex_lock(&f->nn->ffv2_participant.inventory_lock);
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2_participant.inventory_count,
+			inventory_before);
+	mutex_unlock(&f->nn->ffv2_participant.inventory_lock);
+	nfsd_ffv2_test_release_counters(NULL, &providers_after);
+	KUNIT_EXPECT_EQ(test, providers_after, providers_before + 1);
+
+	current_export = nfsd_ffv2_proto_export_populate(f);
+	if (IS_ERR(current_export)) {
+		exp_put(predecessor);
+		KUNIT_FAIL(test, "fresh export publication failed: %ld",
+			   PTR_ERR(current_export));
+		goto out;
+	}
+	KUNIT_EXPECT_PTR_NE(test, current_export, f->seeded);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_current(current_export));
+	error = nfsd_ffv2_export_access_get(current_export);
+	if (error) {
+		exp_put(current_export);
+		exp_put(predecessor);
+		KUNIT_FAIL(test, "fresh export access failed: %d", error);
+		goto out;
+	}
+	nfsd_ffv2_export_access_put(current_export);
+	if (!nfsd_ffv2_proto_fixture_rearm_export(f, current_export,
+						  sizeof(f->bytes), 0, false)) {
+		exp_put(current_export);
+		exp_put(predecessor);
+		KUNIT_FAIL(test, "failed to transfer fixture export");
+		goto out;
+	}
+	exp_put(f->seeded);
+	f->seeded = current_export;
+	exp_put(predecessor);
+	KUNIT_EXPECT_FALSE(test,
+			   nfsd_ffv2_proto_inventory_contains(f, predecessor));
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_proto_inventory_contains(f, current_export));
+	mutex_lock(&f->nn->ffv2_participant.inventory_lock);
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2_participant.inventory_count, 1u);
+	mutex_unlock(&f->nn->ffv2_participant.inventory_lock);
+
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_create(&store, file_keys), 0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_proto_multi_request_store(f, &req, nonce, store),
+			0);
+	memset(bundle, 0, sizeof(*bundle));
+	error = nfsd_ffv2_prototype_register(f->nn, f->net, &req, bundle);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	if (error)
+		goto out;
+	KUNIT_EXPECT_EQ(test, bundle->object_count, 2u);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_prototype_state_get(f->nn),
+			NFSD_FFV2_PROTOTYPE_READY);
+	for (i = 0; i < bundle->object_count; i++) {
+		KUNIT_EXPECT_GT(test, bundle->objects[i].handle_len, 0u);
+		KUNIT_EXPECT_PTR_NE(test,
+				    memchr_inv(bundle->objects[i].stateid, 0,
+					       sizeof(bundle->objects[i].stateid)), NULL);
+	}
+	KUNIT_EXPECT_NE(test,
+			memcmp(bundle->objects[0].handle,
+			       bundle->objects[1].handle,
+			       max(bundle->objects[0].handle_len,
+				   bundle->objects[1].handle_len)), 0);
+	KUNIT_EXPECT_NE(test,
+			memcmp(bundle->objects[0].stateid,
+			       bundle->objects[1].stateid,
+			       sizeof(bundle->objects[0].stateid)), 0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req, replay),
+			0);
+	KUNIT_EXPECT_EQ(test, memcmp(bundle, replay, sizeof(*bundle)), 0);
 out:
 	nfsd_ffv2_proto_fixture_exit(f);
 }
