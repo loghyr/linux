@@ -6880,6 +6880,7 @@ struct nfsd_ffv2_nl {
 };
 
 #define NFSD_FFV2_NL_BUF	512
+#define NFSD_FFV2_NL_PROTO_BUF	2048
 
 /* Reserve one attribute, leaving the padding zeroed.  NULL if it will not fit. */
 static struct nlattr *nfsd_ffv2_nl_reserve(void *buf, size_t cap, size_t *off,
@@ -12524,7 +12525,8 @@ static void nfsd_ffv2_prototype_vector_identity_test(struct kunit *test)
 				  64, 64 * 1024, NFSD_FFV2_MAX_PAYLOAD_BYTES));
 	KUNIT_EXPECT_FALSE(test,
 			   nfsd_ffv2_prototype_test_geometry_valid(
-				   64, 68 * 1024, NFSD_FFV2_MAX_PAYLOAD_BYTES));
+				   64, 64 * 1024 + 1,
+				   NFSD_FFV2_MAX_PAYLOAD_BYTES));
 	KUNIT_EXPECT_FALSE(
 		test, nfsd_ffv2_prototype_test_geometry_valid(0, 64 * 1024, 0));
 	KUNIT_EXPECT_FALSE(test,
@@ -12597,6 +12599,7 @@ struct nfsd_ffv2_proto_fixture {
 	struct nfsd_ffv2_binding	*binding;
 	struct path			root;
 	struct dentry			*object_dentry;
+	struct dentry			*object_dentry2;
 	u8				uuid[16];
 	/* The ordinary handle the substituted resolution hands back. */
 	u8				inner[8];
@@ -12671,6 +12674,10 @@ static void nfsd_ffv2_proto_fixture_exit(struct nfsd_ffv2_proto_fixture *f)
 	if (f->object_dentry) {
 		dput(f->object_dentry);
 		f->object_dentry = NULL;
+	}
+	if (f->object_dentry2) {
+		dput(f->object_dentry2);
+		f->object_dentry2 = NULL;
 	}
 	if (f->root_held) {
 		path_put(&f->root);
@@ -12796,6 +12803,21 @@ static bool nfsd_ffv2_proto_fixture_init(struct kunit *test,
 	object_inode->i_ino = get_next_ino();
 	set_nlink(object_inode, 1);
 	d_add(f->object_dentry, object_inode);
+	f->object_dentry2 = d_alloc_name(f->root.dentry,
+					 "ffv2-proto-object-2");
+	if (!f->object_dentry2) {
+		KUNIT_FAIL(test, "failed to allocate second object dentry");
+		return false;
+	}
+	object_inode = new_inode(f->root.mnt->mnt_sb);
+	if (!object_inode) {
+		KUNIT_FAIL(test, "failed to allocate second object inode");
+		return false;
+	}
+	object_inode->i_mode = S_IFREG | 0600;
+	object_inode->i_ino = get_next_ino();
+	set_nlink(object_inode, 1);
+	d_add(f->object_dentry2, object_inode);
 
 	nfsd_ffv2_init_test_export(&exp, f->nn, f->domain, &f->root);
 	exp.ex_uuid = kmemdup(f->uuid, sizeof(f->uuid), GFP_KERNEL);
@@ -12898,6 +12920,78 @@ static void nfsd_ffv2_proto_request(struct nfsd_ffv2_prototype_request *req,
 	req->persisted_handle = persisted_handle;
 	req->writer_id = 7;
 	req->pnfs_clientid = 0;
+}
+
+static int
+nfsd_ffv2_proto_multi_request_store(struct nfsd_ffv2_proto_fixture *f,
+				     struct nfsd_ffv2_prototype_request *req,
+				     const u8 *nonce,
+				     struct nfsd_ffv2_store *store)
+{
+	static const u8 handles[2][8] = {
+		{ 1, 0, 1, 1, 0xa7, 0xb7, 0xc7, 0xd7 },
+		{ 1, 0, 1, 2, 0xa8, 0xb8, 0xc8, 0xd8 },
+	};
+	static const u8 persisted[2][32] = {
+		{ [0 ... 15] = 0x3d, [16 ... 31] = 0x60 },
+		{ [0 ... 15] = 0x3d, [16 ... 30] = 0x60, [31] = 0x61 },
+	};
+	static const u8 inner2[8] = { 1, 0, 1, 2, 0xa8, 0xb8, 0xc8, 0xd8 };
+	int error;
+	u32 i;
+
+	error = nfsd_ffv2_prototype_test_object_member(
+		f->object, 0, handles[0], sizeof(handles[0]), f->object_dentry,
+		f->inner, f->inner_len);
+	if (error) {
+		nfsd_ffv2_store_test_close(store);
+		return error;
+	}
+	if (!error)
+		error = nfsd_ffv2_prototype_test_object_member(
+			f->object, 1, handles[1], sizeof(handles[1]),
+			f->object_dentry2, inner2, sizeof(inner2));
+	if (error) {
+		nfsd_ffv2_store_test_close(store);
+		return error;
+	}
+	if (!error)
+		error = nfsd_ffv2_prototype_test_object_store(f->object, store);
+	if (error) {
+		nfsd_ffv2_store_test_close(store);
+		return error;
+	}
+	nfsd_ffv2_proto_request(req, nonce);
+	req->chunk_size = 4096;
+	req->data_count = 1;
+	req->parity_count = 1;
+	req->object_count = 2;
+	for (i = 0; i < req->object_count; i++) {
+		req->objects[i].handle = handles[i];
+		req->objects[i].handle_len = sizeof(handles[i]);
+		req->objects[i].persisted_handle = persisted[i];
+	}
+	return 0;
+}
+
+static int
+nfsd_ffv2_proto_multi_request(struct nfsd_ffv2_proto_fixture *f,
+			      struct nfsd_ffv2_prototype_request *req,
+			      const u8 *nonce)
+{
+	struct nfsd_ffv2_store *store;
+	u8 file_keys[2][32];
+	int error;
+
+	error = nfsd_ffv2_store_test_create(&store, file_keys);
+	if (error)
+		return error;
+	return nfsd_ffv2_proto_multi_request_store(f, req, nonce, store);
+}
+
+static void nfsd_ffv2_proto_store_close(void *data)
+{
+	nfsd_ffv2_store_test_close(data);
 }
 
 /*
@@ -13184,7 +13278,8 @@ static void nfsd_ffv2_prototype_registration_unwind_test(struct kunit *test)
 				nfsd_ffv2_prototype_challenge(f->nn, f->net,
 							      nonce, &expires),
 				0);
-		nfsd_ffv2_proto_request(&req, nonce);
+		KUNIT_ASSERT_EQ(test,
+				nfsd_ffv2_proto_multi_request(f, &req, nonce), 0);
 		nfsd_ffv2_test_fault_arm(phases[i]);
 		error = nfsd_ffv2_prototype_register(f->nn, f->net, &req,
 						     bundle);
@@ -13207,6 +13302,194 @@ static void nfsd_ffv2_prototype_registration_unwind_test(struct kunit *test)
 	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_NONE);
 out:
 	nfsd_ffv2_test_fault_arm(NFSD_FFV2_FAULT_NONE);
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
+static void nfsd_ffv2_prototype_multi_registration_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_bundle *bundle, *replay;
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct nfsd_ffv2_fh_info info;
+	struct knfsd_fh outer = {};
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u64 expires;
+	u32 i;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	replay = kunit_kzalloc(test, sizeof(*replay), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	KUNIT_ASSERT_NOT_NULL(test, replay);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_prototype_enable(f->nn, f->net), 0);
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires), 0);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_proto_multi_request(f, &req, nonce), 0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req, bundle),
+			0);
+	KUNIT_EXPECT_EQ(test, bundle->object_count, 2u);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_prototype_state_get(f->nn),
+			NFSD_FFV2_PROTOTYPE_READY);
+	for (i = 0; i < bundle->object_count; i++) {
+		KUNIT_EXPECT_GT(test, bundle->objects[i].handle_len, 0u);
+		KUNIT_EXPECT_PTR_NE(test,
+				memchr_inv(bundle->objects[i].stateid, 0,
+					   sizeof(bundle->objects[i].stateid)), NULL);
+	}
+	KUNIT_EXPECT_NE(test, 0,
+			memcmp(bundle->objects[0].stateid,
+			       bundle->objects[1].stateid,
+			       sizeof(bundle->objects[0].stateid)));
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req, replay),
+			0);
+	KUNIT_EXPECT_EQ(test, memcmp(bundle, replay, sizeof(*bundle)), 0);
+	memcpy(outer.fh_raw, bundle->objects[0].handle,
+	       bundle->objects[0].handle_len);
+	outer.fh_size = bundle->objects[0].handle_len;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_fh_parse(&outer, &info), 0);
+	mutex_lock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_object_unregister(f->nn, bundle->generation,
+						   info.object_uuid), -ENOENT);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_service_generation_retire(f->nn,
+							   bundle->generation), 0);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_prototype_unregister(f->nn, f->net,
+						  bundle->source_uuid,
+						  bundle->generation), 0);
+	f->enabled = false;
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
+static void nfsd_ffv2_prototype_multi_resolve_unwind_test(struct kunit *test)
+{
+	static const u8 missing[] = { 9, 9, 9, 9, 9, 9, 9, 9 };
+	struct nfsd_ffv2_prototype_bundle *bundle;
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct nfsd_ffv2_generation *generation;
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u64 expires;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_prototype_enable(f->nn, f->net), 0);
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires), 0);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_proto_multi_request(f, &req, nonce), 0);
+	req.objects[1].handle = missing;
+	req.objects[1].handle_len = sizeof(missing);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req, bundle),
+			-ESTALE);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_prototype_state_get(f->nn),
+			NFSD_FFV2_PROTOTYPE_OPEN);
+	generation = nfsd_ffv2_test_active_generation_get(f->nn);
+	KUNIT_EXPECT_PTR_EQ(test, generation, NULL);
+	if (generation)
+		nfsd_ffv2_test_generation_put(generation);
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
+static void nfsd_ffv2_prototype_multi_restart_refusal_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_bundle *bundle;
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_store *store, *reopened;
+	u8 file_keys[2][32];
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u64 expires;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_prototype_enable(f->nn, f->net), 0);
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires), 0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_create(&store, file_keys), 0);
+	KUNIT_ASSERT_EQ(test,
+			kunit_add_action_or_reset(
+				test, nfsd_ffv2_proto_store_close, store), 0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_store_test_reopen_fault(
+				store, &reopened, file_keys,
+				NFSD_FFV2_REOPEN_ABSENT_MEMBER), 0);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_proto_multi_request_store(f, &req, nonce,
+						     reopened), 0);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req, bundle),
+			-ENOENT);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_prototype_state_get(f->nn),
+			NFSD_FFV2_PROTOTYPE_OPEN);
+	generation = nfsd_ffv2_test_active_generation_get(f->nn);
+	KUNIT_EXPECT_PTR_EQ(test, generation, NULL);
+	if (generation)
+		nfsd_ffv2_test_generation_put(generation);
+out:
+	nfsd_ffv2_proto_fixture_exit(f);
+}
+
+static void nfsd_ffv2_prototype_multi_trust_unwind_test(struct kunit *test)
+{
+	struct nfsd_ffv2_prototype_bundle *bundle;
+	struct nfsd_ffv2_prototype_request req;
+	struct nfsd_ffv2_proto_fixture *f;
+	struct nfsd_ffv2_generation *generation;
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	u64 expires;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	bundle = kunit_kzalloc(test, sizeof(*bundle), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_NOT_NULL(test, bundle);
+	if (!nfsd_ffv2_proto_fixture_init(test, f))
+		goto out;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_prototype_enable(f->nn, f->net), 0);
+	f->enabled = true;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_prototype_challenge(f->nn, f->net, nonce,
+						      &expires), 0);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_proto_multi_request(f, &req, nonce), 0);
+	nfsd_ffv2_prototype_test_fail_second_trust(f->object);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_prototype_register(f->nn, f->net, &req, bundle),
+			-EIO);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_prototype_state_get(f->nn),
+			NFSD_FFV2_PROTOTYPE_OPEN);
+	generation = nfsd_ffv2_test_active_generation_get(f->nn);
+	KUNIT_EXPECT_PTR_EQ(test, generation, NULL);
+	if (generation)
+		nfsd_ffv2_test_generation_put(generation);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_prototype_test_nonce_check(f->nn, f->net,
+						       nonce), 0);
+out:
 	nfsd_ffv2_proto_fixture_exit(f);
 }
 
@@ -15599,46 +15882,50 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 	u8 handle[NFS4_FHSIZE + 1] = { 1, 2, 3, 4, 5, 6, 7, 8 };
 	u8 object_attrs[256];
 	u8 children[896] = {};
-	char buf[NFSD_FFV2_NL_BUF];
+	char *buf;
+	size_t buf_cap = NFSD_FFV2_NL_PROTO_BUF;
 	size_t child_off = 0, object_off, off;
 	u32 count = a->object_count ?: 1;
 	u32 i;
 	int error;
 
+	buf = kzalloc(buf_cap, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
 	off = nfsd_ffv2_nl_proto_begin(nl, buf,
 				       NFSD_CMD_FFV2_PROTOTYPE_REGISTER);
-	error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+	error = nfsd_ffv2_nl_put(buf, buf_cap, &off,
 				 NFSD_A_FFV2_PROTOTYPE_NONCE, a->nonce,
 				 a->nonce_len);
 	if (!error && !a->omit_domain)
-		error = nfsd_ffv2_nl_put_str(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put_str(buf, buf_cap, &off,
 					     NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN,
 					     a->domain);
 	if (!error)
-		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put_u32(buf, buf_cap, &off,
 					     NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE,
 					     a->chunk_size);
 	if (!error)
-		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put_u32(buf, buf_cap, &off,
 					     NFSD_A_FFV2_PROTOTYPE_DATA_COUNT,
 					     a->data_count);
 	if (!error)
-		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put_u32(buf, buf_cap, &off,
 					     NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT,
 					     a->parity_count);
 	if (!error)
-		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put(buf, buf_cap, &off,
 					 NFSD_A_FFV2_PROTOTYPE_STORE_UUID,
 					 store_uuid, sizeof(store_uuid));
 	if (!error)
-		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put(buf, buf_cap, &off,
 					 NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN,
 					 binding_token, sizeof(binding_token));
 	if (!error)
-		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put_u32(buf, buf_cap, &off,
 					     NFSD_A_FFV2_PROTOTYPE_WRITER_ID, 7);
 	if (!error)
-		error = nfsd_ffv2_nl_put_u64(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put_u64(buf, buf_cap, &off,
 					     NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID, 0);
 	for (i = 0; !error && i < count - a->omit_last; i++) {
 		u16 index = a->reverse_types ? count - i - 1 : i;
@@ -15673,16 +15960,18 @@ static int nfsd_ffv2_nl_proto_register(struct nfsd_ffv2_nl *nl,
 						 object_off);
 	}
 	if (!error)
-		error = nfsd_ffv2_nl_put(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put(buf, buf_cap, &off,
 					 NFSD_A_FFV2_PROTOTYPE_OBJECTS |
 					 NLA_F_NESTED, children, child_off);
 	if (!error && a->unknown_attr)
-		error = nfsd_ffv2_nl_put_u32(buf, sizeof(buf), &off,
+		error = nfsd_ffv2_nl_put_u32(buf, buf_cap, &off,
 					     a->unknown_attr, 0);
-	if (error)
-		return error;
-	return nfsd_ffv2_nl_call(nl, NFSD_CMD_FFV2_PROTOTYPE_REGISTER, buf,
-				 off, reply, reply_cap);
+	if (!error)
+		error = nfsd_ffv2_nl_call(nl,
+					  NFSD_CMD_FFV2_PROTOTYPE_REGISTER, buf,
+					  off, reply, reply_cap);
+	kfree(buf);
+	return error;
 }
 
 /* An unregister naming a registration that does not exist. */
@@ -15714,14 +16003,17 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 	static const u8 stranger[NFSD_FFV2_PROTOTYPE_NONCE_LEN] = { 0 };
 	const bool built = IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH);
 	struct nfsd_ffv2_nl_register_args args = {};
-	char reply[NFSD_FFV2_NL_BUF];
+	char *reply;
+	size_t reply_cap = NFSD_FFV2_NL_PROTO_BUF;
 	const struct nlattr *nla;
 	struct nfsd_ffv2_nl *nl;
 	struct net *net;
 	int got, error;
 
 	nl = kunit_kzalloc(test, sizeof(*nl), GFP_KERNEL);
+	reply = kunit_kzalloc(test, reply_cap, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, nl);
+	KUNIT_ASSERT_NOT_NULL(test, reply);
 	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
 	KUNIT_ASSERT_FALSE(test, IS_ERR(net));
 	error = nfsd_ffv2_nl_open_named(net, nl, NFSD_FAMILY_NAME);
@@ -15748,12 +16040,12 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 	 */
 	KUNIT_EXPECT_EQ(test, -ERANGE,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.nonce_len = sizeof(stranger);
 	args.omit_domain = true;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.omit_domain = false;
 	/*
 	 * An attribute this command has no policy for is refused too.  Which
@@ -15763,88 +16055,92 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 	args.unknown_attr = NFSD_A_FFV2_PROTOTYPE_MAX + 1;
 	KUNIT_EXPECT_LT(test,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)), 0);
+						    reply_cap), 0);
 	args.unknown_attr = 0;
 
 	/* A valid singleton and k=1,m=1 array reach the closed gate. */
 	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.object_count = 2;
 	args.parity_count = 1;
 	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 
 	/* Array shape is rejected before a nonce can reach the gate. */
 	args.object_count = NFSD_FFV2_PROTOTYPE_OBJECT_MAX + 1;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.object_count = 2;
 	args.missing_nested = true;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.missing_nested = false;
 	args.first_type = 1;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.first_type = 0;
 	args.empty_child = true;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.empty_child = false;
 	args.omit_last = true;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.omit_last = false;
 	args.duplicate_type = true;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.duplicate_type = false;
 	args.reverse_types = true;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.reverse_types = false;
 	args.output_attr = true;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.output_attr = false;
 	args.persisted_len = 31;
 	KUNIT_EXPECT_EQ(test, -ERANGE,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.persisted_len = 32;
 	args.handle_len = 0;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
-	args.handle_len = NFS4_FHSIZE + 1;
-	KUNIT_EXPECT_EQ(test, -EMSGSIZE,
+						    reply_cap));
+	args.handle_len = NFS4_FHSIZE;
+	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
+	args.handle_len = NFS4_FHSIZE + 1;
+	KUNIT_EXPECT_EQ(test, -ERANGE,
+			nfsd_ffv2_nl_proto_register(nl, &args, reply,
+						    reply_cap));
 	args.handle_len = 8;
 	args.data_count = U32_MAX;
 	args.parity_count = 3;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.data_count = 1;
 	args.parity_count = 0;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.data_count = 0;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.data_count = 1;
 	args.object_count = 0;
 	args.parity_count = 0;
@@ -15853,14 +16149,14 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
 			nfsd_ffv2_nl_proto_bare(nl,
 						NFSD_CMD_FFV2_PROTOTYPE_DISABLE,
-						reply, sizeof(reply)));
+						reply, reply_cap));
 	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
 			nfsd_ffv2_nl_proto_bare(nl,
 						NFSD_CMD_FFV2_PROTOTYPE_CHALLENGE,
-						reply, sizeof(reply)));
+						reply, reply_cap));
 
 	error = nfsd_ffv2_nl_proto_bare(nl, NFSD_CMD_FFV2_PROTOTYPE_ENABLE,
-					reply, sizeof(reply));
+					reply, reply_cap);
 	if (!built) {
 		/*
 		 * The whole profile is absent, and the enable is where that
@@ -15873,11 +16169,11 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, -EBUSY,
 			nfsd_ffv2_nl_proto_bare(nl,
 						NFSD_CMD_FFV2_PROTOTYPE_ENABLE,
-						reply, sizeof(reply)));
+						reply, reply_cap));
 
 	/* A challenge answers with a nonce and a deadline, not an ack. */
 	got = nfsd_ffv2_nl_proto_bare(nl, NFSD_CMD_FFV2_PROTOTYPE_CHALLENGE,
-				      reply, sizeof(reply));
+				      reply, reply_cap);
 	KUNIT_EXPECT_GT(test, got, 0);
 	if (got > 0) {
 		nla = nfsd_ffv2_nl_find(reply, got,
@@ -15893,7 +16189,7 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 	/* A nonce this gate never issued is unknown, not merely refused. */
 	KUNIT_EXPECT_EQ(test, -ENOENT,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	/*
 	 * A layout that cannot describe an object is refused before the
 	 * nonce is even consulted, so an unusable request cannot spend one.
@@ -15901,27 +16197,27 @@ static void nfsd_ffv2_prototype_nl_test(struct kunit *test)
 	args.parity_count = 1;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.parity_count = 0;
 	args.chunk_size = 0;
 	KUNIT_EXPECT_EQ(test, -EINVAL,
 			nfsd_ffv2_nl_proto_register(nl, &args, reply,
-						    sizeof(reply)));
+						    reply_cap));
 	args.chunk_size = 64;
 
 	/* Nothing is registered, so there is nothing to unregister. */
 	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
 			nfsd_ffv2_nl_proto_unregister(nl, reply,
-						      sizeof(reply)));
+						      reply_cap));
 
 	KUNIT_EXPECT_EQ(test, 0,
 			nfsd_ffv2_nl_proto_bare(nl,
 						NFSD_CMD_FFV2_PROTOTYPE_DISABLE,
-						reply, sizeof(reply)));
+						reply, reply_cap));
 	KUNIT_EXPECT_EQ(test, -EOPNOTSUPP,
 			nfsd_ffv2_nl_proto_bare(nl,
 						NFSD_CMD_FFV2_PROTOTYPE_DISABLE,
-						reply, sizeof(reply)));
+						reply, reply_cap));
 out_close:
 	nfsd_ffv2_nl_close(nl);
 	put_net(net);
@@ -16272,6 +16568,10 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_prototype_vector_identity_test),
 	KUNIT_CASE(nfsd_ffv2_member_identity_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_read_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_multi_registration_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_multi_resolve_unwind_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_multi_restart_refusal_test),
+	KUNIT_CASE(nfsd_ffv2_prototype_multi_trust_unwind_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_registration_unwind_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_publish_window_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_prototype_worker_giveup_test),
