@@ -1024,9 +1024,77 @@ void nfsd_ffv2_prototype_test_object_put(struct nfsd_ffv2_prototype_test_object 
 		return;
 	if (obj->dentry)
 		dput(obj->dentry);
+	if (obj->dentry2)
+		dput(obj->dentry2);
 	if (obj->exp)
 		exp_put(obj->exp);
+	if (obj->store)
+		nfsd_ffv2_store_test_close(obj->store);
 	kfree(obj);
+}
+
+int nfsd_ffv2_prototype_test_object_store(
+	struct nfsd_ffv2_prototype_test_object *obj,
+	struct nfsd_ffv2_store *store)
+{
+	if (!obj || !store)
+		return -EINVAL;
+	if (cmpxchg(&obj->store, NULL, store))
+		return -EBUSY;
+	return 0;
+}
+
+int nfsd_ffv2_prototype_test_object_member(
+	struct nfsd_ffv2_prototype_test_object *obj, u32 index,
+	const u8 *request_handle, u16 request_handle_len,
+	struct dentry *dentry, const u8 *inner, u16 inner_len)
+{
+	if (!obj || index > 1 || !request_handle || !request_handle_len ||
+	    request_handle_len > NFS4_FHSIZE || !dentry || !inner ||
+	    inner_len > NFS4_FHSIZE)
+		return -EINVAL;
+	memcpy(obj->request_handle[index], request_handle, request_handle_len);
+	obj->request_handle_len[index] = request_handle_len;
+	if (!index)
+		return 0;
+	if (obj->dentry2)
+		dput(obj->dentry2);
+	obj->dentry2 = dget(dentry);
+	memcpy(obj->inner2, inner, inner_len);
+	obj->inner2_len = inner_len;
+	return 0;
+}
+
+void nfsd_ffv2_prototype_test_fail_second_trust(
+	struct nfsd_ffv2_prototype_test_object *obj)
+{
+	if (obj)
+		obj->fail_second_trust = true;
+}
+
+static bool nfsd_ffv2_prototype_test_second_trust_fails(u32 index)
+{
+	struct nfsd_ffv2_prototype_test_object *obj;
+	bool fail = false;
+
+	obj = nfsd_ffv2_prototype_test_object_acquire();
+	if (obj && index == 1)
+		fail = xchg(&obj->fail_second_trust, false);
+	nfsd_ffv2_prototype_test_object_put(obj);
+	return fail;
+}
+
+static struct nfsd_ffv2_store *
+nfsd_ffv2_prototype_test_store_take(void)
+{
+	struct nfsd_ffv2_prototype_test_object *obj;
+	struct nfsd_ffv2_store *store = NULL;
+
+	obj = nfsd_ffv2_prototype_test_object_acquire();
+	if (obj)
+		store = xchg(&obj->store, NULL);
+	nfsd_ffv2_prototype_test_object_put(obj);
+	return store;
 }
 
 /*
@@ -1139,9 +1207,14 @@ static bool nfsd_ffv2_prototype_test_armed(void)
 	return nfsd_ffv2_prototype_test_object_armed();
 }
 
-static bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp)
+static bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp,
+					      const u8 *handle, u32 handle_len)
 {
 	struct nfsd_ffv2_prototype_test_object *obj;
+	struct dentry *dentry;
+	const u8 *inner;
+	u16 inner_len;
+	u32 index = 0;
 
 	obj = nfsd_ffv2_prototype_test_object_acquire();
 	if (!obj)
@@ -1155,11 +1228,25 @@ static bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp)
 		nfsd_ffv2_prototype_test_object_put(obj);
 		return false;
 	}
+	if (obj->request_handle_len[0]) {
+		for (index = 0; index < ARRAY_SIZE(obj->request_handle_len); index++)
+			if (obj->request_handle_len[index] == handle_len &&
+			    !memcmp(obj->request_handle[index], handle, handle_len))
+				break;
+		if (index == ARRAY_SIZE(obj->request_handle_len) ||
+		    (index && !obj->dentry2)) {
+			nfsd_ffv2_prototype_test_object_put(obj);
+			return false;
+		}
+	}
+	dentry = index ? obj->dentry2 : obj->dentry;
+	inner = index ? obj->inner2 : obj->inner;
+	inner_len = index ? obj->inner2_len : obj->inner_len;
 	fh_init(fhp, NFS4_FHSIZE);
 	fhp->fh_export = exp_get(obj->exp);
-	fhp->fh_dentry = dget(obj->dentry);
-	fhp->fh_handle.fh_size = obj->inner_len;
-	memcpy(fhp->fh_handle.fh_raw, obj->inner, obj->inner_len);
+	fhp->fh_dentry = dget(dentry);
+	fhp->fh_handle.fh_size = inner_len;
+	memcpy(fhp->fh_handle.fh_raw, inner, inner_len);
 	if (obj->claim) {
 		if (nfsd_ffv2_export_access_get(obj->exp)) {
 			fh_put(fhp);
@@ -1177,7 +1264,13 @@ static inline bool nfsd_ffv2_prototype_test_armed(void)
 	return false;
 }
 
-static inline bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp)
+static inline bool nfsd_ffv2_prototype_test_resolve(struct svc_fh *fhp,
+					     const u8 *handle, u32 handle_len)
+{
+	return false;
+}
+
+static inline bool nfsd_ffv2_prototype_test_second_trust_fails(u32 index)
 {
 	return false;
 }
@@ -1216,6 +1309,9 @@ struct nfsd_ffv2_prototype_provider {
 	int (*read_payload)(void *store, void *data, size_t len, loff_t offset);
 	void				*reader;
 	bool				fail_alloc;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	bool				test_store;
+#endif
 	u8				*bytes;
 	struct nfsd_ffv2_read_chunk	*read;
 	__be32				*status;
@@ -1261,7 +1357,12 @@ nfsd_ffv2_prototype_provider_free(struct nfsd_ffv2_prototype_provider *provider)
 {
 	if (!provider)
 		return;
-	nfsd_ffv2_store_close(provider->store);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (provider->test_store)
+		nfsd_ffv2_store_test_close(provider->store);
+	else
+#endif
+		nfsd_ffv2_store_close(provider->store);
 	kvfree(provider->bytes);
 	kvfree(provider->read);
 	kvfree(provider->status);
@@ -1934,11 +2035,25 @@ nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 	if (nfsd_ffv2_prototype_test_armed()) {
-		if (count != 1)
-			return -EOPNOTSUPP;
-		return nfsd_ffv2_prototype_snapshot_build(path, cred, chunk_size,
-							  data_count, generation,
-							  result);
+		struct nfsd_ffv2_store *store;
+
+		store = nfsd_ffv2_prototype_test_store_take();
+		if (!store) {
+			if (count != 1)
+				return -EOPNOTSUPP;
+			return nfsd_ffv2_prototype_snapshot_build(
+				path, cred, chunk_size, data_count, generation,
+				result);
+		}
+		provider = kzalloc_obj(*provider, GFP_KERNEL);
+		if (!provider) {
+			nfsd_ffv2_store_test_close(store);
+			return -ENOMEM;
+		}
+		provider->count = count;
+		provider->store = store;
+		provider->test_store = true;
+		goto lookup_files;
 	}
 #endif
 	provider = kzalloc_obj(*provider, GFP_KERNEL);
@@ -1949,6 +2064,9 @@ nfsd_ffv2_prototype_provider_build(struct nfsd_net *nn, struct path *path,
 						&provider->store);
 	if (error)
 		goto out_free;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+lookup_files:
+#endif
 	for (i = 0; i < count; i++) {
 		member = &provider->members[i];
 		memcpy(member->object_uuid, object_uuids[i], 16);
@@ -2064,7 +2182,7 @@ static int ffv2_prototype_resolve(const struct net *net,
 	__be32 status;
 	int error;
 
-	if (nfsd_ffv2_prototype_test_resolve(fhp))
+	if (nfsd_ffv2_prototype_test_resolve(fhp, handle, handle_len))
 		return 0;
 	domain = auth_domain_find((char *)req->auth_domain);
 	if (!domain)
@@ -2132,11 +2250,17 @@ bool nfsd_ffv2_prototype_test_request_equal(
 	const struct nfsd_ffv2_prototype_request *left,
 	const struct nfsd_ffv2_prototype_request *right)
 {
-	struct nfsd_ffv2_prototype_committed left_record, right_record;
+	struct nfsd_ffv2_prototype_committed *records;
+	bool equal = false;
 
-	nfsd_ffv2_prototype_commit_record(&left_record, left);
-	nfsd_ffv2_prototype_commit_record(&right_record, right);
-	return !memcmp(&left_record, &right_record, sizeof(left_record));
+	records = kcalloc(2, sizeof(*records), GFP_KERNEL);
+	if (!records)
+		return false;
+	nfsd_ffv2_prototype_commit_record(&records[0], left);
+	nfsd_ffv2_prototype_commit_record(&records[1], right);
+	equal = !memcmp(&records[0], &records[1], sizeof(*records));
+	kfree(records);
+	return equal;
 }
 #endif
 
@@ -2444,8 +2568,12 @@ int nfsd_ffv2_prototype_register(struct nfsd_net *nn, const struct net *net,
 	for (i = 0; i < object_count; i++) {
 		stateid_t stateid;
 
-		error = nfsd_ffv2_prototype_trust(nn, work->object_uuids[i], req,
-						  work->admitted[i].stateid, &stateid);
+		if (nfsd_ffv2_prototype_test_second_trust_fails(i))
+			error = -EIO;
+		else
+			error = nfsd_ffv2_prototype_trust(
+				nn, work->object_uuids[i], req,
+				work->admitted[i].stateid, &stateid);
 		if (error)
 			goto out_published;
 		memcpy(staged->objects[i].stateid, &stateid,

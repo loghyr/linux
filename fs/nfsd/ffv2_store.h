@@ -413,6 +413,15 @@ int nfsd_ffv2_store_test_create(struct nfsd_ffv2_store **result,
 int nfsd_ffv2_store_test_reopen(struct nfsd_ffv2_store *old,
 				struct nfsd_ffv2_store **result,
 				const u8 file_keys[2][32]);
+enum nfsd_ffv2_store_test_reopen_fault {
+	NFSD_FFV2_REOPEN_ABSENT_MEMBER,
+	NFSD_FFV2_REOPEN_CORRUPT_WAL,
+	NFSD_FFV2_REOPEN_DUPLICATE_MEMBER,
+	NFSD_FFV2_REOPEN_WRONG_EXPORT,
+};
+int nfsd_ffv2_store_test_reopen_fault(
+	struct nfsd_ffv2_store *old, struct nfsd_ffv2_store **result,
+	const u8 file_keys[2][32], enum nfsd_ffv2_store_test_reopen_fault fault);
 int nfsd_ffv2_store_test_lookup_file(struct nfsd_ffv2_store *store,
 				     const u8 handle[32],
 				     struct nfsd_ffv2_store_file *file);
@@ -430,6 +439,10 @@ int nfsd_ffv2_store_test_lifecycle(
 	struct nfsd_ffv2_store_mutation_result *result, u32 transition);
 bool nfsd_ffv2_store_test_binding(struct nfsd_ffv2_store *store, u32 id,
 				  const u8 file_key[32]);
+int nfsd_ffv2_store_test_alias_pending(struct nfsd_ffv2_store *store,
+	const u8 from_key[32], const u8 to_key[32], u64 chunk_index);
+void nfsd_ffv2_store_test_advance_incarnation(
+	struct nfsd_ffv2_store *store);
 void nfsd_ffv2_store_test_fail_visible_replay(struct nfsd_ffv2_store *store);
 void nfsd_ffv2_store_test_fail_admission_after_trust(
 	struct nfsd_ffv2_store *store);

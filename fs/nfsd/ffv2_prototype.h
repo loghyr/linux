@@ -20,6 +20,7 @@ struct user_namespace;
 struct nfsd_ffv2_chunk_request;
 struct nfsd_ffv2_chunk_result;
 struct nfsd_ffv2_store_file;
+struct nfsd_ffv2_store;
 struct nfsd_ffv2_visible_chunk;
 
 /*
@@ -256,11 +257,18 @@ struct nfsd_ffv2_prototype_test_object {
 	refcount_t		ref;
 	struct svc_export	*exp;
 	struct dentry		*dentry;
+	struct dentry		*dentry2;
 	size_t			len;
 	size_t			sampled;
 	u16			inner_len;
+	u16			inner2_len;
+	u16			request_handle_len[2];
 	bool			claim;
+	bool			fail_second_trust;
+	struct nfsd_ffv2_store	*store;
 	u8			inner[NFS4_FHSIZE];
+	u8			inner2[NFS4_FHSIZE];
+	u8			request_handle[2][NFS4_FHSIZE];
 	u8			bytes[];
 };
 
@@ -272,6 +280,15 @@ nfsd_ffv2_prototype_test_object_arm(struct svc_export *exp,
 				    size_t sampled, bool claim);
 bool nfsd_ffv2_prototype_test_object_disarm(struct nfsd_ffv2_prototype_test_object *obj);
 void nfsd_ffv2_prototype_test_object_put(struct nfsd_ffv2_prototype_test_object *obj);
+int nfsd_ffv2_prototype_test_object_store(
+	struct nfsd_ffv2_prototype_test_object *obj,
+	struct nfsd_ffv2_store *store);
+int nfsd_ffv2_prototype_test_object_member(
+	struct nfsd_ffv2_prototype_test_object *obj, u32 index,
+	const u8 *request_handle, u16 request_handle_len,
+	struct dentry *dentry, const u8 *inner, u16 inner_len);
+void nfsd_ffv2_prototype_test_fail_second_trust(
+	struct nfsd_ffv2_prototype_test_object *obj);
 struct nfsd_ffv2_prototype_test_object *
 nfsd_ffv2_prototype_test_object_acquire(void);
 bool nfsd_ffv2_prototype_test_object_armed(void);
