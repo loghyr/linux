@@ -332,8 +332,9 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	uint8_t binding_token[32];
 	uint8_t persisted_handles[2][32];
 	uint8_t wires[2][16];
-	const struct nlattr *nla;
+	const struct nlattr *nla, *top[5];
 	size_t handle_lens[2], len, attrlen;
+	size_t top_offset = 0;
 	size_t object_len;
 	size_t mapped_lens[2] = {}, uuid_len = 0;
 	uint8_t mapped[2][128], uuid[16];
@@ -413,10 +414,25 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 		nl_nest_end(nl, objects);
 	}
 	len = nl_talk(nl, reply, sizeof(reply));
+	for (i = 0; i < 5; i++) {
+		static const uint16_t types[] = {
+			NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID,
+			NFSD_A_FFV2_PROTOTYPE_SERVICE_UUID,
+			NFSD_A_FFV2_PROTOTYPE_REPLAY_UUID,
+			NFSD_A_FFV2_PROTOTYPE_GENERATION,
+			NFSD_A_FFV2_PROTOTYPE_OBJECTS,
+		};
 
-	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID);
-	if (!nla)
-		die("registration returned no source uuid");
+		top[i] = nl_next(reply, len, &top_offset);
+		if (!top[i] ||
+		    (top[i]->nla_type & NLA_TYPE_MASK) != types[i] ||
+		    (i == 4 && !(top[i]->nla_type & NLA_F_NESTED)))
+			die("registration returned malformed top-level attributes");
+	}
+	if (top_offset != len)
+		die("registration returned extra top-level attributes");
+
+	nla = top[0];
 	value = nl_data(nla, &attrlen);
 	if (attrlen != sizeof(uuid))
 		die("source uuid is %zu bytes", attrlen);
@@ -424,28 +440,24 @@ static void cmd_register(struct ffv2_nl *nl, const char *domain,
 	uuid_len = attrlen;
 	print_hex("PROTO-SOURCE-UUID", uuid, uuid_len);
 
-	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_SERVICE_UUID);
-	if (nla) {
-		value = nl_data(nla, &attrlen);
-		print_hex("PROTO-SERVICE-UUID", value, attrlen);
-	}
-	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_REPLAY_UUID);
-	if (nla) {
-		value = nl_data(nla, &attrlen);
-		print_hex("PROTO-REPLAY-UUID", value, attrlen);
-	}
-	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_GENERATION);
-	if (!nla)
-		die("registration returned no generation");
+	nla = top[1];
+	value = nl_data(nla, &attrlen);
+	if (attrlen != sizeof(uuid))
+		die("service uuid is %zu bytes", attrlen);
+	print_hex("PROTO-SERVICE-UUID", value, attrlen);
+	nla = top[2];
+	value = nl_data(nla, &attrlen);
+	if (attrlen != sizeof(uuid))
+		die("replay uuid is %zu bytes", attrlen);
+	print_hex("PROTO-REPLAY-UUID", value, attrlen);
+	nla = top[3];
 	value = nl_data(nla, &attrlen);
 	if (attrlen != sizeof(generation))
 		die("generation is %zu bytes", attrlen);
 	memcpy(&generation, value, sizeof(generation));
 	printf("PROTO-GENERATION=%llu\n", (unsigned long long)generation);
 
-	nla = nl_find(reply, len, NFSD_A_FFV2_PROTOTYPE_OBJECTS);
-	if (!nla)
-		die("registration returned no object array");
+	nla = top[4];
 	object_data = nl_data(nla, &object_len);
 	for (i = 0; i < object_count; i++) {
 		char label[64];
