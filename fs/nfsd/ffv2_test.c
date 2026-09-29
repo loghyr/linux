@@ -10956,7 +10956,7 @@ static void nfsd_ffv2_encode_mutation_test(struct kunit *test)
 
 	len = nfsd_ffv2_mutation_encode(test, &u, OP_CHUNK_WRITE, &buf);
 	KUNIT_ASSERT_EQ(test, 52, len);
-	KUNIT_EXPECT_EQ(test, 123U, nfsd_ffv2_ro_word(&buf, 0));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 0));
 	KUNIT_EXPECT_EQ(test, (u32)NFS_FILE_SYNC,
 			nfsd_ffv2_ro_word(&buf, 4));
 	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 16));
@@ -10968,6 +10968,19 @@ static void nfsd_ffv2_encode_mutation_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, 0x55667788U, nfsd_ffv2_ro_word(&buf, 40));
 	KUNIT_EXPECT_EQ(test, 0xaabbccddU, nfsd_ffv2_ro_word(&buf, 44));
 	KUNIT_EXPECT_EQ(test, 0x12345678U, nfsd_ffv2_ro_word(&buf, 48));
+
+	ffv2->result_bytes = 0;
+	ffv2->result_status = nfserr_chunk_guarded;
+	len = nfsd_ffv2_mutation_encode(test, &u, OP_CHUNK_WRITE, &buf);
+	KUNIT_ASSERT_EQ(test, 52, len);
+	KUNIT_EXPECT_EQ(test, 0U, nfsd_ffv2_ro_word(&buf, 0));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 16));
+	KUNIT_EXPECT_EQ(test, be32_to_cpu(nfserr_chunk_guarded),
+			nfsd_ffv2_ro_word(&buf, 20));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 24));
+	KUNIT_EXPECT_EQ(test, 1U, nfsd_ffv2_ro_word(&buf, 32));
+
+	ffv2->result_status = nfs_ok;
 	for (i = 0; i < ARRAY_SIZE(lifecycle_ops); i++) {
 		len = nfsd_ffv2_mutation_encode(test, &u, lifecycle_ops[i],
 						&buf);
