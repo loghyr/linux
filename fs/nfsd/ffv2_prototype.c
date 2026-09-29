@@ -2292,10 +2292,9 @@ static int nfsd_ffv2_prototype_trust(struct nfsd_net *nn,
 	req.stateid = *stateid;
 	req.object_uuid = object_uuid;
 	req.actor = NFSD_FFV2_CALLER_DATA_CLIENT;
-	req.pnfs_clientid.cl_boot =
-		be32_to_cpu((__force __be32)upper_32_bits(request->pnfs_clientid));
-	req.pnfs_clientid.cl_id =
-		be32_to_cpu((__force __be32)lower_32_bits(request->pnfs_clientid));
+	static_assert(sizeof(req.pnfs_clientid) == sizeof(request->pnfs_clientid));
+	memcpy(&req.pnfs_clientid, &request->pnfs_clientid,
+	       sizeof(req.pnfs_clientid));
 	req.client_id = request->writer_id;
 	req.iomode = IOMODE_RW;
 	req.profile_mask = NFSD_FFV2_PROFILE_READ_DATA |

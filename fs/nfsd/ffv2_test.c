@@ -13278,19 +13278,29 @@ static void nfsd_ffv2_proto_store_close(void *data)
 static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 {
 	const struct nfsd_ffv2_chunk_request creq = { .offset = 0, .count = 4 };
+	const clientid_t pnfs_clientid = {
+		.cl_boot = 0x01234567,
+		.cl_id = 0x89abcdef,
+	};
 	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
 	u8 spent[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
 	u8 wrong_persisted_handle[32];
 	struct nfsd_ffv2_prototype_request req;
 	struct nfsd_ffv2_prototype_bundle *bundle, *replay;
+	struct nfsd_ffv2_actor_id actor = {
+		.client_id = 7,
+		.present = true,
+	};
 	struct nfsd_ffv2_admission admission = {};
 	struct nfsd_ffv2_chunk_result result;
 	struct nfsd_ffv2_proto_fixture *f;
 	struct nfsd_ffv2_fh_info info;
 	struct nfsd_ffv2_binding *again;
+	struct nfs4_client *client;
 	struct knfsd_fh outer = {};
 	struct svc_export exp;
 	stateid_t stateid;
+	u64 clientid_scalar;
 	u64 expires = 0;
 	u64 callbacks;
 	unsigned int i;
@@ -13301,8 +13311,14 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, f);
 	KUNIT_ASSERT_NOT_NULL(test, bundle);
 	KUNIT_ASSERT_NOT_NULL(test, replay);
+	client = kunit_kzalloc(test, sizeof(*client), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, client);
 	if (!nfsd_ffv2_proto_fixture_init(test, f))
 		goto out;
+	client->cl_clientid = pnfs_clientid;
+	f->session->se_client = client;
+	static_assert(sizeof(clientid_scalar) == sizeof(pnfs_clientid));
+	memcpy(&clientid_scalar, &pnfs_clientid, sizeof(clientid_scalar));
 
 	KUNIT_ASSERT_EQ(test, 0, nfsd_ffv2_prototype_enable(f->nn, f->net));
 	f->enabled = true;
@@ -13322,6 +13338,7 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 						      &expires));
 	memcpy(spent, nonce, sizeof(spent));
 	nfsd_ffv2_proto_request(&req, spent);
+	req.pnfs_clientid = clientid_scalar;
 	KUNIT_ASSERT_EQ(test, 0,
 			nfsd_ffv2_prototype_register(f->nn, f->net, &req,
 						     bundle));
@@ -13418,6 +13435,18 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 
 	memcpy(&stateid, bundle->stateid, sizeof(stateid));
 	callbacks = nfsd_ffv2_test_provider_callbacks();
+	/*
+	 * Registration consumes the proc-exported native u64 scalar.  Writer
+	 * policy compares the installed identity with the session's original
+	 * clientid_t, so this fails if either word is reversed or byte-swapped.
+	 */
+	KUNIT_EXPECT_EQ(test, nfs_ok,
+			nfsd_ffv2_test_validate_operation(f->rqstp, f->mapped,
+							  f->session,
+							  OP_CHUNK_WRITE,
+							  &stateid, &actor,
+							  &admission));
+	nfsd_ffv2_complete(&admission);
 	KUNIT_EXPECT_EQ(test, nfs_ok,
 			nfsd_ffv2_test_validate_operation(f->rqstp, f->mapped,
 							  f->session,
