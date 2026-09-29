@@ -11795,6 +11795,136 @@ static bool nfsd_ffv2_prototype_wait_state(struct nfsd_net *nn,
 	return true;
 }
 
+static u32 nfsd_ffv2_exchange_baseline(void)
+{
+	u32 flags = EXCHGID4_FLAG_SUPP_MOVED_REFER;
+
+	if (IS_ENABLED(CONFIG_NFSD_PNFS))
+		return flags | EXCHGID4_FLAG_USE_PNFS_MDS;
+	return flags | EXCHGID4_FLAG_USE_NON_PNFS;
+}
+
+struct nfsd_ffv2_exchange_sampler {
+	struct nfsd_net	*nn;
+	u32		baseline;
+	atomic_t	bad;
+	atomic_t	samples;
+	struct completion started;
+};
+
+static int nfsd_ffv2_exchange_sample_thread(void *data)
+{
+	struct nfsd_ffv2_exchange_sampler *sampler = data;
+	u32 baseline = sampler->baseline & EXCHGID4_FLAG_MASK_PNFS;
+	u32 ds = baseline | EXCHGID4_FLAG_USE_PNFS_DS;
+	u32 role;
+
+	while (!kthread_should_stop()) {
+		role = nfsd4_test_exchange_flags(sampler->nn, 0) &
+		       EXCHGID4_FLAG_MASK_PNFS;
+		if (role != baseline && role != ds)
+			atomic_inc(&sampler->bad);
+		if (atomic_inc_return(&sampler->samples) == 1)
+			complete(&sampler->started);
+		cond_resched();
+	}
+	return 0;
+}
+
+/*
+ * EXCHANGE_ID samples the prototype gate before taking client_lock.  This
+ * exercises that production selector across independent namespaces and a
+ * complete gate cycle, including a case-2 style retry carrying old bits.
+ */
+static void nfsd_ffv2_exchange_role_test(struct kunit *test)
+{
+	const u32 preserved = EXCHGID4_FLAG_CONFIRMED_R;
+	const u32 baseline = nfsd_ffv2_exchange_baseline();
+	struct nfsd_net *nn, *other, *restarted;
+	u32 flags;
+	int error;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	other = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, other);
+	KUNIT_ASSERT_EQ(test, error, 0);
+
+	flags = nfsd4_test_exchange_flags(nn,
+					  preserved | EXCHGID4_FLAG_MASK_PNFS);
+	KUNIT_EXPECT_EQ(test, baseline | preserved, flags);
+	KUNIT_EXPECT_EQ(test, baseline,
+			nfsd4_test_exchange_flags(other, 0));
+
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_enable(nn, &init_net));
+	flags = nfsd4_test_exchange_flags(nn, flags);
+	KUNIT_EXPECT_EQ(test,
+			baseline | EXCHGID4_FLAG_USE_PNFS_DS | preserved,
+			flags);
+	KUNIT_EXPECT_EQ(test, baseline,
+			nfsd4_test_exchange_flags(other, 0));
+
+	KUNIT_ASSERT_EQ(test, 0,
+			nfsd_ffv2_prototype_disable(nn, &init_net));
+	flags = nfsd4_test_exchange_flags(nn, flags);
+	KUNIT_EXPECT_EQ(test, baseline | preserved, flags);
+
+	/* A new namespace models the gate state immediately after restart. */
+	restarted = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, restarted);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit,
+					  restarted);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	KUNIT_EXPECT_EQ(test, baseline,
+			nfsd4_test_exchange_flags(restarted, 0));
+}
+
+static void nfsd_ffv2_exchange_role_race_test(struct kunit *test)
+{
+	struct nfsd_ffv2_exchange_sampler sampler = {};
+	struct task_struct *task;
+	struct nfsd_net *nn;
+	int error = 0;
+	unsigned int i;
+
+	nn = nfsd_ffv2_test_net(test);
+	KUNIT_ASSERT_NOT_NULL(test, nn);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_test_net_exit, nn);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	sampler.nn = nn;
+	sampler.baseline = nfsd_ffv2_exchange_baseline();
+	atomic_set(&sampler.bad, 0);
+	atomic_set(&sampler.samples, 0);
+	init_completion(&sampler.started);
+	task = kthread_run(nfsd_ffv2_exchange_sample_thread, &sampler,
+			   "ffv2-exchange-role");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(task));
+	if (!wait_for_completion_timeout(&sampler.started, 5 * HZ)) {
+		kthread_stop(task);
+		KUNIT_FAIL(test, "exchange role sampler did not start");
+		return;
+	}
+
+	for (i = 0; i < 32; i++) {
+		error = nfsd_ffv2_prototype_enable(nn, &init_net);
+		if (error)
+			break;
+		error = nfsd_ffv2_prototype_disable(nn, &init_net);
+		if (error)
+			break;
+		cond_resched();
+	}
+	kthread_stop(task);
+
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_GT(test, atomic_read(&sampler.samples), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&sampler.bad), 0);
+}
+
 /*
  * The ordinary cycle, and the exclusions around it: one gate per
  * namespace, no metadata-server source while it is up, and repeated
@@ -12295,6 +12425,8 @@ static void nfsd_ffv2_prototype_crew_pause_test(struct kunit *test)
 	/* Held there, and nothing in this body lets it out. */
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_ENABLING,
 			nfsd_ffv2_prototype_state_get(nn));
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_exchange_baseline(),
+			nfsd4_test_exchange_flags(nn, 0));
 	KUNIT_EXPECT_EQ(test, 0UL,
 			wait_for_completion_timeout(&enable->done, HZ / 4));
 
@@ -12357,6 +12489,8 @@ static void nfsd_ffv2_prototype_enabling_close_test(struct kunit *test)
 	closing = nfsd_ffv2_prototype_wait_state(nn,
 						 NFSD_FFV2_PROTOTYPE_CLOSING);
 	KUNIT_EXPECT_TRUE(test, closing);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_exchange_baseline(),
+			nfsd4_test_exchange_flags(nn, 0));
 	second = nfsd_ffv2_proto_crew_start(crew, 2, nn, &init_net,
 					    nfsd_ffv2_proto_call_disable,
 					    "ffv2-proto-close2");
@@ -13193,6 +13327,10 @@ static void nfsd_ffv2_prototype_read_test(struct kunit *test)
 						     bundle));
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_PROTOTYPE_READY,
 			nfsd_ffv2_prototype_state_get(f->nn));
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_exchange_baseline() |
+			EXCHGID4_FLAG_USE_PNFS_DS,
+			nfsd4_test_exchange_flags(f->nn, 0));
 	KUNIT_EXPECT_EQ(test, NFSD_FFV2_SOURCE_PROTOTYPE,
 			nfsd_ffv2_source_get(f->nn));
 	KUNIT_EXPECT_NE(test, 0ULL, bundle->generation);
@@ -16809,6 +16947,8 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_store_backed_read_isolation_test),
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
 	KUNIT_CASE(nfsd_ffv2_prototype_gate_test),
+	KUNIT_CASE(nfsd_ffv2_exchange_role_test),
+	KUNIT_CASE(nfsd_ffv2_exchange_role_race_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_owner_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_setup_failure_test),
 	KUNIT_CASE(nfsd_ffv2_prototype_crew_start_failure_test),

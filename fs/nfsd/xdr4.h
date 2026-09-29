@@ -1095,6 +1095,7 @@ __be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp);
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 __be32 nfsd4_test_decode_op(struct svc_rqst *rqstp, u32 opnum, const void *buf,
 			    size_t len, union nfsd4_op_u *u, size_t *consumed);
+u32 nfsd4_test_exchange_flags(struct nfsd_net *nn, u32 flags);
 #endif
 bool nfsd4_ffv2_replay_identity_match(const struct nfsd4_compoundargs *args,
 				      const struct nfsd4_slot *slot);

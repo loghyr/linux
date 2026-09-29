@@ -207,6 +207,7 @@ int nfsd_ffv2_prototype_enable(struct nfsd_net *nn, const struct net *net);
 int nfsd_ffv2_prototype_disable(struct nfsd_net *nn, const struct net *net);
 enum nfsd_ffv2_prototype_state
 nfsd_ffv2_prototype_state_get(struct nfsd_net *nn);
+bool nfsd_ffv2_prototype_ds_role(struct nfsd_net *nn);
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 struct nfsd_ffv2_prototype_test_store_ops {
 	int (*visible)(void *store, const u8 file_key[32], u64 chunk_index,
@@ -363,6 +364,13 @@ static inline int nfsd_ffv2_prototype_op_admit(struct nfsd_net *nn,
 }
 
 static inline void nfsd_ffv2_prototype_op_release(struct nfsd_net *nn) { }
+#endif
+
+#if !IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+static inline bool nfsd_ffv2_prototype_ds_role(struct nfsd_net *nn)
+{
+	return false;
+}
 #endif
 
 #endif /* _NFSD_FFV2_PROTOTYPE_H */

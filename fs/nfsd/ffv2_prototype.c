@@ -424,6 +424,15 @@ nfsd_ffv2_prototype_state_get(struct nfsd_net *nn)
 	return state;
 }
 
+bool nfsd_ffv2_prototype_ds_role(struct nfsd_net *nn)
+{
+	enum nfsd_ffv2_prototype_state state;
+
+	state = nfsd_ffv2_prototype_state_get(nn);
+	return state == NFSD_FFV2_PROTOTYPE_OPEN ||
+	       state == NFSD_FFV2_PROTOTYPE_READY;
+}
+
 static bool nfsd_ffv2_prototype_quiet(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
