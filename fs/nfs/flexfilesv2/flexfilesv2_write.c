@@ -631,6 +631,7 @@ static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
 	struct ffv2_chunk_write_dispatch *w = data;
 	struct ffv2_captured_guard *slot =
 		&w->sw->ctx->captured_guard[w->mirror_idx];
+	u32 client_id;
 
 	ffv2_rpc_bound_timeout(task);
 
@@ -644,14 +645,8 @@ static void ffv2_chunk_write_prepare(struct rpc_task *task, void *data)
 	 * slot with nothing in it sends the {0,0} sentinel that an
 	 * empty chunk accepts.
 	 */
-	w->wire.args.guard.check = true;
-	if (slot->valid) {
-		w->wire.args.guard.guard = slot->guard;
-	} else {
-		w->wire.args.guard.guard.cg_gen_id = 0;
-	}
-	w->wire.args.guard.guard.cg_client_id =
-		ffv2_cg_client_id(w->sw->ctx->fls->mirror_array[0]);
+	client_id = ffv2_cg_client_id(w->sw->ctx->fls->mirror_array[0]);
+	ffv2_chunk_write_guard_prepare(&w->wire.args.guard, slot, client_id);
 
 	nfs4_setup_sequence(w->ds_clp, &w->wire.seq_args, &w->wire.res.seq_res,
 			    task);

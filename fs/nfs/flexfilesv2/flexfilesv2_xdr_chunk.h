@@ -47,6 +47,22 @@ struct ffv2_write_chunk_guard4 {
 	struct chunk_guard4	guard;
 };
 
+static inline void
+ffv2_chunk_write_guard_prepare(struct ffv2_write_chunk_guard4 *guard,
+			       const struct ffv2_captured_guard *slot,
+			       u32 client_id)
+{
+	guard->check = true;
+	if (!slot->valid) {
+		guard->guard.cg_gen_id = 0;
+		guard->guard.cg_client_id = 0;
+		return;
+	}
+
+	guard->guard = slot->guard;
+	guard->guard.cg_client_id = client_id;
+}
+
 /*
  * CHUNK_WRITE4args in-memory form.
  *

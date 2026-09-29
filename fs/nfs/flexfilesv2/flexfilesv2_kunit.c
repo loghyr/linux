@@ -32,6 +32,30 @@ static void ffv2_rpc_timeout_policy_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, task.tk_flags & RPC_TASK_SOFTCONN);
 }
 
+static void ffv2_chunk_write_guard_prepare_test(struct kunit *test)
+{
+	struct ffv2_write_chunk_guard4 guard = {
+		.guard = {
+			.cg_gen_id = 19,
+			.cg_client_id = 23,
+		},
+	};
+	struct ffv2_captured_guard slot = { };
+
+	ffv2_chunk_write_guard_prepare(&guard, &slot, 29);
+	KUNIT_EXPECT_TRUE(test, guard.check);
+	KUNIT_EXPECT_EQ(test, (u32)0, guard.guard.cg_gen_id);
+	KUNIT_EXPECT_EQ(test, (u32)0, guard.guard.cg_client_id);
+
+	slot.valid = true;
+	slot.guard.cg_gen_id = 31;
+	slot.guard.cg_client_id = 37;
+	ffv2_chunk_write_guard_prepare(&guard, &slot, 41);
+	KUNIT_EXPECT_TRUE(test, guard.check);
+	KUNIT_EXPECT_EQ(test, (u32)31, guard.guard.cg_gen_id);
+	KUNIT_EXPECT_EQ(test, (u32)41, guard.guard.cg_client_id);
+}
+
 static void ffv2_mixed_cohort_verifier_test(struct kunit *test)
 {
 	struct ffv2_pending_chunk first = { };
@@ -298,6 +322,7 @@ static void ffv2_deferred_group_range_test(struct kunit *test)
 
 static struct kunit_case ffv2_deferred_test_cases[] = {
 	KUNIT_CASE(ffv2_rpc_timeout_policy_test),
+	KUNIT_CASE(ffv2_chunk_write_guard_prepare_test),
 	KUNIT_CASE(ffv2_mixed_cohort_verifier_test),
 	KUNIT_CASE(ffv2_deferred_group_wait_test),
 	KUNIT_CASE(ffv2_deferred_owner_identity_test),
