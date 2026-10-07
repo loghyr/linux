@@ -481,8 +481,13 @@ static ssize_t write_pool_threads(struct file *file, char *buf, size_t size)
 	int npools;
 	int *nthreads;
 	struct net *net = netns(file);
+	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
 	mutex_lock(&nfsd_mutex);
+	if (size > 0 && nn->nfsd_shutdown_in_progress) {
+		mutex_unlock(&nfsd_mutex);
+		return -EAGAIN;
+	}
 	npools = nfsd_nrpools(net);
 	if (npools == 0) {
 		/*
@@ -1673,7 +1678,7 @@ static int nfsd_nl_fh_key_set(const struct nlattr *attr, struct nfsd_net *nn)
  */
 int nfsd_nl_threads_set_doit(struct sk_buff *skb, struct genl_info *info)
 {
-	int *nthreads, nrpools = 0, i, ret = -EOPNOTSUPP, rem;
+	int *nthreads = NULL, nrpools = 0, i, ret = -EOPNOTSUPP, rem;
 	struct net *net = genl_info_net(info);
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 	const struct nlattr *attr;
@@ -1688,6 +1693,10 @@ int nfsd_nl_threads_set_doit(struct sk_buff *skb, struct genl_info *info)
 		nrpools++;
 
 	mutex_lock(&nfsd_mutex);
+	if (nn->nfsd_shutdown_in_progress) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
 
 	nthreads = kzalloc_objs(int, nrpools);
 	if (!nthreads) {
@@ -2749,9 +2758,10 @@ static __net_init int nfsd_net_init(struct net *net)
 	int retval;
 	int i;
 
+	nfsd_ffv2_net_init(nn);
 	retval = nfsd_net_cb_init(nn);
 	if (retval)
-		return retval;
+		goto out_ffv2_error;
 	retval = nfsd_export_init(net);
 	if (retval)
 		goto out_export_error;
@@ -2786,6 +2796,7 @@ static __net_init int nfsd_net_init(struct net *net)
 		nn->nfsd4_minorversions[i] = nfsd_support_version(4);
 	nn->nfsd_info.mutex = &nfsd_mutex;
 	nn->nfsd_serv = NULL;
+	nn->nfsd_shutdown_in_progress = false;
 	nfsd4_init_leases_net(nn);
 	get_random_bytes(&nn->siphash_key, sizeof(nn->siphash_key));
 	seqlock_init(&nn->writeverf_lock);
@@ -2809,25 +2820,31 @@ out_idmap_error:
 	nfsd_export_shutdown(net);
 out_export_error:
 	nfsd_net_cb_shutdown(nn);
+out_ffv2_error:
+	nfsd_ffv2_net_pre_exit(nn);
+	nfsd_ffv2_net_destroy(nn);
 	return retval;
 }
 
-#if IS_ENABLED(CONFIG_NFS_LOCALIO)
 /**
- * nfsd_net_pre_exit - Disconnect localio clients from net namespace
+ * nfsd_net_pre_exit - Fence nfsd users from a departing net namespace
  * @net: a network namespace that is about to be destroyed
  *
- * This invalidates ->net pointers held by localio clients
- * while they can still safely access nn->counter.
+ * Fence FFv2 service admission. With LOCALIO enabled, invalidate ->net
+ * pointers while clients can still access nn->counter.
+ *
+ * Context: sleeps. Called before per-net destruction without nfsd_mutex.
  */
 static __net_exit void nfsd_net_pre_exit(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
+	nfsd_ffv2_net_pre_exit(nn);
+#if IS_ENABLED(CONFIG_NFS_LOCALIO)
 	nfs_localio_invalidate_clients(&nn->local_clients,
 				       &nn->local_clients_lock);
-}
 #endif
+}
 
 /**
  * nfsd_net_exit - Release the nfsd_net portion of a net namespace
@@ -2838,6 +2855,7 @@ static __net_exit void nfsd_net_exit(struct net *net)
 {
 	struct nfsd_net *nn = net_generic(net, nfsd_net_id);
 
+	nfsd_ffv2_net_destroy(nn);
 	kfree_sensitive(nn->fh_key);
 	nfsd_net_cb_shutdown(nn);
 	nfsd_proc_stat_shutdown(net);
@@ -2852,9 +2870,7 @@ static __net_exit void nfsd_net_exit(struct net *net)
 
 static struct pernet_operations nfsd_net_ops = {
 	.init = nfsd_net_init,
-#if IS_ENABLED(CONFIG_NFS_LOCALIO)
 	.pre_exit = nfsd_net_pre_exit,
-#endif
 	.exit = nfsd_net_exit,
 	.id   = &nfsd_net_id,
 	.size = sizeof(struct nfsd_net),
