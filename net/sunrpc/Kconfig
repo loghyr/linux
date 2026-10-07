@@ -3,6 +3,16 @@ config SUNRPC
 	tristate
 	depends on MULTIUSER
 
+config SUNRPC_CACHE_KUNIT_TEST
+	tristate "KUnit tests for the SUNRPC cache" if !KUNIT_ALL_TESTS
+	default KUNIT_ALL_TESTS
+	depends on KUNIT && SUNRPC
+	help
+	  Build focused tests for exact SUNRPC cache replacement. These tests
+	  check current-object selection, stale and expired predecessors,
+	  reference ownership, and removal of a replaced predecessor.
+	  Enable this only for kernel testing.
+
 config SUNRPC_GSS
 	tristate
 	select OID_REGISTRY
