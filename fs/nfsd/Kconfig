@@ -91,6 +91,17 @@ config NFSD_V4
 
 	  If unsure, say N.
 
+config NFSD_FFV2
+	bool "NFS server Flex Files v2 data server support"
+	depends on NFSD_V4
+	default n
+	help
+	  Build the Flex Files v2 data server lifecycle into nfsd. Provider
+	  registration remains disabled until its export and authority paths
+	  are available.
+
+	  If unsure, say N.
+
 config NFSD_PNFS
 	bool
 

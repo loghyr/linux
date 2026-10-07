@@ -17,6 +17,8 @@
 #include <linux/siphash.h>
 #include <linux/sunrpc/stats.h>
 
+#include "ffv2.h"
+
 /* Hash tables for nfs4_clientid state */
 #define CLIENT_HASH_BITS                 4
 #define CLIENT_HASH_SIZE                (1 << CLIENT_HASH_BITS)
@@ -72,6 +74,9 @@ enum {
  * up expired clients and delegations within the container.
  */
 struct nfsd_net {
+#ifdef CONFIG_NFSD_FFV2
+	struct nfsd_ffv2_anchor ffv2;
+#endif
 	struct cld_net *cld_net;
 
 	struct cache_detail *svc_expkey_cache;
@@ -145,6 +150,8 @@ struct nfsd_net {
 
 	atomic_t nr_reclaim_complete;
 
+	/* Protected by nfsd_mutex. */
+	bool nfsd_shutdown_in_progress;
 	seqlock_t writeverf_lock;
 	unsigned char writeverf[8];
 
