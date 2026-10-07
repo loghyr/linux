@@ -751,6 +751,10 @@ int nfsd_set_nrthreads(int n, int *nthreads, struct net *net)
 	if (n == 1) {
 		err = svc_set_num_threads(nn->nfsd_serv, nn->min_threads,
 					  nthreads[0]);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		if (!err && nfsd_ffv2_test_start_failure())
+			err = -EIO;
+#endif
 		return err;
 	}
 
@@ -783,6 +787,12 @@ int nfsd_set_nrthreads(int n, int *nthreads, struct net *net)
 					   nn->min_threads, nthreads[i]);
 		if (err)
 			goto out;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		if (nfsd_ffv2_test_start_failure()) {
+			err = -EIO;
+			goto out;
+		}
+#endif
 	}
 
 	/* Anything undefined in array is considered to be 0 */
@@ -982,6 +992,10 @@ nfsd(void *vrqstp)
 	/* use dynamic allocation if ntli should ever become large */
 	static_assert(sizeof(struct nfsd_thread_local_info) < 256);
 	rqstp->rq_private = &ntli;
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	nfsd_ffv2_test_worker(rqstp, perm_sock);
+#endif
 
 	/*
 	 * The main request loop

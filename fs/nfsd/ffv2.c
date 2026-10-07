@@ -38,6 +38,9 @@ struct nfsd_ffv2_generation {
 	struct list_head		admissions;
 	wait_queue_head_t		admitted_wait;
 	struct completion		retired;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	atomic_t			test_waiters;
+#endif
 	void				*payload;
 	void				(*release)(void *payload);
 };
@@ -71,6 +74,42 @@ static void nfsd_ffv2_generation_put(struct nfsd_ffv2_generation *generation)
 	kfree(generation);
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static atomic_t nfsd_ffv2_start_failure;
+
+static struct nfsd_ffv2_generation *
+nfsd_ffv2_generation_alloc(void *payload, void (*release)(void *))
+{
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_identity *identity;
+
+	identity = kzalloc_obj(*identity, GFP_KERNEL);
+	if (!identity)
+		return NULL;
+
+	generation = kzalloc_obj(*generation, GFP_KERNEL);
+	if (!generation) {
+		kfree(identity);
+		return NULL;
+	}
+
+	refcount_set(&identity->ref, 1);
+	WRITE_ONCE(identity->state, NFSD_FFV2_IDENTITY_LIVE);
+	refcount_set(&generation->ref, 1);
+	generation->identity = identity;
+	atomic_set(&generation->state, NFSD_FFV2_GENERATION_ACTIVE);
+	atomic_set(&generation->admitted, 0);
+	spin_lock_init(&generation->admissions_lock);
+	INIT_LIST_HEAD(&generation->admissions);
+	init_waitqueue_head(&generation->admitted_wait);
+	init_completion(&generation->retired);
+	atomic_set(&generation->test_waiters, 0);
+	generation->payload = payload;
+	generation->release = release;
+	return generation;
+}
+#endif
+
 static struct nfsd_ffv2_generation *
 nfsd_ffv2_retire_begin_locked(struct nfsd_ffv2_anchor *anchor)
 {
@@ -102,6 +141,29 @@ nfsd_ffv2_release_payload(struct nfsd_ffv2_generation *generation)
 		generation->release(payload);
 }
 
+static void nfsd_ffv2_wait_admitted(struct nfsd_ffv2_generation *generation)
+{
+	DEFINE_WAIT(wait);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	bool reported = false;
+#endif
+
+	for (;;) {
+		prepare_to_wait(&generation->admitted_wait, &wait,
+				TASK_UNINTERRUPTIBLE);
+		if (!atomic_read(&generation->admitted))
+			break;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		if (!reported) {
+			atomic_inc(&generation->test_waiters);
+			reported = true;
+		}
+#endif
+		schedule();
+	}
+	finish_wait(&generation->admitted_wait, &wait);
+}
+
 static void nfsd_ffv2_retire_finish(struct nfsd_ffv2_anchor *anchor,
 				    struct nfsd_ffv2_generation *generation)
 {
@@ -110,8 +172,7 @@ static void nfsd_ffv2_retire_finish(struct nfsd_ffv2_anchor *anchor,
 	if (!generation)
 		return;
 
-	wait_event(generation->admitted_wait,
-		   atomic_read(&generation->admitted) == 0);
+	nfsd_ffv2_wait_admitted(generation);
 
 	if (atomic_cmpxchg(&generation->state,
 			   NFSD_FFV2_GENERATION_STOPPING,
@@ -141,6 +202,37 @@ out_complete:
 	nfsd_ffv2_generation_put(generation);
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static int nfsd_ffv2_publish(struct nfsd_ffv2_anchor *anchor,
+			     struct nfsd_ffv2_generation *generation,
+			     u64 *generation_id)
+{
+	int error = 0;
+
+	mutex_lock(&anchor->lock);
+	if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
+	    anchor->service_state == NFSD_FFV2_SERVICE_STOPPING ||
+	    anchor->service_state == NFSD_FFV2_SERVICE_DRAIN_FAILED) {
+		error = -ESHUTDOWN;
+	} else if (anchor->service_state == NFSD_FFV2_SERVICE_DOWN) {
+		error = -ENXIO;
+	} else if (anchor->active || anchor->retiring) {
+		error = -EBUSY;
+	} else if (!anchor->next_generation ||
+		   anchor->next_generation == U64_MAX) {
+		error = -EOVERFLOW;
+	} else {
+		generation->identity->generation = anchor->next_generation++;
+		refcount_inc(&generation->ref);
+		anchor->active = generation;
+		if (generation_id)
+			*generation_id = generation->identity->generation;
+	}
+	mutex_unlock(&anchor->lock);
+	return error;
+}
+#endif
+
 /**
  * nfsd_ffv2_net_init - initialize the namespace anchor
  * @nn: namespace with no FFv2 users
@@ -154,6 +246,9 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 	refcount_set(&anchor->ref, 1);
 	init_completion(&anchor->released);
 	mutex_init(&anchor->lock);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	anchor->test_destroy_waiting = NULL;
+#endif
 	anchor->net_state = NFSD_FFV2_NET_LIVE;
 	anchor->service_state = NFSD_FFV2_SERVICE_DOWN;
 	anchor->next_generation = 1;
@@ -202,6 +297,10 @@ void nfsd_ffv2_net_destroy(struct nfsd_net *nn)
 	WARN_ON_ONCE(anchor->retiring);
 	mutex_unlock(&anchor->lock);
 	nfsd_ffv2_anchor_put(anchor);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (READ_ONCE(anchor->test_destroy_waiting))
+		complete(READ_ONCE(anchor->test_destroy_waiting));
+#endif
 	wait_for_completion(&anchor->released);
 	mutex_destroy(&anchor->lock);
 }
@@ -451,3 +550,226 @@ void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 	nfsd_ffv2_generation_put(generation);
 	nfsd_ffv2_anchor_put(anchor);
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/**
+ * nfsd_ffv2_test_publish - publish a synthetic generation
+ * @nn: live namespace with its service up
+ * @payload: caller-owned payload transferred only on success
+ * @release: callback that consumes payload after admitted work drains
+ * @generation_id: optional output for the nonzero generation number
+ *
+ * Context: Sleeps. Caller holds nfsd_mutex.
+ * Return: 0 on publication, or a negative errno without consuming payload.
+ */
+int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
+			   void (*release)(void *), u64 *generation_id)
+{
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	int error;
+
+	lockdep_assert_held(&nfsd_mutex);
+	if (!nfsd_ffv2_anchor_get(anchor))
+		return -ESHUTDOWN;
+	generation = nfsd_ffv2_generation_alloc(payload, release);
+	if (!generation) {
+		nfsd_ffv2_anchor_put(anchor);
+		return -ENOMEM;
+	}
+	error = nfsd_ffv2_publish(anchor, generation, generation_id);
+	if (error)
+		generation->payload = NULL;
+	nfsd_ffv2_generation_put(generation);
+	nfsd_ffv2_anchor_put(anchor);
+	return error;
+}
+
+/**
+ * nfsd_ffv2_test_admit - admit synthetic work through the lifecycle gate
+ * @nn: live namespace with a published generation
+ * @admission: unused caller-owned record retained until completion
+ *
+ * Context: Sleeps.
+ * Return: 0 with owned anchor and generation references, or a negative errno.
+ */
+int nfsd_ffv2_test_admit(struct nfsd_net *nn,
+			 struct nfsd_ffv2_admission *admission)
+{
+	return nfsd_ffv2_admit_generation(nn, admission);
+}
+
+static bool
+nfsd_ffv2_generation_has_task(struct nfsd_ffv2_generation *generation,
+			      struct task_struct *task)
+{
+	struct nfsd_ffv2_admission *admission;
+	bool found = false;
+
+	spin_lock(&generation->admissions_lock);
+	list_for_each_entry(admission, &generation->admissions, node) {
+		if (admission->task == task) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock(&generation->admissions_lock);
+	return found;
+}
+
+/**
+ * nfsd_ffv2_test_unregister - retire one synthetic generation
+ * @nn: namespace whose anchor remains allocated
+ * @generation_id: generation to retire
+ *
+ * Context: Sleeps. Drops and reacquires the caller-held nfsd_mutex.
+ * Return: 0 after retirement, -EDEADLK if the caller is admitted, or another errno.
+ */
+int nfsd_ffv2_test_unregister(struct nfsd_net *nn, u64 generation_id)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_generation *generation;
+	int error = 0;
+
+	lockdep_assert_held(&nfsd_mutex);
+	if (!nfsd_ffv2_anchor_get(anchor))
+		return -ESHUTDOWN;
+	mutex_lock(&anchor->lock);
+	generation = anchor->active;
+	if (!generation ||
+	    generation->identity->generation != generation_id)
+		generation = anchor->retiring;
+	if (!generation ||
+	    generation->identity->generation != generation_id) {
+		error = -ENOENT;
+		generation = NULL;
+	} else if (nfsd_ffv2_generation_has_task(generation, current)) {
+		error = -EDEADLK;
+		generation = NULL;
+	} else if (generation == anchor->active) {
+		generation = nfsd_ffv2_retire_begin_locked(anchor);
+	} else {
+		refcount_inc(&generation->ref);
+	}
+	mutex_unlock(&anchor->lock);
+	if (error) {
+		nfsd_ffv2_anchor_put(anchor);
+		return error;
+	}
+	mutex_unlock(&nfsd_mutex);
+	nfsd_ffv2_retire_finish(anchor, generation);
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_anchor_put(anchor);
+	return error;
+}
+
+/**
+ * nfsd_ffv2_test_generation_retired - observe a generation tombstone
+ * @generation: generation kept alive by the caller
+ *
+ * Context: Does not sleep.
+ * Return: True after retirement begins.
+ */
+bool
+nfsd_ffv2_test_generation_retired(struct nfsd_ffv2_generation *generation)
+{
+	/* Pair with retirement publication before dereferencing an identity. */
+	return smp_load_acquire(&generation->identity->state) ==
+			NFSD_FFV2_IDENTITY_RETIRED;
+}
+
+/**
+ * nfsd_ffv2_test_admission_retired - observe an admitted generation tombstone
+ * @admission: admission whose completion remains blocked
+ *
+ * Context: Does not sleep.
+ * Return: True after the admitted generation begins retirement.
+ */
+bool
+nfsd_ffv2_test_admission_retired(struct nfsd_ffv2_admission *admission)
+{
+	return nfsd_ffv2_test_generation_retired(admission->generation);
+}
+
+/**
+ * nfsd_ffv2_test_waiters - read retirement wait entries
+ * @admission: admission whose completion remains blocked
+ *
+ * Context: Does not sleep.
+ * Return: Number of retirement callers that observed outstanding admissions.
+ */
+unsigned int nfsd_ffv2_test_waiters(struct nfsd_ffv2_admission *admission)
+{
+	return atomic_read(&admission->generation->test_waiters);
+}
+
+/**
+ * nfsd_ffv2_test_anchor_refcount - read namespace anchor holders
+ * @nn: namespace whose anchor remains allocated
+ *
+ * Context: Does not sleep.
+ * Return: Snapshot of the anchor reference count.
+ */
+unsigned int nfsd_ffv2_test_anchor_refcount(struct nfsd_net *nn)
+{
+	return refcount_read(&nn->ffv2.ref);
+}
+
+/**
+ * nfsd_ffv2_test_anchor_hold - hold an anchor across namespace destruction
+ * @nn: namespace whose anchor remains allocated
+ *
+ * Context: Does not sleep.
+ * Return: True if a reference was acquired; pair success with anchor_release.
+ */
+bool nfsd_ffv2_test_anchor_hold(struct nfsd_net *nn)
+{
+	return nfsd_ffv2_anchor_get(&nn->ffv2);
+}
+
+/**
+ * nfsd_ffv2_test_anchor_release - drop a fixture-owned anchor reference
+ * @nn: namespace pinned by anchor_hold
+ *
+ * Context: Does not sleep.
+ */
+void nfsd_ffv2_test_anchor_release(struct nfsd_net *nn)
+{
+	nfsd_ffv2_anchor_put(&nn->ffv2);
+}
+
+/**
+ * nfsd_ffv2_test_destroy_waiting - observe namespace anchor destruction
+ * @nn: namespace whose destruction has not started
+ * @entered: completion kept alive until destruction returns
+ *
+ * Context: Does not sleep. Arm before the destruction worker starts.
+ */
+void nfsd_ffv2_test_destroy_waiting(struct nfsd_net *nn,
+				    struct completion *entered)
+{
+	WRITE_ONCE(nn->ffv2.test_destroy_waiting, entered);
+}
+
+/**
+ * nfsd_ffv2_test_set_start_failure - arm a test-only service-start failure
+ * @fail: whether the next successful worker adjustment should fail
+ *
+ * Context: does not sleep.
+ */
+void nfsd_ffv2_test_set_start_failure(bool fail)
+{
+	atomic_set(&nfsd_ffv2_start_failure, fail);
+}
+
+/**
+ * nfsd_ffv2_test_start_failure - consume a test-only service-start failure
+ *
+ * Context: does not sleep.
+ * Return: true when the current worker adjustment should report failure.
+ */
+bool nfsd_ffv2_test_start_failure(void)
+{
+	return atomic_xchg(&nfsd_ffv2_start_failure, 0);
+}
+#endif

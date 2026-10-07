@@ -11,6 +11,7 @@ struct net;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
 struct svc_rqst;
+struct svc_xprt;
 struct task_struct;
 
 #ifdef CONFIG_NFSD_FFV2
@@ -32,6 +33,9 @@ struct nfsd_ffv2_anchor {
 	struct completion		released;
 	/* Serializes service state, generation publication, and admission. */
 	struct mutex			lock;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	struct completion		*test_destroy_waiting;
+#endif
 	enum nfsd_ffv2_net_state	net_state;
 	enum nfsd_ffv2_service_state	service_state;
 	u64				next_generation;
@@ -64,6 +68,26 @@ struct nfsd_ffv2_admission {
 int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 		    struct nfsd_ffv2_admission *admission);
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission);
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
+			   void (*release)(void *), u64 *generation);
+int nfsd_ffv2_test_admit(struct nfsd_net *nn,
+			 struct nfsd_ffv2_admission *admission);
+int nfsd_ffv2_test_unregister(struct nfsd_net *nn, u64 generation);
+bool nfsd_ffv2_test_generation_retired(struct nfsd_ffv2_generation *generation);
+bool nfsd_ffv2_test_admission_retired(struct nfsd_ffv2_admission *admission);
+unsigned int nfsd_ffv2_test_waiters(struct nfsd_ffv2_admission *admission);
+unsigned int nfsd_ffv2_test_anchor_refcount(struct nfsd_net *nn);
+bool nfsd_ffv2_test_anchor_hold(struct nfsd_net *nn);
+void nfsd_ffv2_test_anchor_release(struct nfsd_net *nn);
+void nfsd_ffv2_test_destroy_waiting(struct nfsd_net *nn,
+				    struct completion *entered);
+void nfsd_ffv2_test_worker(struct svc_rqst *rqstp, struct svc_xprt *xprt);
+void nfsd_ffv2_test_set_start_failure(bool fail);
+bool nfsd_ffv2_test_start_failure(void);
+
+#endif
 
 #else
 static inline void nfsd_ffv2_net_init(struct nfsd_net *nn) { }
