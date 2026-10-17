@@ -14,6 +14,7 @@
 #include "ffv2.h"
 #include "nfsd.h"
 #include "netns.h"
+#include "netlink.h"
 
 struct nfsd_ffv2_unregister_ctx {
 	struct nfsd_net	*nn;
@@ -725,6 +726,36 @@ fail:
 	KUNIT_FAIL(test, "failed to establish retirement race: %d", error);
 }
 
+static int nfsd_ffv2_threads_set(struct net *net)
+{
+	struct nlattr *attrs[NFSD_A_SERVER_MAX + 1] = {};
+	struct genl_info info = { .attrs = attrs };
+	struct sk_buff *skb;
+	void *hdr;
+	int ret;
+
+	skb = genlmsg_new(nla_total_size(sizeof(u32)), GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	hdr = genlmsg_put(skb, 0, 1, &nfsd_nl_family, 0,
+			  NFSD_CMD_THREADS_SET);
+	if (!hdr || nla_put_u32(skb, NFSD_A_SERVER_THREADS, 1)) {
+		ret = -EMSGSIZE;
+		goto out_free;
+	}
+	genlmsg_end(skb, hdr);
+	info.nlhdr = nlmsg_hdr(skb);
+	info.genlhdr = nlmsg_data(info.nlhdr);
+	attrs[NFSD_A_SERVER_THREADS] = nla_find(genlmsg_data(info.genlhdr),
+						genlmsg_len(info.genlhdr),
+						NFSD_A_SERVER_THREADS);
+	genl_info_net_set(&info, net);
+	ret = nfsd_nl_threads_set_doit(skb, &info);
+out_free:
+	nlmsg_free(skb);
+	return ret;
+}
+
 static void nfsd_ffv2_service_integration_test(struct kunit *test)
 {
 	struct nfsd_ffv2_worker_ctx worker = {};
@@ -819,6 +850,7 @@ static void nfsd_ffv2_service_integration_test(struct kunit *test)
 			nfsd_svc(1, &threads, net, current_cred(), NULL),
 			-EAGAIN);
 	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_threads_set(net), -EAGAIN);
 
 	complete(&release.proceed);
 	timeout = wait_for_completion_timeout(&shutdown.done, HZ);
