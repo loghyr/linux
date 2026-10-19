@@ -10,6 +10,9 @@
 struct net;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
+struct path;
+struct nfsd_ffv2_reservation;
+struct svc_fh;
 struct svc_rqst;
 struct svc_xprt;
 struct task_struct;
@@ -44,6 +47,12 @@ struct nfsd_ffv2_anchor {
 };
 
 struct nfsd_ffv2_participant {
+	/* Registry membership and reservations use nfsd_ffv2_registry_lock. */
+	struct list_head node;
+	struct list_head reservations;
+	refcount_t ref;
+	struct completion released;
+	struct net *net;
 	/* Admission count and epoch serialize with stop and namespace exit. */
 	spinlock_t		update_lock;
 	wait_queue_head_t		update_wait;
@@ -58,6 +67,7 @@ struct nfsd_ffv2_participant {
 	unsigned int		inventory_count;
 	bool			attached;
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	atomic_t		test_reservation_alloc_failure;
 	struct completion	*test_update_validated;
 	struct completion	*test_update_continue;
 	struct completion	*test_inventory_wait_entered;
@@ -77,10 +87,11 @@ struct nfsd_ffv2_export_update {
 	struct nfsd_ffv2_participant *participant;
 	u64				epoch;
 	bool				admitted;
+	bool				policy_locked;
 };
 
 struct svc_export;
-int nfsd_ffv2_participant_register(struct nfsd_net *nn);
+int nfsd_ffv2_participant_register(struct nfsd_net *nn, struct net *net);
 void nfsd_ffv2_participant_detach_begin(struct nfsd_net *nn);
 void nfsd_ffv2_participant_detach_finish(struct nfsd_net *nn);
 int nfsd_ffv2_export_update_begin(struct svc_export *exp,
@@ -90,6 +101,21 @@ void nfsd_ffv2_export_update_end(struct svc_export *exp,
 				 struct nfsd_ffv2_export_update *update);
 void nfsd_ffv2_export_update_abort(struct nfsd_ffv2_export_update *update);
 void nfsd_ffv2_export_release(struct svc_export *exp);
+
+int nfsd_ffv2_reservation_claim(struct nfsd_net *owner, const struct path *root,
+				const u8 store_uuid[16], const u8 export_uuid[16],
+				const u8 binding_token[32],
+				struct nfsd_ffv2_reservation **result);
+int nfsd_ffv2_reservation_claim_expected(struct nfsd_net *owner,
+					 const struct path *root,
+					 const u8 store_uuid[16],
+					 const u8 binding_token[32],
+					 struct svc_export *expected,
+					 struct nfsd_ffv2_reservation **result);
+int nfsd_ffv2_reservation_gate_io(struct nfsd_ffv2_reservation *reservation);
+void nfsd_ffv2_reservation_abort(struct nfsd_ffv2_reservation *reservation);
+void nfsd_ffv2_reservation_fence(struct nfsd_ffv2_reservation *reservation);
+bool nfsd4_ffv2_mount_crossing_allowed(const struct path *path);
 
 void nfsd_ffv2_net_init(struct nfsd_net *nn);
 void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn);
@@ -118,6 +144,20 @@ int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission);
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_test_fail_reservation_alloc(struct nfsd_net *nn);
+bool nfsd_ffv2_test_reservation_waiting(struct nfsd_ffv2_reservation *reservation);
+int nfsd_ffv2_test_reservation_claim(struct nfsd_net *owner,
+				     const struct path *root,
+				     const u8 store_uuid[16],
+				     const u8 binding_token[32],
+				     struct nfsd_ffv2_reservation **result);
+int nfsd_ffv2_test_reservation_claim_expected(struct nfsd_net *owner,
+					      const struct path *root,
+					      const u8 store_uuid[16],
+					      const u8 binding_token[32],
+					      struct svc_export *expected,
+					      struct nfsd_ffv2_reservation **result);
+
 int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
 			   void (*release)(void *), u64 *generation);
 int nfsd_ffv2_test_admit(struct nfsd_net *nn,
