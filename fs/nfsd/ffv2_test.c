@@ -2,12 +2,16 @@
 #include <kunit/test.h>
 #include <linux/completion.h>
 #include <linux/cred.h>
+#include <linux/lockd/bind.h>
+#include <linux/mount.h>
 #include <linux/fs_struct.h>
+#include <linux/file.h>
 #include <linux/iopoll.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
+#include <linux/shmem_fs.h>
 #include <linux/sunrpc/svcsock.h>
 #include <linux/sunrpc/svcauth.h>
 #include <linux/sunrpc/svc_xprt.h>
@@ -19,6 +23,8 @@
 #include "netns.h"
 #include "netlink.h"
 #include "nfsfh.h"
+#include "filecache.h"
+#include "vfs.h"
 
 struct nfsd_ffv2_unregister_ctx {
 	struct nfsd_net	*nn;
@@ -1887,7 +1893,227 @@ out_net:
 	net_ns_barrier();
 }
 
+struct nfsd_ffv2_file_wait_ctx {
+	struct nfsd_file_ffv2_gate *gate;
+	int result;
+	struct completion done;
+};
+
+static int nfsd_ffv2_file_wait_thread(void *data)
+{
+	struct nfsd_ffv2_file_wait_ctx *ctx = data;
+
+	allow_signal(SIGUSR1);
+	ctx->result = nfsd_file_ffv2_gate_wait(ctx->gate);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_nlm_open_refusal_test(struct kunit *test)
+{
+	struct nlmsvc_ffv2_gate gate, probe;
+	struct file *files[2], *read_file, *write_file;
+	struct nlm_file *owner;
+	unsigned int mask, i;
+	long baseline[2];
+	int error;
+
+	for (i = 0; i < ARRAY_SIZE(files); i++) {
+		files[i] = shmem_file_setup("nlm-open-refusal", PAGE_SIZE,
+					    mk_vma_flags(VMA_NORESERVE_BIT));
+		if (IS_ERR(files[i])) {
+			KUNIT_FAIL(test, "NLM slot %u open: %ld", i,
+				   PTR_ERR(files[i]));
+			while (i)
+				fput(files[--i]);
+			return;
+		}
+		baseline[i] = file_count(files[i]);
+	}
+
+	for (mask = 1; mask < 4; mask++) {
+		read_file = mask & 1 ? files[0] : NULL;
+		write_file = mask & 2 ? files[1] : NULL;
+		error = nlmsvc_ffv2_gate_begin(&gate, file_inode(files[0])->i_sb);
+		KUNIT_EXPECT_EQ(test, error, 0);
+		if (error)
+			break;
+		owner = nlmsvc_ffv2_test_file_insert(read_file, write_file);
+		KUNIT_EXPECT_PTR_EQ(test, owner, NULL);
+		for (i = 0; i < ARRAY_SIZE(files); i++) {
+			KUNIT_EXPECT_EQ_MSG(test, file_count(files[i]), baseline[i],
+					    "refused slot %u mask %u owns no file", i, mask);
+		}
+		nlmsvc_ffv2_gate_end(&gate);
+		if (owner)
+			nlmsvc_ffv2_test_file_put(owner);
+		/* Recover references retained by a missing refusal close. */
+		for (i = 0; i < ARRAY_SIZE(files); i++)
+			while (file_count(files[i]) > baseline[i])
+				fput(files[i]);
+		error = nlmsvc_ffv2_gate_begin(&probe, file_inode(files[0])->i_sb);
+		KUNIT_EXPECT_EQ_MSG(test, error, 0, "no refused table entry");
+		if (!error)
+			nlmsvc_ffv2_gate_end(&probe);
+
+		owner = nlmsvc_ffv2_test_file_insert(read_file, write_file);
+		KUNIT_EXPECT_NOT_NULL(test, owner);
+		if (!owner)
+			continue;
+		for (i = 0; i < ARRAY_SIZE(files); i++)
+			KUNIT_EXPECT_EQ(test, file_count(files[i]),
+					baseline[i] + !!(mask & (1U << i)));
+		error = nlmsvc_ffv2_gate_begin(&probe, file_inode(files[0])->i_sb);
+		KUNIT_EXPECT_EQ_MSG(test, error, -EBUSY, "successful table entry");
+		if (!error)
+			nlmsvc_ffv2_gate_end(&probe);
+		nlmsvc_ffv2_test_file_put(owner);
+		for (i = 0; i < ARRAY_SIZE(files); i++)
+			KUNIT_EXPECT_EQ_MSG(test, file_count(files[i]), baseline[i],
+					    "released slot %u mask %u", i, mask);
+		error = nlmsvc_ffv2_gate_begin(&probe, file_inode(files[0])->i_sb);
+		KUNIT_EXPECT_EQ(test, error, 0);
+		if (!error)
+			nlmsvc_ffv2_gate_end(&probe);
+	}
+	owner = nlmsvc_ffv2_test_file_insert(NULL, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, owner, NULL);
+	if (owner)
+		nlmsvc_ffv2_test_file_put(owner);
+	for (i = 0; i < ARRAY_SIZE(files); i++) {
+		KUNIT_EXPECT_EQ(test, file_count(files[i]), baseline[i]);
+		fput(files[i]);
+	}
+}
+
+static void nfsd_ffv2_filecache_gate_test(struct kunit *test)
+{
+	struct nfsd_ffv2_file_wait_ctx ctx;
+	struct nfsd_file_ffv2_gate gate, duplicate;
+	struct nlmsvc_ffv2_gate nlm_gate, nlm_duplicate;
+	struct nfsd_file *nf, *blocked;
+	struct task_struct *task;
+	struct nlm_file *nlm_file;
+	struct file *filp;
+	struct path root;
+	bool waiting;
+	int error;
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_file_ffv2_test_cache_start();
+	mutex_unlock(&nfsd_mutex);
+	if (error) {
+		KUNIT_FAIL(test, "filecache startup: %d", error);
+		return;
+	}
+	get_fs_root(current->fs, &root);
+	nf = nfsd_file_ffv2_test_alloc(d_inode(root.dentry), NFSD_MAY_READ, false);
+	if (!nf) {
+		KUNIT_FAIL(test, "persistent file allocation");
+		goto out_root;
+	}
+	error = nfsd_file_ffv2_gate_begin(&gate, d_inode(root.dentry));
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	if (!error)
+		nfsd_file_ffv2_gate_end(&gate);
+	nfsd_file_put(nf);
+	if (error != -EBUSY)
+		goto out_root;
+
+	nf = nfsd_file_ffv2_test_alloc(d_inode(root.dentry),
+				       NFSD_MAY_READ | NFSD_MAY_LOCALIO, false);
+	if (!nf) {
+		KUNIT_FAIL(test, "LOCALIO file allocation");
+		goto out_root;
+	}
+	error = nfsd_file_ffv2_gate_begin(&gate, d_inode(root.dentry));
+	if (error) {
+		KUNIT_FAIL(test, "filecache gate begin: %d", error);
+		nfsd_file_put(nf);
+		goto out_root;
+	}
+	KUNIT_EXPECT_EQ(test, gate.live, 1U);
+	KUNIT_EXPECT_EQ(test, nf->nf_may,
+			(unsigned int)(NFSD_MAY_READ | NFSD_MAY_LOCALIO));
+	error = nfsd_file_ffv2_gate_begin(&duplicate, d_inode(root.dentry));
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	if (!error)
+		nfsd_file_ffv2_gate_end(&duplicate);
+	blocked = nfsd_file_ffv2_test_alloc(d_inode(root.dentry), NFSD_MAY_READ, false);
+	KUNIT_EXPECT_PTR_EQ(test, blocked, NULL);
+	if (blocked)
+		nfsd_file_put(blocked);
+	ctx.gate = &gate;
+	init_completion(&ctx.done);
+	task = kthread_run(nfsd_ffv2_file_wait_thread, &ctx, "ffv2-file-wait");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "filecache wait worker: %ld", PTR_ERR(task));
+		goto out_file;
+	}
+	error = read_poll_timeout(waitqueue_active, waiting, waiting,
+				  1000, 1000000, false, &gate.wait);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx.done));
+	send_sig(SIGUSR1, task, 1);
+	wait_for_completion(&ctx.done);
+	kthread_stop(task);
+	KUNIT_EXPECT_EQ(test, ctx.result, -ERESTARTSYS);
+	KUNIT_EXPECT_EQ(test, gate.live, 1U);
+	blocked = nfsd_file_ffv2_test_alloc(d_inode(root.dentry), NFSD_MAY_READ, false);
+	KUNIT_EXPECT_PTR_EQ(test, blocked, NULL);
+	if (blocked)
+		nfsd_file_put(blocked);
+out_file:
+	nfsd_file_put(nf);
+	if (!list_empty(&gate.list))
+		KUNIT_EXPECT_EQ(test, nfsd_file_ffv2_gate_wait(&gate), 0);
+	KUNIT_EXPECT_EQ(test, gate.live, 0U);
+	nfsd_file_ffv2_gate_end(&gate);
+	blocked = nfsd_file_ffv2_test_alloc(d_inode(root.dentry), NFSD_MAY_READ, false);
+	KUNIT_EXPECT_NOT_NULL(test, blocked);
+	if (blocked)
+		nfsd_file_put(blocked);
+
+	filp = dentry_open(&root, O_RDONLY, current_cred());
+	if (IS_ERR(filp)) {
+		KUNIT_FAIL(test, "NLM file open: %ld", PTR_ERR(filp));
+		goto out_root;
+	}
+	nlm_file = nlmsvc_ffv2_test_file_get(filp);
+	fput(filp);
+	if (!nlm_file) {
+		KUNIT_FAIL(test, "NLM file allocation");
+		goto out_root;
+	}
+	error = nlmsvc_ffv2_gate_begin(&nlm_gate, root.mnt->mnt_sb);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	if (!error)
+		nlmsvc_ffv2_gate_end(&nlm_gate);
+	nlmsvc_ffv2_test_file_put(nlm_file);
+	error = nlmsvc_ffv2_gate_begin(&nlm_gate, root.mnt->mnt_sb);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	if (!error) {
+		error = nlmsvc_ffv2_gate_begin(&nlm_duplicate, root.mnt->mnt_sb);
+		KUNIT_EXPECT_EQ(test, error, -EBUSY);
+		if (!error)
+			nlmsvc_ffv2_gate_end(&nlm_duplicate);
+		nlmsvc_ffv2_gate_end(&nlm_gate);
+		error = nlmsvc_ffv2_gate_begin(&nlm_duplicate, root.mnt->mnt_sb);
+		KUNIT_EXPECT_EQ(test, error, 0);
+		if (!error)
+			nlmsvc_ffv2_gate_end(&nlm_duplicate);
+	}
+out_root:
+	path_put(&root);
+	mutex_lock(&nfsd_mutex);
+	nfsd_file_cache_shutdown();
+	mutex_unlock(&nfsd_mutex);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_filecache_gate_test),
+	KUNIT_CASE(nfsd_ffv2_nlm_open_refusal_test),
 	KUNIT_CASE(nfsd_ffv2_export_access_test),
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),

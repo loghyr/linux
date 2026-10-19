@@ -3,6 +3,21 @@
 
 #include <linux/fsnotify_backend.h>
 
+#ifdef CONFIG_NFSD_FFV2
+/* Membership and live count are protected by nfsd_file_ffv2_lock. */
+struct nfsd_file_ffv2_gate {
+	struct list_head list;
+	struct super_block *sb;
+	wait_queue_head_t wait;
+	unsigned int live;
+};
+
+int nfsd_file_ffv2_gate_begin(struct nfsd_file_ffv2_gate *gate,
+			      struct inode *export_inode);
+int nfsd_file_ffv2_gate_wait(struct nfsd_file_ffv2_gate *gate);
+void nfsd_file_ffv2_gate_end(struct nfsd_file_ffv2_gate *gate);
+#endif
+
 /*
  * Limit the time that the list_lru_one lock is held during
  * an LRU scan.
@@ -49,11 +64,19 @@ struct nfsd_file {
 #define NFSD_FILE_RECENT	(4)
 	unsigned long		nf_flags;
 	refcount_t		nf_ref;
+#ifdef CONFIG_NFSD_FFV2
+	unsigned int		nf_may;
+#else
 	unsigned char		nf_may;
+#endif
 
 	struct nfsd_file_mark	*nf_mark;
 	struct list_head	nf_lru;
 	struct list_head	nf_gc;
+#ifdef CONFIG_NFSD_FFV2
+	struct list_head	nf_ffv2_live;
+	struct super_block	*nf_sb;
+#endif
 	struct rcu_head		nf_rcu;
 	ktime_t			nf_birthtime;
 
@@ -89,4 +112,9 @@ __be32 nfsd_file_acquire_dir(struct svc_rqst *rqstp, struct svc_fh *fhp,
 		  struct nfsd_file **pnf);
 int nfsd_file_cache_stats_show(struct seq_file *m, void *v);
 void nfsd_fsnotify_recalc_mask(struct nfsd_file *nf);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+int nfsd_file_ffv2_test_cache_start(void);
+struct nfsd_file *nfsd_file_ffv2_test_alloc(struct inode *inode,
+					    unsigned int may, bool want_gc);
+#endif
 #endif /* _FS_NFSD_FILECACHE_H */
