@@ -7,6 +7,7 @@
 #include <linux/refcount.h>
 #include <linux/completion.h>
 
+struct knfsd_fh;
 struct net;
 struct nfsd_net;
 struct nfsd_ffv2_generation;
@@ -18,6 +19,23 @@ struct svc_xprt;
 struct task_struct;
 
 #ifdef CONFIG_NFSD_FFV2
+#define NFSD_FFV2_FH_HEADER_SIZE	56
+#define NFSD_FFV2_FH_INNER_MAX	72
+#define NFSD_FFV2_FH_MAX		128
+
+struct nfsd_ffv2_fh_info {
+	u64		generation;
+	u8		object_uuid[16];
+	u8		export_uuid[16];
+	/* Borrows bytes from the supplied handle. */
+	const u8	*inner;
+	u16		inner_len;
+};
+
+int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info);
+int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
+			const struct nfsd_ffv2_fh_info *info);
+
 enum nfsd_ffv2_net_state {
 	NFSD_FFV2_NET_LIVE,
 	NFSD_FFV2_NET_EXITING,
