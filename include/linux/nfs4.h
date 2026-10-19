@@ -159,6 +159,22 @@ enum nfs_opnum4 {
 	OP_LISTXATTRS              = 74,
 	OP_REMOVEXATTR             = 75,
 
+	/* Flex Files v2 data-server operations */
+	OP_CHUNK_COMMIT		 = 78,
+	OP_CHUNK_ERROR		 = 79,
+	OP_CHUNK_FINALIZE	 = 80,
+	OP_CHUNK_HEADER_READ	 = 81,
+	OP_CHUNK_LOCK		 = 82,
+	OP_CHUNK_READ		 = 83,
+	OP_CHUNK_REPAIRED	 = 84,
+	OP_CHUNK_ROLLBACK	 = 85,
+	OP_CHUNK_UNLOCK		 = 86,
+	OP_CHUNK_WRITE		 = 87,
+	OP_CHUNK_WRITE_REPAIR	 = 88,
+	OP_TRUST_STATEID	 = 89,
+	OP_REVOKE_STATEID	 = 90,
+	OP_BULK_REVOKE_STATEID	 = 91,
+
 	OP_ILLEGAL = 10044,
 };
 
@@ -168,7 +184,7 @@ Needs to be updated if more operations are defined in future.*/
 #define FIRST_NFS4_OP	OP_ACCESS
 #define LAST_NFS40_OP	OP_RELEASE_LOCKOWNER
 #define LAST_NFS41_OP	OP_RECLAIM_COMPLETE
-#define LAST_NFS42_OP	OP_REMOVEXATTR
+#define LAST_NFS42_OP	OP_BULK_REVOKE_STATEID
 #define LAST_NFS4_OP	LAST_NFS42_OP
 
 /* error codes for internal client use */

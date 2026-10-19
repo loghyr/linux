@@ -13,6 +13,7 @@
 #include <linux/unaligned.h>
 
 #include "ffv2.h"
+#include "ffv2_trust.h"
 #include "filecache.h"
 #include "export.h"
 #include "nfsd.h"
@@ -1596,3 +1597,117 @@ bool nfsd_ffv2_test_reservation_waiting(struct nfsd_ffv2_reservation *reservatio
 	return waitqueue_active(&reservation->file_gate.wait);
 }
 #endif
+
+static const struct nfsd_ffv2_op_profile nfsd_ffv2_op_profiles[] = {
+	[OP_CHUNK_READ] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
+		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
+		.profile_bit	= NFSD_FFV2_PROFILE_READ_DATA,
+	},
+	[OP_CHUNK_HEADER_READ] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
+		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
+		.profile_bit	= NFSD_FFV2_PROFILE_READ_METADATA,
+	},
+	[OP_CHUNK_WRITE] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_DATA,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_COMMIT] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_FINALIZE] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_ROLLBACK] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_WRITE_LIFECYCLE,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_WRITE_REPAIR] = {
+		.callers	= NFSD_FFV2_CALLERS(REPAIR_ACTOR),
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_REPAIR_WRITE,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_REPAIRED] = {
+		.callers	= NFSD_FFV2_CALLERS(REPAIR_ACTOR),
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_REPORT_REPAIRED,
+		.writer_identity = true,
+	},
+	[OP_CHUNK_LOCK] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT) |
+				  NFSD_FFV2_CALLERS(REPAIR_ACTOR),
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_LOCK_CONTROL,
+	},
+	[OP_CHUNK_UNLOCK] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT) |
+				  NFSD_FFV2_CALLERS(REPAIR_ACTOR),
+		.iomode		= NFSD_FFV2_IOMODE_RW_ONLY,
+		.profile_bit	= NFSD_FFV2_PROFILE_LOCK_CONTROL,
+	},
+	[OP_CHUNK_ERROR] = {
+		.callers	= NFSD_FFV2_CALLERS(DATA_CLIENT),
+		.iomode		= NFSD_FFV2_IOMODE_READ_OR_RW,
+		.profile_bit	= NFSD_FFV2_PROFILE_REPORT_ERROR,
+	},
+	[OP_TRUST_STATEID] = {
+		.callers	= NFSD_FFV2_CALLERS(MDS_CONTROL),
+		.iomode		= NFSD_FFV2_IOMODE_ANY,
+	},
+	[OP_REVOKE_STATEID] = {
+		.callers	= NFSD_FFV2_CALLERS(MDS_CONTROL),
+		.iomode		= NFSD_FFV2_IOMODE_ANY,
+	},
+	[OP_BULK_REVOKE_STATEID] = {
+		.callers	= NFSD_FFV2_CALLERS(MDS_CONTROL),
+		.iomode		= NFSD_FFV2_IOMODE_ANY,
+		/* Takes only a clientid4; it names no file. */
+		.no_filehandle	= true,
+	},
+};
+
+/**
+ * nfsd_ffv2_op_profile - describe one operation's authorization requirements
+ * @opnum: NFSv4 operation number
+ *
+ * Returns the operation's profile, or NULL when the operation has none and
+ * therefore cannot be authorized.
+ */
+const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum)
+{
+	const struct nfsd_ffv2_op_profile *profile;
+
+	if (opnum >= ARRAY_SIZE(nfsd_ffv2_op_profiles))
+		return NULL;
+	profile = &nfsd_ffv2_op_profiles[opnum];
+	if (!profile->callers)
+		return NULL;
+	return profile;
+}
+
+/**
+ * nfsd_ffv2_op_no_filehandle - does this operation name no file?
+ * @opnum: NFSv4 operation number
+ *
+ * Returns true for a control operation whose arguments contain no
+ * filehandle, such as BULK_REVOKE_STATEID.
+ */
+bool nfsd_ffv2_op_no_filehandle(u32 opnum)
+{
+	const struct nfsd_ffv2_op_profile *profile;
+
+	profile = nfsd_ffv2_op_profile(opnum);
+	return profile && profile->no_filehandle;
+}

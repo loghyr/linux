@@ -44,6 +44,10 @@
 #include <linux/xattr.h>
 #include <linux/vmalloc.h>
 #include <linux/nfsacl.h>
+#include <crypto/sha2.h>
+#ifdef CONFIG_NFSD_FFV2
+#include "ffv2_trust.h"
+#endif
 
 #include <uapi/linux/xattr.h>
 
@@ -68,6 +72,51 @@
 
 
 #define NFSDDBG_FACILITY		NFSDDBG_XDR
+
+#ifdef CONFIG_NFSD_FFV2
+static const u8 nfsd4_ffv2_compound_domain[] =
+	"NFSD-FFV2-COMPOUND-V1";
+
+int nfsd4_ffv2_compound_digest(const struct xdr_buf *buf, unsigned int offset,
+			       size_t len,
+			       u8 digest[NFSD4_FFV2_DIGEST_SIZE])
+{
+	struct sha256_ctx ctx;
+	u8 block[256];
+
+	sha256_init(&ctx);
+	sha256_update(&ctx, nfsd4_ffv2_compound_domain,
+		      sizeof(nfsd4_ffv2_compound_domain) - 1);
+	while (len) {
+		unsigned int count = min_t(unsigned int, len, sizeof(block));
+
+		if (read_bytes_from_xdr_buf(buf, offset, block, count)) {
+			memzero_explicit(block, sizeof(block));
+			return -EBADMSG;
+		}
+		sha256_update(&ctx, block, count);
+		offset += count;
+		len -= count;
+	}
+	sha256_final(&ctx, digest);
+	memzero_explicit(block, sizeof(block));
+	return 0;
+}
+
+static int nfsd4_ffv2_digest_request(struct nfsd4_compoundargs *argp,
+				     unsigned int offset, size_t len)
+{
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (argp->ffv2_digest_test) {
+		argp->ffv2_digest_test->calls++;
+		if (argp->ffv2_digest_test->fail)
+			return -EBADMSG;
+	}
+#endif
+	return nfsd4_ffv2_compound_digest(argp->xdr->buf, offset, len,
+					  argp->ffv2_digest);
+}
+#endif
 
 const u32 nfsd_suppattrs[3][3] = {
 	{NFSD4_SUPPORTED_ATTRS_WORD0,
@@ -2511,6 +2560,352 @@ nfsd4_decode_removexattr(struct nfsd4_compoundargs *argp,
 	return nfsd4_decode_xattr_name(argp, &removexattr->rmxa_name);
 }
 
+#ifdef CONFIG_NFSD_FFV2
+#define NFSD4_FFV2_MAX_ITEMS	4096U
+#define NFSD4_FFV2_MAX_PAYLOAD	(4U * 1024U * 1024U)
+#define NFSD4_FFV2_MAX_HEADER_READ 1024U
+#define NFSD4_FFV2_LOCK_ADOPT	BIT(0)
+#define NFSD4_FFV2_LOCK_TAKEOVER	BIT(1)
+#define NFSD4_FFV2_WRITE_ACTIVATE_IF_EMPTY BIT(0)
+
+static __be32
+nfsd4_decode_ffv2_range(struct nfsd4_compoundargs *argp,
+			struct nfsd4_ffv2 *ffv2)
+{
+	__be32 status;
+
+	memset(ffv2, 0, sizeof(*ffv2));
+	status = nfsd4_decode_stateid4(argp, &ffv2->stateid);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u64(argp->xdr, &ffv2->offset) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->count) < 0)
+		return nfserr_bad_xdr;
+	if (ffv2->count > NFSD4_FFV2_MAX_ITEMS)
+		return nfserr_inval;
+	return nfs_ok;
+}
+
+/*
+ * chunk_cohort_id4 is a 64-bit writer-chosen identifier followed by the
+ * writer's 32-bit client id.  Both the write operations and chunk_owner4
+ * begin with this pair.
+ */
+static __be32 nfsd4_decode_ffv2_writer(struct nfsd4_compoundargs *argp,
+				       struct nfsd4_ffv2 *ffv2)
+{
+	if (xdr_stream_decode_u64(argp->xdr, &ffv2->owner_cohort_id) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_client_id) < 0)
+		return nfserr_bad_xdr;
+	ffv2->owner_present = true;
+	return nfs_ok;
+}
+
+static __be32 nfsd4_decode_ffv2_owner(struct nfsd4_compoundargs *argp,
+				      struct nfsd4_ffv2 *ffv2)
+{
+	__be32 status;
+
+	status = nfsd4_decode_ffv2_writer(argp, ffv2);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_id) < 0)
+		return nfserr_bad_xdr;
+	return nfs_ok;
+}
+
+/* The supported lifecycle profile retains exactly one chunk_owner4. */
+static __be32
+nfsd4_decode_ffv2_owners(struct nfsd4_compoundargs *argp,
+			 struct nfsd4_ffv2 *ffv2)
+{
+	u32 count;
+
+	if (xdr_stream_decode_u32(argp->xdr, &count) < 0)
+		return nfserr_bad_xdr;
+	if (count != 1)
+		return count > NFSD4_FFV2_MAX_ITEMS ? nfserr_inval :
+						       nfserr_notsupp;
+	return nfsd4_decode_ffv2_owner(argp, ffv2);
+}
+
+static __be32 nfsd4_decode_ffv2_opaque(struct nfsd4_compoundargs *argp,
+				       u32 len)
+{
+	unsigned int offset = xdr_stream_pos(argp->xdr);
+	u8 padding[XDR_UNIT - 1];
+	u32 pad = -len & (XDR_UNIT - 1);
+
+	if (!xdr_inline_decode(argp->xdr, len))
+		return nfserr_bad_xdr;
+	if (pad &&
+	    (read_bytes_from_xdr_buf(argp->xdr->buf, offset + len,
+				     padding, pad) ||
+	     memchr_inv(padding, 0, pad)))
+		return nfserr_bad_xdr;
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_decode_ffv2_ignored_string(struct nfsd4_compoundargs *argp, u32 maxlen)
+{
+	u32 len;
+
+	if (xdr_stream_decode_u32(argp->xdr, &len) < 0)
+		return nfserr_bad_xdr;
+	if (len > maxlen)
+		return nfserr_bad_xdr;
+	return nfsd4_decode_ffv2_opaque(argp, len);
+}
+
+static __be32
+nfsd4_decode_ffv2_lifecycle(struct nfsd4_compoundargs *argp,
+			    union nfsd4_op_u *u)
+{
+	__be32 status;
+
+	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
+	if (status)
+		return status;
+	return nfsd4_decode_ffv2_owners(argp, &u->ffv2);
+}
+
+static __be32
+nfsd4_decode_chunk_error(struct nfsd4_compoundargs *argp,
+			 union nfsd4_op_u *u)
+{
+	__be32 status;
+
+	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
+	if (status)
+		return status;
+	if (!xdr_inline_decode(argp->xdr, XDR_UNIT))
+		return nfserr_bad_xdr;
+	return nfsd4_decode_ffv2_owner(argp, &u->ffv2);
+}
+
+static __be32
+nfsd4_decode_chunk_read(struct nfsd4_compoundargs *argp,
+			union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_read *read = &u->chunk_read;
+	__be32 status;
+
+	memset(read, 0, sizeof(*read));
+	status = nfsd4_decode_stateid4(argp, &read->cra_stateid);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u64(argp->xdr, &read->cra_offset) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &read->cra_count) < 0)
+		return nfserr_bad_xdr;
+	if (read->cra_count > NFSD4_FFV2_MAX_ITEMS)
+		return nfserr_inval;
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_decode_chunk_header_read(struct nfsd4_compoundargs *argp,
+			       union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_header_read *read = &u->chunk_header_read;
+	__be32 status;
+
+	memset(read, 0, sizeof(*read));
+	status = nfsd4_decode_stateid4(argp, &read->chra_stateid);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u64(argp->xdr, &read->chra_offset) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &read->chra_count) < 0)
+		return nfserr_bad_xdr;
+	if (read->chra_count > NFSD4_FFV2_MAX_HEADER_READ)
+		return nfserr_inval;
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_decode_chunk_lock(struct nfsd4_compoundargs *argp,
+			union nfsd4_op_u *u)
+{
+	u32 adopt, flags;
+	__be32 status;
+
+	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u32(argp->xdr, &flags) < 0)
+		return nfserr_bad_xdr;
+	if (flags & ~(NFSD4_FFV2_LOCK_ADOPT | NFSD4_FFV2_LOCK_TAKEOVER) ||
+	    flags == (NFSD4_FFV2_LOCK_ADOPT | NFSD4_FFV2_LOCK_TAKEOVER))
+		return nfserr_inval;
+	status = nfsd4_decode_ffv2_owner(argp, &u->ffv2);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u32(argp->xdr, &adopt) < 0 || adopt > 1)
+		return nfserr_bad_xdr;
+	if (!!(flags & NFSD4_FFV2_LOCK_ADOPT) != adopt)
+		return nfserr_inval;
+	if (adopt && !xdr_inline_decode(argp->xdr, 4 * XDR_UNIT))
+		return nfserr_bad_xdr;
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_decode_ffv2_owner_op(struct nfsd4_compoundargs *argp,
+			   union nfsd4_op_u *u)
+{
+	__be32 status;
+
+	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
+	if (status)
+		return status;
+	return nfsd4_decode_ffv2_owner(argp, &u->ffv2);
+}
+
+static __be32
+nfsd4_decode_chunk_write_common(struct nfsd4_compoundargs *argp,
+				union nfsd4_op_u *u, bool repair)
+{
+	struct nfsd4_ffv2 *ffv2 = &u->ffv2;
+	unsigned int checksum_offset;
+	u8 padding[XDR_UNIT - 1];
+	u32 check, count, pad;
+	__be32 status;
+
+	memset(&u->ffv2, 0, sizeof(u->ffv2));
+	status = nfsd4_decode_stateid4(argp, &u->ffv2.stateid);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u64(argp->xdr, &u->ffv2.offset) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->stable_how) < 0)
+		return nfserr_bad_xdr;
+	if (ffv2->stable_how > NFS_FILE_SYNC)
+		return nfserr_bad_xdr;
+	status = nfsd4_decode_ffv2_writer(argp, &u->ffv2);
+	if (status)
+		return status;
+	if (xdr_stream_decode_u32(argp->xdr, &count) < 0)
+		return nfserr_bad_xdr;
+	if (count != 1)
+		return count > NFSD4_FFV2_MAX_ITEMS ? nfserr_inval :
+						       nfserr_notsupp;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->owner_id) < 0 ||
+	    xdr_stream_decode_u32(argp->xdr, &ffv2->payload_id) < 0)
+		return nfserr_bad_xdr;
+	if (!repair) {
+		if (xdr_stream_decode_u32(argp->xdr, &ffv2->flags) < 0)
+			return nfserr_bad_xdr;
+		if (ffv2->flags & ~NFSD4_FFV2_WRITE_ACTIVATE_IF_EMPTY)
+			return nfserr_inval;
+		if (xdr_stream_decode_u32(argp->xdr, &check) < 0 || check > 1)
+			return nfserr_bad_xdr;
+		ffv2->guard_check = check;
+		if (check) {
+			if (xdr_stream_decode_u32(argp->xdr,
+						  &ffv2->guard_generation) < 0 ||
+			    xdr_stream_decode_u32(argp->xdr,
+						  &ffv2->guard_writer) < 0)
+				return nfserr_bad_xdr;
+			ffv2->guard_never_written = !ffv2->guard_generation &&
+						     !ffv2->guard_writer;
+		}
+	}
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->chunk_size) < 0 ||
+	    xdr_stream_decode_u32(argp->xdr, &count) < 0)
+		return nfserr_bad_xdr;
+	if (count != 1)
+		return count > NFSD4_FFV2_MAX_ITEMS ? nfserr_inval :
+						       nfserr_notsupp;
+	if (xdr_stream_decode_u32(argp->xdr,
+				  &ffv2->checksum_algorithm) < 0 ||
+	    xdr_stream_decode_u32(argp->xdr, &ffv2->checksum_len) < 0)
+		return nfserr_bad_xdr;
+	if (ffv2->checksum_len > sizeof(ffv2->checksum))
+		return nfserr_bad_xdr;
+	checksum_offset = xdr_stream_pos(argp->xdr);
+	if (!xdr_inline_decode(argp->xdr, ffv2->checksum_len) ||
+	    read_bytes_from_xdr_buf(argp->xdr->buf, checksum_offset,
+				    ffv2->checksum, ffv2->checksum_len))
+		return nfserr_bad_xdr;
+	pad = -ffv2->checksum_len & (XDR_UNIT - 1);
+	if (pad &&
+	    (read_bytes_from_xdr_buf(argp->xdr->buf,
+				     checksum_offset + ffv2->checksum_len,
+				     padding, pad) || memchr_inv(padding, 0, pad)))
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr, &ffv2->payload_len) < 0)
+		return nfserr_bad_xdr;
+	if (ffv2->payload_len > NFSD4_FFV2_MAX_PAYLOAD)
+		return nfserr_inval;
+	if (!xdr_stream_subsegment(argp->xdr, &ffv2->payload,
+				   ffv2->payload_len))
+		return nfserr_bad_xdr;
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_decode_chunk_write(struct nfsd4_compoundargs *argp,
+			 union nfsd4_op_u *u)
+{
+	return nfsd4_decode_chunk_write_common(argp, u, false);
+}
+
+static __be32
+nfsd4_decode_chunk_write_repair(struct nfsd4_compoundargs *argp,
+				union nfsd4_op_u *u)
+{
+	return nfsd4_decode_chunk_write_common(argp, u, true);
+}
+
+static __be32
+nfsd4_decode_trust_stateid(struct nfsd4_compoundargs *argp,
+			   union nfsd4_op_u *u)
+{
+	struct timespec64 expires;
+	__be32 status;
+
+	memset(&u->ffv2, 0, sizeof(u->ffv2));
+	status = nfsd4_decode_stateid4(argp, &u->ffv2.stateid);
+	if (status)
+		return status;
+	/* clientid4, FFv2 client ID, and layoutiomode4 */
+	if (!xdr_inline_decode(argp->xdr, 4 * XDR_UNIT))
+		return nfserr_bad_xdr;
+	status = nfsd4_decode_nfstime4(argp, &expires);
+	if (status)
+		return status;
+	return nfsd4_decode_ffv2_ignored_string(argp, NFS4_OPAQUE_LIMIT);
+}
+
+static __be32
+nfsd4_decode_revoke_stateid(struct nfsd4_compoundargs *argp,
+			    union nfsd4_op_u *u)
+{
+	memset(&u->ffv2, 0, sizeof(u->ffv2));
+	return nfsd4_decode_stateid4(argp, &u->ffv2.stateid);
+}
+
+static __be32
+nfsd4_decode_bulk_revoke_stateid(struct nfsd4_compoundargs *argp,
+				 union nfsd4_op_u *u)
+{
+	memset(&u->ffv2, 0, sizeof(u->ffv2));
+	/* BULK_REVOKE_STATEID4args is a single clientid4 and names no file. */
+	if (xdr_stream_decode_u32(argp->xdr,
+				  &u->ffv2.target_clientid.cl_boot) < 0)
+		return nfserr_bad_xdr;
+	if (xdr_stream_decode_u32(argp->xdr,
+				  &u->ffv2.target_clientid.cl_id) < 0)
+		return nfserr_bad_xdr;
+	u->ffv2.target_present = true;
+	return nfs_ok;
+}
+#endif
+
 static __be32
 nfsd4_decode_noop(struct nfsd4_compoundargs *argp, union nfsd4_op_u *p)
 {
@@ -2525,7 +2920,7 @@ nfsd4_decode_notsupp(struct nfsd4_compoundargs *argp, union nfsd4_op_u *p)
 
 typedef __be32(*nfsd4_dec)(struct nfsd4_compoundargs *argp, union nfsd4_op_u *u);
 
-static const nfsd4_dec nfsd4_dec_ops[] = {
+static const nfsd4_dec nfsd4_dec_ops[LAST_NFS4_OP + 1] = {
 	[OP_ACCESS]		= nfsd4_decode_access,
 	[OP_CLOSE]		= nfsd4_decode_close,
 	[OP_COMMIT]		= nfsd4_decode_commit,
@@ -2612,6 +3007,24 @@ static const nfsd4_dec nfsd4_dec_ops[] = {
 	[OP_SETXATTR]		= nfsd4_decode_setxattr,
 	[OP_LISTXATTRS]		= nfsd4_decode_listxattrs,
 	[OP_REMOVEXATTR]	= nfsd4_decode_removexattr,
+
+#ifdef CONFIG_NFSD_FFV2
+	/* Flex Files v2 data-server operations */
+	[OP_CHUNK_COMMIT]	= nfsd4_decode_ffv2_lifecycle,
+	[OP_CHUNK_ERROR]	= nfsd4_decode_chunk_error,
+	[OP_CHUNK_FINALIZE]	= nfsd4_decode_ffv2_lifecycle,
+	[OP_CHUNK_HEADER_READ]	= nfsd4_decode_chunk_header_read,
+	[OP_CHUNK_LOCK]		= nfsd4_decode_chunk_lock,
+	[OP_CHUNK_READ]		= nfsd4_decode_chunk_read,
+	[OP_CHUNK_REPAIRED]	= nfsd4_decode_ffv2_owner_op,
+	[OP_CHUNK_ROLLBACK]	= nfsd4_decode_ffv2_lifecycle,
+	[OP_CHUNK_UNLOCK]	= nfsd4_decode_ffv2_owner_op,
+	[OP_CHUNK_WRITE]	= nfsd4_decode_chunk_write,
+	[OP_CHUNK_WRITE_REPAIR] = nfsd4_decode_chunk_write_repair,
+	[OP_TRUST_STATEID]	= nfsd4_decode_trust_stateid,
+	[OP_REVOKE_STATEID]	= nfsd4_decode_revoke_stateid,
+	[OP_BULK_REVOKE_STATEID] = nfsd4_decode_bulk_revoke_stateid,
+#endif
 };
 
 static inline bool
@@ -2623,10 +3036,39 @@ nfsd4_opnum_in_range(struct nfsd4_compoundargs *argp, struct nfsd4_op *op)
 		return false;
 	else if (argp->minorversion == 1 && op->opnum > LAST_NFS41_OP)
 		return false;
-	else if (argp->minorversion == 2 && op->opnum > LAST_NFS42_OP)
-		return false;
+	else if (argp->minorversion == 2) {
+		if (op->opnum > LAST_NFS42_OP)
+			return false;
+		if (!IS_ENABLED(CONFIG_NFSD_FFV2) &&
+		    op->opnum >= OP_CHUNK_COMMIT)
+			return false;
+		if (op->opnum > OP_REMOVEXATTR && op->opnum < OP_CHUNK_COMMIT)
+			return false;
+	}
 	return true;
 }
+
+#ifdef CONFIG_NFSD_FFV2
+static bool nfsd4_opnum_is_ffv2(u32 opnum)
+{
+	return nfsd_ffv2_op_profile(opnum);
+}
+
+static void nfsd4_ffv2_record_decode_error(struct nfsd4_compoundargs *argp,
+					   __be32 status)
+{
+	if (!argp->ffv2_present)
+		return;
+	if (status == nfserr_bad_xdr) {
+		argp->ffv2_decode_class = NFSD4_FFV2_DECODE_BADXDR;
+	} else if (status == nfserr_op_illegal || status == nfserr_notsupp) {
+		argp->ffv2_decode_class = NFSD4_FFV2_DECODE_NOTSUPP;
+	} else {
+		argp->ffv2_decode_class = NFSD4_FFV2_DECODE_ERROR;
+		argp->ffv2_decode_status = status;
+	}
+}
+#endif
 
 static bool
 nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
@@ -2638,8 +3080,18 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 	int max_reply = auth_slack + 8; /* opcnt, status */
 	int readcount = 0;
 	int readbytes = 0;
+#ifdef CONFIG_NFSD_FFV2
+	bool decode_complete = true;
+	unsigned int transcript_offset;
+	size_t transcript_len;
+#endif
 	__be32 *p;
 	int i;
+
+#ifdef CONFIG_NFSD_FFV2
+	transcript_offset = xdr_stream_pos(argp->xdr);
+	transcript_len = xdr_stream_remaining(argp->xdr);
+#endif
 
 	if (xdr_stream_decode_u32(argp->xdr, &argp->taglen) < 0)
 		return false;
@@ -2663,6 +3115,10 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 		return false;
 	argp->opcnt = min_t(u32, argp->client_opcnt,
 			    NFSD_MAX_OPS_PER_COMPOUND);
+#ifdef CONFIG_NFSD_FFV2
+	if (argp->opcnt != argp->client_opcnt)
+		decode_complete = false;
+#endif
 
 	if (argp->opcnt > ARRAY_SIZE(argp->iops)) {
 		argp->ops = vcalloc(argp->opcnt, sizeof(*argp->ops));
@@ -2672,8 +3128,12 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 		}
 	}
 
-	if (argp->minorversion > NFSD_SUPPORTED_MINOR_VERSION)
+	if (argp->minorversion > NFSD_SUPPORTED_MINOR_VERSION) {
 		argp->opcnt = 0;
+#ifdef CONFIG_NFSD_FFV2
+		decode_complete = false;
+#endif
+	}
 
 	for (i = 0; i < argp->opcnt; i++) {
 		op = &argp->ops[i];
@@ -2682,6 +3142,10 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 
 		if (xdr_stream_decode_u32(argp->xdr, &op->opnum) < 0)
 			return false;
+#ifdef CONFIG_NFSD_FFV2
+		if (nfsd4_opnum_is_ffv2(op->opnum))
+			argp->ffv2_present = true;
+#endif
 		if (nfsd4_opnum_in_range(argp, op)) {
 			op->opdesc = OPDESC(op);
 			op->status = nfsd4_dec_ops[op->opnum](argp, &op->u);
@@ -2716,10 +3180,27 @@ nfsd4_decode_compound(struct nfsd4_compoundargs *argp)
 			max_reply += NFS4_OPAQUE_LIMIT;
 
 		if (op->status) {
+#ifdef CONFIG_NFSD_FFV2
+			nfsd4_ffv2_record_decode_error(argp, op->status);
+			decode_complete = false;
+#endif
 			argp->opcnt = i+1;
 			break;
 		}
 	}
+#ifdef CONFIG_NFSD_FFV2
+	if (argp->ffv2_present && decode_complete) {
+		if (xdr_stream_remaining(argp->xdr))
+			return false;
+		if (nfsd4_ffv2_digest_request(argp, transcript_offset,
+					      transcript_len))
+			return false;
+		argp->ffv2_digest_valid = true;
+	}
+	if (argp->ffv2_present && !argp->ffv2_digest_valid &&
+	    argp->ffv2_decode_class == NFSD4_FFV2_DECODE_NONE)
+		argp->ffv2_decode_class = NFSD4_FFV2_DECODE_NOTSUPP;
+#endif
 	/* Sessions make the DRC unnecessary: */
 	if (argp->minorversion)
 		cachethis = false;
@@ -6579,6 +7060,23 @@ static const nfsd4_enc nfsd4_enc_ops[] = {
 	[OP_SETXATTR]		= nfsd4_encode_setxattr,
 	[OP_LISTXATTRS]		= nfsd4_encode_listxattrs,
 	[OP_REMOVEXATTR]	= nfsd4_encode_removexattr,
+#ifdef CONFIG_NFSD_FFV2
+	[OP_CHUNK_COMMIT] = nfsd4_encode_noop,
+	[OP_CHUNK_ERROR] = nfsd4_encode_noop,
+	[OP_CHUNK_FINALIZE] = nfsd4_encode_noop,
+	[OP_CHUNK_HEADER_READ] = nfsd4_encode_noop,
+	[OP_CHUNK_LOCK] = nfsd4_encode_noop,
+	[OP_CHUNK_READ] = nfsd4_encode_noop,
+	[OP_CHUNK_REPAIRED] = nfsd4_encode_noop,
+	[OP_CHUNK_ROLLBACK] = nfsd4_encode_noop,
+	[OP_CHUNK_UNLOCK] = nfsd4_encode_noop,
+	[OP_CHUNK_WRITE] = nfsd4_encode_noop,
+	[OP_CHUNK_WRITE_REPAIR] = nfsd4_encode_noop,
+	[OP_TRUST_STATEID] = nfsd4_encode_noop,
+	[OP_REVOKE_STATEID] = nfsd4_encode_noop,
+	[OP_BULK_REVOKE_STATEID] = nfsd4_encode_noop,
+#endif
+
 };
 
 /*
@@ -6756,6 +7254,65 @@ void nfsd4_release_compoundargs(struct svc_rqst *rqstp)
 	}
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/**
+ * nfsd4_test_decode_op - run one operation decoder over raw argument bytes
+ * @rqstp: request the decode is attributed to
+ * @opnum: operation whose decoder to run
+ * @buf: encoded argument bytes, without the operation number
+ * @len: length of @buf in bytes
+ * @u: receives the decoded arguments
+ * @consumed: receives the bytes the decoder consumed
+ *
+ * Drives the production decoder table over a caller-supplied stream so a
+ * test can check the wire shape rather than a helper's idea of it.  It
+ * decodes only; nothing is dispatched and no state is published.
+ *
+ * Returns the decoder's status.
+ */
+__be32 nfsd4_test_decode_op(struct svc_rqst *rqstp, u32 opnum, const void *buf,
+			    size_t len, union nfsd4_op_u *u, size_t *consumed)
+{
+	struct nfsd4_compoundargs *args;
+	struct xdr_stream stream;
+	struct xdr_buf xbuf = {};
+	struct kvec iov;
+	__be32 status;
+
+	if (opnum >= ARRAY_SIZE(nfsd4_dec_ops) || !nfsd4_dec_ops[opnum])
+		return nfserr_op_illegal;
+
+	/* Too large for the stack; the compound args embed an op array. */
+	args = kzalloc_obj(*args, GFP_KERNEL);
+	if (!args)
+		return nfserr_jukebox;
+
+	iov.iov_base = (void *)buf;
+	iov.iov_len = len;
+	xbuf.head[0] = iov;
+	xbuf.len = len;
+	xbuf.buflen = len;
+	xdr_init_decode(&stream, &xbuf, (__be32 *)buf, NULL);
+
+	args->xdr = &stream;
+	args->rqstp = rqstp;
+	args->ops = args->iops;
+	args->minorversion = 1;
+
+	status = nfsd4_dec_ops[opnum](args, u);
+	if (consumed)
+		*consumed = xdr_stream_pos(&stream);
+	while (args->to_free) {
+		struct svcxdr_tmpbuf *tb = args->to_free;
+
+		args->to_free = tb->next;
+		kfree(tb);
+	}
+	kfree(args);
+	return status;
+}
+#endif /* CONFIG_NFSD_FFV2_KUNIT_TEST */
+
 bool
 nfs4svc_decode_compoundargs(struct svc_rqst *rqstp, struct xdr_stream *xdr)
 {
@@ -6767,6 +7324,13 @@ nfs4svc_decode_compoundargs(struct svc_rqst *rqstp, struct xdr_stream *xdr)
 	args->xdr = xdr;
 	args->ops = args->iops;
 	args->rqstp = rqstp;
+#ifdef CONFIG_NFSD_FFV2
+	args->ffv2_present = false;
+	args->ffv2_digest_valid = false;
+	args->ffv2_decode_class = NFSD4_FFV2_DECODE_NONE;
+	args->ffv2_decode_status = nfs_ok;
+	memset(args->ffv2_digest, 0, sizeof(args->ffv2_digest));
+#endif
 
 	/*
 	 * NFSv4 operation decoders can invoke svc cache lookups

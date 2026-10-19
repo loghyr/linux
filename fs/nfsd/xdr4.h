@@ -846,6 +846,50 @@ struct nfsd4_copy_notify {
 	struct nl4_server	*cpn_src;
 };
 
+#ifdef CONFIG_NFSD_FFV2
+#define NFSD4_FFV2_CHECKSUM_MAX	64
+
+struct nfsd4_ffv2 {
+	stateid_t	stateid;
+	u64		offset;
+	u32		count;
+	u32		stable_how;
+	/* Copied wire identities; payload borrows the request XDR buffer. */
+	u64		owner_cohort_id;
+	u32		owner_client_id;
+	u32		owner_id;
+	bool		owner_present;
+	u32		payload_id;
+	u32		flags;
+	bool		guard_check;
+	bool		guard_never_written;
+	u32		guard_generation;
+	u32		guard_writer;
+	u32		chunk_size;
+	u32		checksum_algorithm;
+	u32		checksum_len;
+	u8		checksum[NFSD4_FFV2_CHECKSUM_MAX];
+	u32		payload_len;
+	struct xdr_buf	payload;
+
+	/* BULK_REVOKE_STATEID4args: the clientid whose state is revoked. */
+	clientid_t	target_clientid;
+	bool		target_present;
+};
+
+struct nfsd4_chunk_read {
+	stateid_t	cra_stateid;
+	u64	cra_offset;
+	u32	cra_count;
+};
+
+struct nfsd4_chunk_header_read {
+	stateid_t	chra_stateid;
+	u64	chra_offset;
+	u32	chra_count;
+};
+#endif
+
 struct nfsd4_op {
 	u32					opnum;
 	__be32					status;
@@ -914,6 +958,13 @@ struct nfsd4_op {
 		struct nfsd4_setxattr		setxattr;
 		struct nfsd4_listxattrs		listxattrs;
 		struct nfsd4_removexattr	removexattr;
+
+#ifdef CONFIG_NFSD_FFV2
+		/* Flex Files v2 data-server operations */
+		struct nfsd4_ffv2		ffv2;
+		struct nfsd4_chunk_read		chunk_read;
+		struct nfsd4_chunk_header_read	chunk_header_read;
+#endif
 	} u;
 };
 
@@ -927,6 +978,22 @@ struct svcxdr_tmpbuf {
 	char buf[];
 };
 
+#ifdef CONFIG_NFSD_FFV2
+enum nfsd4_ffv2_decode_class {
+	NFSD4_FFV2_DECODE_NONE,
+	NFSD4_FFV2_DECODE_BADXDR,
+	NFSD4_FFV2_DECODE_NOTSUPP,
+	NFSD4_FFV2_DECODE_ERROR,
+};
+#endif
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct nfsd4_ffv2_digest_test_ctx {
+	unsigned int calls;
+	bool fail;
+};
+#endif
+
 struct nfsd4_compoundargs {
 	/* scratch variables for XDR decode */
 	struct xdr_stream		*xdr;
@@ -939,6 +1006,16 @@ struct nfsd4_compoundargs {
 	u32				client_opcnt;
 	u32				opcnt;
 	bool				splice_ok;
+#ifdef CONFIG_NFSD_FFV2
+	bool				ffv2_present;
+	bool				ffv2_digest_valid;
+	enum nfsd4_ffv2_decode_class	ffv2_decode_class;
+	__be32				ffv2_decode_status;
+	u8				ffv2_digest[NFSD4_FFV2_DIGEST_SIZE];
+#endif
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	struct nfsd4_ffv2_digest_test_ctx *ffv2_digest_test;
+#endif
 	struct nfsd4_op			*ops;
 	struct nfsd4_op			iops[8];
 };
@@ -972,6 +1049,26 @@ void warn_on_nonidempotent_op(struct nfsd4_op *op);
 
 bool nfsd4_mach_creds_match(struct nfs4_client *cl, struct svc_rqst *rqstp);
 bool nfs4svc_decode_compoundargs(struct svc_rqst *rqstp, struct xdr_stream *xdr);
+#ifdef CONFIG_NFSD_FFV2
+int nfsd4_ffv2_compound_digest(const struct xdr_buf *buf, unsigned int offset,
+			       size_t len, u8 digest[NFSD4_FFV2_DIGEST_SIZE]);
+__be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp);
+bool nfsd4_ffv2_replay_identity_match(const struct nfsd4_compoundargs *args,
+				      const struct nfsd4_slot *slot);
+#endif
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd4_test_decode_op(struct svc_rqst *rqstp, u32 opnum, const void *buf,
+			    size_t len, union nfsd4_op_u *u, size_t *consumed);
+void nfsd4_test_dispatch_compound(struct svc_rqst *rqstp);
+void nfsd4_test_record_ffv2_identity(struct nfsd4_slot *slot,
+				     const struct nfsd4_compoundargs *args);
+bool nfsd4_test_replay_matches_cache(struct svc_rqst *rqstp,
+				     struct nfsd4_sequence *seq,
+				   struct nfsd4_slot *slot);
+__be32 nfsd4_test_ffv2_run_op(struct svc_rqst *rqstp,
+			      struct nfsd4_compound_state *cstate, u32 opnum,
+			   union nfsd4_op_u *u);
+#endif
 bool nfs4svc_encode_compoundres(struct svc_rqst *rqstp, struct xdr_stream *xdr);
 __be32 nfsd4_check_resp_size(struct nfsd4_compoundres *, u32);
 void nfsd4_encode_operation(struct nfsd4_compoundres *, struct nfsd4_op *);
