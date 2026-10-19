@@ -2669,7 +2669,12 @@ nfsd4_decode_ffv2_lifecycle(struct nfsd4_compoundargs *argp,
 	status = nfsd4_decode_ffv2_range(argp, &u->ffv2);
 	if (status)
 		return status;
-	return nfsd4_decode_ffv2_owners(argp, &u->ffv2);
+	status = nfsd4_decode_ffv2_owners(argp, &u->ffv2);
+	if (status)
+		return status;
+	if (u->ffv2.count != 1)
+		return nfserr_notsupp;
+	return nfs_ok;
 }
 
 static __be32

@@ -3364,7 +3364,58 @@ static void nfsd_ffv2_dispatch_precedence_test(struct kunit *test)
 	net_ns_barrier();
 }
 
+static void nfsd_ffv2_single_range_test(struct kunit *test)
+{
+	static const u32 ops[] = {
+		OP_CHUNK_COMMIT, OP_CHUNK_FINALIZE, OP_CHUNK_ROLLBACK,
+	};
+	struct svc_rqst *rqstp;
+	union nfsd4_op_u *u;
+	__be32 wire[32];
+	unsigned int i, count;
+	size_t len, consumed;
+
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	u = kunit_kzalloc(test, sizeof(*u), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+	KUNIT_ASSERT_NOT_NULL(test, u);
+	for (i = 0; i < ARRAY_SIZE(ops); i++) {
+		len = nfsd_ffv2_wire_op(wire, ops[i]);
+		for (count = 0; count <= 2; count++) {
+			wire[6] = cpu_to_be32(count);
+			FFV2_EXPECT_STATUS_MSG(test,
+					       nfsd4_test_decode_op(rqstp, ops[i], wire,
+								    len, u, &consumed),
+				count == 1 ? nfs_ok : nfserr_notsupp,
+				"operation %u ranges %u", ops[i], count);
+			KUNIT_EXPECT_EQ(test, consumed, len);
+			if (count == 1) {
+				KUNIT_EXPECT_EQ(test, u->ffv2.count, 1U);
+				KUNIT_EXPECT_TRUE(test, u->ffv2.owner_present);
+				KUNIT_EXPECT_EQ(test, u->ffv2.owner_cohort_id,
+						0x0123456789abcdefULL);
+				KUNIT_EXPECT_EQ(test, u->ffv2.owner_client_id, 0x13579bdfU);
+				KUNIT_EXPECT_EQ(test, u->ffv2.owner_id, 7U);
+			}
+			FFV2_EXPECT_STATUS(test,
+					   nfsd4_test_decode_op(rqstp, ops[i], wire,
+								len - 4, u, NULL),
+				nfserr_bad_xdr);
+		}
+		wire[6] = cpu_to_be32(4097);
+		FFV2_EXPECT_STATUS(test,
+				   nfsd4_test_decode_op(rqstp, ops[i], wire, len, u, NULL),
+			nfserr_inval);
+		wire[6] = cpu_to_be32(1);
+		wire[7] = cpu_to_be32(0);
+		FFV2_EXPECT_STATUS(test,
+				   nfsd4_test_decode_op(rqstp, ops[i], wire, len, u, NULL),
+			nfserr_notsupp);
+	}
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_single_range_test),
 	KUNIT_CASE(nfsd_ffv2_compound_digest_test),
 	KUNIT_CASE(nfsd_ffv2_selective_digest_test),
 	KUNIT_CASE(nfsd_ffv2_selective_mixed_test),
