@@ -18,6 +18,7 @@
 #include "nfsd.h"
 #include "netns.h"
 #include "netlink.h"
+#include "nfsfh.h"
 
 struct nfsd_ffv2_unregister_ctx {
 	struct nfsd_net	*nn;
@@ -1720,7 +1721,174 @@ out_net:
 	net_ns_barrier();
 }
 
+struct nfsd_ffv2_access_wait_ctx {
+	struct svc_export *exp;
+	int result;
+	struct completion done;
+};
+
+static int nfsd_ffv2_access_wait_thread(void *data)
+{
+	struct nfsd_ffv2_access_wait_ctx *ctx = data;
+
+	allow_signal(SIGUSR1);
+	ctx->result = nfsd_ffv2_export_transition_wait(ctx->exp);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_export_access_test(struct kunit *test)
+{
+	struct nfsd_ffv2_access_wait_ctx ctx;
+	struct svc_export key, *exp, *next;
+	struct svc_fh first, second;
+	struct auth_domain *domain;
+	struct task_struct *task;
+	struct nfsd_net *nn;
+	struct path root;
+	struct net *net;
+	bool waiting;
+	unsigned int refs;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "access netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	domain = unix_domain_find("ffv2-access-kunit");
+	if (!domain) {
+		KUNIT_FAIL(test, "access auth domain allocation");
+		goto out_net;
+	}
+	get_fs_root(current->fs, &root);
+	nfsd_ffv2_init_export_test_key(&key, nn, domain, &root);
+	key.ex_uuid = kmemdup("export-uuid-test", 16, GFP_KERNEL);
+	if (!key.ex_uuid) {
+		KUNIT_FAIL(test, "access UUID allocation");
+		goto out_root;
+	}
+	exp = nfsd_export_cache_update(&key);
+	kfree(key.ex_uuid);
+	key.ex_uuid = NULL;
+	if (IS_ERR(exp)) {
+		KUNIT_FAIL(test, "access export update: %ld", PTR_ERR(exp));
+		goto out_root;
+	}
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_current(exp));
+	fh_init(&first, NFS4_FHSIZE);
+	fh_init(&second, NFS4_FHSIZE);
+	KUNIT_EXPECT_EQ(test, fh_compose(&first, exp, root.dentry, NULL), nfs_ok);
+	if (!first.fh_export)
+		goto out_exp;
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 1U);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_exact(exp), 0);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_get(exp), -ESTALE);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_fh_dup2(&second, &first), nfs_ok);
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 2U);
+	ctx.exp = exp;
+	init_completion(&ctx.done);
+	task = kthread_run(nfsd_ffv2_access_wait_thread, &ctx, "ffv2-access");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "access worker: %ld", PTR_ERR(task));
+		goto out_handles;
+	}
+	error = read_poll_timeout(waitqueue_active, waiting, waiting,
+				  1000, 1000000, false, &exp->ex_ffv2_access_wait);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx.done));
+	fh_put(&first);
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 1U);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx.done));
+	fh_put(&second);
+	wait_for_completion(&ctx.done);
+	kthread_stop(task);
+	KUNIT_EXPECT_EQ(test, ctx.result, 0);
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 0U);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_clone(exp), -ESTALE);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_transition_abort_exact(exp));
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_access_get(exp), 0);
+	first.fh_export = exp_get(exp);
+	first.fh_ffv2_admitted = true;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_exact(exp), 0);
+	init_completion(&ctx.done);
+	task = kthread_run(nfsd_ffv2_access_wait_thread, &ctx, "ffv2-cancel");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "cancel worker: %ld", PTR_ERR(task));
+		goto out_handles;
+	}
+	error = read_poll_timeout(waitqueue_active, waiting, waiting,
+				  1000, 1000000, false, &exp->ex_ffv2_access_wait);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	send_sig(SIGUSR1, task, 1);
+	wait_for_completion(&ctx.done);
+	kthread_stop(task);
+	KUNIT_EXPECT_EQ(test, ctx.result, -ERESTARTSYS);
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 1U);
+	fh_put(&first);
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 0U);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_transition_abort_exact(exp));
+
+	nfsd_ffv2_test_fail_export_alloc();
+	next = nfsd_ffv2_test_export_update_exact(&key, exp);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(next));
+	if (IS_ERR(next))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(next), -ENOMEM);
+	else
+		exp_put(next);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_current(exp));
+
+	/* A retained predecessor cannot substitute for the current cache entry. */
+	next = nfsd_ffv2_test_export_update_exact(&key, exp);
+	if (IS_ERR(next)) {
+		KUNIT_FAIL(test, "access replacement: %ld", PTR_ERR(next));
+		goto out_exp;
+	}
+	KUNIT_EXPECT_TRUE(test, hlist_unhashed(&exp->h.cache_list));
+	/* Make expiry unable to hide accidental predecessor hash membership. */
+	exp->h.expiry_time = TIME64_MAX;
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_current(next));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_is_current(exp));
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_exact(exp), -ESTALE);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_exact(next), 0);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_export_transition_abort_exact(exp));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_transitioning(next));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_transition_abort_exact(next));
+	exp_put(next);
+	set_bit(CACHE_NEGATIVE, &key.h.flags);
+	next = nfsd_export_cache_update(&key);
+	if (IS_ERR(next)) {
+		KUNIT_FAIL(test, "negative current entry: %ld", PTR_ERR(next));
+		goto out_exp;
+	}
+	refs = kref_read(&next->h.ref);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_exact(next), -ENOENT);
+	KUNIT_EXPECT_EQ(test, kref_read(&next->h.ref), refs);
+	/* Keep a refusal-control's missing caller reference from leaking cleanup. */
+	if (kref_read(&next->h.ref) + 1 == refs)
+		cache_get(&next->h);
+	exp_put(next);
+	goto out_exp;
+out_handles:
+	fh_put(&first);
+	fh_put(&second);
+	if (nfsd_ffv2_export_is_transitioning(exp))
+		nfsd_ffv2_export_transition_abort_exact(exp);
+out_exp:
+	exp_put(exp);
+out_root:
+	nfsd_export_flush(net);
+	path_put(&root);
+	auth_domain_put(domain);
+out_net:
+	put_net(net);
+	net_ns_barrier();
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_export_access_test),
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
 	KUNIT_CASE(nfsd_ffv2_zero_threads_test),

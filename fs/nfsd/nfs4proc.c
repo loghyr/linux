@@ -139,15 +139,28 @@ is_create_with_attrs(struct nfsd4_open *open)
 		    || open->op_createmode == NFS4_CREATE_EXCLUSIVE4_1);
 }
 
-static inline void
+static inline __be32
 fh_dup2(struct svc_fh *dst, struct svc_fh *src)
 {
+#ifdef CONFIG_NFSD_FFV2
+	if (src->fh_ffv2_admitted &&
+	    nfsd_ffv2_export_access_clone(src->fh_export))
+		return nfserr_stale;
+#endif
 	fh_put(dst);
 	dget(src->fh_dentry);
 	if (src->fh_export)
 		exp_get(src->fh_export);
 	*dst = *src;
+	return nfs_ok;
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd_ffv2_test_fh_dup2(struct svc_fh *dst, struct svc_fh *src)
+{
+	return fh_dup2(dst, src);
+}
+#endif
 
 static __be32
 do_open_permission(struct svc_rqst *rqstp, struct svc_fh *current_fh, struct nfsd4_open *open, int accmode)
@@ -675,7 +688,11 @@ out:
 		open->op_filp = NULL;
 	}
 	if (resfh && resfh != &cstate->current_fh) {
-		fh_dup2(&cstate->current_fh, resfh);
+		__be32 dup_status;
+
+		dup_status = fh_dup2(&cstate->current_fh, resfh);
+		if (!status)
+			status = dup_status;
 		fh_put(resfh);
 		kfree(resfh);
 	}
@@ -758,7 +775,8 @@ nfsd4_restorefh(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	if (!cstate->save_fh.fh_dentry)
 		return nfserr_restorefh;
 
-	fh_dup2(&cstate->current_fh, &cstate->save_fh);
+	if (fh_dup2(&cstate->current_fh, &cstate->save_fh))
+		return nfserr_stale;
 	if (HAS_CSTATE_FLAG(cstate, SAVED_STATE_ID_FLAG)) {
 		memcpy(&cstate->current_stateid, &cstate->save_stateid, sizeof(stateid_t));
 		SET_CSTATE_FLAG(cstate, CURRENT_STATE_ID_FLAG);
@@ -770,7 +788,8 @@ static __be32
 nfsd4_savefh(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	     union nfsd4_op_u *u)
 {
-	fh_dup2(&cstate->save_fh, &cstate->current_fh);
+	if (fh_dup2(&cstate->save_fh, &cstate->current_fh))
+		return nfserr_stale;
 	if (HAS_CSTATE_FLAG(cstate, CURRENT_STATE_ID_FLAG)) {
 		memcpy(&cstate->save_stateid, &cstate->current_stateid, sizeof(stateid_t));
 		SET_CSTATE_FLAG(cstate, SAVED_STATE_ID_FLAG);
@@ -938,7 +957,7 @@ nfsd4_create(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	if (attrs.na_paclerr)
 		create->cr_bmval[2] &= ~FATTR4_WORD2_POSIX_ACCESS_ACL;
 	set_change_info(&create->cr_cinfo, &cstate->current_fh);
-	fh_dup2(&cstate->current_fh, &resfh);
+	status = fh_dup2(&cstate->current_fh, &resfh);
 out:
 	fh_put(&resfh);
 out_umask:

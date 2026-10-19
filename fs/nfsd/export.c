@@ -1523,6 +1523,135 @@ static int svc_export_match(struct cache_head *a, struct cache_head *b)
 		path_equal(&orig->ex_path, &new->ex_path);
 }
 
+#ifdef CONFIG_NFSD_FFV2
+static void nfsd_ffv2_export_access_init(struct svc_export *exp)
+{
+	spin_lock_init(&exp->ex_ffv2_access_lock);
+	init_waitqueue_head(&exp->ex_ffv2_access_wait);
+	exp->ex_ffv2_access_state = NFSD_FFV2_EXPORT_OPEN;
+	exp->ex_ffv2_access_count = 0;
+}
+
+int nfsd_ffv2_export_access_get(struct svc_export *exp)
+{
+	int error = 0;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	if (exp->ex_ffv2_access_state != NFSD_FFV2_EXPORT_OPEN)
+		error = -ESTALE;
+	else
+		exp->ex_ffv2_access_count++;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	return error;
+}
+
+int nfsd_ffv2_export_access_clone(struct svc_export *exp)
+{
+	int error = 0;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	if (!exp->ex_ffv2_access_count ||
+	    exp->ex_ffv2_access_state == NFSD_FFV2_EXPORT_SERVICE)
+		error = -ESTALE;
+	else
+		exp->ex_ffv2_access_count++;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	return error;
+}
+
+void nfsd_ffv2_export_access_put(struct svc_export *exp)
+{
+	bool wake = false;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	if (WARN_ON_ONCE(!exp->ex_ffv2_access_count)) {
+		spin_unlock(&exp->ex_ffv2_access_lock);
+		return;
+	}
+	exp->ex_ffv2_access_count--;
+	wake = !exp->ex_ffv2_access_count;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	if (wake)
+		wake_up_all(&exp->ex_ffv2_access_wait);
+}
+
+bool nfsd_ffv2_export_is_service(struct svc_export *exp)
+{
+	bool service;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	service = exp->ex_ffv2_access_state == NFSD_FFV2_EXPORT_SERVICE;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	return service;
+}
+
+int nfsd_ffv2_export_transition_begin(struct svc_export *exp)
+{
+	int error = 0;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	if (exp->ex_ffv2_access_state != NFSD_FFV2_EXPORT_OPEN)
+		error = -EBUSY;
+	else
+		exp->ex_ffv2_access_state = NFSD_FFV2_EXPORT_TRANSITIONING;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	return error;
+}
+
+int nfsd_ffv2_export_transition_wait(struct svc_export *exp)
+{
+	int error;
+
+	error = wait_event_interruptible(exp->ex_ffv2_access_wait,
+					 !READ_ONCE(exp->ex_ffv2_access_count));
+	if (error)
+		return error;
+	/*
+	 * Woken with the access still outstanding is not a drain, whatever
+	 * woke it: the transition must not proceed.
+	 */
+	if (READ_ONCE(exp->ex_ffv2_access_count))
+		return -ERESTARTSYS;
+	return 0;
+}
+
+bool nfsd_ffv2_export_is_transitioning(struct svc_export *exp)
+{
+	bool transitioning;
+
+	spin_lock(&exp->ex_ffv2_access_lock);
+	transitioning = exp->ex_ffv2_access_state ==
+			NFSD_FFV2_EXPORT_TRANSITIONING;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	return transitioning;
+}
+
+void nfsd_ffv2_export_transition_abort(struct svc_export *exp)
+{
+	spin_lock(&exp->ex_ffv2_access_lock);
+	if (WARN_ON_ONCE(exp->ex_ffv2_access_state !=
+			 NFSD_FFV2_EXPORT_TRANSITIONING)) {
+		spin_unlock(&exp->ex_ffv2_access_lock);
+		return;
+	}
+	exp->ex_ffv2_access_state = NFSD_FFV2_EXPORT_OPEN;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+	wake_up_all(&exp->ex_ffv2_access_wait);
+}
+
+void nfsd_ffv2_export_transition_commit(struct svc_export *exp)
+{
+	spin_lock(&exp->ex_ffv2_access_lock);
+	WARN_ON_ONCE(exp->ex_ffv2_access_count);
+	if (exp->ex_ffv2_access_state == NFSD_FFV2_EXPORT_SERVICE) {
+		spin_unlock(&exp->ex_ffv2_access_lock);
+		return;
+	}
+	exp->ex_ffv2_access_state = NFSD_FFV2_EXPORT_SERVICE;
+	spin_unlock(&exp->ex_ffv2_access_lock);
+}
+#endif
+
 static void svc_export_init(struct cache_head *cnew, struct cache_head *citem)
 {
 	struct svc_export *new = container_of(cnew, struct svc_export, h);
@@ -1542,6 +1671,7 @@ static void svc_export_init(struct cache_head *cnew, struct cache_head *citem)
 	INIT_LIST_HEAD(&new->ex_ffv2_inventory);
 	new->ex_ffv2_participant = NULL;
 	new->ex_ffv2_listed = false;
+	nfsd_ffv2_export_access_init(new);
 #endif
 	export_stats_reset(new->ex_stats);
 }
@@ -1665,7 +1795,126 @@ svc_export_update(struct svc_export *new, struct svc_export *old)
 
 /* Serialize lookup, admission and replacement against other updates. */
 #ifdef CONFIG_NFSD_FFV2
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct svc_export *
+nfsd_ffv2_test_export_update_exact(struct svc_export *new,
+				   struct svc_export *old)
+{
+	struct cache_head *ch;
+
+	ch = sunrpc_cache_update_exact(old->cd, &new->h, &old->h,
+				       svc_export_hash(old));
+	if (IS_ERR(ch))
+		return ERR_CAST(ch);
+	return container_of(ch, struct svc_export, h);
+}
+#endif
+
 static DEFINE_MUTEX(nfsd_export_update_lock);
+
+struct svc_export *
+nfsd_ffv2_export_lookup(struct cache_detail *cd, struct auth_domain *client,
+			const struct path *path)
+{
+	struct svc_export key = {
+		.cd = cd,
+		.ex_client = client,
+		.ex_path = *path,
+	};
+	struct svc_export *exp;
+	int error;
+
+	mutex_lock(&nfsd_export_update_lock);
+	exp = svc_export_lookup(&key);
+	if (!exp) {
+		exp = ERR_PTR(-ENOMEM);
+		goto out_unlock;
+	}
+	error = cache_check(cd, &exp->h, NULL);
+	if (error) {
+		exp = ERR_PTR(error);
+		goto out_unlock;
+	}
+	if (!exp->ex_uuid ||
+	    (exp->ex_flags & NFSEXP_V4ROOT) ||
+	    ((exp->ex_flags & NFSEXP_FSID) && !exp->ex_fsid)) {
+		error = -EINVAL;
+		goto out_put;
+	}
+	mutex_unlock(&nfsd_export_update_lock);
+	return exp;
+
+out_put:
+	exp_put(exp);
+	exp = ERR_PTR(error);
+out_unlock:
+	mutex_unlock(&nfsd_export_update_lock);
+	return exp;
+}
+
+int nfsd_ffv2_export_transition_exact(struct svc_export *exp)
+{
+	int error;
+
+	mutex_lock(&nfsd_export_update_lock);
+	if (!sunrpc_cache_is_current(exp->cd, &exp->h, &exp->h,
+				     svc_export_hash(exp))) {
+		error = -ESTALE;
+		goto out_unlock;
+	}
+	/* cache_check() consumes its reference on refusal. */
+	cache_get(&exp->h);
+	error = cache_check(exp->cd, &exp->h, NULL);
+	if (!error) {
+		exp_put(exp);
+		error = nfsd_ffv2_export_transition_begin(exp);
+	}
+out_unlock:
+	mutex_unlock(&nfsd_export_update_lock);
+	return error;
+}
+
+struct svc_export *
+nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
+			const struct path *path)
+{
+	struct svc_export *exp;
+	int error;
+
+	exp = nfsd_ffv2_export_lookup(cd, client, path);
+	if (IS_ERR(exp))
+		return exp;
+	error = nfsd_ffv2_export_transition_exact(exp);
+	if (!error)
+		return exp;
+	exp_put(exp);
+	return ERR_PTR(error);
+}
+
+bool nfsd_ffv2_export_is_current(struct svc_export *exp)
+{
+	bool is_current;
+
+	mutex_lock(&nfsd_export_update_lock);
+	is_current = sunrpc_cache_is_current(exp->cd, &exp->h, &exp->h,
+					     svc_export_hash(exp));
+	mutex_unlock(&nfsd_export_update_lock);
+	return is_current;
+}
+
+bool nfsd_ffv2_export_transition_abort_exact(struct svc_export *exp)
+{
+	bool is_current;
+
+	mutex_lock(&nfsd_export_update_lock);
+	is_current = sunrpc_cache_is_current(exp->cd, &exp->h, &exp->h,
+					     svc_export_hash(exp));
+	if (is_current)
+		nfsd_ffv2_export_transition_abort(exp);
+	mutex_unlock(&nfsd_export_update_lock);
+	return is_current;
+}
+
 #endif
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)

@@ -269,6 +269,29 @@ sunrpc_cache_is_current_locked(struct cache_detail *detail,
 }
 
 /**
+ * sunrpc_cache_is_current - test exact cache object membership
+ * @detail: cache containing the hash bucket
+ * @key: match key for the bucket
+ * @expected: referenced object to compare with the current match
+ * @hash: bucket index for @key
+ *
+ * Context: Does not sleep. Takes the cache hash spinlock.
+ * Return: true if @expected is the current, unexpired matching object.
+ */
+bool sunrpc_cache_is_current(struct cache_detail *detail,
+			     struct cache_head *key,
+			     struct cache_head *expected, int hash)
+{
+	bool is_current;
+
+	spin_lock(&detail->hash_lock);
+	is_current = sunrpc_cache_is_current_locked(detail, key, expected, hash);
+	spin_unlock(&detail->hash_lock);
+	return is_current;
+}
+EXPORT_SYMBOL_GPL(sunrpc_cache_is_current);
+
+/**
  * sunrpc_cache_update_exact - replace an exact current cache object
  * @detail: cache to update
  * @new: update payload

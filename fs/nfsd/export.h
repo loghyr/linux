@@ -60,6 +60,14 @@ struct export_stats {
 	struct percpu_counter	counter[EXP_STATS_COUNTERS_NUM];
 };
 
+#ifdef CONFIG_NFSD_FFV2
+enum nfsd_ffv2_export_access_state {
+	NFSD_FFV2_EXPORT_OPEN,
+	NFSD_FFV2_EXPORT_TRANSITIONING,
+	NFSD_FFV2_EXPORT_SERVICE,
+};
+#endif
+
 struct svc_export {
 	struct cache_head	h;
 	struct auth_domain *	ex_client;
@@ -83,6 +91,11 @@ struct svc_export {
 	struct path		ex_ffv2_path;
 	struct nfsd_ffv2_participant *ex_ffv2_participant;
 	bool			ex_ffv2_listed;
+	/* Protects ordinary handle admissions and transition state. */
+	spinlock_t		ex_ffv2_access_lock;
+	wait_queue_head_t	ex_ffv2_access_wait;
+	enum nfsd_ffv2_export_access_state ex_ffv2_access_state;
+	unsigned int		ex_ffv2_access_count;
 #endif
 };
 
@@ -105,6 +118,27 @@ struct svc_expkey {
 #define EX_NOHIDE(exp)		((exp)->ex_flags & NFSEXP_NOHIDE)
 #define EX_WGATHER(exp)		((exp)->ex_flags & NFSEXP_GATHERED_WRITES)
 
+#ifdef CONFIG_NFSD_FFV2
+struct svc_export *
+nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
+			const struct path *path);
+struct svc_export *
+nfsd_ffv2_export_lookup(struct cache_detail *cd, struct auth_domain *client,
+			const struct path *path);
+int nfsd_ffv2_export_transition_exact(struct svc_export *exp);
+bool nfsd_ffv2_export_is_current(struct svc_export *exp);
+bool nfsd_ffv2_export_transition_abort_exact(struct svc_export *exp);
+int nfsd_ffv2_export_access_get(struct svc_export *exp);
+int nfsd_ffv2_export_access_clone(struct svc_export *exp);
+void nfsd_ffv2_export_access_put(struct svc_export *exp);
+bool nfsd_ffv2_export_is_service(struct svc_export *exp);
+int nfsd_ffv2_export_transition_begin(struct svc_export *exp);
+int nfsd_ffv2_export_transition_wait(struct svc_export *exp);
+bool nfsd_ffv2_export_is_transitioning(struct svc_export *exp);
+void nfsd_ffv2_export_transition_abort(struct svc_export *exp);
+void nfsd_ffv2_export_transition_commit(struct svc_export *exp);
+#endif
+
 struct svc_cred;
 int nfsexp_flags(struct svc_cred *cred, struct svc_export *exp);
 __be32 check_xprtsec_policy(struct svc_export *exp, struct svc_rqst *rqstp);
@@ -122,6 +156,9 @@ void			nfsd_export_flush(struct net *);
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 struct svc_export *nfsd_export_cache_update(struct svc_export *new);
 void nfsd_ffv2_test_fail_export_alloc(void);
+struct svc_export *
+nfsd_ffv2_test_export_update_exact(struct svc_export *new,
+				   struct svc_export *old);
 #endif
 struct svc_export *	rqst_exp_get_by_name(struct svc_rqst *,
 					     const struct path *);
