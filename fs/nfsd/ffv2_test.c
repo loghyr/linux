@@ -286,7 +286,7 @@ static struct nfsd_net *nfsd_ffv2_test_net(struct kunit *test)
 	if (!nn)
 		return NULL;
 	nfsd_ffv2_net_init(nn);
-	error = nfsd_ffv2_participant_register(nn);
+	error = nfsd_ffv2_participant_register(nn, NULL);
 	if (error) {
 		nfsd_ffv2_net_pre_exit(nn);
 		nfsd_ffv2_net_destroy(nn);
@@ -2111,7 +2111,339 @@ out_root:
 	mutex_unlock(&nfsd_mutex);
 }
 
+static void nfsd_ffv2_reservation_access_test(struct kunit *test)
+{
+	struct nfsd_ffv2_reservation *reservation = NULL;
+	struct nfsd_ffv2_export_update update;
+	struct completion exit_done;
+	struct svc_export key, *exp = NULL, *foreign = NULL, *replacement;
+	struct svc_export *refused;
+	struct auth_domain *domain;
+	struct file_system_type *type;
+	struct vfsmount *mount;
+	struct path root, distinct;
+	struct nfsd_net *nn, *other_nn;
+	struct net *net, *other_net;
+	u8 uuid[16] = { 1 }, token[32] = { 2 };
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "reservation netns: %ld", PTR_ERR(net));
+		return;
+	}
+	other_net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(other_net)) {
+		KUNIT_FAIL(test, "foreign netns: %ld", PTR_ERR(other_net));
+		goto out_net;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	other_nn = net_generic(other_net, nfsd_net_id);
+	domain = unix_domain_find("ffv2-reservation-kunit");
+	if (!domain) {
+		KUNIT_FAIL(test, "reservation auth domain");
+		goto out_other_net;
+	}
+	get_fs_root(current->fs, &root);
+	type = get_fs_type("tmpfs");
+	if (!type) {
+		KUNIT_FAIL(test, "tmpfs unavailable");
+		goto out_root;
+	}
+	mount = kern_mount(type);
+	put_filesystem(type);
+	if (IS_ERR(mount)) {
+		KUNIT_FAIL(test, "distinct superblock: %ld", PTR_ERR(mount));
+		goto out_root;
+	}
+	distinct.mnt = mount;
+	distinct.dentry = mount->mnt_root;
+	KUNIT_EXPECT_PTR_NE(test, root.mnt->mnt_sb, distinct.mnt->mnt_sb);
+
+	nfsd_ffv2_init_export_test_key(&key, nn, domain, &root);
+	key.ex_uuid = kmemdup(uuid, sizeof(uuid), GFP_KERNEL);
+	if (!key.ex_uuid) {
+		KUNIT_FAIL(test, "reservation UUID allocation");
+		goto out_mount;
+	}
+	exp = nfsd_export_cache_update(&key);
+	kfree(key.ex_uuid);
+	key.ex_uuid = NULL;
+	if (IS_ERR(exp)) {
+		KUNIT_FAIL(test, "reservation export: %ld", PTR_ERR(exp));
+		exp = NULL;
+		goto out_mount;
+	}
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_exact(exp), 0);
+	nfsd_ffv2_init_export_test_key(&key, other_nn, domain, &root);
+	foreign = nfsd_export_cache_update(&key);
+	if (IS_ERR(foreign)) {
+		KUNIT_FAIL(test, "foreign export: %ld", PTR_ERR(foreign));
+		foreign = NULL;
+		goto out_mount;
+	}
+	error = nfsd_ffv2_test_reservation_claim_expected(nn, &root, uuid, token,
+							  exp, &reservation);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	if (!error) {
+		nfsd_ffv2_reservation_abort(reservation);
+		reservation = NULL;
+	}
+	exp_put(foreign);
+	foreign = NULL;
+	nfsd_export_flush(other_net);
+	nfsd_ffv2_init_export_test_key(&key, other_nn, domain, &distinct);
+	foreign = nfsd_export_cache_update(&key);
+	if (IS_ERR(foreign)) {
+		KUNIT_FAIL(test, "distinct export: %ld", PTR_ERR(foreign));
+		foreign = NULL;
+		goto out_mount;
+	}
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_transition_abort_exact(exp));
+	nfsd_ffv2_init_export_test_key(&key, nn, domain, &root);
+	key.ex_uuid = kmemdup(uuid, sizeof(uuid), GFP_KERNEL);
+	if (!key.ex_uuid) {
+		KUNIT_FAIL(test, "replacement UUID allocation");
+		goto out_mount;
+	}
+	error = nfsd_ffv2_export_update_begin(&key, &update);
+	if (!error)
+		error = nfsd_ffv2_export_update_validate(&update);
+	if (error) {
+		if (update.admitted)
+			nfsd_ffv2_export_update_abort(&update);
+		kfree(key.ex_uuid);
+		key.ex_uuid = NULL;
+		KUNIT_FAIL(test, "exact update admission: %d", error);
+		goto out_mount;
+	}
+	replacement = nfsd_ffv2_test_export_update_exact(&key, exp);
+	if (IS_ERR(replacement))
+		nfsd_ffv2_export_update_abort(&update);
+	else
+		nfsd_ffv2_export_update_end(replacement, &update);
+	kfree(key.ex_uuid);
+	key.ex_uuid = NULL;
+	if (IS_ERR(replacement)) {
+		KUNIT_FAIL(test, "reservation replacement: %ld", PTR_ERR(replacement));
+		goto out_mount;
+	}
+	refused = nfsd_ffv2_test_export_update_exact(&key, exp);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(refused));
+	if (IS_ERR(refused))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(refused), -ESTALE);
+	else
+		exp_put(refused);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_exact(replacement), 0);
+	error = nfsd_ffv2_test_reservation_claim_expected(nn, &root, uuid, token,
+							  replacement, &reservation);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	if (!error) {
+		nfsd_ffv2_reservation_abort(reservation);
+		reservation = NULL;
+	}
+	exp_put(exp);
+	exp = replacement;
+	nfsd_ffv2_test_fail_reservation_alloc(nn);
+	error = nfsd_ffv2_test_reservation_claim_expected(nn, &root, uuid, token,
+							  exp, &reservation);
+	KUNIT_EXPECT_EQ(test, error, -ENOMEM);
+	if (!error) {
+		nfsd_ffv2_reservation_abort(reservation);
+		reservation = NULL;
+	}
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	error = nfsd_ffv2_test_reservation_claim_expected(nn, &root, uuid, token,
+							  exp, &reservation);
+	if (error) {
+		KUNIT_FAIL(test, "distinct-superblock claim: %d", error);
+		goto out_mount;
+	}
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&distinct));
+	replacement = nfsd_export_cache_update(&key);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(replacement));
+	if (IS_ERR(replacement))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(replacement), -EBUSY);
+	else
+		exp_put(replacement);
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.update_count, 0U);
+	nfsd_ffv2_reservation_abort(reservation);
+	reservation = NULL;
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_transition_abort_exact(exp));
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_transition_exact(exp), 0);
+	error = nfsd_ffv2_test_reservation_claim_expected(nn, &root, uuid, token,
+							  exp, &reservation);
+	if (error) {
+		KUNIT_FAIL(test, "exit reservation: %d", error);
+		goto out_mount;
+	}
+	init_completion(&exit_done);
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_wait_done, &exit_done);
+	nfsd_ffv2_net_pre_exit(nn);
+	replacement = nfsd_export_cache_update(&key);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(replacement));
+	if (IS_ERR(replacement))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(replacement), -ESHUTDOWN);
+	else
+		exp_put(replacement);
+	exp_put(exp);
+	exp = NULL;
+	nfsd_export_flush(net);
+	put_net(net);
+	wait_for_completion(&exit_done);
+	net_ns_barrier();
+	net = NULL;
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	nfsd_ffv2_reservation_abort(reservation);
+	reservation = NULL;
+out_mount:
+	if (reservation)
+		nfsd_ffv2_reservation_abort(reservation);
+	if (exp)
+		exp_put(exp);
+	if (foreign)
+		exp_put(foreign);
+	if (net)
+		nfsd_export_flush(net);
+	nfsd_export_flush(other_net);
+	kern_unmount(mount);
+out_root:
+	path_put(&root);
+	auth_domain_put(domain);
+out_other_net:
+	put_net(other_net);
+	net_ns_barrier();
+out_net:
+	if (net)
+		put_net(net);
+	net_ns_barrier();
+}
+
+struct nfsd_ffv2_reservation_wait_ctx {
+	struct nfsd_ffv2_reservation *reservation;
+	int result;
+	struct completion done;
+};
+
+static int nfsd_ffv2_reservation_wait_thread(void *data)
+{
+	struct nfsd_ffv2_reservation_wait_ctx *ctx = data;
+
+	allow_signal(SIGUSR1);
+	ctx->result = nfsd_ffv2_reservation_gate_io(ctx->reservation);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_reservation_io_test(struct kunit *test)
+{
+	struct nfsd_ffv2_reservation_wait_ctx ctx;
+	struct nfsd_ffv2_reservation *reservation = NULL;
+	struct nlmsvc_ffv2_gate nlm_gate;
+	struct nfsd_file *nf, *probe;
+	struct task_struct *task;
+	struct nfsd_net *nn;
+	struct path root;
+	struct net *net;
+	u8 uuid[16] = { 3 }, token[32] = { 4 };
+	bool waiting;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "gate netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_file_ffv2_test_cache_start();
+	mutex_unlock(&nfsd_mutex);
+	if (error) {
+		KUNIT_FAIL(test, "gate filecache startup: %d", error);
+		goto out_net;
+	}
+	get_fs_root(current->fs, &root);
+	error = nfsd_ffv2_test_reservation_claim(nn, &root, uuid, token, &reservation);
+	if (error) {
+		KUNIT_FAIL(test, "gate reservation: %d", error);
+		goto out_root;
+	}
+	error = nlmsvc_ffv2_gate_begin(&nlm_gate, root.mnt->mnt_sb);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	if (!error) {
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_reservation_gate_io(reservation), -EBUSY);
+		nlmsvc_ffv2_gate_end(&nlm_gate);
+	}
+	nf = nfsd_file_ffv2_test_alloc(d_inode(root.dentry), NFSD_MAY_READ, false);
+	if (!nf) {
+		KUNIT_FAIL(test, "gate persistent file allocation");
+		goto out_reservation;
+	}
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_reservation_gate_io(reservation), -EBUSY);
+	error = nlmsvc_ffv2_gate_begin(&nlm_gate, root.mnt->mnt_sb);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	if (!error)
+		nlmsvc_ffv2_gate_end(&nlm_gate);
+	nfsd_file_put(nf);
+	nf = nfsd_file_ffv2_test_alloc(d_inode(root.dentry),
+				       NFSD_MAY_READ | NFSD_MAY_LOCALIO, false);
+	if (!nf) {
+		KUNIT_FAIL(test, "gate retained LOCALIO file");
+		goto out_reservation;
+	}
+	ctx.reservation = reservation;
+	init_completion(&ctx.done);
+	task = kthread_run(nfsd_ffv2_reservation_wait_thread, &ctx, "ffv2-gate-io");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "gate I/O worker: %ld", PTR_ERR(task));
+		nfsd_file_put(nf);
+		goto out_reservation;
+	}
+	error = read_poll_timeout(nfsd_ffv2_test_reservation_waiting, waiting, waiting,
+				  1000, 1000000, false, reservation);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx.done));
+	send_sig(SIGUSR1, task, 1);
+	wait_for_completion(&ctx.done);
+	kthread_stop(task);
+	KUNIT_EXPECT_EQ(test, ctx.result, -ERESTARTSYS);
+	error = nlmsvc_ffv2_gate_begin(&nlm_gate, root.mnt->mnt_sb);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	if (!error)
+		nlmsvc_ffv2_gate_end(&nlm_gate);
+	probe = nfsd_file_ffv2_test_alloc(d_inode(root.dentry), NFSD_MAY_READ, false);
+	KUNIT_EXPECT_NOT_NULL(test, probe);
+	if (probe)
+		nfsd_file_put(probe);
+	nfsd_file_put(nf);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_reservation_gate_io(reservation), 0);
+	error = nlmsvc_ffv2_gate_begin(&nlm_gate, root.mnt->mnt_sb);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	if (!error)
+		nlmsvc_ffv2_gate_end(&nlm_gate);
+out_reservation:
+	nfsd_ffv2_reservation_abort(reservation);
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_mount_crossing_allowed(&root));
+	error = nlmsvc_ffv2_gate_begin(&nlm_gate, root.mnt->mnt_sb);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	if (!error)
+		nlmsvc_ffv2_gate_end(&nlm_gate);
+out_root:
+	path_put(&root);
+	mutex_lock(&nfsd_mutex);
+	nfsd_file_cache_shutdown();
+	mutex_unlock(&nfsd_mutex);
+out_net:
+	put_net(net);
+	net_ns_barrier();
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_reservation_access_test),
+	KUNIT_CASE(nfsd_ffv2_reservation_io_test),
 	KUNIT_CASE(nfsd_ffv2_filecache_gate_test),
 	KUNIT_CASE(nfsd_ffv2_nlm_open_refusal_test),
 	KUNIT_CASE(nfsd_ffv2_export_access_test),

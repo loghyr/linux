@@ -128,6 +128,9 @@ nfsd_ffv2_export_lookup(struct cache_detail *cd, struct auth_domain *client,
 int nfsd_ffv2_export_transition_exact(struct svc_export *exp);
 bool nfsd_ffv2_export_is_current(struct svc_export *exp);
 bool nfsd_ffv2_export_transition_abort_exact(struct svc_export *exp);
+void nfsd_ffv2_export_update_lock(void);
+void nfsd_ffv2_export_update_unlock(void);
+bool nfsd_ffv2_export_is_current_locked(struct svc_export *exp);
 int nfsd_ffv2_export_access_get(struct svc_export *exp);
 int nfsd_ffv2_export_access_clone(struct svc_export *exp);
 void nfsd_ffv2_export_access_put(struct svc_export *exp);

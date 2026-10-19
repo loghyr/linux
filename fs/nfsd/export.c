@@ -1812,6 +1812,23 @@ nfsd_ffv2_test_export_update_exact(struct svc_export *new,
 
 static DEFINE_MUTEX(nfsd_export_update_lock);
 
+void nfsd_ffv2_export_update_lock(void)
+{
+	mutex_lock(&nfsd_export_update_lock);
+}
+
+void nfsd_ffv2_export_update_unlock(void)
+{
+	mutex_unlock(&nfsd_export_update_lock);
+}
+
+bool nfsd_ffv2_export_is_current_locked(struct svc_export *exp)
+{
+	lockdep_assert_held(&nfsd_export_update_lock);
+	return sunrpc_cache_is_current(exp->cd, &exp->h, &exp->h,
+				      svc_export_hash(exp));
+}
+
 struct svc_export *
 nfsd_ffv2_export_lookup(struct cache_detail *cd, struct auth_domain *client,
 			const struct path *path)
@@ -2544,7 +2561,7 @@ nfsd_export_init(struct net *net)
 	if (rv)
 		goto destroy_expkey_cache;
 #ifdef CONFIG_NFSD_FFV2
-	rv = nfsd_ffv2_participant_register(nn);
+	rv = nfsd_ffv2_participant_register(nn, net);
 	if (rv)
 		goto unregister_expkey_cache;
 #endif

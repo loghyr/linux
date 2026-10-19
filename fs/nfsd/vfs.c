@@ -47,6 +47,7 @@
 #include "stats.h"
 #include "vfs.h"
 #include "filecache.h"
+#include "ffv2.h"
 #include "trace.h"
 
 #define NFSDDBG_FACILITY		NFSDDBG_FILEOP
@@ -141,6 +142,13 @@ nfsd_cross_mnt(struct svc_rqst *rqstp, struct dentry **dpp,
 	err = follow_down(&path, follow_flags);
 	if (err < 0)
 		goto out;
+#ifdef CONFIG_NFSD_FFV2
+	/* Reserved backing superblocks are excluded from ordinary namespaces. */
+	if (!nfsd4_ffv2_mount_crossing_allowed(&path)) {
+		err = -EACCES;
+		goto out;
+	}
+#endif
 
 	if (path.mnt == exp->ex_path.mnt && path.dentry == dentry &&
 	    nfsd_mountpoint(dentry, exp) == 2) {
