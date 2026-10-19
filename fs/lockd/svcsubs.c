@@ -32,6 +32,21 @@
 static struct hlist_head	nlm_files[FILE_NRHASH];
 static DEFINE_MUTEX(nlm_file_mutex);
 
+#ifdef CONFIG_NFSD_FFV2
+static LIST_HEAD(nlm_ffv2_gates);
+
+static bool nlmsvc_ffv2_blocked(struct super_block *sb)
+{
+	struct nlmsvc_ffv2_gate *gate;
+
+	lockdep_assert_held(&nlm_file_mutex);
+	list_for_each_entry(gate, &nlm_ffv2_gates, list)
+		if (gate->sb == sb)
+			return true;
+	return false;
+}
+#endif
+
 #ifdef CONFIG_SUNRPC_DEBUG
 static inline void nlm_debug_print_fh(char *msg, struct nfs_fh *f)
 {
@@ -74,6 +89,20 @@ static inline unsigned int file_hash(struct nfs_fh *f)
 int lock_to_openmode(struct file_lock *lock)
 {
 	return lock_is_write(lock) ? O_WRONLY : O_RDONLY;
+}
+
+static struct nlm_file *nlmsvc_alloc_file(const struct nfs_fh *fh)
+{
+	struct nlm_file *file;
+
+	file = kzalloc_obj(*file);
+	if (!file)
+		return NULL;
+	memcpy(&file->f_handle, fh, sizeof(*fh));
+	mutex_init(&file->f_mutex);
+	INIT_HLIST_NODE(&file->f_list);
+	INIT_LIST_HEAD(&file->f_blocks);
+	return file;
 }
 
 /*
@@ -140,66 +169,6 @@ static __be32 nlm_do_fopen(struct svc_rqst *rqstp,
 }
 
 /*
- * Lookup file info. If it doesn't exist, create a file info struct
- * and open a (VFS) file for the given inode.
- */
-__be32
-nlm_lookup_file(struct svc_rqst *rqstp, struct nlm_file **result,
-		struct lockd_lock *lock, int mode)
-{
-	struct nlm_file	*file;
-	unsigned int	hash;
-	__be32		nfserr;
-
-	nlm_debug_print_fh("nlm_lookup_file", &lock->fh);
-
-	hash = file_hash(&lock->fh);
-
-	/* Lock file table */
-	mutex_lock(&nlm_file_mutex);
-
-	hlist_for_each_entry(file, &nlm_files[hash], f_list)
-		if (!nfs_compare_fh(&file->f_handle, &lock->fh)) {
-			mutex_lock(&file->f_mutex);
-			nfserr = nlm_do_fopen(rqstp, file, mode);
-			mutex_unlock(&file->f_mutex);
-			if (nfserr)
-				goto out_unlock;
-			goto found;
-		}
-	nlm_debug_print_fh("creating file for", &lock->fh);
-
-	nfserr = nlm_lck_denied_nolocks;
-	file = kzalloc_obj(*file);
-	if (!file)
-		goto out_free;
-
-	memcpy(&file->f_handle, &lock->fh, sizeof(struct nfs_fh));
-	mutex_init(&file->f_mutex);
-	INIT_HLIST_NODE(&file->f_list);
-	INIT_LIST_HEAD(&file->f_blocks);
-
-	nfserr = nlm_do_fopen(rqstp, file, mode);
-	if (nfserr)
-		goto out_free;
-
-	hlist_add_head(&file->f_list, &nlm_files[hash]);
-
-found:
-	dprintk("lockd: found file %p (count %d)\n", file, file->f_count);
-	*result = file;
-	file->f_count++;
-
-out_unlock:
-	mutex_unlock(&nlm_file_mutex);
-	return nfserr;
-
-out_free:
-	kfree(file);
-	goto out_unlock;
-}
-
-/*
  * Release the struct file references held by a nlm_file.
  */
 static void nlm_release_files(struct nlm_file *file)
@@ -224,6 +193,82 @@ static void nlm_release_files(struct nlm_file *file)
 		if (file->f_file[O_WRONLY])
 			fput(file->f_file[O_WRONLY]);
 	}
+}
+
+static __be32 nlmsvc_insert_file(struct nlm_file *file, unsigned int hash)
+{
+	lockdep_assert_held(&nlm_file_mutex);
+#ifdef CONFIG_NFSD_FFV2
+	if (nlmsvc_ffv2_blocked(nlmsvc_file_inode(file)->i_sb)) {
+		nlm_release_files(file);
+		return nlm_lck_denied_nolocks;
+	}
+#endif
+	hlist_add_head(&file->f_list, &nlm_files[hash]);
+	return nlm_granted;
+}
+
+/*
+ * Lookup file info. If it doesn't exist, create a file info struct
+ * and open a (VFS) file for the given inode.
+ */
+__be32
+nlm_lookup_file(struct svc_rqst *rqstp, struct nlm_file **result,
+		struct lockd_lock *lock, int mode)
+{
+	struct nlm_file	*file;
+	unsigned int	hash;
+	__be32		nfserr;
+
+	nlm_debug_print_fh("nlm_lookup_file", &lock->fh);
+
+	hash = file_hash(&lock->fh);
+
+	/* Lock file table */
+	mutex_lock(&nlm_file_mutex);
+
+	hlist_for_each_entry(file, &nlm_files[hash], f_list)
+		if (!nfs_compare_fh(&file->f_handle, &lock->fh)) {
+#ifdef CONFIG_NFSD_FFV2
+			if (nlmsvc_ffv2_blocked(nlmsvc_file_inode(file)->i_sb)) {
+				nfserr = nlm_lck_denied_nolocks;
+				goto out_unlock;
+			}
+#endif
+			mutex_lock(&file->f_mutex);
+			nfserr = nlm_do_fopen(rqstp, file, mode);
+			mutex_unlock(&file->f_mutex);
+			if (nfserr)
+				goto out_unlock;
+			goto found;
+		}
+	nlm_debug_print_fh("creating file for", &lock->fh);
+
+	nfserr = nlm_lck_denied_nolocks;
+	file = nlmsvc_alloc_file(&lock->fh);
+	if (!file)
+		goto out_free;
+
+	nfserr = nlm_do_fopen(rqstp, file, mode);
+	if (nfserr)
+		goto out_free;
+
+	nfserr = nlmsvc_insert_file(file, hash);
+	if (nfserr)
+		goto out_free;
+
+found:
+	dprintk("lockd: found file %p (count %d)\n", file, file->f_count);
+	*result = file;
+	file->f_count++;
+
+out_unlock:
+	mutex_unlock(&nlm_file_mutex);
+	return nfserr;
+
+out_free:
+	kfree(file);
+	goto out_unlock;
 }
 
 /*
@@ -554,6 +599,58 @@ nlmsvc_unlock_all_by_sb(struct super_block *sb)
 }
 EXPORT_SYMBOL_GPL(nlmsvc_unlock_all_by_sb);
 
+#ifdef CONFIG_NFSD_FFV2
+/**
+ * nlmsvc_ffv2_gate_begin - exclude NLM owners of a backing superblock
+ * @gate: caller-owned storage retained until gate_end
+ * @sb: superblock kept alive by the caller
+ *
+ * Context: Sleeps. Takes nlm_file_mutex.
+ * Return: zero with the gate held, or -EBUSY without a gate.
+ */
+int nlmsvc_ffv2_gate_begin(struct nlmsvc_ffv2_gate *gate,
+			   struct super_block *sb)
+{
+	struct nlm_file *file;
+	unsigned int i;
+	int error = 0;
+
+	INIT_LIST_HEAD(&gate->list);
+	gate->sb = sb;
+	mutex_lock(&nlm_file_mutex);
+	if (nlmsvc_ffv2_blocked(sb)) {
+		error = -EBUSY;
+		goto out_unlock;
+	}
+	for (i = 0; i < FILE_NRHASH; i++)
+		hlist_for_each_entry(file, &nlm_files[i], f_list)
+			if (nlmsvc_file_inode(file)->i_sb == sb) {
+				error = -EBUSY;
+				goto out_unlock;
+			}
+	list_add_tail(&gate->list, &nlm_ffv2_gates);
+out_unlock:
+	mutex_unlock(&nlm_file_mutex);
+	return error;
+}
+EXPORT_SYMBOL_GPL(nlmsvc_ffv2_gate_begin);
+
+/**
+ * nlmsvc_ffv2_gate_end - release an NLM exclusion gate
+ * @gate: initialized gate whose owner has finished using it
+ *
+ * Context: Sleeps. Takes nlm_file_mutex.
+ */
+void nlmsvc_ffv2_gate_end(struct nlmsvc_ffv2_gate *gate)
+{
+	mutex_lock(&nlm_file_mutex);
+	if (!list_empty(&gate->list))
+		list_del_init(&gate->list);
+	mutex_unlock(&nlm_file_mutex);
+}
+EXPORT_SYMBOL_GPL(nlmsvc_ffv2_gate_end);
+#endif
+
 static int
 nlmsvc_match_ip(void *datap, struct nlm_host *host)
 {
@@ -576,3 +673,78 @@ nlmsvc_unlock_all_by_ip(struct sockaddr *server_addr)
 	return ret ? -EIO : 0;
 }
 EXPORT_SYMBOL_GPL(nlmsvc_unlock_all_by_ip);
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/**
+ * nlmsvc_ffv2_test_file_get - retain a test-owned file in the NLM table
+ * @filp: referenced VFS file, borrowed for the call
+ *
+ * Context: Sleeps. Takes nlm_file_mutex.
+ * Return: a table owner for test_file_put, or NULL on allocation failure.
+ */
+struct nlm_file *nlmsvc_ffv2_test_file_get(struct file *filp)
+{
+	struct nfs_fh fh = {};
+	struct nlm_file *file;
+
+	file = nlmsvc_alloc_file(&fh);
+	if (!file)
+		return NULL;
+	file->f_file[O_RDONLY] = get_file(filp);
+	file->f_count = 1;
+	mutex_lock(&nlm_file_mutex);
+	hlist_add_head(&file->f_list, &nlm_files[file_hash(&fh)]);
+	mutex_unlock(&nlm_file_mutex);
+	return file;
+}
+EXPORT_SYMBOL_GPL(nlmsvc_ffv2_test_file_get);
+
+/**
+ * nlmsvc_ffv2_test_file_insert - finish a new NLM entry after open
+ * @read_file: borrowed read slot, or NULL for an unsuccessful read open
+ * @write_file: borrowed write slot, or NULL for an unsuccessful write open
+ *
+ * Context: Sleeps. Takes nlm_file_mutex. At least one slot is initialized.
+ * Return: a table owner for test_file_put, or NULL on allocation or refusal.
+ */
+struct nlm_file *nlmsvc_ffv2_test_file_insert(struct file *read_file,
+					      struct file *write_file)
+{
+	struct nfs_fh fh = {};
+	struct nlm_file *file;
+	__be32 status;
+
+	if (!read_file && !write_file)
+		return NULL;
+	file = nlmsvc_alloc_file(&fh);
+	if (!file)
+		return NULL;
+	if (read_file)
+		file->f_file[O_RDONLY] = get_file(read_file);
+	if (write_file)
+		file->f_file[O_WRONLY] = get_file(write_file);
+	mutex_lock(&nlm_file_mutex);
+	status = nlmsvc_insert_file(file, file_hash(&fh));
+	if (!status)
+		file->f_count++;
+	mutex_unlock(&nlm_file_mutex);
+	if (status) {
+		kfree(file);
+		return NULL;
+	}
+	return file;
+}
+EXPORT_SYMBOL_GPL(nlmsvc_ffv2_test_file_insert);
+
+/**
+ * nlmsvc_ffv2_test_file_put - release a test-owned NLM table entry
+ * @file: sole test owner returned by test_file_get
+ *
+ * Context: Sleeps. Takes nlm_file_mutex.
+ */
+void nlmsvc_ffv2_test_file_put(struct nlm_file *file)
+{
+	nlm_release_file(file);
+}
+EXPORT_SYMBOL_GPL(nlmsvc_ffv2_test_file_put);
+#endif

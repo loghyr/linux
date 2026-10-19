@@ -18,6 +18,13 @@ struct rpc_clnt;
 struct super_block;
 struct module;
 
+#ifdef CONFIG_NFSD_FFV2
+struct nlmsvc_ffv2_gate {
+	struct list_head	list;
+	struct super_block *sb;
+};
+#endif
+
 /**
  * struct nlmsvc_binding - lockd -> nfsd callback table
  * @owner:  module that provides this binding.
@@ -86,6 +93,18 @@ extern void	lockd_down(struct net *net);
  * Cluster failover support
  */
 int nlmsvc_unlock_all_by_sb(struct super_block *sb);
+#ifdef CONFIG_NFSD_FFV2
+int nlmsvc_ffv2_gate_begin(struct nlmsvc_ffv2_gate *gate,
+			   struct super_block *sb);
+void nlmsvc_ffv2_gate_end(struct nlmsvc_ffv2_gate *gate);
+#endif
 int nlmsvc_unlock_all_by_ip(struct sockaddr *server_addr);
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct nlm_file;
+struct nlm_file *nlmsvc_ffv2_test_file_get(struct file *filp);
+struct nlm_file *nlmsvc_ffv2_test_file_insert(struct file *read_file,
+					      struct file *write_file);
+void nlmsvc_ffv2_test_file_put(struct nlm_file *file);
+#endif
 #endif /* LINUX_LOCKD_BIND_H */
