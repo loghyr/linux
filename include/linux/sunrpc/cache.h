@@ -190,6 +190,9 @@ sunrpc_cache_lookup_rcu(struct cache_detail *detail,
 extern struct cache_head *
 sunrpc_cache_update(struct cache_detail *detail,
 		    struct cache_head *new, struct cache_head *old, int hash);
+bool sunrpc_cache_is_current(struct cache_detail *detail,
+			     struct cache_head *key,
+			     struct cache_head *expected, int hash);
 extern struct cache_head *
 sunrpc_cache_update_exact(struct cache_detail *detail,
 			  struct cache_head *new, struct cache_head *old,
