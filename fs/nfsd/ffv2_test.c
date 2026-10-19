@@ -2,16 +2,19 @@
 #include <kunit/test.h>
 #include <linux/completion.h>
 #include <linux/cred.h>
+#include <linux/fs_struct.h>
 #include <linux/iopoll.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/refcount.h>
 #include <linux/sched.h>
 #include <linux/sunrpc/svcsock.h>
+#include <linux/sunrpc/svcauth.h>
 #include <linux/sunrpc/svc_xprt.h>
 #include <net/net_namespace.h>
 
 #include "ffv2.h"
+#include "export.h"
 #include "nfsd.h"
 #include "netns.h"
 #include "netlink.h"
@@ -1268,6 +1271,455 @@ static void nfsd_ffv2_partial_start_cleanup_test(struct kunit *test)
 	net_ns_barrier();
 }
 
+static void nfsd_ffv2_init_export_test_key(struct svc_export *exp,
+					   struct nfsd_net *nn,
+					   struct auth_domain *domain,
+					   const struct path *root)
+{
+	memset(exp, 0, sizeof(*exp));
+	exp->cd = nn->svc_export_cache;
+	exp->ex_client = domain;
+	exp->ex_path = *root;
+	exp->h.expiry_time = TIME64_MAX;
+	exp->ex_anon_uid = GLOBAL_ROOT_UID;
+	exp->ex_anon_gid = GLOBAL_ROOT_GID;
+	exp->ex_xprtsec_modes = NFSEXP_XPRTSEC_ALL;
+}
+
+static void nfsd_ffv2_ordinary_export_update_test(struct kunit *test)
+{
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_export_update update;
+	struct svc_export key, *published;
+	struct auth_domain *domain;
+	struct nfsd_net *nn;
+	struct path root;
+	struct net *net;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "export test netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	domain = unix_domain_find("ffv2-export-update-kunit");
+	if (!domain) {
+		KUNIT_FAIL(test, "export test auth domain allocation failed");
+		goto out_net;
+	}
+	get_fs_root(current->fs, &root);
+	nfsd_ffv2_init_export_test_key(&key, nn, domain, &root);
+	published = nfsd_export_cache_update(&key);
+	if (IS_ERR(published)) {
+		KUNIT_FAIL(test, "positive update: %ld", PTR_ERR(published));
+		goto out_root;
+	}
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 1U);
+	KUNIT_EXPECT_TRUE(test, published->ex_ffv2_listed);
+	exp_put(published);
+
+	nfsd_ffv2_test_fail_export_alloc();
+	published = nfsd_export_cache_update(&key);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(published));
+	if (IS_ERR(published))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(published), -ENOMEM);
+	else
+		exp_put(published);
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.update_count, 0U);
+
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_up(nn);
+	generation = nfsd_ffv2_service_stop_begin(nn);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_PTR_EQ(test, generation, NULL);
+	set_bit(CACHE_NEGATIVE, &key.h.flags);
+	published = nfsd_export_cache_update(&key);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(published));
+	if (IS_ERR(published))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(published), -ESHUTDOWN);
+	else
+		exp_put(published);
+	nfsd_ffv2_service_stop_finish(nn, generation);
+	mutex_lock(&nfsd_mutex);
+	nfsd_ffv2_service_down(nn);
+	mutex_unlock(&nfsd_mutex);
+	published = nfsd_export_cache_update(&key);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(published));
+	if (!IS_ERR(published)) {
+		KUNIT_EXPECT_TRUE(test, test_bit(CACHE_NEGATIVE, &published->h.flags));
+		KUNIT_EXPECT_FALSE(test, published->ex_ffv2_listed);
+		exp_put(published);
+	}
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_up(nn);
+	generation = nfsd_ffv2_service_stop_begin(nn);
+	nfsd_ffv2_service_stop_failed(nn, generation);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_service_up(nn), -EAGAIN);
+	nfsd_ffv2_service_down(nn);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	clear_bit(CACHE_NEGATIVE, &key.h.flags);
+	published = nfsd_export_cache_update(&key);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(published));
+	if (!IS_ERR(published))
+		exp_put(published);
+
+	/* Reopening must not make an update from the prior epoch valid. */
+	error = nfsd_ffv2_export_update_begin(&key, &update);
+	if (error) {
+		KUNIT_FAIL(test, "admit epoch update: %d", error);
+		goto out_root;
+	}
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_service_up(nn);
+	generation = nfsd_ffv2_service_stop_begin(nn);
+	nfsd_ffv2_service_stop_failed(nn, generation);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_TRUE(test, nn->ffv2_participant.updates_open);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_export_update_validate(&update),
+			-ESHUTDOWN);
+	nfsd_ffv2_export_update_abort(&update);
+
+	nfsd_ffv2_net_pre_exit(nn);
+	nfsd_ffv2_test_try_reopen_updates(nn);
+	KUNIT_EXPECT_FALSE(test, nn->ffv2_participant.updates_open);
+	clear_bit(CACHE_NEGATIVE, &key.h.flags);
+	published = nfsd_export_cache_update(&key);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(published));
+	if (IS_ERR(published))
+		KUNIT_EXPECT_EQ(test, PTR_ERR(published), -ESHUTDOWN);
+	else
+		exp_put(published);
+	nfsd_export_flush(net);
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 0U);
+out_root:
+	path_put(&root);
+	auth_domain_put(domain);
+out_net:
+	put_net(net);
+	net_ns_barrier();
+}
+
+struct nfsd_ffv2_cache_update_ctx {
+	struct svc_export *key;
+	struct svc_export *result;
+	struct completion done;
+};
+
+static int nfsd_ffv2_cache_update_thread(void *data)
+{
+	struct nfsd_ffv2_cache_update_ctx *ctx = data;
+
+	ctx->result = nfsd_export_cache_update(ctx->key);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static bool nfsd_ffv2_update_waiting(struct nfsd_net *nn)
+{
+	/* The token is held until the observer sees the enqueued waiter. */
+	return waitqueue_active(&nn->ffv2_participant.update_wait);
+}
+
+static void nfsd_ffv2_ordinary_update_drain_test(struct kunit *test)
+{
+	struct nfsd_ffv2_cache_update_ctx update = {};
+	struct nfsd_ffv2_shutdown_ctx shutdown;
+	struct task_struct *update_task, *shutdown_task = NULL;
+	struct completion validated, proceed;
+	struct svc_export key, *published;
+	struct auth_domain *domain;
+	struct nfsd_net *nn;
+	struct path root;
+	struct net *net;
+	bool waiting;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "drain test netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	domain = unix_domain_find("ffv2-export-drain-kunit");
+	if (!domain) {
+		KUNIT_FAIL(test, "drain auth domain allocation failed");
+		goto out_net;
+	}
+	get_fs_root(current->fs, &root);
+	nfsd_ffv2_init_export_test_key(&key, nn, domain, &root);
+	error = nfsd_ffv2_start_test_service(net, NULL);
+	if (error) {
+		KUNIT_FAIL(test, "start ordinary server: %d", error);
+		goto out_root;
+	}
+
+	init_completion(&validated);
+	init_completion(&proceed);
+	init_completion(&update.done);
+	update.key = &key;
+	WRITE_ONCE(nn->ffv2_participant.test_update_validated, &validated);
+	WRITE_ONCE(nn->ffv2_participant.test_update_continue, &proceed);
+	update_task = kthread_run(nfsd_ffv2_cache_update_thread, &update,
+				  "nfsd-ffv2-cache-update-test");
+	if (IS_ERR(update_task)) {
+		KUNIT_FAIL(test, "start update worker: %ld", PTR_ERR(update_task));
+		goto out_service;
+	}
+	if (!wait_for_completion_timeout(&validated, 5 * HZ)) {
+		KUNIT_FAIL(test, "update did not pass validation");
+		goto out_update;
+	}
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.update_count, 1U);
+	nfsd_ffv2_shutdown_ctx_init(&shutdown, net);
+	shutdown_task = nfsd_ffv2_shutdown_thread_start(&shutdown, false);
+	if (IS_ERR(shutdown_task)) {
+		KUNIT_FAIL(test, "start shutdown worker: %ld", PTR_ERR(shutdown_task));
+		shutdown_task = NULL;
+		nfsd_ffv2_shutdown_ctx_put(&shutdown);
+		goto out_update;
+	}
+	error = read_poll_timeout(nfsd_ffv2_update_waiting, waiting, waiting,
+				  10, USEC_PER_SEC, false, nn);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&shutdown.done));
+	KUNIT_EXPECT_FALSE(test, completion_done(&update.done));
+	KUNIT_EXPECT_FALSE(test, nn->ffv2_participant.updates_open);
+
+out_update:
+	/* Release and join all users before clearing hooks or fixture storage. */
+	complete_all(&proceed);
+	wait_for_completion(&update.done);
+	kthread_stop(update_task);
+	if (!IS_ERR(update.result)) {
+		KUNIT_EXPECT_TRUE(test, update.result->ex_ffv2_listed);
+		exp_put(update.result);
+	} else {
+		KUNIT_FAIL(test, "validated cache update: %ld", PTR_ERR(update.result));
+	}
+	if (shutdown_task) {
+		wait_for_completion(&shutdown.done);
+		kthread_stop(shutdown_task);
+		nfsd_ffv2_shutdown_ctx_put(&shutdown);
+		KUNIT_EXPECT_EQ(test, nn->ffv2_participant.update_count, 0U);
+		KUNIT_EXPECT_TRUE(test, nn->ffv2_participant.updates_open);
+	}
+out_service:
+	WRITE_ONCE(nn->ffv2_participant.test_update_validated, NULL);
+	WRITE_ONCE(nn->ffv2_participant.test_update_continue, NULL);
+	nfsd_shutdown_threads(net);
+	/* Configuration is accepted after real shutdown and after restart. */
+	published = nfsd_export_cache_update(&key);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(published));
+	if (!IS_ERR(published))
+		exp_put(published);
+	error = nfsd_ffv2_start_test_service(net, NULL);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	if (!error) {
+		published = nfsd_export_cache_update(&key);
+		KUNIT_EXPECT_FALSE(test, IS_ERR(published));
+		if (!IS_ERR(published))
+			exp_put(published);
+		nfsd_shutdown_threads(net);
+	}
+out_root:
+	path_put(&root);
+	auth_domain_put(domain);
+out_net:
+	put_net(net);
+	net_ns_barrier();
+}
+
+struct nfsd_ffv2_export_detach_ctx {
+	struct net *net;
+	struct completion done;
+};
+
+static int nfsd_ffv2_export_detach_thread(void *data)
+{
+	struct nfsd_ffv2_export_detach_ctx *ctx = data;
+
+	put_net(ctx->net);
+	net_ns_barrier();
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+struct nfsd_ffv2_export_put_ctx {
+	struct svc_export *exp;
+	struct completion done;
+};
+
+static int nfsd_ffv2_export_put_thread(void *data)
+{
+	struct nfsd_ffv2_export_put_ctx *ctx = data;
+
+	exp_put(ctx->exp);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_ordinary_export_detach_test(struct kunit *test)
+{
+	struct nfsd_ffv2_export_detach_ctx ctx;
+	struct nfsd_ffv2_export_put_ctx put_ctx;
+	struct svc_export key, *published;
+	struct auth_domain *domain;
+	struct completion entered, finished, release_zero, release_continue;
+	struct completion postwait_entered, postwait_continue, destroy_continue;
+	struct completion lock_entered;
+	struct task_struct *task, *put_task, *inventory_task = NULL;
+	struct nfsd_net *nn;
+	struct path root;
+	struct net *net;
+	unsigned int waiting_count = UINT_MAX;
+	unsigned int state;
+	int error;
+
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(net)) {
+		KUNIT_FAIL(test, "detach test netns: %ld", PTR_ERR(net));
+		return;
+	}
+	nn = net_generic(net, nfsd_net_id);
+	domain = unix_domain_find("ffv2-export-detach-kunit");
+	if (!domain) {
+		KUNIT_FAIL(test, "detach auth domain allocation failed");
+		goto out_net;
+	}
+	get_fs_root(current->fs, &root);
+	nfsd_ffv2_init_export_test_key(&key, nn, domain, &root);
+	published = nfsd_export_cache_update(&key);
+	if (IS_ERR(published)) {
+		KUNIT_FAIL(test, "detach export update: %ld", PTR_ERR(published));
+		goto out_root;
+	}
+	KUNIT_EXPECT_TRUE(test, published->ex_ffv2_listed);
+	KUNIT_EXPECT_EQ(test, nn->ffv2_participant.inventory_count, 1U);
+	/* Hold a separate reader reference across cache unregister. */
+	exp_get(published);
+	init_completion(&entered);
+	init_completion(&finished);
+	init_completion(&release_zero);
+	init_completion(&release_continue);
+	init_completion(&postwait_entered);
+	init_completion(&postwait_continue);
+	init_completion(&destroy_continue);
+	init_completion(&lock_entered);
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_lock_entered, &lock_entered);
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_task, &inventory_task);
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_destroy_continue,
+		   &destroy_continue);
+	init_completion(&ctx.done);
+	init_completion(&put_ctx.done);
+	put_ctx.exp = published;
+	ctx.net = net;
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_wait_entered, &entered);
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_wait_done, &finished);
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_postwait_entered,
+		   &postwait_entered);
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_postwait_continue,
+		   &postwait_continue);
+	WRITE_ONCE(nn->ffv2_participant.test_inventory_wait_count,
+		   &waiting_count);
+	WRITE_ONCE(nn->ffv2_participant.test_release_count_zero,
+		   &release_zero);
+	WRITE_ONCE(nn->ffv2_participant.test_release_continue,
+		   &release_continue);
+	task = kthread_run(nfsd_ffv2_export_detach_thread, &ctx,
+			   "nfsd-ffv2-export-detach-test");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "start detach thread: %ld", PTR_ERR(task));
+		WRITE_ONCE(nn->ffv2_participant.test_inventory_wait_entered,
+			   NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_inventory_wait_done, NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_inventory_postwait_entered,
+			   NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_inventory_postwait_continue,
+			   NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_inventory_wait_count,
+			   NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_release_count_zero, NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_release_continue, NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_inventory_lock_entered, NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_inventory_task, NULL);
+		WRITE_ONCE(nn->ffv2_participant.test_inventory_destroy_continue, NULL);
+		exp_put(published);
+		exp_put(published);
+		goto out_root;
+	}
+	/* The worker owns the last netns reference from this point on. */
+	if (!wait_for_completion_timeout(&entered, 5 * HZ)) {
+		KUNIT_FAIL(test, "detach did not reach inventory wait");
+	} else {
+		KUNIT_EXPECT_EQ(test, waiting_count, 1U);
+		KUNIT_EXPECT_FALSE(test, completion_done(&finished));
+	}
+	exp_put(published);
+	KUNIT_EXPECT_FALSE(test, completion_done(&finished));
+	put_task = kthread_run(nfsd_ffv2_export_put_thread, &put_ctx,
+			       "nfsd-ffv2-export-put-test");
+	if (IS_ERR(put_task)) {
+		KUNIT_FAIL(test, "start export put thread: %ld",
+			   PTR_ERR(put_task));
+		complete_all(&release_continue);
+		complete_all(&postwait_continue);
+		exp_put(published);
+	} else {
+		if (!wait_for_completion_timeout(&release_zero, 5 * HZ))
+			KUNIT_FAIL(test, "final put did not reach inventory lock");
+		else if (!wait_for_completion_timeout(&postwait_entered, 5 * HZ))
+			KUNIT_FAIL(test, "detach did not pass inventory wait");
+		complete(&postwait_continue);
+		if (!wait_for_completion_timeout(&lock_entered, 5 * HZ))
+			KUNIT_FAIL(test, "detach did not leave its test gate");
+		if (inventory_task) {
+			error = read_poll_timeout(READ_ONCE, state,
+						  state == TASK_UNINTERRUPTIBLE,
+						  10, USEC_PER_SEC, false,
+						  inventory_task->__state);
+			KUNIT_EXPECT_EQ(test, error, 0);
+			/* The only uninterruptible wait now is lock or control gate. */
+			KUNIT_EXPECT_FALSE(test, completion_done(&finished));
+		} else {
+			KUNIT_FAIL(test, "detach task was not captured");
+		}
+		complete(&release_continue);
+		if (!wait_for_completion_timeout(&put_ctx.done, 5 * HZ)) {
+			KUNIT_FAIL(test, "export put worker did not finish");
+			wait_for_completion(&put_ctx.done);
+		}
+		kthread_stop(put_task);
+	}
+	complete_all(&destroy_continue);
+	if (!wait_for_completion_timeout(&finished, 5 * HZ)) {
+		KUNIT_FAIL(test, "final export put did not release detach");
+		wait_for_completion(&finished);
+	}
+	if (!wait_for_completion_timeout(&ctx.done, 5 * HZ)) {
+		KUNIT_FAIL(test, "netns worker did not finish");
+		wait_for_completion(&ctx.done);
+	}
+	kthread_stop(task);
+	if (inventory_task)
+		put_task_struct(inventory_task);
+	path_put(&root);
+	auth_domain_put(domain);
+	return;
+out_root:
+	path_put(&root);
+	auth_domain_put(domain);
+out_net:
+	put_net(net);
+	net_ns_barrier();
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_lifecycle_test),
 	KUNIT_CASE(nfsd_ffv2_admission_unregister_test),
@@ -1282,6 +1734,9 @@ static struct kunit_case nfsd_ffv2_test_cases[] = {
 	KUNIT_CASE(nfsd_ffv2_shutdown_start_failure_test),
 	KUNIT_CASE(nfsd_ffv2_listener_only_integration_test),
 	KUNIT_CASE(nfsd_ffv2_partial_start_cleanup_test),
+	KUNIT_CASE(nfsd_ffv2_ordinary_export_update_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_ordinary_update_drain_test),
+	KUNIT_CASE(nfsd_ffv2_ordinary_export_detach_test),
 	{}
 };
 

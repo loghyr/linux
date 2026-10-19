@@ -31,7 +31,9 @@
 
 #define NFSDDBG_FACILITY	NFSDDBG_EXPORT
 
+#if !IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 static struct svc_export *nfsd_export_cache_update(struct svc_export *new);
+#endif
 
 /*
  * We have two caches.
@@ -1572,9 +1574,24 @@ static void export_update(struct cache_head *cnew, struct cache_head *citem)
 	new->ex_xprtsec_modes = item->ex_xprtsec_modes;
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static atomic_t nfsd_ffv2_test_export_alloc_failure;
+
+void nfsd_ffv2_test_fail_export_alloc(void)
+{
+	atomic_set(&nfsd_ffv2_test_export_alloc_failure, 1);
+}
+#endif
+
 static struct cache_head *svc_export_alloc(void)
 {
-	struct svc_export *i = kmalloc_obj(*i);
+	struct svc_export *i;
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (atomic_xchg(&nfsd_ffv2_test_export_alloc_failure, 0))
+		return NULL;
+#endif
+	i = kmalloc_obj(*i);
 	if (!i)
 		return NULL;
 
@@ -1651,7 +1668,11 @@ svc_export_update(struct svc_export *new, struct svc_export *old)
 static DEFINE_MUTEX(nfsd_export_update_lock);
 #endif
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct svc_export *
+#else
 static struct svc_export *
+#endif
 nfsd_export_cache_update(struct svc_export *new)
 {
 	struct svc_export *old, *result;
@@ -1681,6 +1702,12 @@ nfsd_export_cache_update(struct svc_export *new)
 		exp_put(old);
 		result = ERR_PTR(error);
 		goto out_unlock;
+	}
+#endif
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (READ_ONCE(update.participant->test_update_validated)) {
+		complete(READ_ONCE(update.participant->test_update_validated));
+		wait_for_completion(READ_ONCE(update.participant->test_update_continue));
 	}
 #endif
 	/* svc_export_update() consumes the lookup reference to old. */

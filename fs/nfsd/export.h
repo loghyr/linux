@@ -119,6 +119,10 @@ __be32 check_nfsd_access(struct svc_export *exp, struct svc_rqst *rqstp,
 int			nfsd_export_init(struct net *);
 void			nfsd_export_shutdown(struct net *);
 void			nfsd_export_flush(struct net *);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct svc_export *nfsd_export_cache_update(struct svc_export *new);
+void nfsd_ffv2_test_fail_export_alloc(void);
+#endif
 struct svc_export *	rqst_exp_get_by_name(struct svc_rqst *,
 					     const struct path *);
 struct svc_export *	rqst_exp_parent(struct svc_rqst *,
