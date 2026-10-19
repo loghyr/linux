@@ -46,6 +46,9 @@
 #include "idmap.h"
 #include "cache.h"
 #include "xdr4.h"
+#ifdef CONFIG_NFSD_FFV2
+#include "ffv2_trust.h"
+#endif
 #include "vfs.h"
 #include "current_stateid.h"
 #include "netns.h"
@@ -3377,6 +3380,13 @@ out:
 	return rpc_success;
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd4_test_dispatch_compound(struct svc_rqst *rqstp)
+{
+	nfsd4_proc_compound(rqstp);
+}
+#endif
+
 #define op_encode_hdr_size		(2)
 #define op_encode_stateid_maxsz		(XDR_QUADLEN(NFS4_STATEID_SIZE))
 #define op_encode_verifier_maxsz	(XDR_QUADLEN(NFS4_VERIFIER_SIZE))
@@ -3767,6 +3777,32 @@ static u32 nfsd4_removexattr_rsize(const struct svc_rqst *rqstp,
 		* sizeof(__be32);
 }
 
+
+#ifdef CONFIG_NFSD_FFV2
+__be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp)
+{
+	const struct nfsd4_compoundargs *args = rqstp->rq_argp;
+
+	if (likely(args->ffv2_digest_valid))
+		return nfs_ok;
+	if (args->ffv2_decode_class == NFSD4_FFV2_DECODE_BADXDR)
+		return nfserr_bad_xdr;
+	if (args->ffv2_decode_class == NFSD4_FFV2_DECODE_ERROR)
+		return args->ffv2_decode_status;
+	return nfserr_notsupp;
+}
+
+static __be32 nfsd4_ffv2_refuse(struct svc_rqst *rqstp,
+				struct nfsd4_compound_state *cstate,
+			      union nfsd4_op_u *u)
+{
+	__be32 status = nfsd4_ffv2_compound_status(rqstp);
+
+	if (status)
+		return status;
+	return nfserr_notsupp;
+}
+#endif
 
 static const struct nfsd4_operation nfsd4_ops[] = {
 	[OP_ACCESS] = {
@@ -4188,7 +4224,105 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_name = "OP_REMOVEXATTR",
 		.op_rsize_bop = nfsd4_removexattr_rsize,
 	},
+#ifdef CONFIG_NFSD_FFV2
+	[OP_CHUNK_COMMIT] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_COMMIT",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_ERROR] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_ERROR",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_FINALIZE] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_FINALIZE",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_HEADER_READ] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = 0,
+		.op_name = "OP_CHUNK_HEADER_READ",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_LOCK] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_LOCK",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_READ] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = 0,
+		.op_name = "OP_CHUNK_READ",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_REPAIRED] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_REPAIRED",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_ROLLBACK] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_ROLLBACK",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_UNLOCK] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_UNLOCK",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_WRITE] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_WRITE",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_CHUNK_WRITE_REPAIR] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_CHUNK_WRITE_REPAIR",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_TRUST_STATEID] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_TRUST_STATEID",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_REVOKE_STATEID] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = OP_MODIFIES_SOMETHING,
+		.op_name = "OP_REVOKE_STATEID",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+	[OP_BULK_REVOKE_STATEID] = {
+		.op_func = nfsd4_ffv2_refuse,
+		.op_flags = ALLOWED_WITHOUT_FH | OP_MODIFIES_SOMETHING,
+		.op_name = "OP_BULK_REVOKE_STATEID",
+		.op_rsize_bop = nfsd4_only_status_rsize,
+	},
+#endif
+
 };
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd4_test_ffv2_run_op(struct svc_rqst *rqstp,
+			      struct nfsd4_compound_state *cstate, u32 opnum,
+			   union nfsd4_op_u *u)
+{
+	if (opnum >= ARRAY_SIZE(nfsd4_ops) || !nfsd4_ops[opnum].op_func)
+		return nfserr_op_illegal;
+	return nfsd4_ops[opnum].op_func(rqstp, cstate, u);
+}
+#endif
 
 /**
  * nfsd4_spo_must_allow - Determine if the compound op contains an

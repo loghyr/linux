@@ -94,6 +94,7 @@ config NFSD_V4
 config NFSD_FFV2
 	bool "NFS server Flex Files v2 data server support"
 	depends on NFSD_V4
+	select CRYPTO_LIB_SHA256
 	default n
 	help
 	  Build the Flex Files v2 data server lifecycle into nfsd. Provider

@@ -19,6 +19,8 @@
 #include <net/net_namespace.h>
 
 #include "ffv2.h"
+#include "ffv2_trust.h"
+#include "xdr4.h"
 #include "export.h"
 #include "nfsd.h"
 #include "netns.h"
@@ -2553,7 +2555,826 @@ static void nfsd_ffv2_codec_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_encode(&bad, &info), -EINVAL);
 }
 
+#define FFV2_EXPECT_STATUS(test, actual, expected) \
+	KUNIT_EXPECT_EQ(test, be32_to_cpu(actual), be32_to_cpu(expected))
+#define FFV2_EXPECT_STATUS_MSG(test, actual, expected, fmt, ...) \
+	KUNIT_EXPECT_EQ_MSG(test, be32_to_cpu(actual), be32_to_cpu(expected), \
+			    fmt, ##__VA_ARGS__)
+
+static void nfsd_ffv2_compound_digest_test(struct kunit *test)
+{
+	static const u8 expected[NFSD4_FFV2_DIGEST_SIZE] = {
+		0xa8, 0x97, 0x8f, 0xb3, 0xb7, 0x5b, 0xba, 0x40,
+		0x2f, 0xce, 0x4b, 0x78, 0xb0, 0xbb, 0x68, 0xa5,
+		0xf2, 0xfa, 0x34, 0x9f, 0xae, 0x98, 0x33, 0xfe,
+		0x68, 0x13, 0x6a, 0x8a, 0x65, 0x3d, 0x32, 0x0d,
+	};
+	u8 wire[] = {
+		0xde, 0xad, 0xbe, 0xef,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x02,
+		0x00, 0x00, 0x00, 0x00,
+	};
+	u8 changed[NFSD4_FFV2_DIGEST_SIZE];
+	u8 digest[NFSD4_FFV2_DIGEST_SIZE];
+	struct xdr_buf buf;
+
+	xdr_buf_init(&buf, wire, sizeof(wire));
+	buf.len = sizeof(wire);
+	KUNIT_ASSERT_EQ(test,
+			nfsd4_ffv2_compound_digest(&buf, 4, sizeof(wire) - 4,
+						   digest),
+			0);
+	KUNIT_EXPECT_MEMEQ(test, digest, expected, sizeof(expected));
+
+	KUNIT_EXPECT_EQ(test,
+			nfsd4_ffv2_compound_digest(&buf, 4, sizeof(wire), changed),
+		-EBADMSG);
+	wire[sizeof(wire) - 1] = 1;
+	KUNIT_ASSERT_EQ(test,
+			nfsd4_ffv2_compound_digest(&buf, 4, sizeof(wire) - 4,
+						   changed),
+			0);
+	KUNIT_EXPECT_MEMNEQ(test, digest, changed, sizeof(digest));
+}
+
+static void nfsd_ffv2_test_attach_transport(struct svc_rqst *rqstp)
+{
+	static struct svc_xprt_class xcl = {
+		.xcl_max_payload	= RPCSVC_MAXPAYLOAD_TCP,
+	};
+	static struct svc_xprt xprt = {
+		.xpt_class		= &xcl,
+	};
+	static struct svc_serv serv = {
+		.sv_max_payload		= RPCSVC_MAXPAYLOAD_TCP,
+	};
+
+	rqstp->rq_xprt = &xprt;
+	rqstp->rq_server = &serv;
+}
+
+static size_t nfsd_ffv2_ro_compound(__be32 *request, u32 offset)
+{
+	__be32 *p = request;
+	int i;
+
+	*p++ = cpu_to_be32(0);		/* tag */
+	*p++ = cpu_to_be32(2);		/* minorversion */
+	*p++ = cpu_to_be32(3);		/* opcount */
+	*p++ = cpu_to_be32(OP_SEQUENCE);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(0);	/* sessionid */
+	*p++ = cpu_to_be32(1);		/* sequenceid */
+	*p++ = cpu_to_be32(0);		/* slotid */
+	*p++ = cpu_to_be32(0);		/* highest slotid */
+	*p++ = cpu_to_be32(1);		/* cachethis */
+	*p++ = cpu_to_be32(OP_PUTFH);
+	*p++ = cpu_to_be32(4);
+	*p++ = cpu_to_be32(0x01020304);
+	*p++ = cpu_to_be32(OP_CHUNK_READ);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(i);	/* stateid */
+	*p++ = cpu_to_be32(0);		/* offset, high word */
+	*p++ = cpu_to_be32(offset);	/* offset, low word */
+	*p++ = cpu_to_be32(1);		/* count */
+	return (char *)p - (char *)request;
+}
+
+static bool nfsd_ffv2_test_compound_decode(struct kunit *test,
+					   struct nfsd4_compoundargs *args,
+					   const void *wire, size_t len,
+					   size_t head_len, size_t page_len)
+{
+	struct nfsd_thread_local_info *ntli;
+	struct svc_rqst *rqstp;
+	struct auth_ops auth = { .flavour = RPC_AUTH_NULL };
+	struct xdr_stream xdr;
+	struct xdr_buf buf = {};
+	struct page *pages[2] = {};
+	u8 *scratch;
+	bool decoded = false;
+	unsigned int i, decoded_opcnt;
+
+	if (head_len + page_len > len || page_len > 2 * PAGE_SIZE)
+		return false;
+	ntli = kunit_kzalloc(test, sizeof(*ntli), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	scratch = kunit_kmalloc(test, PAGE_SIZE, GFP_KERNEL);
+	if (!ntli || !rqstp || !scratch)
+		return false;
+	for (i = 0; i < DIV_ROUND_UP(page_len, PAGE_SIZE); i++) {
+		pages[i] = alloc_page(GFP_KERNEL);
+		if (!pages[i])
+			goto out_pages;
+		memcpy(page_address(pages[i]),
+		       (const u8 *)wire + head_len + i * PAGE_SIZE,
+		       min_t(size_t, PAGE_SIZE, page_len - i * PAGE_SIZE));
+	}
+	buf.head[0].iov_base = (void *)wire;
+	buf.head[0].iov_len = head_len;
+	buf.pages = pages;
+	buf.page_len = page_len;
+	buf.tail[0].iov_base = (u8 *)wire + head_len + page_len;
+	buf.tail[0].iov_len = len - head_len - page_len;
+	buf.len = len;
+	buf.buflen = len;
+	xdr_init_decode(&xdr, &buf, buf.head[0].iov_base, NULL);
+	xdr_set_scratch_buffer(&xdr, scratch, PAGE_SIZE);
+	rqstp->rq_argp = args;
+	rqstp->rq_private = ntli;
+	rqstp->rq_authop = &auth;
+	nfsd_ffv2_test_attach_transport(rqstp);
+	args->opcnt = 0;
+	decoded = nfs4svc_decode_compoundargs(rqstp, &xdr);
+	decoded_opcnt = args->opcnt;
+	nfsd4_release_compoundargs(rqstp);
+	/* Only inline operations and copied metadata survive cleanup. */
+	args->opcnt = decoded_opcnt;
+	xdr_finish_decode(&xdr);
+out_pages:
+	for (i = 0; i < ARRAY_SIZE(pages); i++)
+		if (pages[i])
+			__free_page(pages[i]);
+	return decoded;
+}
+
+static void nfsd_ffv2_selective_digest_test(struct kunit *test)
+{
+	struct nfsd4_ffv2_digest_test_ctx ctx = {};
+	struct nfsd4_compoundargs *args;
+	struct xdr_buf baseline;
+	__be32 *p;
+	u8 *wire;
+	u8 expected[NFSD4_FFV2_DIGEST_SIZE];
+	u8 zero[NFSD4_FFV2_DIGEST_SIZE] = { 0 };
+	size_t len;
+	int i;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	wire = kunit_kzalloc(test, 2 * PAGE_SIZE + 256, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	KUNIT_ASSERT_NOT_NULL(test, wire);
+	args->ffv2_digest_test = &ctx;
+
+	p = (__be32 *)wire;
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(2);
+	*p++ = cpu_to_be32(0);
+	len = (u8 *)p - wire;
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, len, 0));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	((__be32 *)wire)[0] = cpu_to_be32(NFSD4_MAX_TAGLEN + 1);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_compound_decode(test, args,
+								wire, len, len, 0));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+	((__be32 *)wire)[0] = cpu_to_be32(0);
+
+	p = (__be32 *)(wire + 8);
+	*p++ = cpu_to_be32(1);
+	*p++ = cpu_to_be32(OP_WRITE);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(i);
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(NFS_FILE_SYNC);
+	*p++ = cpu_to_be32(2 * PAGE_SIZE);
+	memset(p, 0x5a, 2 * PAGE_SIZE);
+	len = (u8 *)p - wire + 2 * PAGE_SIZE;
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len,
+							 (u8 *)p - wire,
+							 2 * PAGE_SIZE));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+
+	len = nfsd_ffv2_ro_compound((__be32 *)wire, 0);
+	xdr_buf_init(&baseline, wire, len);
+	baseline.len = len;
+	KUNIT_ASSERT_EQ(test, nfsd4_ffv2_compound_digest(&baseline, 0, len,
+							 expected), 0);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, 20, 64));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 1U);
+	KUNIT_EXPECT_TRUE(test, args->ffv2_digest_valid);
+	KUNIT_EXPECT_MEMEQ(test, args->ffv2_digest, expected,
+			   sizeof(expected));
+
+	ctx.fail = true;
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_compound_decode(test, args,
+								wire, len, 20, 64));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 2U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	KUNIT_EXPECT_MEMEQ(test, args->ffv2_digest,
+			   zero, sizeof(expected));
+	ctx.fail = false;
+
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len - 1, 20, 64));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 2U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	KUNIT_EXPECT_EQ(test, args->ffv2_decode_class,
+			NFSD4_FFV2_DECODE_BADXDR);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_compound_decode(test, args,
+								wire, len + 4, 20, 64));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 2U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+}
+
+static void nfsd_ffv2_selective_mixed_test(struct kunit *test)
+{
+	struct nfsd4_ffv2_digest_test_ctx ctx = {};
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_slot *slot;
+	struct xdr_buf baseline;
+	__be32 wire[32] = {};
+	__be32 reordered[32] = {};
+	__be32 *p = wire;
+	u8 expected[NFSD4_FFV2_DIGEST_SIZE];
+	u8 original[NFSD4_FFV2_DIGEST_SIZE];
+	size_t len;
+	int i;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	slot = kunit_kzalloc(test, sizeof(*slot), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	args->ffv2_digest_test = &ctx;
+	*p++ = cpu_to_be32(1);
+	*p++ = cpu_to_be32(0x61000000);
+	*p++ = cpu_to_be32(2);
+	*p++ = cpu_to_be32(2);
+	*p++ = cpu_to_be32(OP_WRITE);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(i);
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(NFS_FILE_SYNC);
+	*p++ = cpu_to_be32(4);
+	*p++ = cpu_to_be32(0x10111213);
+	*p++ = cpu_to_be32(OP_CHUNK_READ);
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(i);
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(0);
+	*p++ = cpu_to_be32(1);
+	len = (u8 *)p - (u8 *)wire;
+	xdr_buf_init(&baseline, wire, len);
+	baseline.len = len;
+	KUNIT_ASSERT_EQ(test, nfsd4_ffv2_compound_digest(&baseline, 0, len,
+							 expected), 0);
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, 8, 48));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 1U);
+	KUNIT_EXPECT_TRUE(test, args->ffv2_digest_valid);
+	KUNIT_EXPECT_MEMEQ(test, args->ffv2_digest, expected,
+			   sizeof(expected));
+	memcpy(original, args->ffv2_digest, sizeof(original));
+	slot->sl_ffv2_present = true;
+	memcpy(slot->sl_ffv2_digest, original, sizeof(original));
+	KUNIT_EXPECT_TRUE(test, nfsd4_ffv2_replay_identity_match(args, slot));
+
+	((u8 *)wire)[4] = 'b';
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, 8, 48));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 2U);
+	KUNIT_EXPECT_MEMNEQ(test, args->ffv2_digest, original,
+			    sizeof(original));
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_replay_identity_match(args, slot));
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_replay_identity_match(args, slot));
+	((u8 *)wire)[4] = 'a';
+
+	((u8 *)wire)[7] = 1;
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, 8, 48));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 3U);
+	KUNIT_EXPECT_MEMNEQ(test, args->ffv2_digest, original,
+			    sizeof(original));
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_replay_identity_match(args, slot));
+	((u8 *)wire)[7] = 0;
+
+	wire[13] ^= cpu_to_be32(1);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, 8, 48));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 4U);
+	KUNIT_EXPECT_MEMNEQ(test, args->ffv2_digest, original,
+			    sizeof(original));
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_replay_identity_match(args, slot));
+	wire[13] ^= cpu_to_be32(1);
+
+	wire[21] = cpu_to_be32(2);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, 8, 48));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 5U);
+	KUNIT_EXPECT_MEMNEQ(test, args->ffv2_digest, original,
+			    sizeof(original));
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_replay_identity_match(args, slot));
+	wire[21] = cpu_to_be32(1);
+	memcpy(reordered, wire, 4 * sizeof(*wire));
+	memcpy(reordered + 4, wire + 14, 8 * sizeof(*wire));
+	memcpy(reordered + 12, wire + 4, 10 * sizeof(*wire));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       reordered, len, 8, 48));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 6U);
+	KUNIT_EXPECT_MEMNEQ(test, args->ffv2_digest, original,
+			    sizeof(original));
+	KUNIT_EXPECT_FALSE(test, nfsd4_ffv2_replay_identity_match(args, slot));
+
+	wire[11] = cpu_to_be32(3);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, 8, 48));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 6U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	KUNIT_EXPECT_EQ(test, args->ffv2_decode_class,
+			NFSD4_FFV2_DECODE_NONE);
+}
+
+static void nfsd_ffv2_selective_errors_test(struct kunit *test)
+{
+	struct nfsd4_ffv2_digest_test_ctx ctx = {};
+	struct nfsd4_compoundargs *args;
+	__be32 wire[32] = {};
+	size_t len;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	args->ffv2_digest_test = &ctx;
+	len = nfsd_ffv2_ro_compound(wire, 0);
+
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_compound_decode(test, args,
+								wire, 2, 2, 0));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+
+	wire[1] = cpu_to_be32(3);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, len, 0));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_present);
+	wire[1] = cpu_to_be32(2);
+
+	wire[2] = cpu_to_be32(NFSD_MAX_OPS_PER_COMPOUND + 1);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_test_compound_decode(test, args,
+								wire, len, len, 0));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	wire[2] = cpu_to_be32(3);
+
+	wire[15] = cpu_to_be32(OP_CHUNK_COMMIT);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, len, 0));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+	KUNIT_EXPECT_TRUE(test, args->ffv2_present);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	wire[15] = cpu_to_be32(OP_CHUNK_READ);
+	wire[1] = cpu_to_be32(1);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, len, 0));
+	KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+	KUNIT_EXPECT_TRUE(test, args->ffv2_present);
+	KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+	KUNIT_EXPECT_EQ(test, args->ffv2_decode_class,
+			NFSD4_FFV2_DECODE_NOTSUPP);
+	{
+		__be32 *capped;
+		unsigned int i;
+
+		capped = kunit_kcalloc(test, NFSD_MAX_OPS_PER_COMPOUND + 32,
+				       sizeof(*capped), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, capped);
+		len = nfsd_ffv2_ro_compound(capped, 0);
+		for (i = 3; i <= NFSD_MAX_OPS_PER_COMPOUND; i++) {
+			capped[len / 4] = cpu_to_be32(OP_GETFH);
+			len += 4;
+		}
+		capped[2] = cpu_to_be32(NFSD_MAX_OPS_PER_COMPOUND + 1);
+		KUNIT_EXPECT_TRUE(test,
+				  nfsd_ffv2_test_compound_decode(test, args, capped, len, len, 0));
+		KUNIT_EXPECT_EQ(test, args->opcnt, NFSD_MAX_OPS_PER_COMPOUND);
+		KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+		KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+		capped[2] = cpu_to_be32(NFSD_MAX_OPS_PER_COMPOUND);
+		KUNIT_EXPECT_TRUE(test,
+				  nfsd_ffv2_test_compound_decode(test, args, capped,
+								 len - 4, len - 4, 0));
+		KUNIT_EXPECT_EQ(test, ctx.calls, 1U);
+		KUNIT_EXPECT_TRUE(test, args->ffv2_digest_valid);
+	}
+}
+
+static void nfsd_ffv2_slot_replay_test(struct kunit *test)
+{
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_slot *slot;
+	struct svc_rqst *rqstp;
+	struct nfsd4_sequence seq = { .cachethis = true };
+	__be32 wire[32] = {};
+	u8 identity[NFSD4_FFV2_DIGEST_SIZE];
+	u8 zero[NFSD4_FFV2_DIGEST_SIZE] = {};
+	size_t len;
+	unsigned int i;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	slot = kunit_kzalloc(test, sizeof(*slot), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	KUNIT_ASSERT_NOT_NULL(test, slot);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+	rqstp->rq_argp = args;
+	rqstp->rq_cred.cr_uid = current_uid();
+	rqstp->rq_cred.cr_gid = current_gid();
+	rqstp->rq_cred.cr_group_info = get_current_groups();
+	slot->sl_cred = rqstp->rq_cred;
+	slot->sl_flags = NFSD4_SLOT_CACHETHIS;
+	len = nfsd_ffv2_ro_compound(wire, 0);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, len, 0));
+	slot->sl_opcnt = args->opcnt;
+	nfsd4_test_record_ffv2_identity(slot, args);
+	memcpy(identity, slot->sl_ffv2_digest, sizeof(identity));
+	KUNIT_EXPECT_TRUE(test, nfsd4_test_replay_matches_cache(rqstp, &seq, slot));
+	wire[22] = cpu_to_be32(2);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, len, 0));
+	KUNIT_EXPECT_FALSE(test, nfsd4_test_replay_matches_cache(rqstp, &seq, slot));
+	wire[22] = cpu_to_be32(1);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len, len, 0));
+	for (i = 0; i < 5; i++) {
+		if (i == 0)
+			args->ffv2_present = false;
+		if (i == 1)
+			args->ffv2_digest_valid = false;
+		if (i == 2)
+			seq.cachethis = false;
+		if (i == 3)
+			slot->sl_opcnt++;
+		if (i == 4)
+			slot->sl_cred.cr_uid = make_kuid(&init_user_ns,
+							 __kuid_val(current_uid()) + 1);
+		KUNIT_EXPECT_FALSE_MSG(test,
+				       nfsd4_test_replay_matches_cache(rqstp, &seq, slot),
+			"retry mismatch %u", i);
+		args->ffv2_present = true;
+		args->ffv2_digest_valid = true;
+		seq.cachethis = true;
+		slot->sl_opcnt = args->opcnt;
+		slot->sl_cred.cr_uid = current_uid();
+	}
+	slot->sl_ffv2_present = false;
+	KUNIT_EXPECT_FALSE(test, nfsd4_test_replay_matches_cache(rqstp, &seq, slot));
+	slot->sl_ffv2_present = true;
+	slot->sl_opcnt--;
+	KUNIT_EXPECT_FALSE(test, nfsd4_test_replay_matches_cache(rqstp, &seq, slot));
+	slot->sl_status = nfserr_notsupp;
+	KUNIT_EXPECT_TRUE(test, nfsd4_test_replay_matches_cache(rqstp, &seq, slot));
+	slot->sl_opcnt++;
+	slot->sl_status = nfs_ok;
+	/* Invalid attempts cannot match or modify a retained valid identity. */
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, len - 1, len - 1, 0));
+	KUNIT_EXPECT_FALSE(test, nfsd4_test_replay_matches_cache(rqstp, &seq, slot));
+	KUNIT_EXPECT_MEMEQ(test, slot->sl_ffv2_digest, identity, sizeof(identity));
+	wire[2] = cpu_to_be32(1);
+	wire[3] = cpu_to_be32(OP_GETFH);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args,
+							       wire, 16, 16, 0));
+	nfsd4_test_record_ffv2_identity(slot, args);
+	slot->sl_opcnt = args->opcnt;
+	KUNIT_EXPECT_FALSE(test, slot->sl_ffv2_present);
+	KUNIT_EXPECT_MEMEQ(test, slot->sl_ffv2_digest, zero, sizeof(zero));
+	KUNIT_EXPECT_TRUE(test, nfsd4_test_replay_matches_cache(rqstp, &seq, slot));
+	put_group_info(rqstp->rq_cred.cr_group_info);
+}
+
+static size_t nfsd_ffv2_wire_op(__be32 *p, u32 op)
+{
+	__be32 *base = p;
+	unsigned int i;
+
+	if (op == OP_BULK_REVOKE_STATEID) {
+		*p++ = cpu_to_be32(0x11223344);
+		*p++ = cpu_to_be32(0x55667788);
+		return (u8 *)p - (u8 *)base;
+	}
+	for (i = 0; i < 4; i++)
+		*p++ = cpu_to_be32(i + 1);
+	if (op == OP_REVOKE_STATEID)
+		return (u8 *)p - (u8 *)base;
+	if (op == OP_TRUST_STATEID) {
+		for (i = 0; i < 4; i++)
+			*p++ = cpu_to_be32(i + 1);
+		*p++ = 0;
+		*p++ = cpu_to_be32(30);
+		*p++ = 0;
+		*p++ = cpu_to_be32(1);
+		*p++ = cpu_to_be32(0x61000000);
+		return (u8 *)p - (u8 *)base;
+	}
+	*p++ = 0;
+	*p++ = cpu_to_be32(4096);
+	if (op == OP_CHUNK_WRITE || op == OP_CHUNK_WRITE_REPAIR) {
+		*p++ = cpu_to_be32(NFS_UNSTABLE);
+		*p++ = cpu_to_be32(0x01234567);
+		*p++ = cpu_to_be32(0x89abcdef);
+		*p++ = cpu_to_be32(0x13579bdf);
+		*p++ = cpu_to_be32(1);
+		*p++ = cpu_to_be32(7);
+		*p++ = cpu_to_be32(9);
+		if (op == OP_CHUNK_WRITE) {
+			*p++ = cpu_to_be32(1);
+			*p++ = cpu_to_be32(1);
+			*p++ = cpu_to_be32(11);
+			*p++ = cpu_to_be32(13);
+		}
+		*p++ = cpu_to_be32(4096);
+		*p++ = cpu_to_be32(1);
+		*p++ = cpu_to_be32(1);
+		*p++ = cpu_to_be32(1);
+		*p++ = cpu_to_be32(0x5a000000);
+		*p++ = cpu_to_be32(4);
+		*p++ = cpu_to_be32(0xaabbccdd);
+		return (u8 *)p - (u8 *)base;
+	}
+	*p++ = cpu_to_be32(1);
+	if (op == OP_CHUNK_READ || op == OP_CHUNK_HEADER_READ)
+		return (u8 *)p - (u8 *)base;
+	if (op == OP_CHUNK_ERROR)
+		*p++ = cpu_to_be32(10001);
+	if (op == OP_CHUNK_COMMIT || op == OP_CHUNK_FINALIZE ||
+	    op == OP_CHUNK_ROLLBACK)
+		*p++ = cpu_to_be32(1);
+	if (op == OP_CHUNK_LOCK)
+		*p++ = 0;
+	*p++ = cpu_to_be32(0x01234567);
+	*p++ = cpu_to_be32(0x89abcdef);
+	*p++ = cpu_to_be32(0x13579bdf);
+	*p++ = cpu_to_be32(7);
+	if (op == OP_CHUNK_LOCK)
+		*p++ = 0;
+	return (u8 *)p - (u8 *)base;
+}
+
+static void nfsd_ffv2_wire_profiles_test(struct kunit *test)
+{
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_compound_state *cstate;
+	struct svc_rqst *rqstp;
+	const struct nfsd_ffv2_op_profile *profile;
+	__be32 wire[64] = {};
+	size_t len;
+	u32 op;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	cstate = kunit_kzalloc(test, sizeof(*cstate), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	KUNIT_ASSERT_NOT_NULL(test, cstate);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+	rqstp->rq_argp = args;
+	wire[1] = cpu_to_be32(2);
+	wire[2] = cpu_to_be32(1);
+	for (op = OP_CHUNK_COMMIT; op <= OP_BULK_REVOKE_STATEID; op++) {
+		wire[3] = cpu_to_be32(op);
+		len = 16 + nfsd_ffv2_wire_op(wire + 4, op);
+		profile = nfsd_ffv2_op_profile(op);
+		KUNIT_ASSERT_NOT_NULL(test, profile);
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_op_no_filehandle(op),
+				op == OP_BULK_REVOKE_STATEID);
+		KUNIT_EXPECT_TRUE_MSG(test,
+				      nfsd_ffv2_test_compound_decode(test, args, wire, len, len, 0),
+			"linear operation %u", op);
+		FFV2_EXPECT_STATUS_MSG(test, args->iops[0].status, nfs_ok,
+				       "linear operation %u", op);
+		KUNIT_EXPECT_TRUE(test, args->ffv2_digest_valid);
+		KUNIT_EXPECT_EQ(test,
+				!!(args->iops[0].opdesc->op_flags & ALLOWED_WITHOUT_FH),
+			profile->no_filehandle);
+		if (op == OP_BULK_REVOKE_STATEID) {
+			KUNIT_EXPECT_TRUE(test, args->iops[0].u.ffv2.target_present);
+			KUNIT_EXPECT_EQ(test, args->iops[0].u.ffv2.target_clientid.cl_boot,
+					0x11223344U);
+			KUNIT_EXPECT_EQ(test, args->iops[0].u.ffv2.target_clientid.cl_id,
+					0x55667788U);
+		} else if (op != OP_CHUNK_READ && op != OP_CHUNK_HEADER_READ) {
+			KUNIT_EXPECT_EQ(test, args->iops[0].u.ffv2.stateid.si_generation, 1U);
+			if (op != OP_TRUST_STATEID && op != OP_REVOKE_STATEID) {
+				KUNIT_EXPECT_TRUE(test, args->iops[0].u.ffv2.owner_present);
+				KUNIT_EXPECT_EQ(test, args->iops[0].u.ffv2.owner_cohort_id,
+						0x0123456789abcdefULL);
+				KUNIT_EXPECT_EQ(test, args->iops[0].u.ffv2.owner_client_id,
+						0x13579bdfU);
+				KUNIT_EXPECT_EQ(test, args->iops[0].u.ffv2.owner_id, 7U);
+			}
+		}
+
+		FFV2_EXPECT_STATUS(test, nfsd4_test_ffv2_run_op(rqstp, cstate, op,
+								&args->iops[0].u), nfserr_notsupp);
+		KUNIT_EXPECT_TRUE(test,
+				  nfsd_ffv2_test_compound_decode(test, args, wire,
+								 len, 20, len - 20));
+		FFV2_EXPECT_STATUS_MSG(test, args->iops[0].status, nfs_ok,
+				       "split operation %u", op);
+		KUNIT_EXPECT_TRUE(test, args->ffv2_digest_valid);
+		KUNIT_EXPECT_TRUE(test,
+				  nfsd_ffv2_test_compound_decode(test, args, wire,
+								 len - 1, len - 1, 0));
+		FFV2_EXPECT_STATUS(test, args->iops[0].status, nfserr_bad_xdr);
+		KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+		FFV2_EXPECT_STATUS(test, nfsd4_test_ffv2_run_op(rqstp, cstate, op,
+								&args->iops[0].u), nfserr_bad_xdr);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, nfsd_ffv2_op_profile(77), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, nfsd_ffv2_op_profile(92), NULL);
+}
+
+static void nfsd_ffv2_wire_bounds_test(struct kunit *test)
+{
+	static const struct {
+		u32 op, word, value, status;
+	} cases[] = {
+		{ OP_CHUNK_READ, 6, 4097, NFS4ERR_INVAL },
+		{ OP_CHUNK_HEADER_READ, 6, 1025, NFS4ERR_INVAL },
+		{ OP_CHUNK_LOCK, 7, 4, NFS4ERR_INVAL },
+		{ OP_CHUNK_LOCK, 7, 3, NFS4ERR_INVAL },
+		{ OP_CHUNK_LOCK, 7, 1, NFS4ERR_INVAL },
+		{ OP_CHUNK_LOCK, 12, 2, NFS4ERR_BADXDR },
+		{ OP_CHUNK_WRITE, 6, 3, NFS4ERR_BADXDR },
+		{ OP_CHUNK_WRITE, 10, 0, NFS4ERR_NOTSUPP },
+		{ OP_CHUNK_WRITE, 10, 4097, NFS4ERR_INVAL },
+		{ OP_CHUNK_WRITE, 13, 2, NFS4ERR_INVAL },
+		{ OP_CHUNK_WRITE, 14, 2, NFS4ERR_BADXDR },
+		{ OP_CHUNK_WRITE, 18, 2, NFS4ERR_NOTSUPP },
+		{ OP_CHUNK_WRITE, 18, 4097, NFS4ERR_INVAL },
+		{ OP_CHUNK_WRITE, 20, 65, NFS4ERR_BADXDR },
+		{ OP_CHUNK_WRITE, 21, 0x5a000001, NFS4ERR_BADXDR },
+		{ OP_CHUNK_WRITE, 22, 4 * 1024 * 1024 + 1, NFS4ERR_INVAL },
+		{ OP_CHUNK_WRITE_REPAIR, 10, 2, NFS4ERR_NOTSUPP },
+		{ OP_CHUNK_WRITE_REPAIR, 14, 0, NFS4ERR_NOTSUPP },
+		{ OP_CHUNK_COMMIT, 7, 0, NFS4ERR_NOTSUPP },
+		{ OP_CHUNK_FINALIZE, 7, 4097, NFS4ERR_INVAL },
+		{ OP_TRUST_STATEID, 11, 1025, NFS4ERR_BADXDR },
+		{ OP_TRUST_STATEID, 12, 0x61000001, NFS4ERR_BADXDR },
+	};
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_compound_state *cstate;
+	struct svc_rqst *rqstp;
+	__be32 wire[64] = {};
+	size_t len;
+	unsigned int i;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	cstate = kunit_kzalloc(test, sizeof(*cstate), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	KUNIT_ASSERT_NOT_NULL(test, cstate);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+	rqstp->rq_argp = args;
+	wire[1] = cpu_to_be32(2);
+	wire[2] = cpu_to_be32(1);
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		wire[3] = cpu_to_be32(cases[i].op);
+		len = 16 + nfsd_ffv2_wire_op(wire + 4, cases[i].op);
+		wire[4 + cases[i].word] = cpu_to_be32(cases[i].value);
+		KUNIT_EXPECT_TRUE(test,
+				  nfsd_ffv2_test_compound_decode(test, args, wire, len, len, 0));
+		FFV2_EXPECT_STATUS_MSG(test, args->iops[0].status,
+				       cpu_to_be32(cases[i].status), "bounds case %u", i);
+		KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+		FFV2_EXPECT_STATUS_MSG(test,
+				       nfsd4_test_ffv2_run_op(rqstp, cstate, cases[i].op,
+							      &args->iops[0].u),
+			cpu_to_be32(cases[i].status), "saved status case %u", i);
+	}
+	wire[3] = cpu_to_be32(OP_CHUNK_LOCK);
+	len = 16 + nfsd_ffv2_wire_op(wire + 4, OP_CHUNK_LOCK);
+	wire[11] = cpu_to_be32(1);
+	wire[16] = cpu_to_be32(1);
+	memset((u8 *)wire + len, 0, 16);
+	len += 16;
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_test_compound_decode(test, args, wire, len, len, 0));
+	FFV2_EXPECT_STATUS(test, args->iops[0].status, nfs_ok);
+	wire[3] = cpu_to_be32(OP_CHUNK_WRITE);
+	len = 16 + nfsd_ffv2_wire_op(wire + 4, OP_CHUNK_WRITE);
+	wire[18] = 0;
+	memmove(wire + 19, wire + 21, len - 21 * 4);
+	len -= 8;
+	KUNIT_EXPECT_TRUE(test,
+			  nfsd_ffv2_test_compound_decode(test, args, wire, len, len, 0));
+	FFV2_EXPECT_STATUS(test, args->iops[0].status, nfs_ok);
+	KUNIT_EXPECT_FALSE(test, args->iops[0].u.ffv2.guard_check);
+}
+
+static void nfsd_ffv2_later_decode_error_test(struct kunit *test)
+{
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_compound_state *cstate;
+	struct svc_rqst *rqstp;
+	struct nfsd4_ffv2_digest_test_ctx ctx = {};
+	__be32 wire[64] = {};
+	size_t len;
+	unsigned int i;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	cstate = kunit_kzalloc(test, sizeof(*cstate), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	KUNIT_ASSERT_NOT_NULL(test, cstate);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+	rqstp->rq_argp = args;
+	args->ffv2_digest_test = &ctx;
+	for (i = 0; i < 3; i++) {
+		len = nfsd_ffv2_ro_compound(wire, 0);
+		wire[2] = cpu_to_be32(4);
+		wire[len / 4] = cpu_to_be32(i == 0 ? OP_GETATTR :
+					  i == 1 ? OP_IO_ADVISE : OP_CHUNK_READ);
+		len += 4;
+		if (i == 2) {
+			len += nfsd_ffv2_wire_op(wire + len / 4, OP_CHUNK_READ);
+			wire[len / 4 - 1] = cpu_to_be32(4097);
+		}
+		KUNIT_EXPECT_TRUE(test,
+				  nfsd_ffv2_test_compound_decode(test, args, wire,
+								 len, 20, len - 20));
+		KUNIT_EXPECT_EQ(test, ctx.calls, 0U);
+		KUNIT_EXPECT_FALSE(test, args->ffv2_digest_valid);
+		FFV2_EXPECT_STATUS(test,
+				   nfsd4_test_ffv2_run_op(rqstp, cstate, OP_CHUNK_READ,
+							  &args->iops[2].u),
+			i == 0 ? nfserr_bad_xdr : i == 1 ? nfserr_notsupp : nfserr_inval);
+	}
+}
+
+static void nfsd_ffv2_dispatch_precedence_test(struct kunit *test)
+{
+	struct nfsd4_compoundargs *args;
+	struct nfsd4_compoundres *resp;
+	struct nfsd_thread_local_info *ntli;
+	struct svc_rqst *rqstp;
+	struct svc_xprt *xprt;
+	struct nfsd_net *nn;
+	struct net *net;
+	__be32 wire[64] = {};
+	void *reply;
+	size_t len;
+	unsigned int i;
+
+	args = kunit_kzalloc(test, sizeof(*args), GFP_KERNEL);
+	resp = kunit_kzalloc(test, sizeof(*resp), GFP_KERNEL);
+	ntli = kunit_kzalloc(test, sizeof(*ntli), GFP_KERNEL);
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	xprt = kunit_kzalloc(test, sizeof(*xprt), GFP_KERNEL);
+	reply = kunit_kzalloc(test, 1024, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, args);
+	KUNIT_ASSERT_NOT_NULL(test, resp);
+	KUNIT_ASSERT_NOT_NULL(test, ntli);
+	KUNIT_ASSERT_NOT_NULL(test, rqstp);
+	KUNIT_ASSERT_NOT_NULL(test, xprt);
+	KUNIT_ASSERT_NOT_NULL(test, reply);
+	net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(net));
+	nn = net_generic(net, nfsd_net_id);
+	xprt->xpt_net = net;
+	rqstp->rq_argp = args;
+	rqstp->rq_resp = resp;
+	rqstp->rq_private = ntli;
+	rqstp->rq_xprt = xprt;
+	for (i = 0; i < 3; i++) {
+		memset(resp, 0, sizeof(*resp));
+		wire[1] = cpu_to_be32(i == 0 ? 0 : 2);
+		wire[2] = cpu_to_be32(1);
+		wire[3] = cpu_to_be32(i == 0 ? OP_GETFH : OP_CHUNK_READ);
+		len = i == 0 ? 16 : 16 + nfsd_ffv2_wire_op(wire + 4, OP_CHUNK_READ);
+		KUNIT_EXPECT_TRUE(test,
+				  nfsd_ffv2_test_compound_decode(test, args, wire, len, len, 0));
+		if (i == 2)
+			nn->nfsd4_minorversions[2] = false;
+		xdr_buf_init(&rqstp->rq_res, reply, 1024);
+		rqstp->rq_res.head[0].iov_len = 0;
+		xdr_init_encode(&rqstp->rq_res_stream, &rqstp->rq_res, reply, NULL);
+		nfsd4_test_dispatch_compound(rqstp);
+		FFV2_EXPECT_STATUS(test, resp->cstate.status,
+				   i == 0 ? nfserr_nofilehandle : i == 1 ?
+			nfserr_op_not_in_session : nfserr_minor_vers_mismatch);
+	}
+	put_net(net);
+	net_ns_barrier();
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_compound_digest_test),
+	KUNIT_CASE(nfsd_ffv2_selective_digest_test),
+	KUNIT_CASE(nfsd_ffv2_selective_mixed_test),
+	KUNIT_CASE(nfsd_ffv2_selective_errors_test),
+	KUNIT_CASE(nfsd_ffv2_slot_replay_test),
+	KUNIT_CASE(nfsd_ffv2_wire_profiles_test),
+	KUNIT_CASE(nfsd_ffv2_wire_bounds_test),
+	KUNIT_CASE(nfsd_ffv2_later_decode_error_test),
+	KUNIT_CASE(nfsd_ffv2_dispatch_precedence_test),
+
 	KUNIT_CASE(nfsd_ffv2_codec_test),
 	KUNIT_CASE(nfsd_ffv2_reservation_access_test),
 	KUNIT_CASE(nfsd_ffv2_reservation_io_test),
