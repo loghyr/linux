@@ -270,11 +270,18 @@ out_unlock:
 static struct nfsd_net *nfsd_ffv2_test_net(struct kunit *test)
 {
 	struct nfsd_net *nn;
+	int error;
 
 	nn = kunit_kzalloc(test, sizeof(*nn), GFP_KERNEL);
 	if (!nn)
 		return NULL;
 	nfsd_ffv2_net_init(nn);
+	error = nfsd_ffv2_participant_register(nn);
+	if (error) {
+		nfsd_ffv2_net_pre_exit(nn);
+		nfsd_ffv2_net_destroy(nn);
+		return NULL;
+	}
 	return nn;
 }
 
@@ -283,6 +290,8 @@ static void nfsd_ffv2_test_net_exit(void *data)
 	struct nfsd_net *nn = data;
 
 	nfsd_ffv2_net_pre_exit(nn);
+	nfsd_ffv2_participant_detach_begin(nn);
+	nfsd_ffv2_participant_detach_finish(nn);
 	nfsd_ffv2_net_destroy(nn);
 }
 
@@ -520,6 +529,8 @@ static void nfsd_ffv2_destroy_wait_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, nn);
 	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_test_anchor_hold(nn));
 	nfsd_ffv2_net_pre_exit(nn);
+	nfsd_ffv2_participant_detach_begin(nn);
+	nfsd_ffv2_participant_detach_finish(nn);
 	ctx.nn = nn;
 	init_completion(&ctx.done);
 	init_completion(&entered);

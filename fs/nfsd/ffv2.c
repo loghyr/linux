@@ -7,6 +7,7 @@
 #include <linux/wait.h>
 
 #include "ffv2.h"
+#include "export.h"
 #include "nfsd.h"
 #include "netns.h"
 
@@ -256,6 +257,171 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 	anchor->retiring = NULL;
 }
 
+static void nfsd_ffv2_updates_set_open(struct nfsd_ffv2_participant *p,
+				       bool open)
+{
+	spin_lock(&p->update_lock);
+	if (open && p->updates_closing)
+		goto out;
+	if (p->updates_open != open) {
+		p->updates_open = open;
+		if (!++p->update_epoch)
+			++p->update_epoch;
+	}
+out:
+	spin_unlock(&p->update_lock);
+}
+
+static void nfsd_ffv2_updates_close_permanent(struct nfsd_ffv2_participant *p)
+{
+	spin_lock(&p->update_lock);
+	p->updates_closing = true;
+	if (p->updates_open) {
+		p->updates_open = false;
+		if (!++p->update_epoch)
+			++p->update_epoch;
+	}
+	spin_unlock(&p->update_lock);
+}
+
+static void nfsd_ffv2_updates_wait(struct nfsd_ffv2_participant *p)
+{
+	wait_event(p->update_wait, !READ_ONCE(p->update_count));
+}
+
+int nfsd_ffv2_participant_register(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_participant *p = &nn->ffv2_participant;
+
+	spin_lock_init(&p->update_lock);
+	init_waitqueue_head(&p->update_wait);
+	p->update_count = 0;
+	p->update_epoch = 1;
+	p->updates_open = true;
+	p->updates_closing = false;
+	mutex_init(&p->inventory_lock);
+	INIT_LIST_HEAD(&p->inventory);
+	init_waitqueue_head(&p->inventory_wait);
+	p->inventory_count = 0;
+	WRITE_ONCE(p->attached, true);
+	return 0;
+}
+
+void nfsd_ffv2_participant_detach_begin(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_participant *p = &nn->ffv2_participant;
+
+	nfsd_ffv2_updates_close_permanent(p);
+	nfsd_ffv2_updates_wait(p);
+	WRITE_ONCE(p->attached, false);
+}
+
+void nfsd_ffv2_participant_detach_finish(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_participant *p = &nn->ffv2_participant;
+
+	wait_event(p->inventory_wait, !READ_ONCE(p->inventory_count));
+	/* The final put can publish zero before dropping inventory_lock. */
+	mutex_lock(&p->inventory_lock);
+	mutex_unlock(&p->inventory_lock);
+	mutex_destroy(&p->inventory_lock);
+}
+
+static void nfsd_ffv2_export_update_put(struct nfsd_ffv2_export_update *update)
+{
+	struct nfsd_ffv2_participant *p = update->participant;
+	bool wake;
+
+	if (!update->admitted)
+		return;
+	spin_lock(&p->update_lock);
+	if (WARN_ON_ONCE(!p->update_count)) {
+		spin_unlock(&p->update_lock);
+		return;
+	}
+	wake = !--p->update_count;
+	update->admitted = false;
+	spin_unlock(&p->update_lock);
+	if (wake)
+		wake_up_all(&p->update_wait);
+}
+
+int nfsd_ffv2_export_update_begin(struct svc_export *exp,
+				  struct nfsd_ffv2_export_update *update)
+{
+	struct nfsd_net *nn = net_generic(exp->cd->net, nfsd_net_id);
+	struct nfsd_ffv2_participant *p = &nn->ffv2_participant;
+	int error = 0;
+
+	memset(update, 0, sizeof(*update));
+	spin_lock(&p->update_lock);
+	if (!p->updates_open || !READ_ONCE(p->attached)) {
+		error = -ESHUTDOWN;
+	} else {
+		p->update_count++;
+		update->participant = p;
+		update->epoch = p->update_epoch;
+		update->admitted = true;
+	}
+	spin_unlock(&p->update_lock);
+	return error;
+}
+
+int nfsd_ffv2_export_update_validate(struct nfsd_ffv2_export_update *update)
+{
+	struct nfsd_ffv2_participant *p = update->participant;
+	int error = 0;
+
+	spin_lock(&p->update_lock);
+	if (!p->updates_open || p->update_epoch != update->epoch)
+		error = -ESHUTDOWN;
+	spin_unlock(&p->update_lock);
+	return error;
+}
+
+void nfsd_ffv2_export_update_end(struct svc_export *exp,
+				 struct nfsd_ffv2_export_update *update)
+{
+	struct nfsd_ffv2_participant *p = update->participant;
+
+	mutex_lock(&p->inventory_lock);
+	if (!test_bit(CACHE_NEGATIVE, &exp->h.flags) &&
+	    !exp->ex_ffv2_listed) {
+		exp->ex_ffv2_path = exp->ex_path;
+		path_get(&exp->ex_ffv2_path);
+		exp->ex_ffv2_participant = p;
+		exp->ex_ffv2_listed = true;
+		list_add_tail(&exp->ex_ffv2_inventory, &p->inventory);
+		p->inventory_count++;
+	}
+	mutex_unlock(&p->inventory_lock);
+	nfsd_ffv2_export_update_put(update);
+}
+
+void nfsd_ffv2_export_update_abort(struct nfsd_ffv2_export_update *update)
+{
+	nfsd_ffv2_export_update_put(update);
+}
+
+void nfsd_ffv2_export_release(struct svc_export *exp)
+{
+	struct nfsd_ffv2_participant *p = exp->ex_ffv2_participant;
+
+	if (!p)
+		return;
+	mutex_lock(&p->inventory_lock);
+	if (exp->ex_ffv2_listed) {
+		list_del_init(&exp->ex_ffv2_inventory);
+		exp->ex_ffv2_listed = false;
+		exp->ex_ffv2_participant = NULL;
+		p->inventory_count--;
+		path_put(&exp->ex_ffv2_path);
+		if (!p->inventory_count)
+			wake_up_all(&p->inventory_wait);
+	}
+	mutex_unlock(&p->inventory_lock);
+}
+
 /**
  * nfsd_ffv2_net_pre_exit - fence and drain a departing namespace
  * @nn: namespace whose anchor remains allocated
@@ -269,6 +435,10 @@ void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
 
 	if (WARN_ON_ONCE(!nfsd_ffv2_anchor_get(anchor)))
 		return;
+	if (READ_ONCE(nn->ffv2_participant.attached)) {
+		nfsd_ffv2_updates_close_permanent(&nn->ffv2_participant);
+		nfsd_ffv2_updates_wait(&nn->ffv2_participant);
+	}
 	mutex_lock(&anchor->lock);
 	/* Pair with admission's lockless rejection before taking ->lock. */
 	smp_store_release(&anchor->net_state, NFSD_FFV2_NET_EXITING);
@@ -329,6 +499,8 @@ int nfsd_ffv2_service_up(struct nfsd_net *nn)
 	else if (anchor->service_state == NFSD_FFV2_SERVICE_DOWN)
 		anchor->service_state = NFSD_FFV2_SERVICE_UP;
 	mutex_unlock(&anchor->lock);
+	if (!error)
+		nfsd_ffv2_updates_set_open(&nn->ffv2_participant, true);
 	nfsd_ffv2_anchor_put(anchor);
 	return error;
 }
@@ -351,6 +523,7 @@ nfsd_ffv2_service_stop_begin(struct nfsd_net *nn)
 	lockdep_assert_held(&nfsd_mutex);
 	if (WARN_ON_ONCE(!nfsd_ffv2_anchor_get(anchor)))
 		return NULL;
+	nfsd_ffv2_updates_set_open(&nn->ffv2_participant, false);
 	mutex_lock(&anchor->lock);
 	if (anchor->service_state == NFSD_FFV2_SERVICE_UP)
 		anchor->service_state = NFSD_FFV2_SERVICE_STOPPING;
@@ -381,6 +554,7 @@ void nfsd_ffv2_service_stop_finish(struct nfsd_net *nn,
 			nfsd_ffv2_generation_put(generation);
 		return;
 	}
+	nfsd_ffv2_updates_wait(&nn->ffv2_participant);
 	nfsd_ffv2_retire_finish(anchor, generation);
 	nfsd_ffv2_anchor_put(anchor);
 }
@@ -396,15 +570,20 @@ void nfsd_ffv2_service_stop_failed(struct nfsd_net *nn,
 				   struct nfsd_ffv2_generation *generation)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	bool reopen = false;
 
 	lockdep_assert_held(&nfsd_mutex);
 	if (WARN_ON_ONCE(!nfsd_ffv2_anchor_get(anchor)))
 		goto out_put;
 	mutex_lock(&anchor->lock);
 	if (anchor->net_state == NFSD_FFV2_NET_LIVE &&
-	    anchor->service_state == NFSD_FFV2_SERVICE_STOPPING)
+	    anchor->service_state == NFSD_FFV2_SERVICE_STOPPING) {
 		anchor->service_state = NFSD_FFV2_SERVICE_DRAIN_FAILED;
+		reopen = true;
+	}
 	mutex_unlock(&anchor->lock);
+	if (reopen)
+		nfsd_ffv2_updates_set_open(&nn->ffv2_participant, true);
 	nfsd_ffv2_anchor_put(anchor);
 out_put:
 	nfsd_ffv2_service_stop_put(generation);
@@ -431,14 +610,19 @@ void nfsd_ffv2_service_stop_put(struct nfsd_ffv2_generation *generation)
 void nfsd_ffv2_service_down(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	bool reopen = false;
 
 	lockdep_assert_held(&nfsd_mutex);
 	if (WARN_ON_ONCE(!nfsd_ffv2_anchor_get(anchor)))
 		return;
 	mutex_lock(&anchor->lock);
-	if (anchor->net_state == NFSD_FFV2_NET_LIVE)
+	if (anchor->net_state == NFSD_FFV2_NET_LIVE) {
 		anchor->service_state = NFSD_FFV2_SERVICE_DOWN;
+		reopen = true;
+	}
 	mutex_unlock(&anchor->lock);
+	if (reopen)
+		nfsd_ffv2_updates_set_open(&nn->ffv2_participant, true);
 	nfsd_ffv2_anchor_put(anchor);
 }
 

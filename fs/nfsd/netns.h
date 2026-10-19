@@ -76,6 +76,7 @@ enum {
 struct nfsd_net {
 #ifdef CONFIG_NFSD_FFV2
 	struct nfsd_ffv2_anchor ffv2;
+	struct nfsd_ffv2_participant ffv2_participant;
 #endif
 	struct cld_net *cld_net;
 
