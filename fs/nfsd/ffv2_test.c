@@ -12,6 +12,7 @@
 #include <linux/refcount.h>
 #include <linux/sched.h>
 #include <linux/shmem_fs.h>
+#include <linux/unaligned.h>
 #include <linux/sunrpc/svcsock.h>
 #include <linux/sunrpc/svcauth.h>
 #include <linux/sunrpc/svc_xprt.h>
@@ -2441,7 +2442,119 @@ out_net:
 	net_ns_barrier();
 }
 
+static void nfsd_ffv2_codec_test(struct kunit *test)
+{
+	static const u8 header[] = {
+		0xff, 'F', 'F', 'V', '2', 'F', 'H', 0, 1, 0, 0, 56,
+		0, 64, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8,
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+		16, 17, 18, 19, 20, 21, 22, 23,
+		24, 25, 26, 27, 28, 29, 30, 31,
+	};
+	struct nfsd_ffv2_fh_info info = { .generation = 0x0102030405060708 };
+	struct nfsd_ffv2_fh_info parsed;
+	struct knfsd_fh fh, bad;
+	u8 inner[NFSD_FFV2_FH_INNER_MAX] = { 1 };
+	unsigned int i, len;
+
+	for (i = 0; i < 16; i++) {
+		info.object_uuid[i] = i;
+		info.export_uuid[i] = i + 16;
+	}
+	info.inner = inner;
+	for (len = 8; len <= sizeof(inner); len += sizeof(inner) - 8) {
+		info.inner_len = len;
+		KUNIT_ASSERT_EQ(test, nfsd_ffv2_fh_encode(&fh, &info), 0);
+		KUNIT_EXPECT_EQ(test, fh.fh_size, 56U + len);
+		KUNIT_ASSERT_EQ(test, nfsd_ffv2_fh_parse(&fh, &parsed), 0);
+		KUNIT_EXPECT_EQ(test, parsed.generation, info.generation);
+		KUNIT_EXPECT_MEMEQ(test, parsed.object_uuid, info.object_uuid, 16);
+		KUNIT_EXPECT_MEMEQ(test, parsed.export_uuid, info.export_uuid, 16);
+		KUNIT_EXPECT_PTR_EQ(test, parsed.inner, fh.fh_raw + 56);
+		KUNIT_EXPECT_EQ(test, parsed.inner_len, len);
+		KUNIT_EXPECT_MEMEQ(test, parsed.inner, inner, len);
+		if (len == 8)
+			KUNIT_EXPECT_MEMEQ(test, fh.fh_raw, header, sizeof(header));
+	}
+
+	info.inner_len = 8;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_fh_encode(&fh, &info), 0);
+	for (i = 0; i < 19; i++) {
+		bad = fh;
+		switch (i) {
+		case 0:
+			bad.fh_size = 55;
+			break;
+		case 1:
+			bad.fh_size = 129;
+			break;
+		case 2:
+			bad.fh_raw[0] ^= 1;
+			break;
+		case 3:
+			bad.fh_raw[8] = 2;
+			break;
+		case 4:
+			bad.fh_raw[9] = 1;
+			break;
+		case 5:
+			put_unaligned_be16(52, bad.fh_raw + 10);
+			put_unaligned_be16(12, bad.fh_raw + 14);
+			break;
+		case 6:
+			put_unaligned_be16(68, bad.fh_raw + 12);
+			break;
+		case 7:
+			put_unaligned_be16(4, bad.fh_raw + 14);
+			break;
+		case 8:
+			put_unaligned_be16(76, bad.fh_raw + 14);
+			break;
+		case 9:
+			put_unaligned_be16(9, bad.fh_raw + 14);
+			break;
+		case 10:
+			put_unaligned_be16(12, bad.fh_raw + 14);
+			break;
+		case 11:
+			bad.fh_raw[56] = 2;
+			break;
+		case 12:
+			memset(bad.fh_raw + 16, 0, 8);
+			break;
+		case 13:
+			bad.fh_size = 60;
+			put_unaligned_be16(60, bad.fh_raw + 12);
+			put_unaligned_be16(4, bad.fh_raw + 14);
+			break;
+		case 14:
+			bad.fh_size = 65;
+			put_unaligned_be16(65, bad.fh_raw + 12);
+			put_unaligned_be16(9, bad.fh_raw + 14);
+			break;
+		default:
+			info.inner_len = i == 15 ? 4 : i == 16 ? 76 : 9;
+			if (i == 18) {
+				info.inner_len = 8;
+				info.generation = 0;
+			}
+			KUNIT_EXPECT_EQ_MSG(test, nfsd_ffv2_fh_encode(&bad, &info),
+					    -EINVAL, "encode case %u", i);
+			continue;
+		}
+		KUNIT_EXPECT_EQ_MSG(test, nfsd_ffv2_fh_parse(&bad, &parsed),
+				    -EBADMSG, "parse case %u", i);
+	}
+	info.generation = 1;
+	info.inner_len = 8;
+	inner[0] = 2;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_encode(&bad, &info), -EINVAL);
+	info.inner = NULL;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_encode(&bad, &info), -EINVAL);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_codec_test),
 	KUNIT_CASE(nfsd_ffv2_reservation_access_test),
 	KUNIT_CASE(nfsd_ffv2_reservation_io_test),
 	KUNIT_CASE(nfsd_ffv2_filecache_gate_test),

@@ -10,12 +10,74 @@
 #include <linux/slab.h>
 #include <linux/sunrpc/svc_xprt.h>
 #include <linux/wait.h>
+#include <linux/unaligned.h>
 
 #include "ffv2.h"
 #include "filecache.h"
 #include "export.h"
 #include "nfsd.h"
 #include "netns.h"
+#include "nfsfh.h"
+
+static const u8 nfsd_ffv2_fh_magic[8] = {
+	0xff, 'F', 'F', 'V', '2', 'F', 'H', 0,
+};
+
+int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info)
+{
+	const u8 *raw = fh->fh_raw;
+	u16 header_len, total_len, inner_len;
+
+	if (fh->fh_size < NFSD_FFV2_FH_HEADER_SIZE ||
+	    fh->fh_size > NFSD_FFV2_FH_MAX)
+		return -EBADMSG;
+	if (memcmp(raw, nfsd_ffv2_fh_magic, sizeof(nfsd_ffv2_fh_magic)) ||
+	    raw[8] != 1 || raw[9])
+		return -EBADMSG;
+	header_len = get_unaligned_be16(raw + 10);
+	total_len = get_unaligned_be16(raw + 12);
+	inner_len = get_unaligned_be16(raw + 14);
+	if (header_len != NFSD_FFV2_FH_HEADER_SIZE ||
+	    total_len != fh->fh_size ||
+	    inner_len < 8 || inner_len > NFSD_FFV2_FH_INNER_MAX ||
+	    inner_len & 3 ||
+	    total_len != header_len + inner_len || raw[56] != 1)
+		return -EBADMSG;
+
+	info->generation = get_unaligned_be64(raw + 16);
+	if (!info->generation)
+		return -EBADMSG;
+	memcpy(info->object_uuid, raw + 24, sizeof(info->object_uuid));
+	memcpy(info->export_uuid, raw + 40, sizeof(info->export_uuid));
+	info->inner = raw + header_len;
+	info->inner_len = inner_len;
+	return 0;
+}
+
+int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
+			const struct nfsd_ffv2_fh_info *info)
+{
+	u16 total_len;
+
+	if (!info->generation || !info->inner || info->inner_len < 8 ||
+	    info->inner_len > NFSD_FFV2_FH_INNER_MAX || info->inner_len & 3 ||
+	    info->inner[0] != 1)
+		return -EINVAL;
+	total_len = NFSD_FFV2_FH_HEADER_SIZE + info->inner_len;
+	memcpy(fh->fh_raw, nfsd_ffv2_fh_magic, sizeof(nfsd_ffv2_fh_magic));
+	fh->fh_raw[8] = 1;
+	fh->fh_raw[9] = 0;
+	put_unaligned_be16(NFSD_FFV2_FH_HEADER_SIZE, fh->fh_raw + 10);
+	put_unaligned_be16(total_len, fh->fh_raw + 12);
+	put_unaligned_be16(info->inner_len, fh->fh_raw + 14);
+	put_unaligned_be64(info->generation, fh->fh_raw + 16);
+	memcpy(fh->fh_raw + 24, info->object_uuid, sizeof(info->object_uuid));
+	memcpy(fh->fh_raw + 40, info->export_uuid, sizeof(info->export_uuid));
+	memcpy(fh->fh_raw + NFSD_FFV2_FH_HEADER_SIZE, info->inner,
+	       info->inner_len);
+	fh->fh_size = total_len;
+	return 0;
+}
 
 enum nfsd_ffv2_identity_state {
 	NFSD_FFV2_IDENTITY_LIVE,
