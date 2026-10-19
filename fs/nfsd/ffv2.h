@@ -43,6 +43,40 @@ struct nfsd_ffv2_anchor {
 	struct nfsd_ffv2_generation	*retiring;
 };
 
+struct nfsd_ffv2_participant {
+	/* Admission count and epoch serialize with stop and namespace exit. */
+	spinlock_t		update_lock;
+	wait_queue_head_t		update_wait;
+	unsigned int		update_count;
+	u64			update_epoch;
+	bool			updates_open;
+	bool			updates_closing;
+	/* The inventory tracks live cache exports without pinning them. */
+	struct mutex		inventory_lock;
+	struct list_head	inventory;
+	wait_queue_head_t	inventory_wait;
+	unsigned int		inventory_count;
+	bool			attached;
+};
+
+struct nfsd_ffv2_export_update {
+	struct nfsd_ffv2_participant *participant;
+	u64				epoch;
+	bool				admitted;
+};
+
+struct svc_export;
+int nfsd_ffv2_participant_register(struct nfsd_net *nn);
+void nfsd_ffv2_participant_detach_begin(struct nfsd_net *nn);
+void nfsd_ffv2_participant_detach_finish(struct nfsd_net *nn);
+int nfsd_ffv2_export_update_begin(struct svc_export *exp,
+				  struct nfsd_ffv2_export_update *update);
+int nfsd_ffv2_export_update_validate(struct nfsd_ffv2_export_update *update);
+void nfsd_ffv2_export_update_end(struct svc_export *exp,
+				 struct nfsd_ffv2_export_update *update);
+void nfsd_ffv2_export_update_abort(struct nfsd_ffv2_export_update *update);
+void nfsd_ffv2_export_release(struct svc_export *exp);
+
 void nfsd_ffv2_net_init(struct nfsd_net *nn);
 void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn);
 void nfsd_ffv2_net_destroy(struct nfsd_net *nn);

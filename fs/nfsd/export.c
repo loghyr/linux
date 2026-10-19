@@ -23,12 +23,15 @@
 #include "nfsd.h"
 #include "nfsfh.h"
 #include "netns.h"
+#include "ffv2.h"
 #include "pnfs.h"
 #include "filecache.h"
 #include "trace.h"
 #include "netlink.h"
 
 #define NFSDDBG_FACILITY	NFSDDBG_EXPORT
+
+static struct svc_export *nfsd_export_cache_update(struct svc_export *new);
 
 /*
  * We have two caches.
@@ -638,6 +641,9 @@ static void svc_export_put(struct kref *ref)
 {
 	struct svc_export *exp = container_of(ref, struct svc_export, h.ref);
 
+#ifdef CONFIG_NFSD_FFV2
+	nfsd_ffv2_export_release(exp);
+#endif
 	path_put(&exp->ex_path);
 	auth_domain_put(exp->ex_client);
 	call_rcu(&exp->ex_rcu, svc_export_release);
@@ -1009,18 +1015,13 @@ static int nfsd_nl_parse_one_export(struct cache_detail *cd,
 			nfsd4_setup_layout_type(&exp);
 	}
 
-	expp = svc_export_lookup(&exp);
-	if (!expp) {
-		err = -ENOMEM;
-		goto out_uuid;
-	}
-	expp = svc_export_update(&exp, expp);
-	if (expp) {
+	expp = nfsd_export_cache_update(&exp);
+	if (!IS_ERR(expp)) {
 		trace_nfsd_export_update(expp);
 		cache_flush();
 		exp_put(expp);
 	} else {
-		err = -ENOMEM;
+		err = PTR_ERR(expp);
 	}
 
 out_uuid:
@@ -1428,18 +1429,14 @@ static int svc_export_parse(struct cache_detail *cd, char *mesg, int mlen)
 			nfsd4_setup_layout_type(&exp);
 	}
 
-	expp = svc_export_lookup(&exp);
-	if (!expp) {
-		err = -ENOMEM;
-		goto out4;
-	}
-	expp = svc_export_update(&exp, expp);
-	if (expp) {
+	expp = nfsd_export_cache_update(&exp);
+	if (!IS_ERR(expp)) {
 		trace_nfsd_export_update(expp);
 		cache_flush();
 		exp_put(expp);
-	} else
-		err = -ENOMEM;
+	} else {
+		err = PTR_ERR(expp);
+	}
 out4:
 	nfsd4_fslocs_free(&exp.ex_fslocs);
 	kfree(exp.ex_uuid);
@@ -1539,6 +1536,11 @@ static void svc_export_init(struct cache_head *cnew, struct cache_head *citem)
 	new->ex_layout_types = 0;
 	new->ex_uuid = NULL;
 	new->cd = item->cd;
+#ifdef CONFIG_NFSD_FFV2
+	INIT_LIST_HEAD(&new->ex_ffv2_inventory);
+	new->ex_ffv2_participant = NULL;
+	new->ex_ffv2_listed = false;
+#endif
 	export_stats_reset(new->ex_stats);
 }
 
@@ -1642,6 +1644,62 @@ svc_export_update(struct svc_export *new, struct svc_export *old)
 		return container_of(ch, struct svc_export, h);
 	else
 		return NULL;
+}
+
+/* Serialize lookup, admission and replacement against other updates. */
+#ifdef CONFIG_NFSD_FFV2
+static DEFINE_MUTEX(nfsd_export_update_lock);
+#endif
+
+static struct svc_export *
+nfsd_export_cache_update(struct svc_export *new)
+{
+	struct svc_export *old, *result;
+#ifdef CONFIG_NFSD_FFV2
+	struct nfsd_ffv2_export_update update;
+	int error;
+#endif
+
+#ifdef CONFIG_NFSD_FFV2
+	mutex_lock(&nfsd_export_update_lock);
+#endif
+	old = svc_export_lookup(new);
+	if (!old) {
+		result = ERR_PTR(-ENOMEM);
+		goto out_unlock;
+	}
+#ifdef CONFIG_NFSD_FFV2
+	error = nfsd_ffv2_export_update_begin(new, &update);
+	if (error) {
+		exp_put(old);
+		result = ERR_PTR(error);
+		goto out_unlock;
+	}
+	error = nfsd_ffv2_export_update_validate(&update);
+	if (error) {
+		nfsd_ffv2_export_update_abort(&update);
+		exp_put(old);
+		result = ERR_PTR(error);
+		goto out_unlock;
+	}
+#endif
+	/* svc_export_update() consumes the lookup reference to old. */
+	result = svc_export_update(new, old);
+	if (!result) {
+#ifdef CONFIG_NFSD_FFV2
+		nfsd_ffv2_export_update_abort(&update);
+#endif
+		result = ERR_PTR(-ENOMEM);
+		goto out_unlock;
+	}
+#ifdef CONFIG_NFSD_FFV2
+	nfsd_ffv2_export_update_end(result, &update);
+#endif
+out_unlock:
+#ifdef CONFIG_NFSD_FFV2
+	mutex_unlock(&nfsd_export_update_lock);
+#endif
+	return result;
 }
 
 
@@ -2209,8 +2267,17 @@ nfsd_export_init(struct net *net)
 	rv = cache_register_net(nn->svc_expkey_cache, net);
 	if (rv)
 		goto destroy_expkey_cache;
+#ifdef CONFIG_NFSD_FFV2
+	rv = nfsd_ffv2_participant_register(nn);
+	if (rv)
+		goto unregister_expkey_cache;
+#endif
 	return 0;
 
+#ifdef CONFIG_NFSD_FFV2
+unregister_expkey_cache:
+	cache_unregister_net(nn->svc_expkey_cache, net);
+#endif
 destroy_expkey_cache:
 	cache_destroy_net(nn->svc_expkey_cache, net);
 unregister_export_cache:
@@ -2242,8 +2309,14 @@ nfsd_export_shutdown(struct net *net)
 
 	dprintk("nfsd: shutting down export module (net: %x).\n", net->ns.inum);
 
+#ifdef CONFIG_NFSD_FFV2
+	nfsd_ffv2_participant_detach_begin(nn);
+#endif
 	cache_unregister_net(nn->svc_expkey_cache, net);
 	cache_unregister_net(nn->svc_export_cache, net);
+#ifdef CONFIG_NFSD_FFV2
+	nfsd_ffv2_participant_detach_finish(nn);
+#endif
 	cache_destroy_net(nn->svc_expkey_cache, net);
 	cache_destroy_net(nn->svc_export_cache, net);
 	svcauth_unix_purge(net);
