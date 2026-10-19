@@ -57,6 +57,20 @@ struct nfsd_ffv2_participant {
 	wait_queue_head_t	inventory_wait;
 	unsigned int		inventory_count;
 	bool			attached;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	struct completion	*test_update_validated;
+	struct completion	*test_update_continue;
+	struct completion	*test_inventory_wait_entered;
+	struct completion	*test_inventory_wait_done;
+	struct completion	*test_inventory_postwait_entered;
+	struct completion	*test_inventory_postwait_continue;
+	struct completion	*test_inventory_lock_entered;
+	struct completion	*test_inventory_destroy_continue;
+	struct task_struct	**test_inventory_task;
+	unsigned int		*test_inventory_wait_count;
+	struct completion	*test_release_count_zero;
+	struct completion	*test_release_continue;
+#endif
 };
 
 struct nfsd_ffv2_export_update {
@@ -120,6 +134,7 @@ void nfsd_ffv2_test_destroy_waiting(struct nfsd_net *nn,
 void nfsd_ffv2_test_worker(struct svc_rqst *rqstp, struct svc_xprt *xprt);
 void nfsd_ffv2_test_set_start_failure(bool fail);
 bool nfsd_ffv2_test_start_failure(void);
+void nfsd_ffv2_test_try_reopen_updates(struct nfsd_net *nn);
 
 #endif
 

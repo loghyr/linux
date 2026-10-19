@@ -272,6 +272,13 @@ out:
 	spin_unlock(&p->update_lock);
 }
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_test_try_reopen_updates(struct nfsd_net *nn)
+{
+	nfsd_ffv2_updates_set_open(&nn->ffv2_participant, true);
+}
+#endif
+
 static void nfsd_ffv2_updates_close_permanent(struct nfsd_ffv2_participant *p)
 {
 	spin_lock(&p->update_lock);
@@ -303,6 +310,20 @@ int nfsd_ffv2_participant_register(struct nfsd_net *nn)
 	INIT_LIST_HEAD(&p->inventory);
 	init_waitqueue_head(&p->inventory_wait);
 	p->inventory_count = 0;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	p->test_update_validated = NULL;
+	p->test_update_continue = NULL;
+	p->test_inventory_wait_entered = NULL;
+	p->test_inventory_wait_done = NULL;
+	p->test_inventory_postwait_entered = NULL;
+	p->test_inventory_postwait_continue = NULL;
+	p->test_inventory_lock_entered = NULL;
+	p->test_inventory_destroy_continue = NULL;
+	p->test_inventory_task = NULL;
+	p->test_inventory_wait_count = NULL;
+	p->test_release_count_zero = NULL;
+	p->test_release_continue = NULL;
+#endif
 	WRITE_ONCE(p->attached, true);
 	return 0;
 }
@@ -320,10 +341,31 @@ void nfsd_ffv2_participant_detach_finish(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_participant *p = &nn->ffv2_participant;
 
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (READ_ONCE(p->test_inventory_wait_count))
+		*READ_ONCE(p->test_inventory_wait_count) = p->inventory_count;
+	if (READ_ONCE(p->test_inventory_wait_entered))
+		complete(READ_ONCE(p->test_inventory_wait_entered));
+#endif
 	wait_event(p->inventory_wait, !READ_ONCE(p->inventory_count));
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (READ_ONCE(p->test_inventory_postwait_entered)) {
+		get_task_struct(current);
+		*READ_ONCE(p->test_inventory_task) = current;
+		complete(READ_ONCE(p->test_inventory_postwait_entered));
+		wait_for_completion(READ_ONCE(p->test_inventory_postwait_continue));
+		complete(READ_ONCE(p->test_inventory_lock_entered));
+	}
+#endif
 	/* The final put can publish zero before dropping inventory_lock. */
 	mutex_lock(&p->inventory_lock);
 	mutex_unlock(&p->inventory_lock);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (READ_ONCE(p->test_inventory_wait_done))
+		complete(READ_ONCE(p->test_inventory_wait_done));
+	if (READ_ONCE(p->test_inventory_destroy_continue))
+		wait_for_completion(READ_ONCE(p->test_inventory_destroy_continue));
+#endif
 	mutex_destroy(&p->inventory_lock);
 }
 
@@ -418,6 +460,12 @@ void nfsd_ffv2_export_release(struct svc_export *exp)
 		path_put(&exp->ex_ffv2_path);
 		if (!p->inventory_count)
 			wake_up_all(&p->inventory_wait);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		if (!p->inventory_count && READ_ONCE(p->test_release_count_zero)) {
+			complete(READ_ONCE(p->test_release_count_zero));
+			wait_for_completion(READ_ONCE(p->test_release_continue));
+		}
+#endif
 	}
 	mutex_unlock(&p->inventory_lock);
 }
