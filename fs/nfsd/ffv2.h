@@ -97,6 +97,10 @@ enum nfsd_ffv2_test_registration_fault {
 	NFSD_FFV2_TEST_WORK_ALLOC,
 	NFSD_FFV2_TEST_MAP_ALLOC,
 	NFSD_FFV2_TEST_MAP_NET,
+	NFSD_FFV2_TEST_TRUST_ALLOC,
+	NFSD_FFV2_TEST_TRUST_PRINCIPAL,
+	NFSD_FFV2_TEST_TRUST_REPLACE,
+	NFSD_FFV2_TEST_TRUST_INSERT,
 };
 
 struct nfsd_ffv2_registration_test {
@@ -109,6 +113,10 @@ struct nfsd_ffv2_registration_test {
 	atomic_t reply_consumed;
 	atomic_t bindings;
 	atomic_t dispatch_calls;
+	struct completion *validation_entered;
+	struct completion *validation_continue;
+	struct completion *execute_entered;
+	struct completion *execute_continue;
 	struct completion *map_verified;
 	struct completion *map_continue;
 	struct completion *before_publish;

@@ -28,6 +28,7 @@
 #include "nfsfh.h"
 #include "state.h"
 #include "vfs.h"
+#include "xdr4.h"
 
 static const u8 nfsd_ffv2_fh_magic[8] = {
 	0xff, 'F', 'F', 'V', '2', 'F', 'H', 0,
@@ -1572,9 +1573,23 @@ bool nfsd_ffv2_requested_zero_threads(int n, const int *nthreads,
 	return true;
 }
 
+static bool nfsd_ffv2_authority_published(struct nfsd_ffv2_authority *authority, u64 *epoch)
+{
+	bool published;
+
+	spin_lock(&authority->state_lock);
+	published = authority->state == NFSD_FFV2_AUTHORITY_PUBLISHED;
+	if (published && epoch)
+		*epoch = authority->epoch;
+	spin_unlock(&authority->state_lock);
+	return published;
+}
+
 static int
 nfsd_ffv2_admit_generation(struct nfsd_net *nn,
-			   struct nfsd_ffv2_admission *admission)
+			   struct nfsd_ffv2_admission *admission,
+			   struct nfsd_ffv2_generation *expected,
+			   struct nfsd_ffv2_authority *authority)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 	struct nfsd_ffv2_generation *generation;
@@ -1597,6 +1612,11 @@ nfsd_ffv2_admit_generation(struct nfsd_net *nn,
 	if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
 	    anchor->service_state != NFSD_FFV2_SERVICE_UP || !generation) {
 		error = -ESHUTDOWN;
+	} else if (expected && generation != expected) {
+		error = -ESTALE;
+	} else if (authority &&
+		   !nfsd_ffv2_authority_published(authority, NULL)) {
+		error = -ESTALE;
 	} else {
 		refcount_inc(&generation->ref);
 		atomic_inc(&generation->admitted);
@@ -1629,7 +1649,7 @@ int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 	if (nfsd_current_rqst() != rqstp || !rqstp->rq_xprt)
 		return -EOPNOTSUPP;
 	nn = net_generic(rqstp->rq_xprt->xpt_net, nfsd_net_id);
-	return nfsd_ffv2_admit_generation(nn, admission);
+	return nfsd_ffv2_admit_generation(nn, admission, NULL, NULL);
 }
 
 /**
@@ -1704,7 +1724,7 @@ int nfsd_ffv2_test_publish(struct nfsd_net *nn, void *payload,
 int nfsd_ffv2_test_admit(struct nfsd_net *nn,
 			 struct nfsd_ffv2_admission *admission)
 {
-	return nfsd_ffv2_admit_generation(nn, admission);
+	return nfsd_ffv2_admit_generation(nn, admission, NULL, NULL);
 }
 
 /**
@@ -2617,6 +2637,67 @@ static void nfsd_ffv2_trust_registry_destroy(struct nfsd_ffv2_trust_registry *re
 	mutex_destroy(&registry->update_lock);
 }
 
+static void nfsd_ffv2_trust_key_init(struct nfsd_ffv2_trust_key *key, const stateid_t *stateid,
+				     const u8 object_uuid[16], u64 authority_epoch)
+{
+	/* Hashed as raw bytes, so every byte must be initialised. */
+	memset(key, 0, sizeof(*key));
+	key->stateid = *stateid;
+	memcpy(key->object_uuid, object_uuid, 16);
+	key->authority_epoch = authority_epoch;
+}
+
+static struct nfsd_ffv2_trust_entry *
+nfsd_ffv2_trust_lookup(struct nfsd_ffv2_trust_registry *registry, const stateid_t *stateid,
+		       const u8 object_uuid[16], u64 authority_epoch)
+{
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_key key;
+
+	nfsd_ffv2_trust_key_init(&key, stateid, object_uuid, authority_epoch);
+
+	rcu_read_lock();
+	entry = rhashtable_lookup(&registry->table, &key, nfsd_ffv2_trust_params);
+	/* A replaced or revoked entry must not start a new operation. */
+	if (entry && atomic_read_acquire(&entry->state) != NFSD_FFV2_TRUST_LIVE)
+		entry = NULL;
+	if (entry && !refcount_inc_not_zero(&entry->ref))
+		entry = NULL;
+	rcu_read_unlock();
+	return entry;
+}
+
+static __be32 nfsd_ffv2_trust_validate(const struct nfsd_ffv2_trust_entry *entry, u64 generation_id,
+				       const u8 object_uuid[16], u64 authority_epoch,
+				       u32 profile_bit, const char *principal)
+{
+	struct timespec64 now;
+
+	if (atomic_read_acquire(&entry->state) != NFSD_FFV2_TRUST_LIVE)
+		return nfserr_bad_stateid;
+	if (entry->generation_id != generation_id)
+		return nfserr_bad_stateid;
+	if (entry->key.authority_epoch != authority_epoch)
+		return nfserr_bad_stateid;
+	if (memcmp(entry->key.object_uuid, object_uuid, 16))
+		return nfserr_bad_stateid;
+	/* Exactly one named bit; never inferred from iomode alone. */
+	if (!profile_bit || hweight32(profile_bit) != 1)
+		return nfserr_bad_stateid;
+	if (!(entry->profile_mask & profile_bit))
+		return nfserr_bad_stateid;
+
+	ktime_get_real_ts64(&now);
+	if (timespec64_compare(&entry->expires, &now) <= 0)
+		return nfserr_bad_stateid;
+
+	if (entry->principal) {
+		if (!principal || strcmp(entry->principal, principal))
+			return nfserr_acces;
+	}
+	return nfs_ok;
+}
+
 int nfsd_ffv2_registration_begin(struct nfsd_net *nn, struct nfsd_ffv2_export_update *registration)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
@@ -3348,7 +3429,7 @@ void *nfsd_ffv2_test_trust_hold(struct nfsd_net *nn)
 	entry = kzalloc_obj(*entry, GFP_KERNEL);
 	if (!entry)
 		return NULL;
-	error = nfsd_ffv2_admit_generation(nn, &admission);
+	error = nfsd_ffv2_admit_generation(nn, &admission, NULL, NULL);
 	if (error) {
 		kfree(entry);
 		return NULL;
@@ -3426,5 +3507,609 @@ bool nfsd_ffv2_test_work_waiting(struct nfsd_net *nn)
 {
 	/* The fixture owns this namespace until every worker has joined. */
 	return waitqueue_active(&nn->ffv2.authority_wait);
+}
+#endif
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static bool nfsd_ffv2_trust_admission_get(struct nfsd_ffv2_trust_registry *registry)
+{
+	bool admitted = false;
+
+	mutex_lock(&registry->update_lock);
+	if (registry->live) {
+		atomic_inc(&registry->admissions);
+		admitted = true;
+	}
+	mutex_unlock(&registry->update_lock);
+	return admitted;
+}
+
+static __be32 nfsd_ffv2_trust_charge_locked(struct nfsd_ffv2_trust_registry *r,
+					    size_t principal_len, bool new_entry)
+{
+	size_t bytes;
+
+	lockdep_assert_held(&r->update_lock);
+
+	if (new_entry && r->entries >= NFSD_FFV2_TRUST_ENTRIES_MAX)
+		return nfserr_delay;
+	if (check_add_overflow(r->principal_bytes, principal_len, &bytes))
+		return nfserr_delay;
+	if (bytes > NFSD_FFV2_TRUST_BYTES_MAX)
+		return nfserr_delay;
+	r->principal_bytes = bytes;
+	if (new_entry)
+		r->entries++;
+	return nfs_ok;
+}
+
+static struct nfsd_ffv2_trust_entry *
+nfsd_ffv2_trust_entry_alloc(struct nfsd_ffv2_trust_registry *registry,
+			    struct nfsd_ffv2_authority *authority, struct nfsd_ffv2_object *object,
+			    u64 generation_id, const struct nfsd_ffv2_trust_request *request,
+			    u64 authority_epoch, size_t principal_len)
+{
+	struct nfsd_ffv2_trust_entry *entry;
+
+	entry = nfsd_ffv2_test_registration_fault(registry->test_nn, NFSD_FFV2_TEST_TRUST_ALLOC) ?
+			NULL :
+			kzalloc_obj(*entry, GFP_KERNEL);
+	if (!entry)
+		return NULL;
+	if (principal_len) {
+		entry->principal =
+			nfsd_ffv2_test_registration_fault(registry->test_nn,
+							  NFSD_FFV2_TEST_TRUST_PRINCIPAL) ?
+				NULL :
+				kmemdup_nul(request->principal, principal_len, GFP_KERNEL);
+		if (!entry->principal) {
+			kfree(entry);
+			return NULL;
+		}
+		entry->principal_len = principal_len;
+	}
+	refcount_set(&entry->ref, 1);
+	INIT_LIST_HEAD(&entry->dispose);
+	/*
+	 * The entry owns an admission from allocation until its final
+	 * release, so a request holding a reference blocks destruction.
+	 * The caller's install admission guarantees the registry is open.
+	 */
+	atomic_inc(&registry->admissions);
+	nfsd_ffv2_trust_key_init(&entry->key, &request->stateid, request->object_uuid,
+				 authority_epoch);
+	entry->generation_id = generation_id;
+	entry->pnfs_clientid = request->pnfs_clientid;
+	entry->client_id = request->client_id;
+	entry->actor = request->actor;
+	entry->iomode = request->iomode;
+	entry->profile_mask = request->profile_mask;
+	entry->expires = request->expires;
+	entry->object = object;
+	entry->registry = registry;
+	atomic_set(&entry->state, NFSD_FFV2_TRUST_LIVE);
+	nfsd_ffv2_authority_get(authority);
+	entry->authority = authority;
+	return entry;
+}
+
+static bool nfsd_ffv2_trust_renewable(const struct nfsd_ffv2_trust_entry *old,
+				      const struct nfsd_ffv2_trust_request *req)
+{
+	return old->pnfs_clientid.cl_boot == req->pnfs_clientid.cl_boot &&
+	       old->pnfs_clientid.cl_id == req->pnfs_clientid.cl_id &&
+	       old->client_id == req->client_id && old->iomode == req->iomode &&
+	       old->actor == req->actor;
+}
+
+static __be32 nfsd_ffv2_trust_install(struct nfsd_ffv2_trust_registry *registry,
+				      struct nfsd_ffv2_authority *authority,
+				      struct nfsd_ffv2_object *object, u64 generation_id,
+				      const struct nfsd_ffv2_trust_request *request)
+{
+	struct nfsd_ffv2_trust_entry *entry, *old, *replaced = NULL;
+	struct nfsd_ffv2_trust_key key;
+	size_t principal_len = 0;
+	u64 authority_epoch;
+	__be32 status;
+	int error;
+
+	if (request->iomode != IOMODE_READ && request->iomode != IOMODE_RW)
+		return nfserr_inval;
+	if (request->expires.tv_nsec < 0 || request->expires.tv_nsec >= NSEC_PER_SEC)
+		return nfserr_inval;
+	if (request->profile_mask & ~NFSD_FFV2_PROFILE_ALL)
+		return nfserr_inval;
+	/* Only a data client or a repair actor can hold a trust entry. */
+	if (request->actor != NFSD_FFV2_CALLER_DATA_CLIENT &&
+	    request->actor != NFSD_FFV2_CALLER_REPAIR_ACTOR)
+		return nfserr_inval;
+	if (request->principal) {
+		principal_len = strnlen(request->principal, NFSD_FFV2_TRUST_PRINCIPAL_MAX + 1);
+		if (principal_len > NFSD_FFV2_TRUST_PRINCIPAL_MAX)
+			return nfserr_inval;
+	}
+	if (!nfsd_ffv2_authority_published(authority, &authority_epoch))
+		return nfserr_bad_stateid;
+
+	/* Holds the registry open for the whole operation. */
+	if (!nfsd_ffv2_trust_admission_get(registry))
+		return nfserr_stale;
+
+	entry = nfsd_ffv2_trust_entry_alloc(registry, authority, object, generation_id, request,
+					    authority_epoch, principal_len);
+	if (!entry) {
+		nfsd_ffv2_trust_admission_put(registry);
+		return nfserr_delay;
+	}
+
+	nfsd_ffv2_trust_key_init(&key, &request->stateid, request->object_uuid, authority_epoch);
+
+	mutex_lock(&registry->update_lock);
+	if (!registry->live) {
+		status = nfserr_stale;
+		goto out_unlock;
+	}
+	old = rhashtable_lookup_fast(&registry->table, &key, nfsd_ffv2_trust_params);
+	if (old && !nfsd_ffv2_trust_renewable(old, request)) {
+		status = nfserr_bad_stateid;
+		goto out_unlock;
+	}
+	status = nfsd_ffv2_trust_charge_locked(registry, principal_len, !old);
+	if (status != nfs_ok)
+		goto out_unlock;
+
+	if (old) {
+		/*
+		 * Replace atomically.  This cannot allocate, so renewal has
+		 * no failure path that could leave the caller's live stateid
+		 * unhashed while the operation reports a retryable error.
+		 */
+		if (nfsd_ffv2_test_registration_fault(registry->test_nn,
+						      NFSD_FFV2_TEST_TRUST_REPLACE))
+			error = -ENOMEM;
+		else
+			error = rhashtable_replace_fast(&registry->table, &old->node, &entry->node,
+							nfsd_ffv2_trust_params);
+		if (!error) {
+			/* The old entry stops answering new lookups; its
+			 * existing readers finish, and its bytes return at
+			 * its own final free.
+			 */
+			atomic_set_release(&old->state, NFSD_FFV2_TRUST_REPLACED);
+			replaced = old;
+		}
+	} else {
+		if (nfsd_ffv2_test_registration_fault(registry->test_nn,
+						      NFSD_FFV2_TEST_TRUST_INSERT))
+			error = -ENOMEM;
+		else
+			error = rhashtable_insert_fast(&registry->table, &entry->node,
+						       nfsd_ffv2_trust_params);
+	}
+	if (error) {
+		/* The old entry, if any, is still hashed and still LIVE. */
+		if (!old && !WARN_ON_ONCE(!registry->entries))
+			registry->entries--;
+		if (!WARN_ON_ONCE(registry->principal_bytes < principal_len))
+			registry->principal_bytes -= principal_len;
+		status = nfserr_delay;
+		goto out_unlock;
+	}
+	mutex_unlock(&registry->update_lock);
+	nfsd_ffv2_trust_entry_put(replaced);
+	nfsd_ffv2_trust_admission_put(registry);
+	return nfs_ok;
+
+out_unlock:
+	mutex_unlock(&registry->update_lock);
+	nfsd_ffv2_trust_entry_put(replaced);
+	/* Releases the entry's own admission through the normal path. */
+	entry->principal_len = 0;
+	nfsd_ffv2_trust_entry_put(entry);
+	nfsd_ffv2_trust_admission_put(registry);
+	return status;
+}
+
+static bool nfsd_ffv2_trust_revoke(struct nfsd_ffv2_trust_registry *registry,
+				   const stateid_t *stateid, const u8 object_uuid[16],
+				   u64 authority_epoch)
+{
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_ffv2_trust_key key;
+	bool removed = false;
+
+	nfsd_ffv2_trust_key_init(&key, stateid, object_uuid, authority_epoch);
+
+	mutex_lock(&registry->update_lock);
+	entry = rhashtable_lookup_fast(&registry->table, &key, nfsd_ffv2_trust_params);
+	if (entry)
+		removed = nfsd_ffv2_trust_unhash_locked(registry, entry, NFSD_FFV2_TRUST_REVOKED);
+	mutex_unlock(&registry->update_lock);
+
+	/* Drops the table reference now that the mutex is released. */
+	if (removed)
+		nfsd_ffv2_trust_entry_put(entry);
+	return removed;
+}
+#endif
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static void nfsd_ffv2_test_policy_pause(struct nfsd_net *nn, bool execution)
+{
+	struct nfsd_ffv2_registration_test *test = &nn->ffv2.test_registration;
+	struct completion *entered, *resume;
+
+	entered = execution ? READ_ONCE(test->execute_entered) :
+			      READ_ONCE(test->validation_entered);
+	resume = execution ? READ_ONCE(test->execute_continue) :
+			     READ_ONCE(test->validation_continue);
+	if (entered) {
+		complete(entered);
+		wait_for_completion(resume);
+	}
+}
+#endif
+
+static bool nfsd_ffv2_authority_matches_session(struct nfsd_ffv2_authority *authority,
+						struct nfsd4_session *session)
+{
+	struct nfs4_client *clp;
+	bool match;
+
+	if (!session)
+		return false;
+	clp = session->se_client;
+	if (!clp)
+		return false;
+
+	spin_lock(&authority->state_lock);
+	match = authority->state == NFSD_FFV2_AUTHORITY_PUBLISHED &&
+		!memcmp(authority->sessionid.data, session->se_sessionid.data,
+			NFS4_MAX_SESSIONID_LEN) &&
+		authority->clientid.cl_boot == clp->cl_clientid.cl_boot &&
+		authority->clientid.cl_id == clp->cl_clientid.cl_id;
+	spin_unlock(&authority->state_lock);
+	return match;
+}
+
+static bool nfsd_ffv2_stateid_is_anonymous(const stateid_t *stateid)
+{
+	static const stateid_t anonymous = {};
+
+	return !memcmp(stateid, &anonymous, sizeof(*stateid));
+}
+
+static bool nfsd_ffv2_trust_entry_has_writer(const struct nfsd_ffv2_trust_entry *entry,
+					     struct nfsd4_session *session)
+{
+	struct nfs4_client *clp;
+
+	if (!session)
+		return false;
+	clp = session->se_client;
+	if (!clp)
+		return false;
+	return entry->pnfs_clientid.cl_boot == clp->cl_clientid.cl_boot &&
+	       entry->pnfs_clientid.cl_id == clp->cl_clientid.cl_id;
+}
+
+static __be32 nfsd_ffv2_trust_check_policy(const struct nfsd_ffv2_trust_entry *entry,
+					   const struct nfsd_ffv2_op_profile *profile,
+					   struct nfsd4_session *session,
+					   const struct nfsd_ffv2_actor_id *actor)
+{
+	u32 iomode = entry->iomode;
+
+	/*
+	 * The caller class comes from the entry the metadata server
+	 * installed, so an ordinary writer cannot present itself as a repair
+	 * actor by choosing a repair operation, and a repair actor cannot
+	 * use an ordinary writer's profile.
+	 */
+	if (!(profile->callers & BIT(entry->actor)))
+		return nfserr_bad_stateid;
+
+	switch (profile->iomode) {
+	case NFSD_FFV2_IOMODE_RW_ONLY:
+		if (iomode != IOMODE_RW)
+			return nfserr_bad_stateid;
+		break;
+	case NFSD_FFV2_IOMODE_READ_OR_RW:
+		if (iomode != IOMODE_READ && iomode != IOMODE_RW)
+			return nfserr_bad_stateid;
+		break;
+	case NFSD_FFV2_IOMODE_ANY:
+		break;
+	}
+
+	/*
+	 * A writer or repair actor must name itself on the wire, and that
+	 * name must be the one the entry was issued to.  A data request need
+	 * not use the MDS session, so the connection cannot supply this.
+	 */
+	if (profile->writer_identity) {
+		if (!actor || !actor->present)
+			return nfserr_bad_stateid;
+		if (actor->client_id != entry->client_id)
+			return nfserr_bad_stateid;
+		if (!nfsd_ffv2_trust_entry_has_writer(entry, session))
+			return nfserr_bad_stateid;
+	}
+	return nfs_ok;
+}
+
+static struct nfsd_ffv2_generation *nfsd_ffv2_active_generation_get(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_generation *generation;
+
+	mutex_lock(&anchor->lock);
+	generation = anchor->active;
+	if (generation && generation->registry_generation)
+		refcount_inc(&generation->ref);
+	else
+		generation = NULL;
+	mutex_unlock(&anchor->lock);
+	return generation;
+}
+
+__be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				    struct nfsd4_session *session, u32 opnum,
+				    const stateid_t *stateid,
+				    const struct nfsd_ffv2_actor_id *actor,
+				    struct nfsd_ffv2_admission *admission)
+{
+	const struct nfsd_ffv2_op_profile *profile;
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_generation *owned = NULL;
+	struct nfsd_ffv2_admission validation = {};
+	struct nfsd_ffv2_authority *authority;
+	struct nfsd_ffv2_object *object;
+	struct nfsd_ffv2_binding *binding;
+	struct nfsd_ffv2_trust_entry *entry;
+	struct nfsd_net *nn;
+	u64 epoch;
+	__be32 status;
+
+	/* An operation with no profile cannot be authorized at all. */
+	profile = nfsd_ffv2_op_profile(opnum);
+	if (!profile)
+		return nfserr_notsupp;
+
+	/*
+	 * Binding and generation identity precede any state lookup.  A
+	 * control operation that names no file, such as BULK_REVOKE_STATEID,
+	 * resolves the active generation directly instead, taking a
+	 * reference before acquiring its payload validation admission.
+	 * It still passes the same authority checks, so this is not a way
+	 * around them.
+	 */
+	binding = fhp ? fhp->fh_ffv2_binding : NULL;
+	if (!binding) {
+		if (!profile->no_filehandle || !rqstp->rq_xprt)
+			return nfserr_stale;
+		nn = net_generic(rqstp->rq_xprt->xpt_net, nfsd_net_id);
+		owned = nfsd_ffv2_active_generation_get(nn);
+		if (!owned)
+			return nfserr_stale;
+		generation = owned;
+	} else {
+		if (binding->net != SVC_NET(rqstp))
+			return nfserr_stale;
+		nn = net_generic(binding->net, nfsd_net_id);
+		if (!nfsd_ffv2_binding_current(nn, binding))
+			return nfserr_stale;
+		generation = binding->admission.generation;
+		if (!generation)
+			return nfserr_stale;
+	}
+	/*
+	 * A filehandle binding already admits the generation for its lifetime.
+	 * A filehandle-less request has only a generation kref so far, which
+	 * does not keep retirement from releasing its payload.  Admit it for
+	 * validation before reading any context-derived state.  This is not
+	 * authorization to execute: the regular admission below still checks
+	 * the generation and authority after all policy checks have passed.
+	 */
+	if (owned && nfsd_ffv2_admit_generation(nn, &validation, generation, NULL)) {
+		status = nfserr_stale;
+		goto out;
+	}
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (owned)
+		nfsd_ffv2_test_policy_pause(nn, false);
+#endif
+
+	context = generation->payload;
+	/* The ordinary generation owns exactly one object. */
+	object = binding ? binding->object : context ? context->object : NULL;
+	if (!context || !object) {
+		status = nfserr_stale;
+		goto out;
+	}
+	authority = context->authority;
+	if (!authority) {
+		status = nfserr_perm;
+		goto out;
+	}
+
+	if (profile->callers & NFSD_FFV2_CALLERS(MDS_CONTROL)) {
+		/*
+		 * Control operations must arrive on the exact registered
+		 * session, still carrying the machine credential and GSS
+		 * profile the authority was derived from.
+		 */
+		status = nfserr_perm;
+		if (!nfsd_ffv2_authority_matches_session(authority, session))
+			goto out;
+		if (nfsd_ffv2_authority_qualify(session->se_client))
+			goto out;
+		if ((session->se_client->cl_cred.cr_raw_principal &&
+		     !rqstp->rq_cred.cr_raw_principal) ||
+		    !nfsd4_mach_creds_match(session->se_client, rqstp))
+			goto out;
+
+		/*
+		 * The service-root capability probe is recognized only after
+		 * authority validation, and only for the exact anonymous
+		 * tuple.  It never creates or consults a trust entry.
+		 */
+		if (opnum == OP_TRUST_STATEID && stateid &&
+		    nfsd_ffv2_stateid_is_anonymous(stateid)) {
+			status = nfserr_inval;
+			goto out;
+		}
+		/*
+		 * A control operation selecting a target client must name
+		 * one; the selection is carried to the operation itself.
+		 */
+		if (opnum == OP_BULK_REVOKE_STATEID && (!actor || !actor->target_present)) {
+			status = nfserr_inval;
+			goto out;
+		}
+		status = nfs_ok;
+		goto admit;
+	}
+
+	/*
+	 * Data and repair operations need not use the MDS session, but their
+	 * trust entry must be rooted in the published authority epoch.
+	 */
+	status = nfserr_bad_stateid;
+	if (!stateid || nfsd_ffv2_stateid_is_anonymous(stateid))
+		goto out;
+	if (!nfsd_ffv2_authority_published(authority, &epoch))
+		goto out;
+
+	entry = nfsd_ffv2_trust_lookup(&context->trust, stateid, object->object_uuid, epoch);
+	if (!entry)
+		goto out;
+
+	status = nfsd_ffv2_trust_validate(entry, generation->identity->generation,
+					  object->object_uuid, epoch, profile->profile_bit,
+					  rqstp->rq_cred.cr_principal);
+	if (status == nfs_ok)
+		status = nfsd_ffv2_trust_check_policy(entry, profile, session, actor);
+	nfsd_ffv2_trust_entry_put(entry);
+	if (status != nfs_ok)
+		goto out;
+
+admit:
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	nfsd_ffv2_test_policy_pause(nn, true);
+#endif
+	/*
+	 * Execution admission is the fence: it revalidates the generation
+	 * identity and the authority state under the anchor lock, and its
+	 * reference is what retirement and namespace exit drain before
+	 * tearing anything down.  The caller releases it on every path.
+	 */
+	if (nfsd_ffv2_admit_generation(nn, admission, generation, authority))
+		status = nfserr_stale;
+out:
+	nfsd_ffv2_complete(&validation);
+	if (owned)
+		nfsd_ffv2_generation_put(owned);
+	return status;
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd_ffv2_test_trust_update(struct nfsd_net *nn, const struct nfsd_ffv2_trust_request *req,
+				   bool revoke)
+{
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_admission validation = {};
+	__be32 status = nfserr_stale;
+	u64 epoch;
+
+	generation = nfsd_ffv2_active_generation_get(nn);
+	if (!generation)
+		return status;
+	if (nfsd_ffv2_admit_generation(nn, &validation, generation, NULL))
+		goto out;
+	nfsd_ffv2_test_policy_pause(nn, false);
+	context = generation->payload;
+	if (!context || !context->object || !context->authority ||
+	    memcmp(context->object->object_uuid, req->object_uuid, 16))
+		goto out;
+	if (revoke) {
+		if (!nfsd_ffv2_authority_published(context->authority, &epoch)) {
+			status = nfserr_bad_stateid;
+			goto out;
+		}
+		nfsd_ffv2_trust_revoke(&context->trust, &req->stateid, req->object_uuid, epoch);
+		status = nfs_ok;
+	} else {
+		status = nfsd_ffv2_trust_install(&context->trust, context->authority,
+						 context->object, generation->identity->generation,
+						 req);
+	}
+out:
+	nfsd_ffv2_complete(&validation);
+	nfsd_ffv2_generation_put(generation);
+	return status;
+}
+#endif
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+static bool nfsd_ffv2_test_trust_select(struct nfsd_net *nn, struct nfsd_ffv2_admission *admission)
+{
+	if (nfsd_ffv2_admit_generation(nn, admission, NULL, NULL))
+		return false;
+	if (!admission->generation->registry_generation) {
+		nfsd_ffv2_complete(admission);
+		return false;
+	}
+	return true;
+}
+
+void *nfsd_ffv2_test_trust_get(struct nfsd_net *nn, const stateid_t *stateid)
+{
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_trust_entry *entry = NULL;
+	u64 epoch;
+
+	if (!nfsd_ffv2_test_trust_select(nn, &admission))
+		return NULL;
+	context = admission.generation->payload;
+	if (nfsd_ffv2_authority_published(context->authority, &epoch))
+		entry = nfsd_ffv2_trust_lookup(&context->trust, stateid,
+					       context->object->object_uuid, epoch);
+	nfsd_ffv2_complete(&admission);
+	return entry;
+}
+
+bool nfsd_ffv2_test_trust_snapshot(struct nfsd_net *nn, struct nfsd_ffv2_trust_stats *stats)
+{
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_service_context *context;
+
+	if (!nfsd_ffv2_test_trust_select(nn, &admission))
+		return false;
+	context = admission.generation->payload;
+	mutex_lock(&context->trust.update_lock);
+	stats->entries = context->trust.entries;
+	stats->bytes = context->trust.principal_bytes;
+	stats->holds = atomic_read(&context->trust.admissions);
+	mutex_unlock(&context->trust.update_lock);
+	stats->generation = admission.generation->identity->generation;
+	stats->epoch = context->authority->epoch;
+	nfsd_ffv2_complete(&admission);
+	return true;
+}
+
+__be32 nfsd_ffv2_test_entry_validate(void *entry, u64 generation, const u8 object_uuid[16],
+				     u64 epoch, u32 profile, const char *principal)
+{
+	return nfsd_ffv2_trust_validate(entry, generation, object_uuid, epoch, profile, principal);
+}
+
+unsigned int nfsd_ffv2_test_admitted(struct nfsd_ffv2_admission *observer)
+{
+	return atomic_read(&observer->generation->admitted);
 }
 #endif

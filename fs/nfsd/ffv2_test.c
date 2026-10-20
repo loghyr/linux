@@ -3128,6 +3128,7 @@ static void nfsd_ffv2_wire_profiles_test(struct kunit *test)
 	struct svc_rqst *rqstp;
 	const struct nfsd_ffv2_op_profile *profile;
 	__be32 wire[64] = {};
+	__be32 expected;
 	size_t len;
 	u32 op;
 
@@ -3174,8 +3175,9 @@ static void nfsd_ffv2_wire_profiles_test(struct kunit *test)
 			}
 		}
 
+		expected = op == OP_BULK_REVOKE_STATEID ? nfserr_stale : nfserr_notsupp;
 		FFV2_EXPECT_STATUS(test, nfsd4_test_ffv2_run_op(rqstp, cstate, op,
-								&args->iops[0].u), nfserr_notsupp);
+								&args->iops[0].u), expected);
 		KUNIT_EXPECT_TRUE(test,
 				  nfsd_ffv2_test_compound_decode(test, args, wire,
 								 len, 20, len - 20));
@@ -4509,17 +4511,21 @@ static void nfsd_ffv2_mapping_clone_test(struct kunit *test)
 	struct nfsd_ffv2_binding *binding;
 	struct task_struct *task;
 	union nfsd4_op_u u = {};
+	unsigned int net_refs;
 	bool waiting;
 	int error;
 
 	if (!m)
 		return;
+	net_refs = ns_ref_read(m->registration->net);
 	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	KUNIT_EXPECT_EQ(test, ns_ref_read(m->registration->net), net_refs + 1);
 	binding = m->cstate.current_fh.fh_ffv2_binding;
 	if (!binding)
 		return;
 	FFV2_EXPECT_STATUS(test, nfsd4_test_ffv2_run_op(&m->rqst, &m->cstate, OP_SAVEFH, &u),
 			   nfs_ok);
+	KUNIT_EXPECT_EQ(test, ns_ref_read(m->registration->net), net_refs + 1);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_binding_refs(binding), 2U);
 	/* A missing clone get must fail safely, before putting a non-owned copy. */
 	if (nfsd_ffv2_test_binding_refs(binding) != 2) {
@@ -4528,8 +4534,10 @@ static void nfsd_ffv2_mapping_clone_test(struct kunit *test)
 	}
 	FFV2_EXPECT_STATUS(test, nfsd4_test_ffv2_run_op(&m->rqst, &m->cstate, OP_RESTOREFH, &u),
 			   nfs_ok);
+	KUNIT_EXPECT_EQ(test, ns_ref_read(m->registration->net), net_refs + 1);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_binding_refs(binding), 2U);
 	fh_put(&m->cstate.current_fh);
+	KUNIT_EXPECT_EQ(test, ns_ref_read(m->registration->net), net_refs + 1);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_binding_refs(binding), 1U);
 	retire.fixture = m->registration;
 	retire.generation = m->generation;
@@ -4548,6 +4556,7 @@ static void nfsd_ffv2_mapping_clone_test(struct kunit *test)
 			1);
 	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfserr_stale);
 	fh_put(&m->cstate.save_fh);
+	KUNIT_EXPECT_EQ(test, ns_ref_read(m->registration->net), net_refs);
 	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&retire.done, 5 * HZ), 0UL);
 	kthread_stop(task);
 	KUNIT_EXPECT_EQ(test, retire.error, 0);
@@ -4653,12 +4662,24 @@ static void nfsd_ffv2_service_dispatch_test(struct kunit *test)
 	struct nfsd_ffv2_fh_info info;
 	struct knfsd_fh inner = {};
 	unsigned int i;
-	static const u32 terminal[] = {
-		OP_CHUNK_COMMIT, OP_CHUNK_FINALIZE, OP_CHUNK_HEADER_READ,
-		OP_CHUNK_READ, OP_CHUNK_WRITE, OP_TRUST_STATEID,
-		OP_REVOKE_STATEID, OP_BULK_REVOKE_STATEID, OP_CHUNK_ROLLBACK,
-		OP_CHUNK_ERROR, OP_CHUNK_LOCK, OP_CHUNK_UNLOCK,
-		OP_CHUNK_WRITE_REPAIR, OP_CHUNK_REPAIRED,
+	static const struct {
+		u32 opnum;
+		bool implemented;
+	} terminal[] = {
+		{ OP_CHUNK_COMMIT, true },
+		{ OP_CHUNK_FINALIZE, true },
+		{ OP_CHUNK_HEADER_READ, true },
+		{ OP_CHUNK_READ, true },
+		{ OP_CHUNK_WRITE, true },
+		{ OP_TRUST_STATEID, false },
+		{ OP_REVOKE_STATEID, false },
+		{ OP_BULK_REVOKE_STATEID, false },
+		{ OP_CHUNK_ROLLBACK, false },
+		{ OP_CHUNK_ERROR, false },
+		{ OP_CHUNK_LOCK, false },
+		{ OP_CHUNK_UNLOCK, false },
+		{ OP_CHUNK_WRITE_REPAIR, false },
+		{ OP_CHUNK_REPAIRED, false },
 	};
 
 	if (!m)
@@ -4672,16 +4693,17 @@ static void nfsd_ffv2_service_dispatch_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls), 0);
 	for (i = 0; i < ARRAY_SIZE(terminal); i++) {
 		atomic_set(&trace->dispatch_calls, 0);
-		op.opnum = terminal[i];
+		op.opnum = terminal[i].opnum;
 		m->args.ffv2_digest_valid = true;
 		FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op),
-				   nfserr_notsupp);
+				   terminal[i].implemented ? nfserr_bad_stateid : nfserr_notsupp);
 		m->args.ffv2_digest_valid = false;
 		m->args.ffv2_decode_class = NFSD4_FFV2_DECODE_ERROR;
 		m->args.ffv2_decode_status = nfserr_inval;
 		FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op),
 				   nfserr_inval);
-		KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls), i < 5 ? 2 : 0);
+		KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls),
+				terminal[i].implemented ? 2 : 0);
 	}
 	fh_put(&m->cstate.current_fh);
 	/* The identical inner handle is refused through the ordinary verifier. */
@@ -4926,7 +4948,628 @@ static void nfsd_ffv2_service_decode_error_test(struct kunit *test)
 	}
 }
 
+/* Trust producers and sessions below are synthetic, not live provisioning. */
+static void nfsd_ffv2_trust_request_init(struct nfsd_ffv2_mapping_fixture *m,
+					 struct nfsd_ffv2_trust_request *req)
+{
+	memset(req, 0, sizeof(*req));
+	req->stateid.si_generation = 7;
+	req->object_uuid = m->registration->uuid;
+	req->actor = NFSD_FFV2_CALLER_DATA_CLIENT;
+	req->pnfs_clientid.cl_boot = 0x10203040;
+	req->pnfs_clientid.cl_id = 0x50607080;
+	req->client_id = 0x12345678;
+	req->iomode = IOMODE_RW;
+	req->profile_mask = NFSD_FFV2_PROFILE_ALL;
+	req->expires.tv_sec = ktime_get_real_seconds() + 3600;
+	req->principal = "writer@KUNIT";
+	m->rqst.rq_cred.cr_principal = (char *)req->principal;
+}
+
+static __be32 nfsd_ffv2_trust_dispatch(struct nfsd_ffv2_mapping_fixture *m, u32 opnum,
+				       const struct nfsd_ffv2_trust_request *req)
+{
+	struct nfsd4_op op = { .opnum = opnum };
+
+	op.u.ffv2.stateid = req->stateid;
+	op.u.ffv2.owner_client_id = req->client_id;
+	op.u.ffv2.owner_present = true;
+	return nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op);
+}
+
+static __be32 nfsd_ffv2_trust_direct(struct nfsd_ffv2_mapping_fixture *m, u32 opnum,
+				     const stateid_t *stateid,
+				     const struct nfsd_ffv2_actor_id *actor)
+{
+	struct nfsd_ffv2_admission admission = {};
+	__be32 status;
+
+	status = nfsd_ffv2_validate_operation(&m->rqst, &m->cstate.current_fh, m->cstate.session,
+					      opnum, stateid, actor, &admission);
+	nfsd_ffv2_complete(&admission);
+	return status;
+}
+
+static void nfsd_ffv2_trust_policy_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_trust_request req, bad;
+	struct nfsd_ffv2_trust_stats stats;
+	struct nfs4_client *writer;
+	struct nfsd4_session session = {};
+	struct nfsd4_op op = { .opnum = OP_CHUNK_WRITE };
+	struct nfsd_ffv2_admission observer = {};
+	unsigned int i;
+	static const u32 allowed[] = { OP_CHUNK_READ, OP_CHUNK_HEADER_READ, OP_CHUNK_WRITE,
+				       OP_CHUNK_COMMIT, OP_CHUNK_FINALIZE };
+
+	if (!m)
+		return;
+	nfsd_ffv2_trust_request_init(m, &req);
+	writer = kunit_kzalloc(test, sizeof(*writer), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, writer);
+	writer->cl_clientid = req.pnfs_clientid;
+	session.se_client = writer;
+	m->cstate.session = &session;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_READ, &req),
+			   nfserr_bad_stateid);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_CHUNK_READ, NULL, NULL),
+			   nfserr_bad_stateid);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_test_admit(m->registration->nn, &observer), 0);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfs_ok);
+	for (i = 0; i < ARRAY_SIZE(allowed); i++) {
+		FFV2_EXPECT_STATUS_MSG(test, nfsd_ffv2_trust_dispatch(m, allowed[i], &req),
+				       nfserr_notsupp, "terminal opcode %u", allowed[i]);
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_admitted(&observer), 2U);
+	}
+	bad = req;
+	memset(&bad.stateid, 0, sizeof(bad.stateid));
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_READ, &bad),
+			   nfserr_bad_stateid);
+	bad.stateid = req.stateid;
+	bad.stateid.si_generation ^= 1;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_READ, &bad),
+			   nfserr_bad_stateid);
+	m->rqst.rq_cred.cr_principal = NULL;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_READ, &req), nfserr_acces);
+	m->rqst.rq_cred.cr_principal = "other@KUNIT";
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_READ, &req), nfserr_acces);
+	m->rqst.rq_cred.cr_principal = (char *)req.principal;
+	bad = req;
+	bad.profile_mask = NFSD_FFV2_PROFILE_WRITE_DATA;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &bad, false),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_READ, &req),
+			   nfserr_bad_stateid);
+	bad = req;
+	bad.expires.tv_sec = 0;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &bad, false),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_READ, &req),
+			   nfserr_bad_stateid);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfs_ok);
+	op.u.ffv2.stateid = req.stateid;
+	op.u.ffv2.owner_present = false;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op),
+			   nfserr_bad_stateid);
+	op.u.ffv2.owner_present = true;
+	op.u.ffv2.owner_client_id = req.client_id + 1;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op),
+			   nfserr_bad_stateid);
+	m->cstate.session = NULL;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_WRITE, &req),
+			   nfserr_bad_stateid);
+	m->cstate.session = &session;
+	writer->cl_clientid.cl_boot ^= 1;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_WRITE, &req),
+			   nfserr_bad_stateid);
+	writer->cl_clientid = req.pnfs_clientid;
+	writer->cl_clientid.cl_id ^= 1;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_WRITE, &req),
+			   nfserr_bad_stateid);
+	writer->cl_clientid = req.pnfs_clientid;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_WRITE, &req), nfserr_notsupp);
+	/* Revoke first: renewal cannot change immutable caller/iomode identity. */
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, true),
+			   nfs_ok);
+	bad = req;
+	bad.iomode = IOMODE_READ;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &bad, false),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_WRITE, &req),
+			   nfserr_bad_stateid);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_READ, &req), nfserr_notsupp);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &bad, true),
+			   nfs_ok);
+	bad = req;
+	bad.actor = NFSD_FFV2_CALLER_REPAIR_ACTOR;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &bad, false),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_WRITE, &req),
+			   nfserr_bad_stateid);
+	/* SERVICE excludes repair/control before their terminal handler. */
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_dispatch(m, OP_CHUNK_WRITE_REPAIR, &req),
+			   nfserr_notsupp);
+	{
+		struct nfsd_ffv2_actor_id actor = { .present = true, .client_id = req.client_id };
+
+		FFV2_EXPECT_STATUS(test,
+				   nfsd_ffv2_trust_direct(m, OP_CHUNK_WRITE_REPAIR, &req.stateid,
+							  &actor),
+				   nfs_ok);
+	}
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_trust_snapshot(m->registration->nn, &stats));
+	KUNIT_EXPECT_EQ(test, stats.entries, 1U);
+	KUNIT_EXPECT_EQ(test, stats.holds, 1U);
+	KUNIT_EXPECT_EQ(test, stats.bytes, strlen(req.principal));
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_admitted(&observer), 2U);
+	nfsd_ffv2_complete(&observer);
+	m->cstate.session = NULL;
+}
+
+static void nfsd_ffv2_trust_entries_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_trust_request req, bad;
+	struct nfsd_ffv2_trust_stats stats;
+	void *entry;
+	u8 other[16] = {};
+	unsigned int i;
+	static const enum nfsd_ffv2_test_registration_fault faults[] = {
+		NFSD_FFV2_TEST_TRUST_ALLOC,
+		NFSD_FFV2_TEST_TRUST_PRINCIPAL,
+		NFSD_FFV2_TEST_TRUST_REPLACE,
+	};
+
+	if (!m)
+		return;
+	nfsd_ffv2_trust_request_init(m, &req);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfs_ok);
+	entry = nfsd_ffv2_test_trust_get(m->registration->nn, &req.stateid);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_trust_snapshot(m->registration->nn, &stats));
+	FFV2_EXPECT_STATUS(test,
+			   nfsd_ffv2_test_entry_validate(entry, stats.generation, req.object_uuid,
+							 stats.epoch, NFSD_FFV2_PROFILE_READ_DATA,
+							 req.principal),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test,
+			   nfsd_ffv2_test_entry_validate(entry, stats.generation + 1,
+							 req.object_uuid, stats.epoch,
+							 NFSD_FFV2_PROFILE_READ_DATA, NULL),
+			   nfserr_bad_stateid);
+	FFV2_EXPECT_STATUS(test,
+			   nfsd_ffv2_test_entry_validate(entry, stats.generation, other,
+							 stats.epoch, NFSD_FFV2_PROFILE_READ_DATA,
+							 NULL),
+			   nfserr_bad_stateid);
+	FFV2_EXPECT_STATUS(test,
+			   nfsd_ffv2_test_entry_validate(entry, stats.generation, req.object_uuid,
+							 stats.epoch + 1,
+							 NFSD_FFV2_PROFILE_READ_DATA, NULL),
+			   nfserr_bad_stateid);
+	for (i = 0; i < 2; i++)
+		FFV2_EXPECT_STATUS(test,
+				   nfsd_ffv2_test_entry_validate(entry, stats.generation,
+								 req.object_uuid, stats.epoch,
+								 i ? 3 : 0, NULL),
+				   nfserr_bad_stateid);
+	for (i = 0; i < ARRAY_SIZE(faults); i++) {
+		atomic_set(&m->registration->nn->ffv2.test_registration.fault, faults[i]);
+		FFV2_EXPECT_STATUS(test,
+				   nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+				   nfserr_delay);
+		KUNIT_EXPECT_EQ(test, atomic_read(&m->registration->nn->ffv2.test_registration.hit),
+				(int)faults[i]);
+		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_trust_snapshot(m->registration->nn, &stats));
+		KUNIT_EXPECT_EQ(test, stats.entries, 1U);
+		KUNIT_EXPECT_EQ(test, stats.holds, 1U);
+		KUNIT_EXPECT_EQ(test, stats.bytes, strlen(req.principal));
+		FFV2_EXPECT_STATUS(test,
+				   nfsd_ffv2_test_entry_validate(entry, stats.generation,
+								 req.object_uuid, stats.epoch,
+								 NFSD_FFV2_PROFILE_READ_DATA,
+								 req.principal),
+				   nfs_ok);
+	}
+	bad = req;
+	bad.client_id++;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &bad, false),
+			   nfserr_bad_stateid);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test,
+			   nfsd_ffv2_test_entry_validate(entry, stats.generation, req.object_uuid,
+							 stats.epoch, NFSD_FFV2_PROFILE_READ_DATA,
+							 req.principal),
+			   nfserr_bad_stateid);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_trust_snapshot(m->registration->nn, &stats));
+	KUNIT_EXPECT_EQ(test, stats.entries, 1U);
+	KUNIT_EXPECT_EQ(test, stats.holds, 2U);
+	KUNIT_EXPECT_EQ(test, stats.bytes, 2 * strlen(req.principal));
+	nfsd_ffv2_test_trust_put(entry);
+	entry = nfsd_ffv2_test_trust_get(m->registration->nn, &req.stateid);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, true),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test,
+			   nfsd_ffv2_test_entry_validate(entry, stats.generation, req.object_uuid,
+							 stats.epoch, NFSD_FFV2_PROFILE_READ_DATA,
+							 req.principal),
+			   nfserr_bad_stateid);
+	KUNIT_EXPECT_PTR_EQ(test, nfsd_ffv2_test_trust_get(m->registration->nn, &req.stateid),
+			    NULL);
+	nfsd_ffv2_test_trust_put(entry);
+	atomic_set(&m->registration->nn->ffv2.test_registration.fault, NFSD_FFV2_TEST_TRUST_INSERT);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfserr_delay);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_trust_snapshot(m->registration->nn, &stats));
+	KUNIT_EXPECT_EQ(test, stats.entries, 0U);
+	KUNIT_EXPECT_EQ(test, stats.holds, 0U);
+	KUNIT_EXPECT_EQ(test, stats.bytes, 0UL);
+}
+
+static void nfsd_ffv2_trust_control_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_actor_id actor = { .target_present = true };
+	struct nfsd4_session *other;
+	stateid_t stateid = { .si_generation = 1 };
+	stateid_t anonymous = {};
+	struct svc_cred saved;
+
+	if (!m)
+		return;
+	other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	m->cstate.session = &m->registration->session;
+	saved = m->rqst.rq_cred;
+	m->rqst.rq_cred = m->registration->client.cl_cred;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_TRUST_STATEID, &anonymous, NULL),
+			   nfserr_inval);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_TRUST_STATEID, &stateid, NULL),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_BULK_REVOKE_STATEID, NULL, NULL),
+			   nfserr_inval);
+	/* Identical credentials and client, but a different session locator. */
+	other->se_client = &m->registration->client;
+	other->se_sessionid = m->registration->session.se_sessionid;
+	other->se_sessionid.data[0] ^= 1;
+	m->cstate.session = other;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_TRUST_STATEID, &anonymous, NULL),
+			   nfserr_perm);
+	m->cstate.session = NULL;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_TRUST_STATEID, &stateid, NULL),
+			   nfserr_perm);
+	m->cstate.session = &m->registration->session;
+	m->rqst.rq_cred.cr_raw_principal = NULL;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_TRUST_STATEID, &stateid, NULL),
+			   nfserr_perm);
+	m->rqst.rq_cred = m->registration->client.cl_cred;
+	m->rqst.rq_cred.cr_raw_principal = "other@KUNIT";
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_TRUST_STATEID, &stateid, NULL),
+			   nfserr_perm);
+	m->rqst.rq_cred = m->registration->client.cl_cred;
+	m->registration->client.cl_mach_cred = false;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_TRUST_STATEID, &stateid, NULL),
+			   nfserr_perm);
+	m->registration->client.cl_mach_cred = true;
+	fh_put(&m->cstate.current_fh);
+	/* Handleless selection uses the actual singleton, not member zero. */
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_trust_direct(m, OP_BULK_REVOKE_STATEID, NULL, &actor),
+			   nfs_ok);
+	{
+		struct nfsd4_op op = { .opnum = OP_BULK_REVOKE_STATEID };
+
+		op.u.ffv2.target_present = true;
+		FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op),
+				   nfserr_notsupp);
+	}
+	m->rqst.rq_cred = saved;
+	m->cstate.session = NULL;
+}
+
+struct nfsd_ffv2_policy_race {
+	struct nfsd_ffv2_mapping_fixture *m;
+	struct nfsd_ffv2_trust_request req;
+	struct completion done;
+	__be32 status;
+	bool install;
+	bool handleless;
+};
+
+static int nfsd_ffv2_policy_thread(void *data)
+{
+	struct nfsd_ffv2_policy_race *race = data;
+	struct nfsd_ffv2_actor_id actor = { .target_present = true };
+
+	if (race->install)
+		race->status =
+			nfsd_ffv2_test_trust_update(race->m->registration->nn, &race->req, false);
+	else if (race->handleless)
+		race->status =
+			nfsd_ffv2_trust_direct(race->m, OP_BULK_REVOKE_STATEID, NULL, &actor);
+	else
+		race->status = nfsd_ffv2_trust_dispatch(race->m, OP_CHUNK_READ, &race->req);
+	complete(&race->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+/* An independent admission keeps broken controls from freeing borrowed payload. */
+static void nfsd_ffv2_validation_hold(struct kunit *test, bool install)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	struct nfsd_ffv2_policy_race race = { .install = install, .handleless = true };
+	struct nfsd_ffv2_object_retire_ctx retire = {};
+	struct nfsd_ffv2_admission observer = {};
+	struct completion entered, resume;
+	struct task_struct *validator = NULL, *drainer = NULL;
+	bool waiting;
+	int error;
+
+	if (!m)
+		return;
+	race.m = m;
+	nfsd_ffv2_trust_request_init(m, &race.req);
+	m->cstate.session = &m->registration->session;
+	m->rqst.rq_cred = m->registration->client.cl_cred;
+	trace = &m->registration->nn->ffv2.test_registration;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_test_admit(m->registration->nn, &observer), 0);
+	init_completion(&entered);
+	init_completion(&resume);
+	init_completion(&race.done);
+	init_completion(&retire.done);
+	trace->validation_entered = &entered;
+	trace->validation_continue = &resume;
+	validator = kthread_run(nfsd_ffv2_policy_thread, &race, "ffv2-validation");
+	if (IS_ERR(validator)) {
+		validator = NULL;
+		KUNIT_FAIL(test, "start validation");
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&entered, 5 * HZ)) {
+		KUNIT_FAIL(test, "validation did not reach protected payload barrier");
+		goto out;
+	}
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_admitted(&observer), 2U);
+	retire.fixture = m->registration;
+	retire.generation = m->generation;
+	drainer = kthread_run(nfsd_ffv2_object_retire_thread, &retire, "ffv2-validation-retire");
+	if (IS_ERR(drainer)) {
+		drainer = NULL;
+		KUNIT_FAIL(test, "start validation retirement");
+		goto out;
+	}
+	error = read_poll_timeout(nfsd_ffv2_test_waiters, waiting, waiting, 10, USEC_PER_SEC, false,
+				  &observer);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_admission_retired(&observer));
+	KUNIT_EXPECT_FALSE(test, completion_done(&retire.done));
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->contexts), 1);
+out:
+	complete_all(&resume);
+	if (validator) {
+		KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&race.done, 5 * HZ), 0UL);
+		kthread_stop(validator);
+		/* Installer owns payload through completion; late execution is fenced. */
+		FFV2_EXPECT_STATUS(test, race.status, install ? nfs_ok : nfserr_stale);
+	}
+	trace->validation_entered = NULL;
+	trace->validation_continue = NULL;
+	nfsd_ffv2_complete(&observer);
+	if (drainer) {
+		KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&retire.done, 5 * HZ), 0UL);
+		kthread_stop(drainer);
+		KUNIT_EXPECT_EQ(test, retire.error, 0);
+		nfsd_ffv2_registration_unwound(test, m->registration);
+	}
+	m->cstate.session = NULL;
+}
+
+static void nfsd_ffv2_handleless_hold_test(struct kunit *test)
+{
+	nfsd_ffv2_validation_hold(test, false);
+}
+
+static void nfsd_ffv2_installer_hold_test(struct kunit *test)
+{
+	nfsd_ffv2_validation_hold(test, true);
+}
+
+static void nfsd_ffv2_execution_fence(struct kunit *test, bool authority)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	struct nfsd_ffv2_policy_race race = {};
+	struct nfsd_ffv2_object_retire_ctx retire = {};
+	struct completion entered, resume;
+	struct task_struct *validator = NULL, *drainer = NULL;
+	bool waiting;
+	int error;
+
+	if (!m)
+		return;
+	race.m = m;
+	nfsd_ffv2_trust_request_init(m, &race.req);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &race.req, false),
+			   nfs_ok);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	trace = &m->registration->nn->ffv2.test_registration;
+	init_completion(&entered);
+	init_completion(&resume);
+	init_completion(&race.done);
+	init_completion(&retire.done);
+	trace->execute_entered = &entered;
+	trace->execute_continue = &resume;
+	validator = kthread_run(nfsd_ffv2_policy_thread, &race, "ffv2-execution");
+	if (IS_ERR(validator)) {
+		validator = NULL;
+		KUNIT_FAIL(test, "start execution fence");
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&entered, 5 * HZ)) {
+		KUNIT_FAIL(test, "execution did not reach late admission barrier");
+		goto out;
+	}
+	if (authority) {
+		/* Lose prompt worker retirement, retaining DEAD on the active generation. */
+		atomic_set(&trace->fault, NFSD_FFV2_TEST_WORK_ALLOC);
+		nfsd_ffv2_test_session_unhash(m->registration->nn, &m->registration->session,
+					      false);
+		m->registration->hashed = false;
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_active_authority_state(m->registration->nn),
+				2);
+	} else {
+		retire.fixture = m->registration;
+		retire.generation = m->generation;
+		drainer = kthread_run(nfsd_ffv2_object_retire_thread, &retire,
+				      "ffv2-execution-retire");
+		if (IS_ERR(drainer)) {
+			drainer = NULL;
+			KUNIT_FAIL(test, "start late retirement");
+			goto out;
+		}
+		error = read_poll_timeout(nfsd_ffv2_test_binding_waiting, waiting, waiting, 10,
+					  USEC_PER_SEC, false,
+					  m->cstate.current_fh.fh_ffv2_binding);
+		KUNIT_EXPECT_EQ(test, error, 0);
+		KUNIT_EXPECT_FALSE(test, completion_done(&retire.done));
+	}
+out:
+	complete_all(&resume);
+	if (validator) {
+		KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&race.done, 5 * HZ), 0UL);
+		kthread_stop(validator);
+		FFV2_EXPECT_STATUS(test, race.status, nfserr_stale);
+	}
+	trace->execute_entered = NULL;
+	trace->execute_continue = NULL;
+	fh_put(&m->cstate.current_fh);
+	if (drainer) {
+		KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&retire.done, 5 * HZ), 0UL);
+		kthread_stop(drainer);
+		KUNIT_EXPECT_EQ(test, retire.error, 0);
+		nfsd_ffv2_registration_unwound(test, m->registration);
+	}
+}
+
+static void nfsd_ffv2_late_authority_test(struct kunit *test)
+{
+	nfsd_ffv2_execution_fence(test, true);
+}
+
+static void nfsd_ffv2_late_generation_test(struct kunit *test)
+{
+	nfsd_ffv2_execution_fence(test, false);
+}
+
+static void nfsd_ffv2_trust_drain_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_object_retire_ctx retire = {};
+	struct nfsd_ffv2_trust_request req;
+	struct task_struct *task;
+	void *entry;
+	bool waiting;
+	int error;
+
+	if (!m)
+		return;
+	nfsd_ffv2_trust_request_init(m, &req);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfs_ok);
+	entry = nfsd_ffv2_test_trust_get(m->registration->nn, &req.stateid);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	retire.fixture = m->registration;
+	retire.generation = m->generation;
+	init_completion(&retire.done);
+	task = kthread_run(nfsd_ffv2_object_retire_thread, &retire, "ffv2-trust-retire");
+	if (IS_ERR(task)) {
+		nfsd_ffv2_test_trust_put(entry);
+		KUNIT_FAIL(test, "start real trust retirement");
+		return;
+	}
+	error = read_poll_timeout(nfsd_ffv2_test_trust_waiting, waiting, waiting, 10, USEC_PER_SEC,
+				  false, entry);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&retire.done));
+	KUNIT_EXPECT_EQ(test, atomic_read(&m->registration->nn->ffv2.test_registration.contexts),
+			1);
+	nfsd_ffv2_test_trust_put(entry);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&retire.done, 5 * HZ), 0UL);
+	kthread_stop(task);
+	KUNIT_EXPECT_EQ(test, retire.error, 0);
+	nfsd_ffv2_registration_unwound(test, m->registration);
+}
+
+static void nfsd_ffv2_trust_budget_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_trust_request req;
+	struct nfsd_ffv2_trust_stats stats;
+	char *principal;
+	void *held;
+	unsigned int i;
+	__be32 status;
+
+	if (!m)
+		return;
+	nfsd_ffv2_trust_request_init(m, &req);
+	principal = kunit_kmalloc(test, NFSD_FFV2_TRUST_PRINCIPAL_MAX + 2, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, principal);
+	memset(principal, 'p', NFSD_FFV2_TRUST_PRINCIPAL_MAX + 1);
+	principal[NFSD_FFV2_TRUST_PRINCIPAL_MAX + 1] = 0;
+	req.principal = principal;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfserr_inval);
+	principal[NFSD_FFV2_TRUST_PRINCIPAL_MAX] = 0;
+	for (i = 0; i < NFSD_FFV2_TRUST_ENTRIES_MAX; i++) {
+		req.stateid.si_generation = i + 1;
+		status = nfsd_ffv2_test_trust_update(m->registration->nn, &req, false);
+		if (status) {
+			FFV2_EXPECT_STATUS_MSG(test, status, nfs_ok, "entry %u", i);
+			return;
+		}
+	}
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_trust_snapshot(m->registration->nn, &stats));
+	KUNIT_EXPECT_EQ(test, stats.entries, NFSD_FFV2_TRUST_ENTRIES_MAX);
+	KUNIT_EXPECT_EQ(test, stats.bytes, (size_t)NFSD_FFV2_TRUST_BYTES_MAX);
+	req.stateid.si_generation = NFSD_FFV2_TRUST_ENTRIES_MAX + 1;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfserr_delay);
+	req.stateid.si_generation = 1;
+	held = nfsd_ffv2_test_trust_get(m->registration->nn, &req.stateid);
+	KUNIT_ASSERT_NOT_NULL(test, held);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfserr_delay);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, true),
+			   nfs_ok);
+	/* Unhash frees a slot, but the referenced principal remains charged. */
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfserr_delay);
+	nfsd_ffv2_test_trust_put(held);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_trust_update(m->registration->nn, &req, false),
+			   nfs_ok);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_trust_drain_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_trust_budget_test),
+	KUNIT_CASE(nfsd_ffv2_trust_policy_test),
+	KUNIT_CASE(nfsd_ffv2_trust_entries_test),
+	KUNIT_CASE(nfsd_ffv2_trust_control_test),
+	KUNIT_CASE(nfsd_ffv2_handleless_hold_test),
+	KUNIT_CASE(nfsd_ffv2_installer_hold_test),
+	KUNIT_CASE(nfsd_ffv2_late_authority_test),
+	KUNIT_CASE(nfsd_ffv2_late_generation_test),
+
 	KUNIT_CASE(nfsd_ffv2_service_decode_error_test),
 	KUNIT_CASE(nfsd_ffv2_mapping_stop_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_mapping_mixed_test),
