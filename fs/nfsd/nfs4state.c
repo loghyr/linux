@@ -2378,6 +2378,9 @@ static struct nfsd4_session *alloc_session(struct nfsd4_channel_attrs *fattrs,
 	if (!new)
 		return NULL;
 	xa_init(&new->se_slots);
+#ifdef CONFIG_NFSD_FFV2
+	nfsd_ffv2_session_init(new);
+#endif
 
 	slot = nfsd4_alloc_slot(fattrs, 0, GFP_KERNEL);
 	if (!slot || xa_is_err(xa_store(&new->se_slots, 0, slot, GFP_KERNEL)))
@@ -2510,6 +2513,9 @@ static void nfsd4_del_conns(struct nfsd4_session *s)
 
 static void __free_session(struct nfsd4_session *ses)
 {
+#ifdef CONFIG_NFSD_FFV2
+	nfsd_ffv2_session_free(ses);
+#endif
 	free_session_slots(ses, 0);
 	xa_destroy(&ses->se_slots);
 	kfree_rcu(ses, rcu_head);
@@ -2666,6 +2672,55 @@ out:
 	return session;
 }
 
+#ifdef CONFIG_NFSD_FFV2
+/**
+ * nfsd4_session_lookup_get - resolve a session locator and take a reference
+ * @net: network namespace whose session table is searched
+ * @sessionid: exact 16-byte session locator
+ *
+ * Returns a referenced live session, or NULL when @net has no live session
+ * with that locator.  A session belonging to another namespace is not
+ * visible here, so it is reported the same way as an unknown locator.
+ *
+ * Caller must hold nn->client_lock.
+ */
+struct nfsd4_session *nfsd4_session_lookup_get(struct net *net, const u8 *sessionid)
+{
+	struct nfs4_sessionid locator;
+	__be32 status;
+
+	memcpy(&locator.data, sessionid, NFS4_MAX_SESSIONID_LEN);
+	return find_in_sessionid_hashtbl(&locator, net, &status);
+}
+
+/**
+ * nfsd4_session_is_live_locked - is this session still usable?
+ * @ses: session to test
+ *
+ * A session stops being usable once DESTROY_SESSION has marked it dead or
+ * client expiry has unhashed it.  Both removal paths run under
+ * nn->client_lock, so a caller holding that lock sees a stable answer.
+ *
+ * Caller must hold nn->client_lock.
+ */
+bool nfsd4_session_is_live_locked(struct nfsd4_session *ses)
+{
+	return !is_session_dead(ses) && !list_empty(&ses->se_hash);
+}
+
+/**
+ * nfsd4_session_put_ref - release a reference taken by session lookup
+ * @ses: the session to release
+ *
+ * Caller must not hold nn->client_lock.
+ */
+void nfsd4_session_put_ref(struct nfsd4_session *ses)
+{
+	nfsd4_put_session(ses);
+}
+
+#endif
+
 /* caller must hold client_lock */
 static void
 unhash_session(struct nfsd4_session *ses)
@@ -2675,6 +2730,7 @@ unhash_session(struct nfsd4_session *ses)
 
 	lockdep_assert_held(&nn->client_lock);
 
+	nfsd_ffv2_session_dead_locked(ses);
 	list_del(&ses->se_hash);
 	spin_lock(&ses->se_client->cl_lock);
 	list_del(&ses->se_perclnt);
@@ -2827,6 +2883,8 @@ unhash_client_locked(struct nfs4_client *clp)
 	}
 	list_del_init(&clp->cl_lru);
 	spin_lock(&clp->cl_lock);
+	list_for_each_entry(ses, &clp->cl_sessions, se_perclnt)
+		nfsd_ffv2_session_dead_locked(ses);
 	spin_lock(&nfsd_session_list_lock);
 	list_for_each_entry(ses, &clp->cl_sessions, se_perclnt) {
 		list_del_init(&ses->se_hash);
@@ -2982,12 +3040,20 @@ static void copy_clid(struct nfs4_client *target, struct nfs4_client *source)
 	target->cl_clientid.cl_id = source->cl_clientid.cl_id; 
 }
 
-static int copy_cred(struct svc_cred *target, struct svc_cred *source)
+static int __copy_cred(struct svc_cred *target, struct svc_cred *source, struct nfsd_net *nn)
 {
-	target->cr_principal = kstrdup(source->cr_principal, GFP_KERNEL);
-	target->cr_raw_principal = kstrdup(source->cr_raw_principal,
-								GFP_KERNEL);
-	target->cr_targ_princ = kstrdup(source->cr_targ_princ, GFP_KERNEL);
+	target->cr_principal =
+		nn && nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_CRED_PRINCIPAL) ?
+			NULL :
+			kstrdup(source->cr_principal, GFP_KERNEL);
+	target->cr_raw_principal =
+		nn && nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_CRED_RAW) ?
+			NULL :
+			kstrdup(source->cr_raw_principal, GFP_KERNEL);
+	target->cr_targ_princ =
+		nn && nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_CRED_TARGET) ?
+			NULL :
+			kstrdup(source->cr_targ_princ, GFP_KERNEL);
 	if ((source->cr_principal && !target->cr_principal) ||
 	    (source->cr_raw_principal && !target->cr_raw_principal) ||
 	    (source->cr_targ_princ && !target->cr_targ_princ))
@@ -3003,6 +3069,18 @@ static int copy_cred(struct svc_cred *target, struct svc_cred *source)
 		gss_mech_get(source->cr_gss_mech);
 	return 0;
 }
+
+static int copy_cred(struct svc_cred *target, struct svc_cred *source)
+{
+	return __copy_cred(target, source, NULL);
+}
+
+#ifdef CONFIG_NFSD_FFV2
+int nfsd4_ffv2_copy_cred(struct nfsd_net *nn, struct svc_cred *target, struct svc_cred *source)
+{
+	return __copy_cred(target, source, nn);
+}
+#endif
 
 static int
 compare_blob(const struct xdr_netobj *o1, const struct xdr_netobj *o2)
@@ -10604,3 +10682,36 @@ nfsd_handle_dir_event(u32 mask, const struct inode *dir, const void *data,
 	nfsd_notify_event_put(evt);
 	return 0;
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_test_session_hash(struct nfsd_net *nn, struct nfsd4_session *session)
+{
+	unsigned int bucket = hash_sessionid(&session->se_sessionid);
+
+	spin_lock(&nn->client_lock);
+	list_add(&session->se_hash, &nn->sessionid_hashtbl[bucket]);
+	list_add(&session->se_perclnt, &session->se_client->cl_sessions);
+	spin_lock(&nfsd_session_list_lock);
+	list_add(&session->se_all_sessions, &nfsd_session_list);
+	atomic_inc(&nfsd_total_sessions);
+	spin_unlock(&nfsd_session_list_lock);
+	spin_unlock(&nn->client_lock);
+}
+
+void nfsd_ffv2_test_session_unhash(struct nfsd_net *nn, struct nfsd4_session *session,
+				   bool client_expiry)
+{
+	spin_lock(&nn->client_lock);
+	if (client_expiry) {
+		unhash_client_locked(session->se_client);
+		list_del_init(&session->se_perclnt);
+	} else {
+		unhash_session(session);
+		INIT_LIST_HEAD(&session->se_hash);
+		INIT_LIST_HEAD(&session->se_perclnt);
+		INIT_LIST_HEAD(&session->se_all_sessions);
+		session->se_dead = true;
+	}
+	spin_unlock(&nn->client_lock);
+}
+#endif

@@ -91,6 +91,8 @@ struct svc_export {
 	struct path		ex_ffv2_path;
 	struct nfsd_ffv2_participant *ex_ffv2_participant;
 	bool			ex_ffv2_listed;
+	struct nfsd_ffv2_service_context __rcu *ex_ffv2_context;
+	struct completion *ex_ffv2_context_released;
 	/* Protects ordinary handle admissions and transition state. */
 	spinlock_t		ex_ffv2_access_lock;
 	wait_queue_head_t	ex_ffv2_access_wait;
@@ -125,6 +127,12 @@ nfsd_ffv2_export_select(struct cache_detail *cd, struct auth_domain *client,
 struct svc_export *
 nfsd_ffv2_export_lookup(struct cache_detail *cd, struct auth_domain *client,
 			const struct path *path);
+void nfsd_export_unhash(struct svc_export *exp);
+struct svc_export *
+nfsd_ffv2_export_update_exact_locked(struct svc_export *new, struct svc_export *old);
+int nfsd_ffv2_export_template_clone(struct svc_export *template, struct svc_export *source);
+void nfsd_ffv2_export_template_free(struct svc_export *template);
+void nfsd_ffv2_export_template_mark_service(struct svc_export *template);
 int nfsd_ffv2_export_transition_exact(struct svc_export *exp);
 bool nfsd_ffv2_export_is_current(struct svc_export *exp);
 bool nfsd_ffv2_export_transition_abort_exact(struct svc_export *exp);
