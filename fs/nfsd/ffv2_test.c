@@ -3432,6 +3432,7 @@ struct nfsd_ffv2_registration_fixture {
 	u32 port;
 	u8 uuid[16];
 	u8 token[32];
+	struct knfsd_fh outer;
 	bool service;
 	bool hashed;
 };
@@ -3696,6 +3697,8 @@ static int nfsd_ffv2_registration_call(struct nfsd_ffv2_registration_fixture *f,
 		error = -EBADMSG;
 		goto out;
 	}
+	f->outer.fh_size = nla_len(attr);
+	memcpy(f->outer.fh_raw, nla_data(attr), nla_len(attr));
 	error = 0;
 	goto out;
 too_big:
@@ -4257,7 +4260,684 @@ out_release:
 	nfsd_ffv2_registration_unwound(test, f);
 }
 
+/* Cache/session inputs are fixtures; handle decoding and policy are production. */
+struct nfsd_ffv2_mapping_fixture {
+	struct nfsd_ffv2_registration_fixture *registration;
+	struct svc_rqst rqst;
+	struct svc_xprt xprt;
+	struct nfsd4_compoundargs args;
+	struct nfsd4_compound_state cstate;
+	u64 generation;
+};
+
+static void nfsd_ffv2_mapping_exit(void *data)
+{
+	struct nfsd_ffv2_mapping_fixture *m = data;
+
+	fh_put(&m->cstate.current_fh);
+	fh_put(&m->cstate.save_fh);
+	put_cred(revert_creds(get_cred(current_real_cred())));
+}
+
+static int nfsd_ffv2_mapping_key_inner(struct nfsd_ffv2_registration_fixture *f,
+				       const struct knfsd_fh *inner)
+{
+	struct fs_struct *saved;
+	char message[256];
+	int len, error;
+
+	len = scnprintf(message, sizeof(message), "%s %u \\x%*phN %llu /\n",
+			f->domain->name, inner->fh_fsid_type,
+			key_len(inner->fh_fsid_type), fh_fsid(inner),
+			(unsigned long long)ktime_get_real_seconds() + 3600);
+	task_lock(current);
+	saved = current->fs;
+	current->fs = f->fs;
+	task_unlock(current);
+	error = f->nn->svc_expkey_cache->cache_parse(f->nn->svc_expkey_cache, message, len);
+	task_lock(current);
+	current->fs = saved;
+	task_unlock(current);
+	return error;
+}
+
+static int nfsd_ffv2_mapping_key(struct nfsd_ffv2_registration_fixture *f)
+{
+	struct nfsd_ffv2_fh_info info;
+	struct knfsd_fh inner = {};
+	int error;
+
+	error = nfsd_ffv2_fh_parse(&f->outer, &info);
+	if (error)
+		return error;
+	inner.fh_size = info.inner_len;
+	memcpy(inner.fh_raw, info.inner, info.inner_len);
+	return nfsd_ffv2_mapping_key_inner(f, &inner);
+}
+
+static struct nfsd_ffv2_mapping_fixture *nfsd_ffv2_mapping_fixture(struct kunit *test)
+{
+	static struct svc_xprt_class xcl = { .xcl_max_payload = RPCSVC_MAXPAYLOAD_TCP };
+	struct nfsd_ffv2_mapping_fixture *m;
+	struct nfsd_ffv2_registration_fixture *f;
+	int error;
+
+	m = kunit_kzalloc(test, sizeof(*m), GFP_KERNEL);
+	if (!m)
+		return NULL;
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return NULL;
+	m->registration = f;
+	if (kunit_add_action_or_reset(test, nfsd_ffv2_mapping_exit, m))
+		return NULL;
+	error = nfsd_ffv2_registration_call(f, false, &m->generation);
+	if (!error)
+		error = nfsd_ffv2_mapping_key(f);
+	if (error) {
+		KUNIT_FAIL(test, "registered mapping inputs: %d", error);
+		return NULL;
+	}
+	m->xprt.xpt_net = f->net;
+	m->xprt.xpt_class = &xcl;
+	m->rqst.rq_xprt = &m->xprt;
+	m->rqst.rq_client = f->domain;
+	m->rqst.rq_cred.cr_flavor = RPC_AUTH_UNIX;
+	m->rqst.rq_cred.cr_uid = GLOBAL_ROOT_UID;
+	m->rqst.rq_cred.cr_gid = GLOBAL_ROOT_GID;
+	m->rqst.rq_cred.cr_group_info = f->client.cl_cred.cr_group_info;
+	m->rqst.rq_argp = &m->args;
+	m->rqst.rq_vers = 4;
+	set_bit(RQ_SECURE, &m->rqst.rq_flags);
+	m->args.ffv2_digest_valid = true;
+	fh_init(&m->cstate.current_fh, NFS4_FHSIZE);
+	fh_init(&m->cstate.save_fh, NFS4_FHSIZE);
+	return m;
+}
+
+static __be32 nfsd_ffv2_mapping_putfh(struct nfsd_ffv2_mapping_fixture *m,
+				      const struct knfsd_fh *outer)
+{
+	union nfsd4_op_u u = {};
+	__be32 status;
+
+	u.putfh.pf_fhlen = outer->fh_size;
+	u.putfh.pf_fhval = (u8 *)outer->fh_raw;
+#ifdef CONFIG_NFSD_V4_2_INTER_SSC
+	u.putfh.no_verify = true;
+#endif
+	status = nfsd4_test_ffv2_run_op(&m->rqst, &m->cstate, OP_PUTFH, &u);
+	put_cred(revert_creds(get_cred(current_real_cred())));
+	return status;
+}
+
+static void nfsd_ffv2_mapped_handle_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct svc_fh *fh;
+	struct svc_export *exp;
+	unsigned int net_refs;
+
+	if (!m)
+		return;
+	fh = &m->cstate.current_fh;
+	net_refs = ns_ref_read(m->registration->net);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	KUNIT_EXPECT_NOT_NULL(test, fh->fh_ffv2_binding);
+	KUNIT_EXPECT_EQ(test, ns_ref_read(m->registration->net), net_refs + 1);
+	KUNIT_EXPECT_PTR_EQ(test, fh->fh_dentry, m->registration->object);
+	KUNIT_EXPECT_TRUE(test, fh_match(&fh->fh_handle, &m->registration->outer));
+	KUNIT_EXPECT_FALSE(test, fh->fh_ffv2_admitted);
+	exp = nfsd_ffv2_export_lookup(m->registration->nn->svc_export_cache,
+				      m->registration->domain, &m->registration->root);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(exp));
+	if (!IS_ERR(exp)) {
+		KUNIT_EXPECT_PTR_EQ(test, fh->fh_export, exp);
+		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_export_is_service(exp));
+		exp_put(exp);
+	}
+	fh_put(fh);
+	fh_put(fh);
+	KUNIT_EXPECT_PTR_EQ(test, fh->fh_ffv2_binding, NULL);
+	KUNIT_EXPECT_EQ(test, ns_ref_read(m->registration->net), net_refs);
+	KUNIT_EXPECT_EQ(test,
+			atomic_read(&m->registration->nn->ffv2.test_registration.bindings), 0);
+}
+
+static void nfsd_ffv2_mapping_identity_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	struct knfsd_fh changed;
+	struct nfsd_ffv2_registration_fixture *other;
+	unsigned int i, anchor_refs;
+	__be32 status;
+
+	if (!m)
+		return;
+	trace = &m->registration->nn->ffv2.test_registration;
+	anchor_refs = nfsd_ffv2_test_anchor_refcount(m->registration->nn);
+	for (i = 0; i < 7; i++) {
+		changed = m->registration->outer;
+		switch (i) {
+		case 0:
+			put_unaligned_be64(m->generation + 1, changed.fh_raw + 16);
+			break;
+		case 1:
+			changed.fh_raw[40] ^= 1;
+			break;
+		case 2:
+			changed.fh_raw[24] ^= 1;
+			break;
+		case 3:
+			changed.fh_size -= 4;
+			put_unaligned_be16(changed.fh_size, changed.fh_raw + 12);
+			put_unaligned_be16(changed.fh_size - NFSD_FFV2_FH_HEADER_SIZE,
+					   changed.fh_raw + 14);
+			break;
+		case 4:
+			changed.fh_raw[changed.fh_size - 1] ^= 1;
+			break;
+		case 5:
+			changed.fh_raw[8]++;
+			break;
+		case 6:
+			changed.fh_size = 1;
+			break;
+		}
+		/* Replacing the old current always puts its owner, even on refusal. */
+		FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer),
+				   nfs_ok);
+		status = nfsd_ffv2_mapping_putfh(m, &changed);
+		FFV2_EXPECT_STATUS_MSG(test, status, i < 5 ? nfserr_stale : nfserr_badhandle,
+				       "identity %u", i);
+		KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_ffv2_binding, NULL);
+		fh_put(&m->cstate.current_fh);
+		KUNIT_EXPECT_EQ(test,
+				atomic_read(&trace->bindings), 0);
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(m->registration->nn),
+				anchor_refs);
+	}
+	other = nfsd_ffv2_registration_fixture(test);
+	if (!other)
+		return;
+	m->xprt.xpt_net = other->net;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfserr_stale);
+	m->xprt.xpt_net = m->registration->net;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(other->nn), 1U);
+}
+
+static void nfsd_ffv2_mapping_unwind_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	unsigned int refs, net_refs;
+	unsigned int i;
+
+	if (!m)
+		return;
+	trace = &m->registration->nn->ffv2.test_registration;
+	refs = nfsd_ffv2_test_anchor_refcount(m->registration->nn);
+	net_refs = ns_ref_read(m->registration->net);
+	for (i = 0; i < 4; i++) {
+		if (i < 2)
+			atomic_set(&trace->fault,
+				   i ? NFSD_FFV2_TEST_MAP_NET : NFSD_FFV2_TEST_MAP_ALLOC);
+		else if (i == 2)
+			clear_bit(RQ_SECURE, &m->rqst.rq_flags);
+		else
+			m->rqst.rq_client = NULL;
+		FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer),
+				   i == 0 ? nfserr_jukebox : i == 2 ? nfserr_perm : nfserr_stale);
+		set_bit(RQ_SECURE, &m->rqst.rq_flags);
+		m->rqst.rq_client = m->registration->domain;
+		KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_ffv2_binding, NULL);
+		fh_put(&m->cstate.current_fh);
+		KUNIT_EXPECT_EQ(test, atomic_read(&trace->bindings), 0);
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_anchor_refcount(m->registration->nn), refs);
+		KUNIT_EXPECT_EQ(test, ns_ref_read(m->registration->net), net_refs);
+		FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer),
+				   nfs_ok);
+		fh_put(&m->cstate.current_fh);
+	}
+}
+
+static void nfsd_ffv2_mapping_clone_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_object_retire_ctx retire = {};
+	struct nfsd_ffv2_binding *binding;
+	struct task_struct *task;
+	union nfsd4_op_u u = {};
+	bool waiting;
+	int error;
+
+	if (!m)
+		return;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	binding = m->cstate.current_fh.fh_ffv2_binding;
+	if (!binding)
+		return;
+	FFV2_EXPECT_STATUS(test, nfsd4_test_ffv2_run_op(&m->rqst, &m->cstate, OP_SAVEFH, &u),
+			   nfs_ok);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_binding_refs(binding), 2U);
+	/* A missing clone get must fail safely, before putting a non-owned copy. */
+	if (nfsd_ffv2_test_binding_refs(binding) != 2) {
+		m->cstate.save_fh.fh_ffv2_binding = NULL;
+		return;
+	}
+	FFV2_EXPECT_STATUS(test, nfsd4_test_ffv2_run_op(&m->rqst, &m->cstate, OP_RESTOREFH, &u),
+			   nfs_ok);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_binding_refs(binding), 2U);
+	fh_put(&m->cstate.current_fh);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_binding_refs(binding), 1U);
+	retire.fixture = m->registration;
+	retire.generation = m->generation;
+	init_completion(&retire.done);
+	task = kthread_run(nfsd_ffv2_object_retire_thread, &retire, "ffv2-map-retire");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "start mapped retirement: %ld", PTR_ERR(task));
+		return;
+	}
+	error = read_poll_timeout(nfsd_ffv2_test_binding_waiting, waiting, waiting,
+				  10, USEC_PER_SEC, false, binding);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&retire.done));
+	KUNIT_EXPECT_TRUE(test, m->registration->nn->ffv2.source_claimed);
+	KUNIT_EXPECT_EQ(test, atomic_read(&m->registration->nn->ffv2.test_registration.contexts),
+			1);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfserr_stale);
+	fh_put(&m->cstate.save_fh);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&retire.done, 5 * HZ), 0UL);
+	kthread_stop(task);
+	KUNIT_EXPECT_EQ(test, retire.error, 0);
+	KUNIT_EXPECT_EQ(test,
+			atomic_read(&m->registration->nn->ffv2.test_registration.bindings), 0);
+	nfsd_ffv2_registration_unwound(test, m->registration);
+}
+
+struct nfsd_ffv2_mapping_race {
+	struct nfsd_ffv2_mapping_fixture *m;
+	__be32 status;
+	struct completion done;
+};
+
+static int nfsd_ffv2_mapping_thread(void *data)
+{
+	struct nfsd_ffv2_mapping_race *race = data;
+
+	race->status = nfsd_ffv2_mapping_putfh(race->m, &race->m->registration->outer);
+	complete(&race->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_mapping_current_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m;
+	struct nfsd_ffv2_mapping_race race;
+	struct nfsd_ffv2_object_retire_ctx retire;
+	struct nfsd_ffv2_admission held = {};
+	struct nfsd_ffv2_registration_test *trace;
+	struct task_struct *mapper, *retirer;
+	struct completion verified, resume;
+	unsigned int waiters;
+	int error;
+
+	m = nfsd_ffv2_mapping_fixture(test);
+	if (!m)
+		return;
+	trace = &m->registration->nn->ffv2.test_registration;
+	init_completion(&verified);
+	init_completion(&resume);
+	init_completion(&race.done);
+	race.m = m;
+	trace->map_verified = &verified;
+	trace->map_continue = &resume;
+	mapper = kthread_run(nfsd_ffv2_mapping_thread, &race, "ffv2-map-current");
+	if (IS_ERR(mapper)) {
+		KUNIT_FAIL(test, "start mapper");
+		goto out_hooks;
+	}
+	retirer = NULL;
+	if (!wait_for_completion_timeout(&verified, 5 * HZ)) {
+		KUNIT_FAIL(test, "mapper did not pass real verifier");
+		goto out_mapper;
+	}
+	/* Own an observer admission until the retirement-wait observation ends. */
+	error = nfsd_ffv2_test_admit(m->registration->nn, &held);
+	if (error) {
+		KUNIT_FAIL(test, "observer admission: %d", error);
+		goto out_mapper;
+	}
+	retire.fixture = m->registration;
+	retire.generation = m->generation;
+	init_completion(&retire.done);
+	retirer = kthread_run(nfsd_ffv2_object_retire_thread, &retire, "ffv2-map-check");
+	if (IS_ERR(retirer)) {
+		retirer = NULL;
+		KUNIT_FAIL(test, "start mapper retirement");
+		goto out_mapper;
+	}
+	error = read_poll_timeout(nfsd_ffv2_test_waiters, waiters, waiters != 0,
+				  10, USEC_PER_SEC, false, &held);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&retire.done));
+out_mapper:
+	complete_all(&resume);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&race.done, 5 * HZ), 0UL);
+	kthread_stop(mapper);
+	if (retirer) {
+		FFV2_EXPECT_STATUS(test, race.status, nfserr_stale);
+		KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_ffv2_binding, NULL);
+		/* Also releases a mapping accepted by a broken current check. */
+		fh_put(&m->cstate.current_fh);
+	}
+	nfsd_ffv2_complete(&held);
+	if (retirer) {
+		KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&retire.done, 5 * HZ), 0UL);
+		kthread_stop(retirer);
+		KUNIT_EXPECT_EQ(test, retire.error, 0);
+		nfsd_ffv2_registration_unwound(test, m->registration);
+	}
+out_hooks:
+	trace->map_verified = NULL;
+	trace->map_continue = NULL;
+}
+
+static void nfsd_ffv2_service_dispatch_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	struct nfsd4_op op = { .opnum = OP_GETFH };
+	struct nfsd_ffv2_fh_info info;
+	struct knfsd_fh inner = {};
+	unsigned int i;
+	static const u32 terminal[] = {
+		OP_CHUNK_COMMIT, OP_CHUNK_FINALIZE, OP_CHUNK_HEADER_READ,
+		OP_CHUNK_READ, OP_CHUNK_WRITE, OP_TRUST_STATEID,
+		OP_REVOKE_STATEID, OP_BULK_REVOKE_STATEID, OP_CHUNK_ROLLBACK,
+		OP_CHUNK_ERROR, OP_CHUNK_LOCK, OP_CHUNK_UNLOCK,
+		OP_CHUNK_WRITE_REPAIR, OP_CHUNK_REPAIRED,
+	};
+
+	if (!m)
+		return;
+	trace = &m->registration->nn->ffv2.test_registration;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	atomic_set(&trace->dispatch_calls, 0);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op),
+			   nfserr_notsupp);
+	KUNIT_EXPECT_PTR_EQ(test, op.u.getfh, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls), 0);
+	for (i = 0; i < ARRAY_SIZE(terminal); i++) {
+		atomic_set(&trace->dispatch_calls, 0);
+		op.opnum = terminal[i];
+		m->args.ffv2_digest_valid = true;
+		FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op),
+				   nfserr_notsupp);
+		m->args.ffv2_digest_valid = false;
+		m->args.ffv2_decode_class = NFSD4_FFV2_DECODE_ERROR;
+		m->args.ffv2_decode_status = nfserr_inval;
+		FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &op),
+				   nfserr_inval);
+		KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls), i < 5 ? 2 : 0);
+	}
+	fh_put(&m->cstate.current_fh);
+	/* The identical inner handle is refused through the ordinary verifier. */
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_fh_parse(&m->registration->outer, &info), 0);
+	inner.fh_size = info.inner_len;
+	memcpy(inner.fh_raw, info.inner, info.inner_len);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &inner), nfserr_stale);
+}
+
+static void nfsd_ffv2_mapping_target_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	struct nfsd_ffv2_mapping_race race;
+	struct completion verified, resume;
+	struct svc_export *exp;
+	struct task_struct *mapper;
+	bool changed = false;
+
+	if (!m)
+		return;
+	exp = nfsd_ffv2_export_lookup(m->registration->nn->svc_export_cache,
+				      m->registration->domain, &m->registration->root);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(exp));
+	trace = &m->registration->nn->ffv2.test_registration;
+	init_completion(&verified);
+	init_completion(&resume);
+	init_completion(&race.done);
+	race.m = m;
+	trace->map_verified = &verified;
+	trace->map_continue = &resume;
+	mapper = kthread_run(nfsd_ffv2_mapping_thread, &race, "ffv2-map-target");
+	if (IS_ERR(mapper)) {
+		KUNIT_FAIL(test, "start target mapper");
+		goto out;
+	}
+	if (!wait_for_completion_timeout(&verified, 5 * HZ)) {
+		KUNIT_FAIL(test, "target mapper did not pass verifier");
+	} else {
+		/* The mapper is parked after real resolution and before identity checks. */
+		exp->ex_uuid[0] ^= 1;
+		changed = true;
+	}
+	complete_all(&resume);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&race.done, 5 * HZ), 0UL);
+	kthread_stop(mapper);
+	if (changed) {
+		exp->ex_uuid[0] ^= 1;
+		FFV2_EXPECT_STATUS(test, race.status, nfserr_stale);
+		KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_ffv2_binding, NULL);
+	}
+	fh_put(&m->cstate.current_fh);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->bindings), 0);
+out:
+	trace->map_verified = NULL;
+	trace->map_continue = NULL;
+	exp_put(exp);
+}
+
+static void nfsd_ffv2_service_compound_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	struct nfsd4_compoundres *resp;
+	struct nfsd_thread_local_info *ntli;
+	struct nfsd4_compoundargs *args;
+	__be32 wire[64] = {}, *p;
+	void *reply;
+	size_t len;
+
+	if (!m)
+		return;
+	trace = &m->registration->nn->ffv2.test_registration;
+	resp = kunit_kzalloc(test, sizeof(*resp), GFP_KERNEL);
+	ntli = kunit_kzalloc(test, sizeof(*ntli), GFP_KERNEL);
+	reply = kunit_kzalloc(test, 1024, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, resp);
+	KUNIT_ASSERT_NOT_NULL(test, ntli);
+	KUNIT_ASSERT_NOT_NULL(test, reply);
+	p = wire;
+	*p++ = 0;
+	*p++ = 0;
+	*p++ = cpu_to_be32(4);
+	*p++ = cpu_to_be32(OP_PUTFH);
+	*p++ = cpu_to_be32(m->registration->outer.fh_size);
+	memcpy(p, m->registration->outer.fh_raw, m->registration->outer.fh_size);
+	p += XDR_QUADLEN(m->registration->outer.fh_size);
+	*p++ = cpu_to_be32(OP_SAVEFH);
+	*p++ = cpu_to_be32(OP_RESTOREFH);
+	*p++ = cpu_to_be32(OP_GETFH);
+	len = (char *)p - (char *)wire;
+	args = &m->args;
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_test_compound_decode(test, args, wire, len, len, 0));
+	m->rqst.rq_resp = resp;
+	m->rqst.rq_private = ntli;
+	m->rqst.rq_server = m->registration->nn->nfsd_serv;
+	xdr_buf_init(&m->rqst.rq_res, reply, 1024);
+	m->rqst.rq_res.head[0].iov_len = 0;
+	xdr_init_encode(&m->rqst.rq_res_stream, &m->rqst.rq_res, reply, NULL);
+	atomic_set(&trace->dispatch_calls, 0);
+	nfsd4_test_dispatch_compound(&m->rqst);
+	put_cred(revert_creds(get_cred(current_real_cred())));
+	FFV2_EXPECT_STATUS(test, resp->cstate.status, nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test, resp->opcnt, 4U);
+	KUNIT_EXPECT_EQ(test,
+			atomic_read(&trace->dispatch_calls), 3);
+	KUNIT_EXPECT_EQ(test,
+			atomic_read(&trace->bindings), 0);
+}
+
+static void nfsd_ffv2_mapping_mixed_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_fixture *ordinary;
+	struct svc_fh src, bad = {};
+	struct svc_export *exp;
+	struct nfsd_ffv2_binding *binding;
+	struct nfsd4_op getfh = { .opnum = OP_GETFH };
+	__be32 status;
+	int error;
+
+	if (!m)
+		return;
+	ordinary = nfsd_ffv2_registration_fixture(test);
+	if (!ordinary)
+		return;
+	exp = nfsd_ffv2_export_lookup(ordinary->nn->svc_export_cache, ordinary->domain,
+				      &ordinary->root);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(exp));
+	fh_init(&src, NFS4_FHSIZE);
+	FFV2_EXPECT_STATUS(test, fh_compose(&src, exp, ordinary->object, NULL), nfs_ok);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	binding = m->cstate.current_fh.fh_ffv2_binding;
+	/* Deliberately invalid ordinary source tests the existing clone-refusal branch. */
+	bad.fh_export = m->cstate.current_fh.fh_export;
+	bad.fh_ffv2_admitted = true;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_fh_dup2(&m->cstate.current_fh, &bad), nfserr_stale);
+	KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_ffv2_binding, binding);
+	KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_dentry, m->registration->object);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_fh_dup2(&m->cstate.current_fh, &src), nfs_ok);
+	KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_ffv2_binding, NULL);
+	KUNIT_EXPECT_TRUE(test, m->cstate.current_fh.fh_ffv2_admitted);
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 2U);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &getfh), nfs_ok);
+	KUNIT_EXPECT_PTR_EQ(test, getfh.u.getfh, &m->cstate.current_fh);
+	/* Decode the ordinary inner handle through OPEN admission and real checks. */
+	error = nfsd_ffv2_mapping_key_inner(ordinary, &src.fh_handle);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	if (!error) {
+		m->xprt.xpt_net = ordinary->net;
+		m->rqst.rq_client = ordinary->domain;
+		status = nfsd_ffv2_mapping_putfh(m, &src.fh_handle);
+		m->xprt.xpt_net = m->registration->net;
+		m->rqst.rq_client = m->registration->domain;
+		FFV2_EXPECT_STATUS(test, status, nfs_ok);
+		KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_dentry, ordinary->object);
+		KUNIT_EXPECT_TRUE(test, m->cstate.current_fh.fh_ffv2_admitted);
+		KUNIT_EXPECT_PTR_EQ(test, m->cstate.current_fh.fh_ffv2_binding, NULL);
+		KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 2U);
+	}
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 1U);
+	fh_put(&src);
+	KUNIT_EXPECT_EQ(test, exp->ex_ffv2_access_count, 0U);
+	exp_put(exp);
+}
+
+static void nfsd_ffv2_mapping_stop_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_shutdown_ctx stop;
+	struct task_struct *task;
+	struct nfsd_ffv2_binding *binding;
+	bool waiting;
+	int error;
+
+	if (!m)
+		return;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	binding = m->cstate.current_fh.fh_ffv2_binding;
+	if (!binding)
+		return;
+	nfsd_ffv2_shutdown_ctx_init(&stop, m->registration->net);
+	task = nfsd_ffv2_shutdown_thread_start(&stop, false);
+	if (IS_ERR(task)) {
+		nfsd_ffv2_shutdown_ctx_put(&stop);
+		KUNIT_FAIL(test, "start mapped stop");
+		return;
+	}
+	error = read_poll_timeout(nfsd_ffv2_test_binding_waiting, waiting, waiting,
+				  10, USEC_PER_SEC, false, binding);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&stop.done));
+	KUNIT_EXPECT_TRUE(test, check_net(m->registration->net));
+	KUNIT_EXPECT_EQ(test, atomic_read(&m->registration->nn->ffv2.test_registration.contexts),
+			1);
+	fh_put(&m->cstate.current_fh);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&stop.done, 5 * HZ), 0UL);
+	kthread_stop(task);
+	nfsd_ffv2_shutdown_ctx_put(&stop);
+	m->registration->service = false;
+	nfsd_ffv2_registration_unwound(test, m->registration);
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfserr_stale);
+}
+
+static void nfsd_ffv2_service_decode_error_test(struct kunit *test)
+{
+	struct nfsd_ffv2_mapping_fixture *m = nfsd_ffv2_mapping_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	__be32 wire[96] = {};
+	__be32 status, expected;
+	bool decoded;
+	size_t len;
+	unsigned int i;
+
+	if (!m)
+		return;
+	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
+	trace = &m->registration->nn->ffv2.test_registration;
+	for (i = 0; i < 3; i++) {
+		nfsd_ffv2_ro_compound(wire, 0);
+		wire[2] = cpu_to_be32(4);
+		wire[15] = cpu_to_be32(OP_CHUNK_LOCK);
+		len = 64 + nfsd_ffv2_wire_op(wire + 16, OP_CHUNK_LOCK);
+		wire[len / 4] = cpu_to_be32(i == 0 ? OP_GETATTR :
+					  i == 1 ? OP_IO_ADVISE : OP_CHUNK_READ);
+		len += 4;
+		if (i == 2) {
+			len += nfsd_ffv2_wire_op(wire + len / 4, OP_CHUNK_READ);
+			wire[len / 4 - 1] = cpu_to_be32(4097);
+		}
+		decoded = nfsd_ffv2_test_compound_decode(test, &m->args, wire, len, len, 0);
+		KUNIT_ASSERT_TRUE(test, decoded);
+		FFV2_EXPECT_STATUS(test, m->args.iops[2].status, nfs_ok);
+		KUNIT_EXPECT_EQ(test, m->args.iops[2].opnum, OP_CHUNK_LOCK);
+		atomic_set(&trace->dispatch_calls, 0);
+		/* The real call boundary is shared with COMPOUND, after session checks. */
+		status = nfsd_ffv2_test_dispatch_op(&m->rqst, &m->cstate, &m->args.iops[2]);
+		expected = i == 0 ? nfserr_bad_xdr : i == 1 ? nfserr_notsupp : nfserr_inval;
+		FFV2_EXPECT_STATUS(test, status, expected);
+		KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls), 0);
+	}
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_service_decode_error_test),
+	KUNIT_CASE(nfsd_ffv2_mapping_stop_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_mapping_mixed_test),
+	KUNIT_CASE(nfsd_ffv2_service_compound_test),
+	KUNIT_CASE(nfsd_ffv2_mapping_target_test),
+	KUNIT_CASE(nfsd_ffv2_service_dispatch_test),
+	KUNIT_CASE(nfsd_ffv2_mapping_current_test),
+	KUNIT_CASE(nfsd_ffv2_mapping_clone_test),
+	KUNIT_CASE(nfsd_ffv2_mapping_unwind_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_mapping_identity_test),
+	KUNIT_CASE(nfsd_ffv2_mapped_handle_test),
 	KUNIT_CASE(nfsd_ffv2_ordinary_registration_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_registration_faults_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_registration_authority_test),

@@ -14,6 +14,7 @@ struct nfsd_ffv2_generation;
 struct path;
 struct nfsd_ffv2_reservation;
 struct svc_fh;
+struct svc_export;
 struct svc_rqst;
 struct svc_xprt;
 struct task_struct;
@@ -39,6 +40,13 @@ struct nfsd_ffv2_fh_info {
 	const u8	*inner;
 	u16		inner_len;
 };
+
+struct nfsd_ffv2_binding;
+
+void nfsd_ffv2_binding_get(struct nfsd_ffv2_binding *binding);
+void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding);
+__be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp);
+__be32 nfsd4_ffv2_export_policy_check(struct svc_export *exp, u32 opnum);
 
 int nfsd_ffv2_fh_parse(const struct knfsd_fh *fh, struct nfsd_ffv2_fh_info *info);
 int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
@@ -87,6 +95,8 @@ enum nfsd_ffv2_test_registration_fault {
 	NFSD_FFV2_TEST_REPLY_BUILD,
 	NFSD_FFV2_TEST_REPLY_SEND,
 	NFSD_FFV2_TEST_WORK_ALLOC,
+	NFSD_FFV2_TEST_MAP_ALLOC,
+	NFSD_FFV2_TEST_MAP_NET,
 };
 
 struct nfsd_ffv2_registration_test {
@@ -97,6 +107,10 @@ struct nfsd_ffv2_registration_test {
 	atomic_t authorities;
 	atomic_t published_refusals;
 	atomic_t reply_consumed;
+	atomic_t bindings;
+	atomic_t dispatch_calls;
+	struct completion *map_verified;
+	struct completion *map_continue;
 	struct completion *before_publish;
 	struct completion *publish_continue;
 	struct completion *export_wait;
@@ -262,6 +276,13 @@ int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission);
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+struct nfsd4_compound_state;
+struct nfsd4_op;
+__be32 nfsd_ffv2_test_dispatch_op(struct svc_rqst *rqstp,
+				  struct nfsd4_compound_state *cstate,
+				  struct nfsd4_op *op);
+unsigned int nfsd_ffv2_test_binding_refs(struct nfsd_ffv2_binding *binding);
+bool nfsd_ffv2_test_binding_waiting(struct nfsd_ffv2_binding *binding);
 void nfsd_ffv2_test_session_hash(struct nfsd_net *nn, struct nfsd4_session *session);
 void nfsd_ffv2_test_session_unhash(struct nfsd_net *nn, struct nfsd4_session *session,
 				   bool client_expiry);
