@@ -149,11 +149,13 @@ fh_dup2(struct svc_fh *dst, struct svc_fh *src)
 	if (src->fh_ffv2_admitted &&
 	    nfsd_ffv2_export_access_clone(src->fh_export))
 		return nfserr_stale;
+	if (src->fh_ffv2_binding)
+		nfsd_ffv2_binding_get(src->fh_ffv2_binding);
 #endif
-	fh_put(dst);
 	dget(src->fh_dentry);
 	if (src->fh_export)
 		exp_get(src->fh_export);
+	fh_put(dst);
 	*dst = *src;
 	return nfs_ok;
 }
@@ -746,15 +748,25 @@ nfsd4_putfh(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	    union nfsd4_op_u *u)
 {
 	struct nfsd4_putfh *putfh = &u->putfh;
+	bool ffv2;
 	__be32 ret;
 
 	fh_put(&cstate->current_fh);
 	cstate->current_fh.fh_handle.fh_size = putfh->pf_fhlen;
 	memcpy(&cstate->current_fh.fh_handle.fh_raw, putfh->pf_fhval,
 	       putfh->pf_fhlen);
-	ret = fh_verify(rqstp, &cstate->current_fh, 0, NFSD_MAY_BYPASS_GSS);
+	ffv2 = putfh->pf_fhlen && putfh->pf_fhval[0] == 0xff;
+	if (ffv2 && !IS_ENABLED(CONFIG_NFSD_FFV2))
+		return nfserr_stale;
+#ifdef CONFIG_NFSD_FFV2
+	if (ffv2)
+		ret = nfsd_ffv2_fh_map(rqstp, &cstate->current_fh);
+	else
+#endif
+		ret = fh_verify(rqstp, &cstate->current_fh, 0,
+				NFSD_MAY_BYPASS_GSS);
 #ifdef CONFIG_NFSD_V4_2_INTER_SSC
-	if (ret == nfserr_stale && putfh->no_verify) {
+	if (!ffv2 && ret == nfserr_stale && putfh->no_verify) {
 		SET_FH_FLAG(&cstate->current_fh, NFSD4_FH_FOREIGN);
 		ret = 0;
 	}
@@ -3205,9 +3217,42 @@ check_if_stalefh_allowed(struct nfsd4_compoundargs *args)
 }
 #endif
 
-/*
- * COMPOUND call.
- */
+/* Compound FH, session and response-space checks precede this call. */
+static __be32 nfsd4_call_op(struct svc_rqst *rqstp,
+			    struct nfsd4_compound_state *cstate,
+			    struct nfsd4_op *op)
+{
+#ifdef CONFIG_NFSD_FFV2
+	struct svc_export *exp = cstate->current_fh.fh_export;
+	__be32 status;
+
+	if (exp) {
+		status = nfsd4_ffv2_export_policy_check(exp, op->opnum);
+		if (status) {
+			/* Refuse execution without hiding a saved later decode error. */
+			if (nfsd_ffv2_op_profile(op->opnum)) {
+				__be32 decoded = nfsd4_ffv2_compound_status(rqstp);
+
+				if (decoded)
+					return decoded;
+			}
+			return status;
+		}
+	}
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	{
+		struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+
+		atomic_inc(&nn->ffv2.test_registration.dispatch_calls);
+	}
+#endif
+#endif
+	if (op->opdesc->op_get_currentstateid)
+		op->opdesc->op_get_currentstateid(cstate, &op->u);
+	return op->opdesc->op_func(rqstp, cstate, &op->u);
+}
+
+/* COMPOUND call. */
 static __be32
 nfsd4_proc_compound(struct svc_rqst *rqstp)
 {
@@ -3330,9 +3375,7 @@ nfsd4_proc_compound(struct svc_rqst *rqstp)
 		if (op->status)
 			goto encode_op;
 
-		if (op->opdesc->op_get_currentstateid)
-			op->opdesc->op_get_currentstateid(cstate, &op->u);
-		op->status = op->opdesc->op_func(rqstp, cstate, &op->u);
+		op->status = nfsd4_call_op(rqstp, cstate, op);
 		trace_nfsd_compound_op_err(rqstp, op->opnum, op->status);
 
 		/* Only from SEQUENCE */
@@ -4314,6 +4357,16 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 };
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd_ffv2_test_dispatch_op(struct svc_rqst *rqstp,
+				  struct nfsd4_compound_state *cstate,
+				  struct nfsd4_op *op)
+{
+	if (op->opnum >= ARRAY_SIZE(nfsd4_ops) || !nfsd4_ops[op->opnum].op_func)
+		return nfserr_op_illegal;
+	op->opdesc = &nfsd4_ops[op->opnum];
+	return nfsd4_call_op(rqstp, cstate, op);
+}
+
 __be32 nfsd4_test_ffv2_run_op(struct svc_rqst *rqstp,
 			      struct nfsd4_compound_state *cstate, u32 opnum,
 			   union nfsd4_op_u *u)

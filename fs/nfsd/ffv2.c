@@ -27,6 +27,7 @@
 #include "netns.h"
 #include "nfsfh.h"
 #include "state.h"
+#include "vfs.h"
 
 static const u8 nfsd_ffv2_fh_magic[8] = {
 	0xff, 'F', 'F', 'V', '2', 'F', 'H', 0,
@@ -258,6 +259,14 @@ struct nfsd_ffv2_generation {
 	bool registry_generation;
 	void				*payload;
 	void				(*release)(void *payload);
+};
+
+struct nfsd_ffv2_binding {
+	refcount_t ref;
+	struct net *net;
+	struct nfsd_ffv2_admission admission;
+	/* The admission, not just a generation reference, protects this object. */
+	struct nfsd_ffv2_object *object;
 };
 
 enum nfsd_ffv2_reservation_state {
@@ -3066,6 +3075,196 @@ out_free:
 out_put_fh:
 	fh_put(&ordinary);
 	goto out_put_exp;
+}
+
+void nfsd_ffv2_binding_get(struct nfsd_ffv2_binding *binding)
+{
+	refcount_inc(&binding->ref);
+}
+
+void nfsd_ffv2_binding_put(struct nfsd_ffv2_binding *binding)
+{
+	if (!refcount_dec_and_test(&binding->ref))
+		return;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	atomic_dec(&binding->admission.anchor->test_registration.bindings);
+#endif
+	nfsd_ffv2_complete(&binding->admission);
+	put_net(binding->net);
+	kfree(binding);
+}
+
+static int nfsd_ffv2_binding_admit(struct nfsd_net *nn,
+				   const struct nfsd_ffv2_fh_info *info,
+				   struct nfsd_ffv2_binding *binding)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	struct nfsd_ffv2_generation *generation;
+	struct nfsd_ffv2_service_context *context;
+	struct nfsd_ffv2_object *object;
+	int error = -ESTALE;
+
+	INIT_LIST_HEAD(&binding->admission.node);
+	if (!nfsd_ffv2_anchor_get(anchor))
+		return -ESHUTDOWN;
+	mutex_lock(&anchor->lock);
+	generation = anchor->active;
+	if (anchor->net_state != NFSD_FFV2_NET_LIVE ||
+	    anchor->service_state != NFSD_FFV2_SERVICE_UP ||
+	    !generation || !generation->registry_generation ||
+	    generation->identity->generation != info->generation)
+		goto out_unlock;
+	context = generation->payload;
+	object = context->object;
+	if (!object->visible ||
+	    memcmp(object->export_uuid, info->export_uuid, sizeof(object->export_uuid)) ||
+	    memcmp(object->object_uuid, info->object_uuid, sizeof(object->object_uuid)) ||
+	    object->inner_fh.fh_size != info->inner_len ||
+	    memcmp(object->inner_fh.fh_raw, info->inner, info->inner_len))
+		goto out_unlock;
+	/* Retirement cannot unpublish or free the payload under anchor->lock. */
+	refcount_inc(&generation->ref);
+	atomic_inc(&generation->admitted);
+	binding->object = object;
+	binding->admission.anchor = anchor;
+	binding->admission.generation = generation;
+	binding->admission.task = current;
+	spin_lock(&generation->admissions_lock);
+	list_add(&binding->admission.node, &generation->admissions);
+	spin_unlock(&generation->admissions_lock);
+	error = 0;
+out_unlock:
+	mutex_unlock(&anchor->lock);
+	if (error)
+		nfsd_ffv2_anchor_put(anchor);
+	return error;
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+unsigned int nfsd_ffv2_test_binding_refs(struct nfsd_ffv2_binding *binding)
+{
+	return refcount_read(&binding->ref);
+}
+
+bool nfsd_ffv2_test_binding_waiting(struct nfsd_ffv2_binding *binding)
+{
+	/* The retained binding keeps this wait queue and its owner alive. */
+	return waitqueue_active(&binding->admission.generation->admitted_wait) &&
+	       atomic_read(&binding->admission.generation->test_waiters);
+}
+#endif
+
+static bool nfsd_ffv2_binding_current(struct nfsd_net *nn,
+				      struct nfsd_ffv2_binding *binding)
+{
+	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
+	bool valid;
+
+	mutex_lock(&anchor->lock);
+	valid = anchor->active == binding->admission.generation &&
+		binding->object->visible;
+	mutex_unlock(&anchor->lock);
+	return valid;
+}
+
+static bool nfsd_ffv2_mapped_target_valid(struct svc_fh *fhp,
+					  struct nfsd_ffv2_binding *binding)
+{
+	struct nfsd_ffv2_service_context *context = binding->admission.generation->payload;
+
+	return fhp->fh_export == context->export && fhp->fh_export->ex_uuid &&
+	       !memcmp(fhp->fh_export->ex_uuid, binding->object->export_uuid,
+		       sizeof(binding->object->export_uuid)) &&
+	       fhp->fh_export->ex_client == binding->object->client &&
+	       fhp->fh_dentry == binding->object->object_path.dentry &&
+	       !nfsd_ffv2_object_validate(fhp->fh_export, binding->object);
+}
+
+__be32 nfsd_ffv2_fh_map(struct svc_rqst *rqstp, struct svc_fh *fhp)
+{
+	struct nfsd_ffv2_binding *binding;
+	struct nfsd_ffv2_fh_info info;
+	struct knfsd_fh outer = fhp->fh_handle;
+	struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+	struct net *net;
+	__be32 status;
+
+	if (nfsd_ffv2_fh_parse(&outer, &info))
+		return nfserr_badhandle;
+	if (nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_MAP_ALLOC))
+		return nfserr_jukebox;
+	binding = kzalloc_obj(*binding, GFP_KERNEL);
+	if (!binding)
+		return nfserr_jukebox;
+	refcount_set(&binding->ref, 1);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	atomic_inc(&nn->ffv2.test_registration.bindings);
+#endif
+	net = nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_MAP_NET) ?
+		NULL : maybe_get_net(SVC_NET(rqstp));
+	if (!net) {
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		atomic_dec(&nn->ffv2.test_registration.bindings);
+#endif
+		kfree(binding);
+		return nfserr_stale;
+	}
+	binding->net = net;
+	if (nfsd_ffv2_binding_admit(nn, &info, binding)) {
+		status = nfserr_stale;
+		goto out_net;
+	}
+
+	fhp->fh_handle = binding->object->inner_fh;
+	status = fh_verify_ffv2_mapped(rqstp, fhp, 0, NFSD_MAY_BYPASS_GSS);
+	if (status)
+		goto out_fh;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (READ_ONCE(nn->ffv2.test_registration.map_verified)) {
+		complete(READ_ONCE(nn->ffv2.test_registration.map_verified));
+		wait_for_completion(READ_ONCE(nn->ffv2.test_registration.map_continue));
+	}
+#endif
+	if (!nfsd_ffv2_mapped_target_valid(fhp, binding) ||
+	    !nfsd_ffv2_binding_current(nn, binding)) {
+		status = nfserr_stale;
+		goto out_fh;
+	}
+	fhp->fh_handle = outer;
+	fhp->fh_ffv2_binding = binding;
+	return nfs_ok;
+
+out_fh:
+	fh_put(fhp);
+	nfsd_ffv2_complete(&binding->admission);
+out_net:
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	atomic_dec(&nn->ffv2.test_registration.bindings);
+#endif
+	put_net(net);
+	kfree(binding);
+	return status;
+}
+
+__be32 nfsd4_ffv2_export_policy_check(struct svc_export *exp, u32 opnum)
+{
+	if (!nfsd_ffv2_export_is_service(exp))
+		return nfs_ok;
+	switch (opnum) {
+	case OP_PUTFH:
+	case OP_PUTROOTFH:
+	case OP_PUTPUBFH:
+	case OP_SAVEFH:
+	case OP_RESTOREFH:
+	case OP_CHUNK_COMMIT:
+	case OP_CHUNK_FINALIZE:
+	case OP_CHUNK_HEADER_READ:
+	case OP_CHUNK_READ:
+	case OP_CHUNK_WRITE:
+		return nfs_ok;
+	default:
+		return nfserr_notsupp;
+	}
 }
 
 static void nfsd_ffv2_service_context_release(void *payload)
