@@ -4,6 +4,8 @@
 
 #include <linux/bits.h>
 #include <linux/types.h>
+#include "state.h"
+#include "ffv2.h"
 
 enum nfsd_ffv2_caller_class {
 	NFSD_FFV2_CALLER_NONE,
@@ -40,5 +42,53 @@ struct nfsd_ffv2_op_profile {
 
 const struct nfsd_ffv2_op_profile *nfsd_ffv2_op_profile(u32 opnum);
 bool nfsd_ffv2_op_no_filehandle(u32 opnum);
+
+struct nfsd_ffv2_actor_id {
+	u32 client_id;
+	bool present;
+	clientid_t target;
+	bool target_present;
+};
+
+__be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				    struct nfsd4_session *session, u32 opnum,
+				    const stateid_t *stateid,
+				    const struct nfsd_ffv2_actor_id *actor,
+				    struct nfsd_ffv2_admission *admission);
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+#define NFSD_FFV2_TRUST_PRINCIPAL_MAX 1024
+#define NFSD_FFV2_TRUST_ENTRIES_MAX 4096
+#define NFSD_FFV2_TRUST_BYTES_MAX (4U * 1024U * 1024U)
+
+struct nfsd_ffv2_trust_request {
+	enum nfsd_ffv2_caller_class actor;
+	stateid_t stateid;
+	const u8 *object_uuid;
+	clientid_t pnfs_clientid;
+	u32 client_id;
+	u32 iomode;
+	u32 profile_mask;
+	struct timespec64 expires;
+	const char *principal;
+};
+
+__be32 nfsd_ffv2_test_trust_update(struct nfsd_net *nn, const struct nfsd_ffv2_trust_request *req,
+				   bool revoke);
+struct nfsd_ffv2_trust_stats {
+	unsigned int entries;
+	unsigned int holds;
+	size_t bytes;
+	u64 generation;
+	u64 epoch;
+};
+
+void *nfsd_ffv2_test_trust_get(struct nfsd_net *nn, const stateid_t *stateid);
+bool nfsd_ffv2_test_trust_snapshot(struct nfsd_net *nn, struct nfsd_ffv2_trust_stats *stats);
+__be32 nfsd_ffv2_test_entry_validate(void *entry, u64 generation, const u8 object_uuid[16],
+				     u64 epoch, u32 profile, const char *principal);
+unsigned int nfsd_ffv2_test_admitted(struct nfsd_ffv2_admission *observer);
+
+#endif
 
 #endif /* _NFSD_FFV2_TRUST_H */
