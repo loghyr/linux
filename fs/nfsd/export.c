@@ -1672,9 +1672,19 @@ static void svc_export_init(struct cache_head *cnew, struct cache_head *citem)
 	new->ex_ffv2_participant = NULL;
 	new->ex_ffv2_listed = false;
 	nfsd_ffv2_export_access_init(new);
+	RCU_INIT_POINTER(new->ex_ffv2_context, NULL);
+	new->ex_ffv2_context_released = NULL;
 #endif
 	export_stats_reset(new->ex_stats);
 }
+
+#ifdef CONFIG_NFSD_FFV2
+void nfsd_export_unhash(struct svc_export *exp)
+{
+	sunrpc_cache_unhash(exp->cd, &exp->h);
+}
+
+#endif
 
 static void export_update(struct cache_head *cnew, struct cache_head *citem)
 {
@@ -1702,6 +1712,12 @@ static void export_update(struct cache_head *cnew, struct cache_head *citem)
 		new->ex_flavors[i] = item->ex_flavors[i];
 	}
 	new->ex_xprtsec_modes = item->ex_xprtsec_modes;
+#ifdef CONFIG_NFSD_FFV2
+	RCU_INIT_POINTER(new->ex_ffv2_context, rcu_access_pointer(item->ex_ffv2_context));
+	RCU_INIT_POINTER(item->ex_ffv2_context, NULL);
+	if (item->ex_ffv2_access_state == NFSD_FFV2_EXPORT_SERVICE)
+		nfsd_ffv2_export_transition_commit(new);
+#endif
 }
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
@@ -1811,6 +1827,100 @@ nfsd_ffv2_test_export_update_exact(struct svc_export *new,
 #endif
 
 static DEFINE_MUTEX(nfsd_export_update_lock);
+
+struct svc_export *
+nfsd_ffv2_export_update_exact_locked(struct svc_export *new, struct svc_export *old)
+{
+	struct cache_head *head;
+
+	lockdep_assert_held(&nfsd_export_update_lock);
+	head = sunrpc_cache_update_exact(old->cd, &new->h, &old->h, svc_export_hash(old));
+	if (IS_ERR(head))
+		return ERR_CAST(head);
+	return container_of(head, struct svc_export, h);
+}
+
+static int
+nfsd_ffv2_fslocs_clone(struct nfsd4_fs_locations *dst,
+		       const struct nfsd4_fs_locations *src, struct nfsd_net *nn)
+{
+	unsigned int i;
+
+	dst->locations_count = src->locations_count;
+	dst->migrated = src->migrated;
+	if (!src->locations_count)
+		return 0;
+	if (nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_TEMPLATE_ARRAY))
+		return -ENOMEM;
+	dst->locations = kcalloc(src->locations_count, sizeof(*dst->locations), GFP_KERNEL);
+	if (!dst->locations)
+		return -ENOMEM;
+	for (i = 0; i < src->locations_count; i++) {
+		if (i == 1 && nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_TEMPLATE_HOST))
+			return -ENOMEM;
+		dst->locations[i].hosts = kstrdup(src->locations[i].hosts, GFP_KERNEL);
+		if (i == 1 && nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_TEMPLATE_PATH))
+			return -ENOMEM;
+		dst->locations[i].path = kstrdup(src->locations[i].path, GFP_KERNEL);
+		if (!dst->locations[i].hosts || !dst->locations[i].path)
+			return -ENOMEM;
+	}
+	return 0;
+}
+
+int nfsd_ffv2_export_template_clone(struct svc_export *template, struct svc_export *source)
+{
+	struct nfsd_net *nn = net_generic(source->cd->net, nfsd_net_id);
+	int error;
+
+	memset(template, 0, sizeof(*template));
+	kref_get(&source->ex_client->ref);
+	template->ex_client = source->ex_client;
+	template->ex_path = source->ex_path;
+	path_get(&template->ex_path);
+	template->cd = source->cd;
+	template->h.expiry_time = source->h.expiry_time;
+	template->ex_flags = source->ex_flags;
+	template->ex_fsid = source->ex_fsid;
+	template->ex_anon_uid = source->ex_anon_uid;
+	template->ex_anon_gid = source->ex_anon_gid;
+	template->ex_layout_types = source->ex_layout_types;
+	template->ex_devid_map = source->ex_devid_map;
+	template->ex_nflavors = source->ex_nflavors;
+	memcpy(template->ex_flavors, source->ex_flavors, sizeof(template->ex_flavors));
+	template->ex_xprtsec_modes = source->ex_xprtsec_modes;
+	template->ex_uuid = nfsd_ffv2_test_registration_fault(nn, NFSD_FFV2_TEST_TEMPLATE_UUID) ?
+		NULL : kmemdup(source->ex_uuid, EX_UUID_LEN, GFP_KERNEL);
+	if (!template->ex_uuid) {
+		error = -ENOMEM;
+		goto out_free;
+	}
+	error = nfsd_ffv2_fslocs_clone(&template->ex_fslocs, &source->ex_fslocs, nn);
+	if (error)
+		goto out_free;
+	return 0;
+
+out_free:
+	nfsd_ffv2_export_template_free(template);
+	return error;
+}
+
+void nfsd_ffv2_export_template_free(struct svc_export *template)
+{
+	nfsd4_fslocs_free(&template->ex_fslocs);
+	kfree(template->ex_uuid);
+	template->ex_uuid = NULL;
+	if (template->ex_path.dentry)
+		path_put(&template->ex_path);
+	if (template->ex_client)
+		auth_domain_put(template->ex_client);
+	template->ex_client = NULL;
+}
+
+void nfsd_ffv2_export_template_mark_service(struct svc_export *template)
+{
+	template->ex_ffv2_access_state = NFSD_FFV2_EXPORT_SERVICE;
+}
 
 void nfsd_ffv2_export_update_lock(void)
 {
@@ -1958,6 +2068,13 @@ nfsd_export_cache_update(struct svc_export *new)
 #ifdef CONFIG_NFSD_FFV2
 	error = nfsd_ffv2_export_update_begin(new, &update);
 	if (error) {
+		exp_put(old);
+		result = ERR_PTR(error);
+		goto out_unlock;
+	}
+	if (rcu_access_pointer(old->ex_ffv2_context)) {
+		error = test_bit(CACHE_NEGATIVE, &new->h.flags) ? -EAGAIN : -EBUSY;
+		nfsd_ffv2_export_update_abort(&update);
 		exp_put(old);
 		result = ERR_PTR(error);
 		goto out_unlock;

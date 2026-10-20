@@ -416,6 +416,56 @@ attribute-sets:
         nested-attributes: server-proc-entry
         multi-attr: true
 
+  -
+    name: ffv2-object
+    attributes:
+      -
+        name: auth-domain
+        type: string
+        checks:
+          max-len: 255
+      -
+        name: export-path
+        type: string
+        checks:
+          max-len: 4095
+      -
+        name: object-path
+        type: string
+        checks:
+          max-len: 4095
+      -
+        name: object-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: store-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: binding-token
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: control-root
+        type: u64
+      -
+        name: generation
+        type: u64
+      -
+        name: filehandle
+        type: binary
+        checks:
+          max-len: 128
+      -
+        name: mds-sessionid
+        type: binary
+        checks:
+          exact-len: 16
+
 operations:
   list:
     -
@@ -627,6 +677,37 @@ operations:
             - proc4-ops
             - proc4ops-ops
             - proc4cb-ops
+
+    -
+      name: ffv2-object-register
+      doc: register one Flex Files v2 logical object
+      attribute-set: ffv2-object
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - auth-domain
+            - export-path
+            - object-path
+            - object-uuid
+            - store-uuid
+            - binding-token
+            - control-root
+            - mds-sessionid
+        reply:
+          attributes:
+            - generation
+            - filehandle
+    -
+      name: ffv2-object-unregister
+      doc: unregister one Flex Files v2 logical object
+      attribute-set: ffv2-object
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - object-uuid
+            - generation
 
 mcast-groups:
   list:

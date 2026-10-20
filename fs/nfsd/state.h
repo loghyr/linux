@@ -446,6 +446,9 @@ struct nfsd4_conn {
  * working on the object (primarily during the processing of compounds).
  */
 struct nfsd4_session {
+#ifdef CONFIG_NFSD_FFV2
+	struct list_head se_ffv2_authorities;
+#endif
 	atomic_t		se_ref;
 	spinlock_t		se_lock;
 	u32			se_cb_slot_avail; /* bitmap of available slots */
@@ -996,4 +999,12 @@ struct nfsd4_get_dir_delegation;
 struct nfs4_delegation *nfsd_get_dir_deleg(struct nfsd4_compound_state *cstate,
 						struct nfsd4_get_dir_delegation *gdd,
 						struct nfsd_file *nf);
+#ifdef CONFIG_NFSD_FFV2
+struct nfsd4_session *nfsd4_session_lookup_get(struct net *net, const u8 *sessionid);
+void nfsd4_session_put_ref(struct nfsd4_session *ses);
+bool nfsd4_session_is_live_locked(struct nfsd4_session *ses);
+int nfsd4_ffv2_copy_cred(struct nfsd_net *nn, struct svc_cred *target, struct svc_cred *source);
+
+#endif
+
 #endif   /* NFSD4_STATE_H */

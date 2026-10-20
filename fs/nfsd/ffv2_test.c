@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
 #include <linux/completion.h>
+#include <linux/sunrpc/gss_api.h>
+#include <linux/sunrpc/auth_gss.h>
+#include <net/sock.h>
 #include <linux/cred.h>
 #include <linux/lockd/bind.h>
 #include <linux/mount.h>
@@ -12,6 +15,7 @@
 #include <linux/refcount.h>
 #include <linux/sched.h>
 #include <linux/shmem_fs.h>
+#include <linux/namei.h>
 #include <linux/unaligned.h>
 #include <linux/sunrpc/svcsock.h>
 #include <linux/sunrpc/svcauth.h>
@@ -3414,7 +3418,856 @@ static void nfsd_ffv2_single_range_test(struct kunit *test)
 	}
 }
 
+/* Synthetic session-table entries do not authenticate an on-wire client. */
+struct nfsd_ffv2_registration_fixture {
+	struct net *net;
+	struct nfsd_net *nn;
+	struct nfs4_client client;
+	struct nfsd4_session session;
+	struct auth_domain *domain;
+	struct path root;
+	struct dentry *object;
+	struct fs_struct *fs;
+	struct socket *reply;
+	u32 port;
+	u8 uuid[16];
+	u8 token[32];
+	bool service;
+	bool hashed;
+};
+
+static void nfsd_ffv2_registration_fixture_exit(void *data)
+{
+	struct nfsd_ffv2_registration_fixture *f = data;
+
+	if (f->reply)
+		sock_release(f->reply);
+	if (f->hashed)
+		nfsd_ffv2_test_session_unhash(f->nn, &f->session, false);
+	if (f->service)
+		nfsd_shutdown_threads(f->net);
+	if (f->net)
+		nfsd_export_flush(f->net);
+	free_svc_cred(&f->client.cl_cred);
+	if (f->domain)
+		auth_domain_put(f->domain);
+	if (f->object) {
+		d_drop(f->object);
+		dput(f->object);
+	}
+	if (f->fs)
+		free_fs_struct(f->fs);
+	if (f->root.mnt) {
+		dput(f->root.dentry);
+		mntput(f->root.mnt);
+	}
+	if (f->net) {
+		put_net(f->net);
+		net_ns_barrier();
+	}
+}
+
+static int nfsd_ffv2_registration_seed(struct nfsd_ffv2_registration_fixture *f)
+{
+	struct svc_export key, *exp;
+	unsigned int i;
+	int error = -ENOMEM;
+
+	nfsd_ffv2_init_export_test_key(&key, f->nn, f->domain, &f->root);
+	key.ex_flags = NFSEXP_NOSUBTREECHECK;
+	key.ex_uuid = kmemdup(f->uuid, sizeof(f->uuid), GFP_KERNEL);
+	if (!key.ex_uuid)
+		return -ENOMEM;
+	key.ex_fslocs.locations_count = 2;
+	key.ex_fslocs.locations = kcalloc(2, sizeof(*key.ex_fslocs.locations), GFP_KERNEL);
+	if (!key.ex_fslocs.locations)
+		goto out_free;
+	for (i = 0; i < 2; i++) {
+		key.ex_fslocs.locations[i].hosts = kstrdup("mds.kunit", GFP_KERNEL);
+		key.ex_fslocs.locations[i].path = kstrdup("/export", GFP_KERNEL);
+		if (!key.ex_fslocs.locations[i].hosts || !key.ex_fslocs.locations[i].path)
+			goto out_free;
+	}
+	exp = nfsd_export_cache_update(&key);
+	error = IS_ERR(exp) ? PTR_ERR(exp) : 0;
+	if (!IS_ERR(exp))
+		exp_put(exp);
+out_free:
+	if (key.ex_fslocs.locations) {
+		for (i = 0; i < 2; i++) {
+			kfree(key.ex_fslocs.locations[i].hosts);
+			kfree(key.ex_fslocs.locations[i].path);
+		}
+		kfree(key.ex_fslocs.locations);
+	}
+	kfree(key.ex_uuid);
+	return error;
+}
+
+static struct nfsd_ffv2_registration_fixture *nfsd_ffv2_registration_fixture(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	struct qstr object_name = QSTR_INIT("object", 6);
+	struct sockaddr_nl addr = { .nl_family = AF_NETLINK };
+	struct file_system_type *type;
+	struct fs_struct *fs;
+	int error;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	if (!f)
+		return NULL;
+	init_svc_cred(&f->client.cl_cred);
+	error = kunit_add_action_or_reset(test, nfsd_ffv2_registration_fixture_exit, f);
+	if (error)
+		return NULL;
+	memset(f->uuid, 0x5a, sizeof(f->uuid));
+	memset(f->token, 0xa5, sizeof(f->token));
+	f->net = copy_net_ns(CLONE_NEWNET, current_user_ns(), &init_net);
+	if (IS_ERR(f->net)) {
+		f->net = NULL;
+		goto fail;
+	}
+	f->nn = net_generic(f->net, nfsd_net_id);
+	error = nfsd_ffv2_start_test_service(f->net, NULL);
+	if (error)
+		goto fail;
+	f->service = true;
+	type = get_fs_type("tmpfs");
+	if (!type)
+		goto fail;
+	f->root.mnt = vfs_kern_mount(type, SB_KERNMOUNT, "ffv2-kunit", NULL);
+	put_filesystem(type);
+	if (IS_ERR(f->root.mnt)) {
+		f->root.mnt = NULL;
+		goto fail;
+	}
+	f->root.dentry = dget(f->root.mnt->mnt_root);
+	fs = copy_fs_struct(current->fs);
+	if (!fs)
+		goto fail;
+	set_fs_root(fs, &f->root);
+	set_fs_pwd(fs, &f->root);
+	f->fs = fs;
+	error = mnt_want_write(f->root.mnt);
+	if (error)
+		goto fail;
+	inode_lock(d_inode(f->root.dentry));
+	f->object = lookup_one(mnt_idmap(f->root.mnt), &object_name, f->root.dentry);
+	if (IS_ERR(f->object)) {
+		error = PTR_ERR(f->object);
+		f->object = NULL;
+	} else {
+		error = vfs_create(mnt_idmap(f->root.mnt), f->object, 0600, NULL);
+	}
+	inode_unlock(d_inode(f->root.dentry));
+	mnt_drop_write(f->root.mnt);
+	if (error)
+		goto fail;
+	f->domain = unix_domain_find("ffv2-registration-kunit");
+	if (!f->domain)
+		goto fail;
+	error = nfsd_ffv2_registration_seed(f);
+	if (error)
+		goto fail;
+	f->client.net = f->net;
+	f->client.cl_minorversion = 2;
+	f->client.cl_exchange_flags = EXCHGID4_FLAG_USE_PNFS_MDS;
+	f->client.cl_mach_cred = true;
+	f->client.cl_time = 1;
+	f->client.cl_state = NFSD4_ACTIVE;
+	atomic_set(&f->client.cl_rpc_users, 1);
+	spin_lock_init(&f->client.cl_lock);
+	INIT_LIST_HEAD(&f->client.cl_lru);
+	INIT_LIST_HEAD(&f->client.cl_idhash);
+	INIT_LIST_HEAD(&f->client.cl_sessions);
+	f->client.cl_cred.cr_flavor = RPC_AUTH_GSS_KRB5I;
+	f->client.cl_cred.cr_gss_mech = gss_mech_get_by_name("krb5");
+	f->client.cl_cred.cr_group_info = groups_alloc(0);
+	f->client.cl_cred.cr_principal = kstrdup("nfs/mds@KUNIT", GFP_KERNEL);
+	f->client.cl_cred.cr_raw_principal = kstrdup("nfs/mds@KUNIT", GFP_KERNEL);
+	f->client.cl_cred.cr_targ_princ = kstrdup("nfs/ds@KUNIT", GFP_KERNEL);
+	if (!f->client.cl_cred.cr_gss_mech || !f->client.cl_cred.cr_group_info ||
+	    !f->client.cl_cred.cr_principal || !f->client.cl_cred.cr_raw_principal ||
+	    !f->client.cl_cred.cr_targ_princ)
+		goto fail;
+	f->session.se_client = &f->client;
+	memset(f->session.se_sessionid.data, 0x73, NFS4_MAX_SESSIONID_LEN);
+	put_unaligned_be32(f->net->ns.inum, f->session.se_sessionid.data + 12);
+	atomic_set(&f->session.se_ref, 1);
+	INIT_LIST_HEAD(&f->session.se_hash);
+	INIT_LIST_HEAD(&f->session.se_perclnt);
+	INIT_LIST_HEAD(&f->session.se_all_sessions);
+	nfsd_ffv2_session_init(&f->session);
+	nfsd_ffv2_test_session_hash(f->nn, &f->session);
+	f->hashed = true;
+	/* A real receiving endpoint lets genlmsg_reply retain its own contract. */
+	error = __sock_create(f->net, AF_NETLINK, SOCK_RAW, NETLINK_GENERIC, &f->reply, 0);
+	if (error)
+		goto fail;
+	error = kernel_bind(f->reply, (struct sockaddr_unsized *)&addr, sizeof(addr));
+	if (error)
+		goto fail;
+	error = kernel_getsockname(f->reply, (struct sockaddr *)&addr);
+	if (error < 0)
+		goto fail;
+	f->port = addr.nl_pid;
+	return f;
+fail:
+	KUNIT_FAIL(test, "ordinary registration fixture failed: %d", error);
+	return NULL;
+}
+
+static int nfsd_ffv2_registration_call(struct nfsd_ffv2_registration_fixture *f, bool unregister,
+				       u64 *generation)
+{
+	struct nlattr *attrs[NFSD_A_FFV2_OBJECT_MAX + 1] = {};
+	struct genl_info info = {
+		.attrs = attrs, .family = &nfsd_nl_family, .snd_portid = f->port, .snd_seq = 23
+	};
+	struct msghdr msg = {};
+	struct kvec vec;
+	struct sk_buff *skb;
+	struct fs_struct *saved_fs;
+	struct nlmsghdr *nlh;
+	struct genlmsghdr *genl;
+	struct nlattr *attr;
+	char buffer[512];
+	void *header;
+	int error, remaining;
+
+	skb = genlmsg_new(512, GFP_KERNEL);
+	if (!skb)
+		return -ENOMEM;
+	header = genlmsg_put(skb, f->port, 23, &nfsd_nl_family, 0,
+			     unregister ? NFSD_CMD_FFV2_OBJECT_UNREGISTER :
+					  NFSD_CMD_FFV2_OBJECT_REGISTER);
+	if (!header) {
+		error = -ENOMEM;
+		goto out;
+	}
+	if (nla_put(skb, NFSD_A_FFV2_OBJECT_OBJECT_UUID, 16, f->uuid))
+		goto too_big;
+	if (unregister) {
+		if (nla_put_u64_64bit(skb, NFSD_A_FFV2_OBJECT_GENERATION, *generation, 0))
+			goto too_big;
+	} else if (nla_put_string(skb, NFSD_A_FFV2_OBJECT_AUTH_DOMAIN, f->domain->name) ||
+		   nla_put_string(skb, NFSD_A_FFV2_OBJECT_EXPORT_PATH, "/") ||
+		   nla_put_string(skb, NFSD_A_FFV2_OBJECT_OBJECT_PATH, "/object") ||
+		   nla_put(skb, NFSD_A_FFV2_OBJECT_STORE_UUID, 16, f->uuid) ||
+		   nla_put(skb, NFSD_A_FFV2_OBJECT_BINDING_TOKEN, 32, f->token) ||
+		   nla_put_u64_64bit(skb, NFSD_A_FFV2_OBJECT_CONTROL_ROOT, 47, 0) ||
+		   nla_put(skb, NFSD_A_FFV2_OBJECT_MDS_SESSIONID, 16,
+			   f->session.se_sessionid.data)) {
+		goto too_big;
+	}
+	genlmsg_end(skb, header);
+	info.nlhdr = nlmsg_hdr(skb);
+	info.genlhdr = nlmsg_data(info.nlhdr);
+	genl_info_net_set(&info, f->net);
+	nla_for_each_attr(attr, genlmsg_data(info.genlhdr), genlmsg_len(info.genlhdr), remaining)
+		if (nla_type(attr) <= NFSD_A_FFV2_OBJECT_MAX)
+			attrs[nla_type(attr)] = attr;
+	task_lock(current);
+	saved_fs = current->fs;
+	current->fs = f->fs;
+	task_unlock(current);
+	error = unregister ? nfsd_nl_ffv2_object_unregister_doit(skb, &info) :
+			     nfsd_nl_ffv2_object_register_doit(skb, &info);
+	task_lock(current);
+	current->fs = saved_fs;
+	task_unlock(current);
+	if (error || unregister)
+		goto out;
+	vec.iov_base = buffer;
+	vec.iov_len = sizeof(buffer);
+	error = kernel_recvmsg(f->reply, &msg, &vec, 1, sizeof(buffer), MSG_DONTWAIT);
+	if (error < 0)
+		goto out;
+	nlh = (struct nlmsghdr *)buffer;
+	genl = nlmsg_data(nlh);
+	attr = nla_find(genlmsg_data(genl), genlmsg_len(genl), NFSD_A_FFV2_OBJECT_GENERATION);
+	if (!attr) {
+		error = -EBADMSG;
+		goto out;
+	}
+	*generation = nla_get_u64(attr);
+	attr = nla_find(genlmsg_data(genl), genlmsg_len(genl), NFSD_A_FFV2_OBJECT_FILEHANDLE);
+	if (!attr || nla_len(attr) < NFSD_FFV2_FH_HEADER_SIZE) {
+		error = -EBADMSG;
+		goto out;
+	}
+	error = 0;
+	goto out;
+too_big:
+	error = -EMSGSIZE;
+out:
+	nlmsg_free(skb);
+	return error;
+}
+
+static void nfsd_ffv2_ordinary_registration_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	struct nfsd_ffv2_export_update second;
+	struct svc_export key, *replacement;
+	struct nfsd_ffv2_admission admission = {};
+	u64 generation = 0, stale;
+	int error;
+
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return;
+	error = nfsd_ffv2_registration_call(f, false, &generation);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	KUNIT_EXPECT_GT(test, generation, 0ULL);
+	KUNIT_EXPECT_FALSE(test, f->nn->ffv2.registration_pending);
+	KUNIT_EXPECT_PTR_EQ(test, f->nn->ffv2.pending, NULL);
+	KUNIT_EXPECT_TRUE(test, f->nn->ffv2.source_claimed);
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2_participant.update_count, 0U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.contexts), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.authorities), 1);
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_registration_begin(f->nn, &second);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_EXPECT_EQ(test, error, -EBUSY);
+	nfsd_ffv2_init_export_test_key(&key, f->nn, f->domain, &f->root);
+	set_bit(CACHE_NEGATIVE, &key.h.flags);
+	replacement = nfsd_export_cache_update(&key);
+	error = IS_ERR(replacement) ? PTR_ERR(replacement) : 0;
+	if (!IS_ERR(replacement))
+		exp_put(replacement);
+	KUNIT_ASSERT_EQ(test, error, -EAGAIN);
+	stale = generation + 1;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, true, &stale), -ENOENT);
+	f->uuid[0] ^= 1;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, true, &generation), -ENOENT);
+	f->uuid[0] ^= 1;
+	nfsd_ffv2_test_wrong_unregister_kind(f->nn, true);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, true, &generation), -ENOENT);
+	nfsd_ffv2_test_wrong_unregister_kind(f->nn, false);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_test_admit(f->nn, &admission), 0);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_registration_call(f, true, &generation), -EDEADLK);
+	nfsd_ffv2_complete(&admission);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_registration_call(f, true, &generation), 0);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, true, &generation), -ENOENT);
+	KUNIT_EXPECT_FALSE(test, f->nn->ffv2.source_claimed);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.contexts), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.authorities), 0);
+}
+
+static void
+nfsd_ffv2_registration_unwound(struct kunit *test, struct nfsd_ffv2_registration_fixture *f)
+{
+	KUNIT_EXPECT_FALSE(test, f->nn->ffv2.source_claimed);
+	KUNIT_EXPECT_FALSE(test, f->nn->ffv2.registration_pending);
+	KUNIT_EXPECT_PTR_EQ(test, f->nn->ffv2.pending, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, f->nn->ffv2.active, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, f->nn->ffv2.retiring, NULL);
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2_participant.update_count, 0U);
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->session.se_ffv2_authorities));
+	KUNIT_EXPECT_TRUE(test, list_empty(&f->nn->ffv2_participant.reservations));
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.contexts), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.registries), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.authorities), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->session.se_ref), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->client.cl_rpc_users), 1);
+}
+
+static void nfsd_ffv2_registration_faults_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	struct nfsd_ffv2_registration_test *trace;
+	enum nfsd_ffv2_test_registration_fault phase;
+	u64 generation;
+	int error;
+
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return;
+	trace = &f->nn->ffv2.test_registration;
+	for (phase = NFSD_FFV2_TEST_OBJECT_ALLOC; phase <= NFSD_FFV2_TEST_REPLY_SEND; phase++) {
+		generation = 0;
+		atomic_set(&trace->fault, phase);
+		error = nfsd_ffv2_registration_call(f, false, &generation);
+		KUNIT_EXPECT_LT_MSG(test, error, 0, "phase %u", phase);
+		KUNIT_EXPECT_EQ_MSG(test, atomic_read(&trace->hit), phase,
+				    "phase %u was not reached", phase);
+		nfsd_ffv2_registration_unwound(test, f);
+		if (phase == NFSD_FFV2_TEST_EXACT_REPLACE)
+			KUNIT_EXPECT_EQ(test, atomic_read(&trace->published_refusals), 1);
+		if (phase == NFSD_FFV2_TEST_REPLY_SEND)
+			KUNIT_EXPECT_EQ(test,
+					atomic_read(&trace->reply_consumed),
+					1);
+		/* The synthetic session remains owned and can be made live again. */
+		f->session.se_dead = false;
+		if (phase == NFSD_FFV2_TEST_REPLY_BUILD || phase == NFSD_FFV2_TEST_REPLY_SEND)
+			KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_seed(f), 0);
+		error = nfsd_ffv2_registration_call(f, false, &generation);
+		KUNIT_ASSERT_EQ_MSG(test, error, 0, "phase %u retry", phase);
+		KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, true, &generation), 0);
+		nfsd_ffv2_registration_unwound(test, f);
+		KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_seed(f), 0);
+	}
+}
+
+static void nfsd_ffv2_registration_authority_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f, *other;
+	struct nfsd_ffv2_export_update registration;
+	struct gss_api_mech *mech;
+	char *principal, *raw;
+	u8 unknown[16] = {};
+	u64 generation = 0;
+	int error, i;
+
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return;
+	other = nfsd_ffv2_registration_fixture(test);
+	if (!other)
+		return;
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_registration_begin(f->nn, &registration);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	error = nfsd_ffv2_authority_register(f->nn, f->net, unknown,
+					     &registration.authority);
+	KUNIT_EXPECT_EQ(test, error, -ENOENT);
+	error = nfsd_ffv2_authority_register(f->nn, f->net,
+					     other->session.se_sessionid.data,
+					     &registration.authority);
+	KUNIT_EXPECT_EQ(test, error, -ENOENT);
+	nfsd_ffv2_registration_end(f->nn, &registration);
+	for (i = 0; i < 6; i++) {
+		principal = f->client.cl_cred.cr_principal;
+		raw = f->client.cl_cred.cr_raw_principal;
+		mech = f->client.cl_cred.cr_gss_mech;
+		switch (i) {
+		case 0:
+			f->client.cl_minorversion = 0;
+			break;
+		case 1:
+			f->client.cl_exchange_flags = 0;
+			break;
+		case 2:
+			f->client.cl_mach_cred = false;
+			break;
+		case 3:
+			f->client.cl_cred.cr_gss_mech = NULL;
+			break;
+		case 4:
+			f->client.cl_cred.cr_flavor = RPC_AUTH_GSS_KRB5;
+			break;
+		case 5:
+			f->client.cl_cred.cr_principal = NULL;
+			f->client.cl_cred.cr_raw_principal = NULL;
+			break;
+		}
+		KUNIT_EXPECT_EQ_MSG(test, nfsd_ffv2_registration_call(f, false, &generation),
+				    -EACCES, "qualification %d", i);
+		f->client.cl_minorversion = 2;
+		f->client.cl_exchange_flags = EXCHGID4_FLAG_USE_PNFS_MDS;
+		f->client.cl_mach_cred = true;
+		f->client.cl_cred.cr_gss_mech = mech;
+		f->client.cl_cred.cr_flavor = RPC_AUTH_GSS_KRB5I;
+		f->client.cl_cred.cr_principal = principal;
+		f->client.cl_cred.cr_raw_principal = raw;
+		nfsd_ffv2_registration_unwound(test, f);
+	}
+	f->session.se_dead = true;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_registration_call(f, false, &generation), -ENOENT);
+	f->session.se_dead = false;
+	f->nn->ffv2.next_authority_epoch = 0;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_registration_call(f, false, &generation), -EOVERFLOW);
+	f->nn->ffv2.next_authority_epoch = U64_MAX;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_registration_call(f, false, &generation), -EOVERFLOW);
+	nfsd_ffv2_registration_unwound(test, f);
+	f->nn->ffv2.next_authority_epoch = U64_MAX - 1;
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_ffv2_registration_begin(f->nn, &registration);
+	mutex_unlock(&nfsd_mutex);
+	KUNIT_ASSERT_EQ(test, error, 0);
+	error = nfsd_ffv2_authority_register(f->nn, f->net, f->session.se_sessionid.data,
+					     &registration.authority);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	if (!error) {
+		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_test_authority_copy(registration.authority,
+								      &f->client.cl_cred));
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_authority_state(registration.authority), 0);
+	}
+	nfsd_ffv2_registration_end(f->nn, &registration);
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2.next_authority_epoch, U64_MAX);
+	nfsd_ffv2_registration_unwound(test, f);
+}
+
+struct nfsd_ffv2_object_retire_ctx {
+	struct nfsd_ffv2_registration_fixture *fixture;
+	u64 generation;
+	struct completion done;
+	int error;
+};
+
+static int nfsd_ffv2_object_retire_thread(void *arg)
+{
+	struct nfsd_ffv2_object_retire_ctx *ctx = arg;
+
+	ctx->error = nfsd_ffv2_registration_call(ctx->fixture, true, &ctx->generation);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_registration_drain_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	struct nfsd_ffv2_object_retire_ctx ctx = {};
+	struct svc_export *held;
+	struct task_struct *task;
+	void *entry;
+	bool waiting;
+	int error;
+
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return;
+	ctx.fixture = f;
+	init_completion(&ctx.done);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, false, &ctx.generation), 0);
+	entry = nfsd_ffv2_test_trust_hold(f->nn);
+	KUNIT_ASSERT_NOT_NULL(test, entry);
+	held = nfsd_ffv2_export_lookup(f->nn->svc_export_cache, f->domain, &f->root);
+	if (IS_ERR(held)) {
+		nfsd_ffv2_test_trust_put(entry);
+		KUNIT_FAIL(test, "hold published export: %ld", PTR_ERR(held));
+		return;
+	}
+	task = kthread_run(nfsd_ffv2_object_retire_thread, &ctx, "ffv2-object-retire");
+	if (IS_ERR(task)) {
+		exp_put(held);
+		nfsd_ffv2_test_trust_put(entry);
+		KUNIT_FAIL(test, "start retirement: %ld", PTR_ERR(task));
+		return;
+	}
+	error = read_poll_timeout(nfsd_ffv2_test_export_waiting, waiting, waiting, 10, USEC_PER_SEC,
+				  false, held);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx.done));
+	exp_put(held);
+	error = read_poll_timeout(nfsd_ffv2_test_trust_waiting, waiting, waiting, 10, USEC_PER_SEC,
+				  false, entry);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&ctx.done));
+	nfsd_ffv2_test_trust_put(entry);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&ctx.done, 5 * HZ), 0UL);
+	kthread_stop(task);
+	KUNIT_EXPECT_EQ(test, ctx.error, 0);
+	nfsd_ffv2_registration_unwound(test, f);
+}
+
+static void nfsd_ffv2_export_completion_test(struct kunit *test)
+{
+	struct svc_export *exp;
+	struct completion released;
+
+	exp = kunit_kzalloc(test, sizeof(*exp), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, exp);
+	init_completion(&released);
+	exp->ex_ffv2_context_released = &released;
+	nfsd_ffv2_export_release(exp);
+	KUNIT_EXPECT_TRUE(test, completion_done(&released));
+}
+
+struct nfsd_ffv2_registration_race {
+	struct nfsd_ffv2_registration_fixture *f;
+	struct nfsd_ffv2_generation *generation;
+	u64 id;
+	struct completion done;
+	int error;
+};
+
+static int nfsd_ffv2_register_thread(void *data)
+{
+	struct nfsd_ffv2_registration_race *ctx = data;
+
+	ctx->error = nfsd_ffv2_registration_call(ctx->f, false, &ctx->id);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static int nfsd_ffv2_registration_stop_thread(void *data)
+{
+	struct nfsd_ffv2_registration_race *ctx = data;
+
+	nfsd_ffv2_service_stop_finish(ctx->f->nn, ctx->generation);
+	complete(&ctx->done);
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void nfsd_ffv2_registration_overlap_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	struct nfsd_ffv2_registration_race reg = {}, stop = {};
+	struct task_struct *publisher, *drainer = NULL;
+	struct completion entered, resume;
+	bool waiting;
+	int error;
+
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return;
+	init_completion(&entered);
+	init_completion(&resume);
+	init_completion(&reg.done);
+	init_completion(&stop.done);
+	reg.f = f;
+	stop.f = f;
+	WRITE_ONCE(f->nn->ffv2.test_registration.before_publish, &entered);
+	WRITE_ONCE(f->nn->ffv2.test_registration.publish_continue, &resume);
+	publisher = kthread_run(nfsd_ffv2_register_thread, &reg, "ffv2-register-race");
+	if (IS_ERR(publisher)) {
+		KUNIT_FAIL(test, "start publisher: %ld", PTR_ERR(publisher));
+		goto out_hooks;
+	}
+	if (!wait_for_completion_timeout(&entered, 5 * HZ)) {
+		KUNIT_FAIL(test, "registration did not reach publication");
+		goto out_publisher;
+	}
+	/* Session death wins before the production publication leaf lock. */
+	nfsd_ffv2_test_session_unhash(f->nn, &f->session, false);
+	f->hashed = false;
+	mutex_lock(&nfsd_mutex);
+	stop.generation = nfsd_ffv2_service_stop_begin(f->nn);
+	mutex_unlock(&nfsd_mutex);
+	drainer = kthread_run(nfsd_ffv2_registration_stop_thread, &stop, "ffv2-registration-drain");
+	if (IS_ERR(drainer)) {
+		drainer = NULL;
+		KUNIT_FAIL(test, "start update drainer");
+		goto out_publisher;
+	}
+	error = read_poll_timeout(nfsd_ffv2_update_waiting, waiting, waiting, 10, USEC_PER_SEC,
+				  false, f->nn);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&stop.done));
+out_publisher:
+	complete_all(&resume);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&reg.done, 5 * HZ), 0UL);
+	kthread_stop(publisher);
+	if (drainer) {
+		KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&stop.done, 5 * HZ), 0UL);
+		kthread_stop(drainer);
+		KUNIT_EXPECT_EQ(test, reg.error, -ESHUTDOWN);
+	}
+	nfsd_ffv2_registration_unwound(test, f);
+out_hooks:
+	WRITE_ONCE(f->nn->ffv2.test_registration.before_publish, NULL);
+	WRITE_ONCE(f->nn->ffv2.test_registration.publish_continue, NULL);
+}
+
+static void nfsd_ffv2_registration_close_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	struct nfsd_ffv2_registration_race reg;
+	struct nfsd_ffv2_exit_ctx exit_ctx;
+	struct task_struct *publisher, *exiter;
+	struct completion entered, resume;
+	bool waiting;
+	int error, mode;
+
+	for (mode = 0; mode < 2; mode++) {
+		f = nfsd_ffv2_registration_fixture(test);
+		if (!f)
+			return;
+		memset(&reg, 0, sizeof(reg));
+		reg.f = f;
+		init_completion(&reg.done);
+		init_completion(&exit_ctx.done);
+		exit_ctx.nn = f->nn;
+		init_completion(&entered);
+		init_completion(&resume);
+		exiter = NULL;
+		WRITE_ONCE(f->nn->ffv2.test_registration.before_publish, &entered);
+		WRITE_ONCE(f->nn->ffv2.test_registration.publish_continue, &resume);
+		publisher = kthread_run(nfsd_ffv2_register_thread, &reg, "ffv2-registration-close");
+		if (IS_ERR(publisher)) {
+			KUNIT_FAIL(test, "start close-race publisher");
+			goto out_hooks;
+		}
+		if (!wait_for_completion_timeout(&entered, 5 * HZ)) {
+			KUNIT_FAIL(test, "close-race publication not reached");
+			goto out_publisher;
+		}
+		if (!mode) {
+			nfsd_ffv2_test_session_unhash(f->nn, &f->session, false);
+			f->hashed = false;
+		} else {
+			exiter = kthread_run(nfsd_ffv2_exit_thread, &exit_ctx,
+					     "ffv2-registration-exit");
+			if (IS_ERR(exiter)) {
+				exiter = NULL;
+				KUNIT_FAIL(test, "start namespace-exit worker");
+				goto out_publisher;
+			}
+			error = read_poll_timeout(nfsd_ffv2_update_waiting, waiting, waiting, 10,
+						  USEC_PER_SEC, false, f->nn);
+			KUNIT_EXPECT_EQ(test, error, 0);
+			KUNIT_EXPECT_FALSE(test, completion_done(&exit_ctx.done));
+		}
+out_publisher:
+		complete_all(&resume);
+		KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&reg.done, 5 * HZ), 0UL);
+		kthread_stop(publisher);
+		if (exiter) {
+			KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&exit_ctx.done, 5 * HZ),
+					0UL);
+			kthread_stop(exiter);
+		}
+		KUNIT_EXPECT_EQ(test, reg.error, mode ? -ESHUTDOWN : -ENOENT);
+		nfsd_ffv2_registration_unwound(test, f);
+out_hooks:
+		WRITE_ONCE(f->nn->ffv2.test_registration.before_publish, NULL);
+		WRITE_ONCE(f->nn->ffv2.test_registration.publish_continue, NULL);
+		kunit_release_action(test, nfsd_ffv2_registration_fixture_exit, f);
+	}
+}
+
+static void nfsd_ffv2_registration_work_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	struct completion entered, resume;
+	u64 generation = 0, replacement = 0;
+	unsigned int count;
+	int error;
+
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, false, &generation), 0);
+	init_completion(&entered);
+	init_completion(&resume);
+	WRITE_ONCE(f->nn->ffv2.test_registration.work_entered, &entered);
+	WRITE_ONCE(f->nn->ffv2.test_registration.work_continue, &resume);
+	/* The client-expiry route also takes the global session-list lock. */
+	nfsd_ffv2_test_session_unhash(f->nn, &f->session, true);
+	f->hashed = false;
+	if (!wait_for_completion_timeout(&entered, 5 * HZ)) {
+		KUNIT_FAIL(test, "session expiry did not queue counted retirement");
+		goto out_work;
+	}
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2.authority_work, 1U);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_registration_call(f, true, &generation), 0);
+	KUNIT_EXPECT_FALSE(test, f->nn->ffv2.source_claimed);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.authorities), 1);
+	/* The synthetic producer supplies a new live locator and client epoch. */
+	f->session.se_dead = false;
+	f->session.se_sessionid.data[0]++;
+	f->client.cl_time = 1;
+	nfsd_ffv2_test_session_hash(f->nn, &f->session);
+	f->hashed = true;
+	error = nfsd_ffv2_registration_seed(f);
+	if (!error)
+		error = nfsd_ffv2_registration_call(f, false, &replacement);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_GT(test, replacement, generation);
+out_work:
+	complete_all(&resume);
+	error = read_poll_timeout(READ_ONCE, count, count == 0, 10, USEC_PER_SEC, false,
+				  f->nn->ffv2.authority_work);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	/* Join the worker's final critical section before unarming its storage. */
+	nfsd_ffv2_test_work_drain(f->nn);
+	WRITE_ONCE(f->nn->ffv2.test_registration.work_entered, NULL);
+	WRITE_ONCE(f->nn->ffv2.test_registration.work_continue, NULL);
+	if (replacement) {
+		KUNIT_EXPECT_PTR_NE(test, f->nn->ffv2.active, NULL);
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_registration_call(f, true, &replacement), 0);
+	}
+	nfsd_ffv2_registration_unwound(test, f);
+}
+
+static void nfsd_ffv2_registration_work_failure_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	u64 generation = 0;
+
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, false, &generation), 0);
+	atomic_set(&f->nn->ffv2.test_registration.fault, NFSD_FFV2_TEST_WORK_ALLOC);
+	nfsd_ffv2_test_session_unhash(f->nn, &f->session, false);
+	f->hashed = false;
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->nn->ffv2.test_registration.hit),
+			NFSD_FFV2_TEST_WORK_ALLOC);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_active_authority_state(f->nn), 2);
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2.authority_work, 0U);
+	KUNIT_EXPECT_PTR_NE(test, f->nn->ffv2.active, NULL);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_registration_call(f, true, &generation), 0);
+	nfsd_ffv2_registration_unwound(test, f);
+}
+
+static void nfsd_ffv2_registration_work_exit_test(struct kunit *test)
+{
+	struct nfsd_ffv2_registration_fixture *f;
+	struct nfsd_ffv2_exit_ctx exit_ctx;
+	struct completion entered, resume;
+	struct task_struct *exiter = NULL;
+	u64 generation = 0;
+	bool waiting;
+	int error;
+
+	f = nfsd_ffv2_registration_fixture(test);
+	if (!f)
+		return;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_registration_call(f, false, &generation), 0);
+	init_completion(&entered);
+	init_completion(&resume);
+	init_completion(&exit_ctx.done);
+	exit_ctx.nn = f->nn;
+	WRITE_ONCE(f->nn->ffv2.test_registration.work_entered, &entered);
+	WRITE_ONCE(f->nn->ffv2.test_registration.work_continue, &resume);
+	nfsd_ffv2_test_session_unhash(f->nn, &f->session, false);
+	f->hashed = false;
+	if (!wait_for_completion_timeout(&entered, 5 * HZ)) {
+		KUNIT_FAIL(test, "retirement worker did not reach its owned barrier");
+		goto out_release;
+	}
+	exiter = kthread_run(nfsd_ffv2_exit_thread, &exit_ctx, "ffv2-work-net-exit");
+	if (IS_ERR(exiter)) {
+		exiter = NULL;
+		KUNIT_FAIL(test, "start namespace exit with queued work");
+		goto out_release;
+	}
+	error = read_poll_timeout(nfsd_ffv2_test_work_waiting, waiting, waiting,
+				  10, USEC_PER_SEC, false, f->nn);
+	KUNIT_EXPECT_EQ(test, error, 0);
+	KUNIT_EXPECT_FALSE(test, completion_done(&exit_ctx.done));
+	KUNIT_EXPECT_EQ(test, f->nn->ffv2.authority_work, 1U);
+out_release:
+	complete_all(&resume);
+	nfsd_ffv2_test_work_drain(f->nn);
+	if (exiter) {
+		KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&exit_ctx.done, 5 * HZ), 0UL);
+		kthread_stop(exiter);
+	}
+	WRITE_ONCE(f->nn->ffv2.test_registration.work_entered, NULL);
+	WRITE_ONCE(f->nn->ffv2.test_registration.work_continue, NULL);
+	nfsd_ffv2_registration_unwound(test, f);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(nfsd_ffv2_ordinary_registration_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_registration_faults_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_registration_authority_test),
+	KUNIT_CASE(nfsd_ffv2_registration_drain_test),
+	KUNIT_CASE(nfsd_ffv2_export_completion_test),
+	KUNIT_CASE(nfsd_ffv2_registration_overlap_test),
+	KUNIT_CASE_SLOW(nfsd_ffv2_registration_close_test),
+	KUNIT_CASE(nfsd_ffv2_registration_work_test),
+	KUNIT_CASE(nfsd_ffv2_registration_work_failure_test),
+	KUNIT_CASE(nfsd_ffv2_registration_work_exit_test),
 	KUNIT_CASE(nfsd_ffv2_single_range_test),
 	KUNIT_CASE(nfsd_ffv2_compound_digest_test),
 	KUNIT_CASE(nfsd_ffv2_selective_digest_test),
