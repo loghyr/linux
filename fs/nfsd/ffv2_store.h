@@ -31,6 +31,23 @@
 #define NFSD_FFV2_MIN_WAL_SIZE		3352972ULL
 #define NFSD_FFV2_MAX_INCARNATION	0x00ffffffULL
 
+#define NFSD_FFV2_SUPER_FILE_SIZE	8192
+
+#define NFSD_FFV2_MAX_DAMAGED_TAIL_SIZE	(1024U * 1024U)
+
+#define NFSD_FFV2_MAX_OBJECTS		4U
+
+#define NFSD_FFV2_MAX_TRANSACTIONS	256U
+
+#define NFSD_FFV2_MAX_ADMISSIONS		32U
+
+#define NFSD_FFV2_MAX_AUTHORITY_STATEIDS 64U
+
+#define NFSD_FFV2_RIGHT_READ		BIT(0)
+#define NFSD_FFV2_RIGHT_WRITE		BIT(1)
+#define NFSD_FFV2_RIGHT_REPAIR		BIT(2)
+#define NFSD_FFV2_RIGHT_CONTROL		BIT(3)
+
 enum nfsd_ffv2_store_record_type {
 	NFSD_FFV2_SUPER_SLOT = 1,
 	NFSD_FFV2_PAYLOAD_DATA = 1,
@@ -159,6 +176,7 @@ struct nfsd_ffv2_control_record {
 	u64 admission_authority_epoch;
 	u64 admission_client_id;
 	u32 body_len;
+	/* Borrowed from the decode input; valid only while it is alive. */
 	const u8 *body;
 };
 
@@ -223,6 +241,7 @@ struct nfsd_ffv2_payload_record {
 	u8 checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
 	u32 content_len;
 	u64 object_bytes;
+	/* Borrowed from the decode input; recovery copies only metadata. */
 	const u8 *content;
 };
 
@@ -267,5 +286,87 @@ bool nfsd_ffv2_restart_fits(u64 valid_bytes, u64 live_wal_reserved,
 			    u64 capacity_wal_bytes, u64 *append_cursor);
 bool nfsd_ffv2_payload_geometry_valid(u64 chunk_index, u32 content_len,
 				      u32 chunk_bytes, u64 max_chunks);
+
+#ifdef CONFIG_NFSD_FFV2_KUNIT_TEST
+struct file;
+struct nfsd_ffv2_store;
+
+enum nfsd_ffv2_recovery_file {
+	NFSD_FFV2_IO_SUPER,
+	NFSD_FFV2_IO_WAL,
+	NFSD_FFV2_IO_PAYLOAD,
+};
+
+enum nfsd_ffv2_recovery_op {
+	NFSD_FFV2_IO_SYNC,
+	NFSD_FFV2_IO_WRITE,
+	NFSD_FFV2_IO_TRUNCATE,
+};
+
+/* Synchronous observer; its data must outlive recovery and the returned store. */
+struct nfsd_ffv2_recovery_io {
+	int (*before)(void *data, enum nfsd_ffv2_recovery_file file,
+		      enum nfsd_ffv2_recovery_op op);
+	void *data;
+};
+
+struct nfsd_ffv2_recovery_input {
+	/* Borrowed file refs; the store takes its own refs until test_close. */
+	struct file *files[3];
+	u8 store_uuid[16];
+	u8 fs_uuid[16];
+	u8 export_uuid[16];
+	u8 binding_token[32];
+	const struct nfsd_ffv2_recovery_io *io;
+};
+
+struct nfsd_ffv2_recovery_state {
+	struct nfsd_ffv2_super_record super;
+	u64 wal_cursor;
+	u64 payload_cursor;
+	u64 wal_payload_cursor;
+	u64 next_lsn;
+	u64 index_generation;
+	u64 next_txn_id;
+	u64 next_version_id;
+	u64 next_admission_id;
+	u64 next_payload_sequence;
+	u64 wal_reserved;
+	u64 payload_staged;
+	u32 registrations;
+	u32 transactions;
+	u32 admissions;
+	u32 receipts;
+	u32 owners;
+	u32 selected_slot;
+	bool failed;
+};
+
+struct nfsd_ffv2_recovery_view {
+	u64 visible_id;
+	u64 pending_id;
+	u64 eof;
+	u64 bound_admission;
+	u32 guard_generation;
+	u32 guard_writer;
+	bool guard_never_written;
+};
+
+int nfsd_ffv2_store_test_recover(const struct nfsd_ffv2_recovery_input *input,
+				 struct nfsd_ffv2_store **result,
+				 struct nfsd_ffv2_recovery_state *state);
+void nfsd_ffv2_store_test_close(struct nfsd_ffv2_store *store);
+void nfsd_ffv2_store_test_state(struct nfsd_ffv2_store *store,
+				struct nfsd_ffv2_recovery_state *state);
+int nfsd_ffv2_store_test_view(struct nfsd_ffv2_store *store,
+			      const u8 file_key[32], u64 index,
+			      struct nfsd_ffv2_recovery_view *view);
+int nfsd_ffv2_store_test_receipt(struct nfsd_ffv2_store *store,
+				 const u8 key[32],
+				 struct nfsd_ffv2_entry_record *entry);
+int nfsd_ffv2_store_test_checkpoint(struct nfsd_ffv2_store *store,
+				    const struct nfsd_ffv2_super_record *record);
+int nfsd_ffv2_store_test_phase(struct nfsd_ffv2_store *store, u64 txn_id);
+#endif
 
 #endif /* _NFSD_FFV2_STORE_H */
