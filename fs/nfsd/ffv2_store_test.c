@@ -2,6 +2,9 @@
 #include <kunit/test.h>
 #include <linux/crc32.h>
 #include <linux/slab.h>
+#include <linux/file.h>
+#include <linux/fs.h>
+#include <linux/shmem_fs.h>
 #include <linux/unaligned.h>
 #include <crypto/sha2.h>
 
@@ -605,6 +608,1071 @@ static void ffv2_replay_boundaries_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, valid);
 }
 
+/* Complete disk histories use fixed offsets, independently of store encoders. */
+#define FFV2_TEST_CAPACITY (8 * 1024 * 1024ULL)
+#define FFV2_TEST_BYTES (64 * 1024)
+#define FFV2_IO_EVENT(file, op) (NFSD_FFV2_IO_##file * 4 + NFSD_FFV2_IO_##op)
+
+struct ffv2_recovery_fixture {
+	struct nfsd_ffv2_recovery_input input;
+	struct nfsd_ffv2_store *store;
+	struct nfsd_ffv2_recovery_state state;
+	struct nfsd_ffv2_recovery_io io;
+	u8 *super;
+	u8 *wal;
+	u8 *payload;
+	u8 keys[2][32];
+	u8 wal_uuid[16];
+	u8 payload_uuid[16];
+	u64 wal_bytes;
+	u64 payload_bytes;
+	u64 lsn;
+	u64 index_generation;
+	u64 eof[2];
+	u32 event[32];
+	u32 events;
+	u32 fail_event;
+};
+
+static int ffv2_recovery_observe(void *data, enum nfsd_ffv2_recovery_file file,
+				 enum nfsd_ffv2_recovery_op op)
+{
+	struct ffv2_recovery_fixture *f = data;
+
+	if (f->events == ARRAY_SIZE(f->event))
+		return -E2BIG;
+	f->event[f->events++] = file * 4 + op;
+	return f->fail_event == f->events ? -EIO : 0;
+}
+
+static void ffv2_recovery_release(void *data)
+{
+	struct ffv2_recovery_fixture *f = data;
+	unsigned int i;
+
+	nfsd_ffv2_store_test_close(f->store);
+	for (i = 0; i < ARRAY_SIZE(f->input.files); i++)
+		if (!IS_ERR_OR_NULL(f->input.files[i]))
+			fput(f->input.files[i]);
+}
+
+static void ffv2_recovery_common(u8 *b, u32 magic, u16 family, u32 header, u32 total,
+				 const u8 uuid[16])
+{
+	put_unaligned_be32(magic, b);
+	put_unaligned_be16(2, b + 4);
+	put_unaligned_be16(family, b + 6);
+	put_unaligned_be32(header, b + 8);
+	put_unaligned_be32(total, b + 12);
+	put_unaligned_be32(~total, b + 16);
+	memcpy(b + 20, uuid, 16);
+}
+
+static void ffv2_recovery_super(struct ffv2_recovery_fixture *f, u32 slot, u64 generation,
+				u32 state)
+{
+	u8 digest_input[sizeof("FFV2-D2-TOKEN-v1") - 1 + 36];
+	u8 *b = f->super + slot * 4096;
+	size_t domain = sizeof("FFV2-D2-TOKEN-v1") - 1;
+
+	memset(b, 0, 4096);
+	ffv2_recovery_common(b, 0x44325342, 1, 36, 360, f->input.store_uuid);
+	put_unaligned_be64(generation, b + 36);
+	memcpy(b + 44, f->input.fs_uuid, 16);
+	memcpy(b + 200, f->input.export_uuid, 16);
+	put_unaligned_be64(1, b + 216);
+	memcpy(b + 240, f->wal_uuid, 16);
+	memcpy(b + 256, f->payload_uuid, 16);
+	memcpy(digest_input, "FFV2-D2-TOKEN-v1", domain);
+	put_unaligned_be32(32, digest_input + domain);
+	memcpy(digest_input + domain + 4, f->input.binding_token, 32);
+	sha256(digest_input, sizeof(digest_input), b + 272);
+	put_unaligned_be64(1, b + 304);
+	put_unaligned_be64(197, b + 312);
+	put_unaligned_be64(4096, b + 320);
+	put_unaligned_be64(FFV2_TEST_CAPACITY, b + 328);
+	put_unaligned_be64(FFV2_TEST_CAPACITY, b + 336);
+	put_unaligned_be32(state, b + 344);
+	put_unaligned_be32(2, b + 348);
+	ffv2_test_crc("FFV2-D2-SB-v1", b, 360);
+}
+
+static u8 *ffv2_recovery_record(struct ffv2_recovery_fixture *f, u16 family, u32 total)
+{
+	u8 *b = f->wal + f->wal_bytes;
+
+	memset(b, 0, total);
+	f->wal_bytes += total;
+	ffv2_test_wal_header(b, family, total, f->input.store_uuid, f->wal_uuid, ++f->lsn, 1);
+	return b;
+}
+
+static void ffv2_recovery_start(struct ffv2_recovery_fixture *f)
+{
+	u8 *b = ffv2_recovery_record(f, 1, 197);
+
+	put_unaligned_be32(2, b + 72);
+	put_unaligned_be64(1, b + 76);
+	put_unaligned_be32(1, b + 101);
+	put_unaligned_be64(197, b + 121);
+	put_unaligned_be64(4096, b + 129);
+	put_unaligned_be64(FFV2_TEST_CAPACITY, b + 137);
+	put_unaligned_be64(FFV2_TEST_CAPACITY, b + 145);
+	memcpy(b + 153, f->input.export_uuid, 16);
+	ffv2_test_crc("FFV2-D2-WAL-v1", b, 197);
+}
+
+static void ffv2_recovery_registration(struct ffv2_recovery_fixture *f, u32 member)
+{
+	u8 handle[32] = {};
+	u8 *b = ffv2_recovery_record(f, 2, 396);
+
+	handle[0] = 0x80 + member;
+	ffv2_test_file_key(handle, f->keys[member]);
+	put_unaligned_be32(1, b + 72);
+	put_unaligned_be32(4, b + 76);
+	put_unaligned_be32(1, b + 80);
+	put_unaligned_be64(1, b + 84);
+	put_unaligned_be32(f->lsn, b + 96);
+	put_unaligned_be32(f->lsn, b + 168);
+	memcpy(b + 208, f->keys[member], 32);
+	put_unaligned_be16(32, b + 242);
+	memcpy(b + 244, handle, 32);
+	put_unaligned_be32(4096, b + 372);
+	put_unaligned_be64(64, b + 376);
+	ffv2_test_crc("FFV2-D2-WAL-v1", b, 396);
+}
+
+static void ffv2_recovery_control_key(struct ffv2_recovery_fixture *f, u8 *b, u32 subtype,
+				      u64 admission)
+{
+	u8 session[16];
+
+	memset(session, 0x51, sizeof(session));
+	put_unaligned_be32(subtype, b + 72);
+	put_unaligned_be32(4, b + 76);
+	put_unaligned_be32(1, b + 80);
+	memcpy(b + 148, session, 16);
+	put_unaligned_be32(f->lsn, b + 168);
+	ffv2_test_operation_key(session, 0, f->lsn, 0, b + 84);
+	memset(b + 176, 0x61, 16);
+	put_unaligned_be64(1, b + 192);
+	put_unaligned_be64(admission, b + 200);
+}
+
+static void ffv2_recovery_trust(struct ffv2_recovery_fixture *f, u64 id, u32 rights)
+{
+	u8 *b = ffv2_recovery_record(f, 2, 296);
+
+	ffv2_recovery_control_key(f, b, 5, id);
+	put_unaligned_be32(0x44324253, b + 208);
+	memcpy(b + 212, "TATE", 4);
+	put_unaligned_be64(id, b + 216);
+	put_unaligned_be32(rights & 3, b + 240);
+	memset(b + 244, 0x71, 16);
+	put_unaligned_be64(id, b + 260);
+	memset(b + 268, 0x72, 16);
+	put_unaligned_be32(17, b + 284);
+	put_unaligned_be32(rights, b + 288);
+	ffv2_test_crc("FFV2-D2-WAL-v1", b, 296);
+}
+
+static void ffv2_recovery_authority(struct ffv2_recovery_fixture *f, u64 id)
+{
+	u8 *b = ffv2_recovery_record(f, 2, 256);
+
+	ffv2_recovery_control_key(f, b, 3, id);
+	memset(b + 208, 0x61, 16);
+	put_unaligned_be64(1, b + 224);
+	put_unaligned_be32(1, b + 232);
+	put_unaligned_be32(0x44324253, b + 236);
+	memcpy(b + 240, "TATE", 4);
+	put_unaligned_be64(id, b + 244);
+	ffv2_test_crc("FFV2-D2-WAL-v1", b, 256);
+}
+
+static u64 ffv2_recovery_payload(struct ffv2_recovery_fixture *f, u64 id)
+{
+	u64 offset = f->payload_bytes;
+	u8 *b = f->payload + offset;
+
+	ffv2_recovery_common(b, 0x44325059, 1, 136, 172, f->input.store_uuid);
+	put_unaligned_be64(BIT_ULL(40) | id, b + 36);
+	ffv2_test_fill(b + 136, 32, 0x30 + id);
+	put_unaligned_be32(~crc32c(~0, b + 136, 32), b + 44);
+	put_unaligned_be32(2, b + 48);
+	put_unaligned_be32(4, b + 52);
+	memcpy(b + 56, b + 44, 4);
+	put_unaligned_be32(32, b + 120);
+	put_unaligned_be64(4096, b + 124);
+	/* The payload trailer covers the header, not the content bytes. */
+	put_unaligned_be32(~crc32c(crc32c(~0, "FFV2-D2-PAY-v1", 14), b, 136), b + 168);
+	f->payload_bytes += 4096;
+	return offset;
+}
+
+static u8 *ffv2_recovery_entry(struct ffv2_recovery_fixture *f, u32 member, u64 admission, u64 txn,
+			       u32 phase, u64 predecessor, u32 generation, u64 owner)
+{
+	u64 offset = ffv2_recovery_payload(f, txn);
+	u8 *b = ffv2_recovery_record(f, 3, 540);
+	u8 *payload = f->payload + offset;
+
+	put_unaligned_be32(phase, b + 72);
+	put_unaligned_be32(1, b + 76);
+	put_unaligned_be32(1, b + 80);
+	put_unaligned_be32(3, b + 84);
+	put_unaligned_be32(1, b + 92);
+	memcpy(b + 96, f->keys[member], 32);
+	put_unaligned_be64(txn, b + 136);
+	memset(b + 144, 0x73, 16);
+	put_unaligned_be32(f->lsn, b + 164);
+	ffv2_test_operation_key(b + 144, 0, f->lsn, 0, b + 172);
+	memset(b + 204, 0x74, 32);
+	memset(b + 236, 0x71, 16);
+	memset(b + 252, 0x72, 16);
+	memset(b + 268, 0x61, 16);
+	put_unaligned_be64(1, b + 284);
+	put_unaligned_be64(admission, b + 308);
+	put_unaligned_be32(0x44324253, b + 316);
+	memcpy(b + 320, "TATE", 4);
+	put_unaligned_be64(admission, b + 324);
+	put_unaligned_be32(17, b + 332);
+	put_unaligned_be32(15, b + 336);
+	put_unaligned_be64(owner, b + 340);
+	put_unaligned_be32(17, b + 348);
+	put_unaligned_be32(1, b + 352);
+	put_unaligned_be32(generation, b + 356);
+	b[360] = !!predecessor;
+	put_unaligned_be64(predecessor, b + 361);
+	put_unaligned_be32(generation ? generation - 1 : 0, b + 369);
+	put_unaligned_be64(BIT_ULL(40) | txn, b + 382);
+	put_unaligned_be32(42 + txn, b + 390);
+	put_unaligned_be64(offset, b + 394);
+	put_unaligned_be32(32, b + 402);
+	if (phase == NFSD_FFV2_COMMITTED) {
+		put_unaligned_be32(f->eof[member] ? 1 : 2, b + 406);
+		f->eof[member] = 32;
+		f->index_generation++;
+		b[442] = 1;
+	} else {
+		put_unaligned_be32(1, b + 406);
+	}
+	put_unaligned_be64(f->eof[member], b + 410);
+	put_unaligned_be64(f->index_generation, b + 426);
+	memset(b + 434, 0x75, 8);
+	put_unaligned_be64(txn, b + 443);
+	put_unaligned_be32(32, b + 451);
+	put_unaligned_be32(2, b + 455);
+	put_unaligned_be32(4, b + 459);
+	memcpy(b + 463, payload + 56, 4);
+	put_unaligned_be32(generation, b + 528);
+	put_unaligned_be32(17, b + 532);
+	ffv2_test_crc("FFV2-D2-WAL-v1", b, 540);
+	return b;
+}
+
+static u8 *ffv2_recovery_lifecycle(struct ffv2_recovery_fixture *f, const u8 *write, u32 phase)
+{
+	u8 *b = ffv2_recovery_record(f, 3, 540);
+
+	memcpy(b + 72, write + 72, 464);
+	put_unaligned_be32(phase, b + 72);
+	put_unaligned_be32(f->lsn, b + 164);
+	ffv2_test_operation_key(b + 144, 0, f->lsn, 0, b + 172);
+	memset(b + 382, 0, 24);
+	put_unaligned_be32(1, b + 406);
+	if (phase == NFSD_FFV2_COMMITTED) {
+		put_unaligned_be32(2, b + 406);
+		put_unaligned_be64(32, b + 410);
+		f->index_generation++;
+	}
+	put_unaligned_be64(f->index_generation, b + 426);
+	b[442] = 0;
+	memset(b + 451, 0, 76);
+	if (phase == NFSD_FFV2_ROLLED_BACK)
+		put_unaligned_be64(0, b + 443);
+	ffv2_test_crc("FFV2-D2-WAL-v1", b, 540);
+	return b;
+}
+
+static struct ffv2_recovery_fixture *ffv2_recovery_fixture(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *b;
+	u32 i;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	f->super = kunit_kzalloc(test, 8192, GFP_KERNEL);
+	f->wal = kunit_kzalloc(test, FFV2_TEST_BYTES, GFP_KERNEL);
+	f->payload = kunit_kzalloc(test, FFV2_TEST_BYTES, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, f->super);
+	KUNIT_ASSERT_NOT_NULL(test, f->wal);
+	KUNIT_ASSERT_NOT_NULL(test, f->payload);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, ffv2_recovery_release, f), 0);
+	for (i = 0; i < ARRAY_SIZE(f->input.files); i++) {
+		f->input.files[i] = shmem_file_setup("ffv2-recovery", 0, EMPTY_VMA_FLAGS);
+		KUNIT_ASSERT_FALSE(test, IS_ERR(f->input.files[i]));
+	}
+	memset(f->input.store_uuid, 0x41, 16);
+	memset(f->input.fs_uuid, 0x42, 16);
+	memset(f->input.export_uuid, 0x43, 16);
+	memset(f->input.binding_token, 0x44, 32);
+	memset(f->wal_uuid, 0x45, 16);
+	memset(f->payload_uuid, 0x46, 16);
+	f->io.before = ffv2_recovery_observe;
+	f->io.data = f;
+	f->input.io = &f->io;
+	ffv2_recovery_super(f, 0, 1, NFSD_FFV2_SUPER_CLEAN);
+	b = f->payload;
+	ffv2_recovery_common(b, 0x44325059, 2, 80, 84, f->input.store_uuid);
+	memcpy(b + 36, f->payload_uuid, 16);
+	memcpy(b + 52, f->wal_uuid, 16);
+	put_unaligned_be64(4096, b + 68);
+	ffv2_test_crc("FFV2-D2-PAY-v1", b, 84);
+	f->payload_bytes = 4096;
+	ffv2_recovery_start(f);
+	ffv2_recovery_registration(f, 0);
+	ffv2_recovery_registration(f, 1);
+	ffv2_recovery_trust(f, 1, 15);
+	ffv2_recovery_authority(f, 1);
+	ffv2_recovery_trust(f, 2, 15);
+	ffv2_recovery_authority(f, 2);
+	return f;
+}
+
+static void ffv2_recovery_install(struct kunit *test, struct ffv2_recovery_fixture *f)
+{
+	const u8 *bytes[] = { f->super, f->wal, f->payload };
+	u64 sizes[] = { 8192, f->wal_bytes, f->payload_bytes };
+	u32 i;
+
+	for (i = 0; i < ARRAY_SIZE(bytes); i++) {
+		loff_t pos = 0;
+
+		KUNIT_ASSERT_EQ(test, vfs_truncate(&f->input.files[i]->f_path, 0), 0);
+		KUNIT_ASSERT_EQ(test, kernel_write(f->input.files[i], bytes[i], sizes[i], &pos),
+				(ssize_t)sizes[i]);
+	}
+}
+
+static int ffv2_recovery_run(struct kunit *test, struct ffv2_recovery_fixture *f)
+{
+	unsigned long refs[3];
+	u32 i;
+	int error;
+
+	ffv2_recovery_install(test, f);
+	for (i = 0; i < ARRAY_SIZE(refs); i++)
+		refs[i] = file_count(f->input.files[i]);
+	error = nfsd_ffv2_store_test_recover(&f->input, &f->store, &f->state);
+	for (i = 0; i < ARRAY_SIZE(refs); i++)
+		KUNIT_EXPECT_EQ(test, file_count(f->input.files[i]), refs[i] + !error);
+	if (error)
+		KUNIT_EXPECT_PTR_EQ(test, f->store, NULL);
+	return error;
+}
+
+static void ffv2_recovery_floor_test(struct kunit *test)
+{
+	struct nfsd_ffv2_super_record r = { .state = NFSD_FFV2_SUPER_CLEAN };
+	u8 *b = kunit_kzalloc(test, 4096, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, b);
+	KUNIT_EXPECT_EQ_MSG(test, nfsd_ffv2_super_encode(&r, b), -EINVAL, "floor zero");
+	r.format_floor = 1;
+	KUNIT_EXPECT_EQ_MSG(test, nfsd_ffv2_super_encode(&r, b), -EINVAL, "floor one");
+	r.format_floor = 3;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_super_encode(&r, b), -EINVAL);
+	r.format_floor = 2;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_super_encode(&r, b), 0);
+}
+
+static void ffv2_recovery_complete_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f = ffv2_recovery_fixture(test);
+	struct nfsd_ffv2_recovery_view view;
+	struct nfsd_ffv2_entry_record *receipt;
+	u8 key[32], checksum[4];
+	u8 *b;
+	u64 wal;
+
+	ffv2_recovery_entry(f, 1, 2, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+	b = ffv2_recovery_entry(f, 0, 1, 2, NFSD_FFV2_PREPARED, 0, 0, 2);
+	ffv2_recovery_lifecycle(f, b, NFSD_FFV2_FINALIZED);
+	ffv2_recovery_lifecycle(f, b, NFSD_FFV2_COMMITTED);
+	memcpy(key, b + 172, 32);
+	memcpy(checksum, b + 463, 4);
+	wal = f->wal_bytes;
+	KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+	KUNIT_EXPECT_EQ(test, f->state.registrations, 2U);
+	KUNIT_EXPECT_EQ(test, f->state.transactions, 2U);
+	KUNIT_EXPECT_EQ(test, f->state.admissions, 2U);
+	KUNIT_EXPECT_EQ(test, f->state.receipts, 4U);
+	KUNIT_EXPECT_EQ(test, f->state.owners, 2U);
+	KUNIT_EXPECT_EQ(test, f->state.next_txn_id, 3ULL);
+	KUNIT_EXPECT_EQ(test, f->state.next_version_id, 3ULL);
+	KUNIT_EXPECT_EQ(test, f->state.next_admission_id, 3ULL);
+	KUNIT_EXPECT_EQ(test, f->state.next_payload_sequence, 1ULL);
+	KUNIT_EXPECT_EQ(test, f->state.wal_cursor, wal + 197);
+	KUNIT_EXPECT_EQ(test, f->state.payload_cursor, 12288ULL);
+	KUNIT_EXPECT_EQ(test, f->state.super.ds_incarnation, 2ULL);
+	KUNIT_EXPECT_EQ(test, f->state.selected_slot, 1U);
+	KUNIT_EXPECT_EQ(test, f->state.wal_reserved, 0ULL);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_view(f->store, f->keys[0], 0, &view), 0);
+	KUNIT_EXPECT_EQ(test, view.visible_id, 2ULL);
+	KUNIT_EXPECT_EQ(test, view.pending_id, 0ULL);
+	KUNIT_EXPECT_EQ(test, view.eof, 32ULL);
+	KUNIT_EXPECT_EQ(test, view.bound_admission, 1ULL);
+	KUNIT_EXPECT_EQ(test, view.guard_writer, 17U);
+	KUNIT_EXPECT_FALSE(test, view.guard_never_written);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_view(f->store, f->keys[1], 0, &view), 0);
+	KUNIT_EXPECT_EQ(test, view.visible_id, 1ULL);
+	KUNIT_EXPECT_EQ(test, view.bound_admission, 2ULL);
+	/* Decoded CONTROL and payload aliases must not escape their scan buffers. */
+	memset(f->wal, 0xaa, f->wal_bytes);
+	memset(f->payload, 0xbb, f->payload_bytes);
+	receipt = kunit_kzalloc(test, sizeof(*receipt), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, receipt);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_receipt(f->store, key, receipt), 0);
+	KUNIT_EXPECT_EQ(test, receipt->writer_payload_id, 44U);
+	KUNIT_EXPECT_EQ(test, receipt->admission.writer, 17U);
+	KUNIT_EXPECT_MEMEQ(test, receipt->result_checksum, checksum, 4);
+	/* A real second recover reads the alternate SUPER and full persisted START. */
+	nfsd_ffv2_store_test_close(f->store);
+	f->store = NULL;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_recover(&f->input, &f->store, &f->state), 0);
+	KUNIT_EXPECT_EQ(test, f->state.super.ds_incarnation, 3ULL);
+	KUNIT_EXPECT_EQ(test, f->state.selected_slot, 0U);
+	KUNIT_EXPECT_EQ(test, f->state.receipts, 4U);
+}
+
+static void ffv2_recovery_slots_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u32 variant;
+
+	for (variant = 0; variant < 5; variant++) {
+		f = ffv2_recovery_fixture(test);
+		if (variant == 0)
+			memset(f->super, 0, 8192);
+		else
+			ffv2_recovery_super(f, 1, variant == 1 ? 1 : 2,
+					    variant == 2 ? NFSD_FFV2_SUPER_FENCED :
+					    variant == 3 ? NFSD_FFV2_SUPER_RETIRED :
+							   NFSD_FFV2_SUPER_CLEAN);
+		KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f),
+				    variant == 4 ? 0 :
+				    variant >= 2 ? -ESHUTDOWN :
+						   -EBADMSG,
+				    "slot variant %u", variant);
+		if (variant == 4)
+			KUNIT_EXPECT_EQ(test, f->state.super.generation, 3ULL);
+	}
+}
+
+static void ffv2_recovery_identity_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u32 variant;
+
+	for (variant = 0; variant < 6; variant++) {
+		f = ffv2_recovery_fixture(test);
+		switch (variant) {
+		case 0:
+			f->input.store_uuid[0]++;
+			break;
+		case 1:
+			f->input.fs_uuid[0]++;
+			break;
+		case 2:
+			f->input.export_uuid[0]++;
+			break;
+		case 3:
+			f->input.binding_token[0]++;
+			break;
+		case 4:
+			f->payload[36]++;
+			ffv2_test_crc("FFV2-D2-PAY-v1", f->payload, 84);
+			break;
+		case 5:
+			f->wal[36]++;
+			ffv2_test_crc("FFV2-D2-WAL-v1", f->wal, 197);
+		}
+		KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f),
+				    variant == 3 ? -EKEYREJECTED : -EBADMSG, "identity %u",
+				    variant);
+	}
+}
+
+static void ffv2_recovery_binding_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f = ffv2_recovery_fixture(test);
+
+	ffv2_recovery_entry(f, 1, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+	ffv2_recovery_entry(f, 0, 1, 2, NFSD_FFV2_COMMITTED, 0, 0, 2);
+	KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), -EBADMSG,
+			    "admission cannot bind a second file");
+}
+
+static void ffv2_recovery_owner_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f = ffv2_recovery_fixture(test);
+
+	ffv2_recovery_entry(f, 1, 2, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+	ffv2_recovery_entry(f, 0, 1, 2, NFSD_FFV2_COMMITTED, 0, 0, 1);
+	KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), -EBADMSG, "duplicate owner");
+}
+
+static void ffv2_recovery_pending_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f = ffv2_recovery_fixture(test);
+	u8 *b;
+
+	ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_PREPARED, 0, 0, 1);
+	KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+	KUNIT_EXPECT_EQ(test, f->state.wal_reserved, 1080ULL);
+	KUNIT_EXPECT_EQ(test, f->state.payload_staged, 4096ULL);
+	nfsd_ffv2_store_test_close(f->store);
+	f->store = NULL;
+	f->events = 0;
+	b = ffv2_recovery_entry(f, 0, 1, 2, NFSD_FFV2_PREPARED, 0, 1, 2);
+	KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), -EBADMSG, "second pending");
+	/* Otherwise valid extent/guard metadata isolates committed rollback refusal. */
+	f = ffv2_recovery_fixture(test);
+	b = ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+	ffv2_recovery_entry(f, 0, 1, 2, NFSD_FFV2_PREPARED, 1, 1, 2);
+	b = ffv2_recovery_lifecycle(f, b, NFSD_FFV2_ROLLED_BACK);
+	put_unaligned_be32(3, b + 406);
+	put_unaligned_be64(0, b + 410);
+	put_unaligned_be64(2, b + 426);
+	ffv2_test_crc("FFV2-D2-WAL-v1", b, 540);
+	KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), -EBADMSG, "rollback strands pending");
+}
+
+static void ffv2_recovery_semantics_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *b;
+	u32 variant;
+
+	for (variant = 0; variant < 8; variant++) {
+		f = ffv2_recovery_fixture(test);
+		ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+		b = ffv2_recovery_entry(f, 0, 1, 2, NFSD_FFV2_COMMITTED, 1, 1, 2);
+		switch (variant) {
+		case 0:
+			put_unaligned_be32(2, b + 369);
+			break;
+		case 1:
+			put_unaligned_be64(99, b + 361);
+			break;
+		case 2:
+			put_unaligned_be32(19, b + 348);
+			break;
+		case 3:
+			put_unaligned_be32(2, b + 356);
+			put_unaligned_be32(2, b + 528);
+			break;
+		case 4:
+			put_unaligned_be64(33, b + 410);
+			break;
+		case 5:
+			put_unaligned_be64(1, b + 136);
+			break;
+		case 6:
+			put_unaligned_be64(1, b + 443);
+			break;
+		case 7:
+			put_unaligned_be64(3, b + 426);
+			break;
+		}
+		ffv2_test_crc("FFV2-D2-WAL-v1", b, 540);
+		KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), -EBADMSG, "semantic %u",
+				    variant);
+	}
+}
+
+static void ffv2_recovery_metadata_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *b, *payload;
+	u32 variant;
+
+	for (variant = 0; variant < 4; variant++) {
+		f = ffv2_recovery_fixture(test);
+		b = ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+		payload = f->payload + 4096;
+		if (variant == 0 || variant == 1) {
+			put_unaligned_be32(variant ? 99 : 0, b + 455);
+			put_unaligned_be32(variant ? 99 : 0, payload + 48);
+		} else if (variant == 2) {
+			b[463] ^= 1;
+		} else {
+			put_unaligned_be32(0, payload + 52);
+			memset(payload + 56, 0, 64);
+		}
+		put_unaligned_be32(~crc32c(crc32c(~0, "FFV2-D2-PAY-v1", 14), payload, 136),
+				   payload + 168);
+		ffv2_test_crc("FFV2-D2-WAL-v1", b, 540);
+		KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), -EBADMSG,
+				    "checksum metadata %u", variant);
+	}
+}
+
+static void ffv2_recovery_damaged_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f = ffv2_recovery_fixture(test);
+	struct nfsd_ffv2_recovery_view view;
+	struct nfsd_ffv2_payload_record payload;
+	bool valid;
+
+	ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+	f->payload[4096 + 136] ^= 1;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_payload_decode(f->payload + 4096, 4096, f->input.store_uuid,
+						 &payload, &valid),
+			0);
+	KUNIT_EXPECT_FALSE(test, valid);
+	KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_view(f->store, f->keys[0], 0, &view), 0);
+	KUNIT_EXPECT_EQ(test, view.visible_id, 1ULL);
+	/* No data-return API in this checkpoint can relabel these bytes as valid. */
+}
+
+static void ffv2_recovery_tails_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *b;
+	u32 variant;
+
+	for (variant = 0; variant < 6; variant++) {
+		f = ffv2_recovery_fixture(test);
+		ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+		b = f->wal + f->wal_bytes;
+		switch (variant) {
+		case 0:
+			f->wal_bytes += 9;
+			break;
+		case 1:
+			b[0] = 1;
+			f->wal_bytes += 9;
+			break;
+		case 2:
+			f->wal_bytes += 100;
+			break;
+		case 3:
+			ffv2_test_wal_header(b, 3, 540, f->input.store_uuid, f->wal_uuid,
+					     f->lsn + 1, 1);
+			f->wal_bytes += 100;
+			break;
+		case 4:
+			b[0] = 1;
+			f->wal_bytes += 100;
+			break;
+		case 5:
+			b = ffv2_recovery_record(f, NFSD_FFV2_WAL_COHORT, 80);
+			ffv2_test_crc("FFV2-D2-WAL-v1", b, 80);
+		}
+		f->payload[f->payload_bytes] = 1;
+		f->payload_bytes += 32;
+		KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), variant >= 4 ? -EBADMSG : 0,
+				    "tail %u", variant);
+		if (variant < 4) {
+			KUNIT_EXPECT_EQ(test, f->state.super.verifier_epoch,
+					variant & 1 ? 2ULL : 0ULL);
+			KUNIT_EXPECT_EQ(test, f->state.payload_cursor, 8192ULL);
+			KUNIT_EXPECT_EQ(test, i_size_read(file_inode(f->input.files[2])), 8192LL);
+		}
+	}
+}
+
+static void ffv2_recovery_chain_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *b;
+	u32 variant;
+
+	for (variant = 0; variant < 7; variant++) {
+		f = ffv2_recovery_fixture(test);
+		b = f->wal;
+		switch (variant) {
+		case 0:
+			put_unaligned_be64(1, b + 84);
+			break;
+		case 1:
+			put_unaligned_be64(2, b + 52);
+			break;
+		case 2:
+			put_unaligned_be64(198, b + 121);
+			break;
+		case 3:
+			put_unaligned_be64(8192, b + 129);
+			break;
+		case 4:
+			put_unaligned_be64(1, b + 169);
+			break;
+		case 5:
+			b[153]++;
+			break;
+		case 6:
+			b = f->wal + 197;
+			put_unaligned_be64(2, b + 60);
+		}
+		ffv2_test_crc("FFV2-D2-WAL-v1", b, variant == 6 ? 396 : 197);
+		KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), -EBADMSG, "chain %u",
+				    variant);
+	}
+}
+
+static void ffv2_recovery_authorization_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *b, *trust;
+	u32 variant;
+
+	for (variant = 0; variant < 4; variant++) {
+		f = ffv2_recovery_fixture(test);
+		b = ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+		trust = f->wal + 197 + 2 * 396;
+		switch (variant) {
+		case 0:
+			put_unaligned_be32(1, trust + 240);
+			put_unaligned_be32(13, trust + 288);
+			put_unaligned_be32(13, b + 336);
+			ffv2_test_crc("FFV2-D2-WAL-v1", trust, 296);
+			break;
+		case 1:
+			b[268]++;
+			break;
+		case 2:
+			put_unaligned_be64(9, b + 308);
+			break;
+		case 3:
+			/* A valid empty authority grant cannot authorize the writer. */
+			b = trust + 296;
+			put_unaligned_be64(2, b + 200);
+			ffv2_test_crc("FFV2-D2-WAL-v1", b, 256);
+			break;
+		}
+		if (variant != 3)
+			ffv2_test_crc("FFV2-D2-WAL-v1", b, 540);
+		KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), -EBADMSG, "authority %u",
+				    variant);
+	}
+}
+
+static void ffv2_recovery_order_test(struct kunit *test)
+{
+	static const u32 order[] = { FFV2_IO_EVENT(PAYLOAD, SYNC), FFV2_IO_EVENT(WAL, WRITE),
+				     FFV2_IO_EVENT(WAL, SYNC), FFV2_IO_EVENT(SUPER, WRITE),
+				     FFV2_IO_EVENT(SUPER, SYNC) };
+	struct ffv2_recovery_fixture *f;
+	u32 fail;
+
+	for (fail = 0; fail <= ARRAY_SIZE(order); fail++) {
+		f = ffv2_recovery_fixture(test);
+		ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+		f->fail_event = fail;
+		KUNIT_EXPECT_EQ(test, ffv2_recovery_run(test, f), fail ? -EIO : 0);
+		KUNIT_EXPECT_EQ(test, f->events, fail ? fail : (u32)ARRAY_SIZE(order));
+		KUNIT_EXPECT_MEMEQ_MSG(test, f->event, order, f->events * sizeof(u32),
+				       "restart I/O order");
+		if (fail) {
+			KUNIT_EXPECT_TRUE(test, f->state.failed);
+			KUNIT_EXPECT_EQ(test, f->state.selected_slot, 0U);
+			KUNIT_EXPECT_EQ(test, f->state.wal_cursor, 0ULL);
+			KUNIT_EXPECT_EQ(test, f->state.payload_cursor, 0ULL);
+		}
+	}
+}
+
+static void ffv2_recovery_checkpoint_test(struct kunit *test)
+{
+	static const u32 order[] = { FFV2_IO_EVENT(PAYLOAD, SYNC), FFV2_IO_EVENT(WAL, SYNC),
+				     FFV2_IO_EVENT(SUPER, WRITE), FFV2_IO_EVENT(SUPER, SYNC) };
+	struct ffv2_recovery_fixture *f;
+	struct nfsd_ffv2_super_record next;
+	u32 fail;
+
+	for (fail = 0; fail <= ARRAY_SIZE(order); fail++) {
+		f = ffv2_recovery_fixture(test);
+		KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+		f->events = 0;
+		f->fail_event = fail;
+		next = f->state.super;
+		next.generation++;
+		KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_checkpoint(f->store, &next),
+				fail ? -EIO : 0);
+		KUNIT_EXPECT_MEMEQ_MSG(test, f->event, order, f->events * sizeof(u32),
+				       "checkpoint I/O order");
+		nfsd_ffv2_store_test_state(f->store, &f->state);
+		KUNIT_EXPECT_EQ(test, f->state.selected_slot, fail ? 1U : 0U);
+		KUNIT_EXPECT_EQ(test, f->state.super.generation, fail ? 2ULL : 3ULL);
+		KUNIT_EXPECT_EQ(test, f->state.failed, !!fail);
+	}
+}
+
+static void ffv2_recovery_cursor_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	struct nfsd_ffv2_super_record next;
+	u8 byte = 0;
+	u32 which;
+
+	for (which = 1; which < 3; which++) {
+		loff_t pos;
+
+		f = ffv2_recovery_fixture(test);
+		KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+		pos = i_size_read(file_inode(f->input.files[which]));
+		KUNIT_ASSERT_EQ(test, kernel_write(f->input.files[which], &byte, 1, &pos), 1L);
+		next = f->state.super;
+		next.generation++;
+		f->events = 0;
+		KUNIT_EXPECT_EQ_MSG(test, nfsd_ffv2_store_test_checkpoint(f->store, &next), -EIO,
+				    "cursor mismatch");
+		KUNIT_EXPECT_EQ(test, f->events, 0U);
+		nfsd_ffv2_store_test_state(f->store, &f->state);
+		KUNIT_EXPECT_TRUE(test, f->state.failed);
+		KUNIT_EXPECT_EQ(test, f->state.selected_slot, 1U);
+	}
+}
+
+static void ffv2_recovery_kvfree(void *data)
+{
+	kvfree(data);
+}
+
+static void ffv2_recovery_headroom_test(struct kunit *test)
+{
+	const u32 starts = 17020;
+	struct ffv2_recovery_fixture *f;
+	u64 valid, capacity, incarnation;
+	u32 variant;
+	u8 *b;
+
+	for (variant = 0; variant < 2; variant++) {
+		f = ffv2_recovery_fixture(test);
+		b = kvzalloc(4 * 1024 * 1024, GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, b);
+		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, ffv2_recovery_kvfree, b), 0);
+		memcpy(b, f->wal, f->wal_bytes);
+		f->wal = b;
+		ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_PREPARED, 0, 0, 1);
+		valid = f->wal_bytes + starts * 197ULL;
+		capacity = valid + 197 + 1080 - variant;
+		put_unaligned_be64(capacity, f->super + 328);
+		ffv2_test_crc("FFV2-D2-SB-v1", f->super, 360);
+		put_unaligned_be64(capacity, f->wal + 137);
+		ffv2_test_crc("FFV2-D2-WAL-v1", f->wal, 197);
+		for (incarnation = 2; incarnation < starts + 2; incarnation++) {
+			b = ffv2_recovery_record(f, 1, 197);
+			put_unaligned_be64(incarnation, b + 60);
+			put_unaligned_be32(2, b + 72);
+			put_unaligned_be64(incarnation, b + 76);
+			put_unaligned_be64(incarnation - 1, b + 84);
+			put_unaligned_be32(2, b + 101);
+			put_unaligned_be64(f->lsn - 1, b + 113);
+			put_unaligned_be64(f->wal_bytes, b + 121);
+			put_unaligned_be64(f->payload_bytes, b + 129);
+			put_unaligned_be64(capacity, b + 137);
+			put_unaligned_be64(FFV2_TEST_CAPACITY, b + 145);
+			memcpy(b + 153, f->input.export_uuid, 16);
+			put_unaligned_be64(1080, b + 169);
+			put_unaligned_be64(4096, b + 185);
+			ffv2_test_crc("FFV2-D2-WAL-v1", b, 197);
+		}
+		KUNIT_ASSERT_EQ(test, f->wal_bytes, valid);
+		KUNIT_EXPECT_EQ_MSG(test, ffv2_recovery_run(test, f), variant ? -ENOSPC : 0,
+				    "START plus pending reserve %u", variant);
+		if (variant)
+			KUNIT_EXPECT_EQ(test, f->events, 0U);
+	}
+}
+
+static void ffv2_recovery_exhaustion_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *b;
+	u32 variant;
+
+	for (variant = 0; variant < 3; variant++) {
+		f = ffv2_recovery_fixture(test);
+		if (!variant) {
+			ffv2_recovery_super(f, 1, U64_MAX, NFSD_FFV2_SUPER_CLEAN);
+		} else {
+			b = ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+			put_unaligned_be64(U64_MAX, b + (variant == 1 ? 136 : 443));
+			ffv2_test_crc("FFV2-D2-WAL-v1", b, 540);
+		}
+		KUNIT_EXPECT_EQ(test, ffv2_recovery_run(test, f), variant ? -EOVERFLOW : -ENOSPC);
+		KUNIT_EXPECT_EQ(test, f->events, 0U);
+	}
+}
+
+static void ffv2_recovery_truncation_test(struct kunit *test)
+{
+	static const u32 order[] = { FFV2_IO_EVENT(WAL, TRUNCATE), FFV2_IO_EVENT(WAL, SYNC),
+				     FFV2_IO_EVENT(PAYLOAD, TRUNCATE), FFV2_IO_EVENT(PAYLOAD, SYNC),
+				     FFV2_IO_EVENT(PAYLOAD, SYNC), FFV2_IO_EVENT(WAL, WRITE),
+				     FFV2_IO_EVENT(WAL, SYNC), FFV2_IO_EVENT(SUPER, WRITE),
+				     FFV2_IO_EVENT(SUPER, SYNC) };
+	struct ffv2_recovery_fixture *f;
+	u32 fail;
+
+	for (fail = 0; fail <= 4; fail++) {
+		f = ffv2_recovery_fixture(test);
+		f->wal_bytes += 9;
+		f->payload_bytes += 9;
+		f->fail_event = fail;
+		KUNIT_EXPECT_EQ(test, ffv2_recovery_run(test, f), fail ? -EIO : 0);
+		KUNIT_EXPECT_EQ(test, f->events, fail ? fail : (u32)ARRAY_SIZE(order));
+		KUNIT_EXPECT_MEMEQ_MSG(test, f->event, order, f->events * sizeof(u32),
+				       "truncate before restart");
+		if (fail) {
+			KUNIT_EXPECT_EQ(test, f->state.selected_slot, 0U);
+			KUNIT_EXPECT_EQ(test, f->state.wal_cursor, 0ULL);
+		}
+	}
+}
+
+static void ffv2_recovery_finalized_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f = ffv2_recovery_fixture(test);
+	struct nfsd_ffv2_recovery_view view;
+	u8 *b;
+
+	b = ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_PREPARED, 0, 0, 1);
+	ffv2_recovery_lifecycle(f, b, NFSD_FFV2_FINALIZED);
+	KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+	KUNIT_EXPECT_EQ(test, f->state.wal_reserved, 540ULL);
+	KUNIT_EXPECT_EQ(test, f->state.payload_staged, 4096ULL);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_view(f->store, f->keys[0], 0, &view), 0);
+	KUNIT_EXPECT_EQ(test, view.visible_id, 0ULL);
+	KUNIT_EXPECT_EQ(test, view.pending_id, 1ULL);
+	KUNIT_EXPECT_EQ(test, view.eof, 0ULL);
+	/* The new START must carry the exact reconstructed reserves on reopen. */
+	nfsd_ffv2_store_test_close(f->store);
+	f->store = NULL;
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_recover(&f->input, &f->store, &f->state), 0);
+	KUNIT_EXPECT_EQ(test, f->state.wal_reserved, 540ULL);
+}
+
+static void ffv2_recovery_rollback_view(struct kunit *test,
+					struct ffv2_recovery_fixture *f,
+					u64 txn, u64 predecessor, u64 index,
+					const u8 key[32])
+{
+	struct nfsd_ffv2_recovery_view view;
+	struct nfsd_ffv2_entry_record *receipt;
+
+	receipt = kunit_kzalloc(test, sizeof(*receipt), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, receipt);
+	nfsd_ffv2_store_test_state(f->store, &f->state);
+	KUNIT_EXPECT_EQ(test, f->state.index_generation, index);
+	KUNIT_EXPECT_EQ(test, f->state.wal_reserved, 0ULL);
+	KUNIT_EXPECT_EQ(test, f->state.payload_staged, 0ULL);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_view(f->store, f->keys[0], 0, &view), 0);
+	KUNIT_EXPECT_EQ(test, view.visible_id, predecessor);
+	KUNIT_EXPECT_EQ(test, view.pending_id, 0ULL);
+	KUNIT_EXPECT_EQ(test, view.eof, predecessor ? 32ULL : 0ULL);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_phase(f->store, txn),
+			(int)NFSD_FFV2_ROLLED_BACK);
+	KUNIT_ASSERT_EQ(test, nfsd_ffv2_store_test_receipt(f->store, key, receipt), 0);
+	KUNIT_EXPECT_EQ(test, receipt->transition, (u32)NFSD_FFV2_ROLLED_BACK);
+	KUNIT_EXPECT_EQ(test, receipt->txn_id, txn);
+	KUNIT_EXPECT_EQ(test, receipt->extent_high_water, view.eof);
+	KUNIT_EXPECT_EQ(test, receipt->index_generation, index);
+	KUNIT_EXPECT_TRUE(test, receipt->admission.rights & NFSD_FFV2_RIGHT_REPAIR);
+}
+
+static void ffv2_recovery_committed_rollback_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *write, *rollback, key[32];
+	u64 predecessor, txn, index;
+	u32 round;
+	int error;
+
+	for (predecessor = 0; predecessor < 2; predecessor++) {
+		f = ffv2_recovery_fixture(test);
+		if (predecessor)
+			ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+		txn = predecessor + 1;
+		write = ffv2_recovery_entry(f, 0, 1, txn, NFSD_FFV2_COMMITTED,
+					    predecessor, predecessor, txn);
+		rollback = ffv2_recovery_lifecycle(f, write, NFSD_FFV2_ROLLED_BACK);
+		index = predecessor + 2;
+		put_unaligned_be32(predecessor ? 1 : 3, rollback + 406);
+		put_unaligned_be64(predecessor ? 32 : 0, rollback + 410);
+		put_unaligned_be64(index, rollback + 426);
+		put_unaligned_be64(predecessor, rollback + 443);
+		ffv2_test_crc("FFV2-D2-WAL-v1", rollback, 540);
+		memcpy(key, rollback + 172, 32);
+		KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+		for (round = 0; round < 2; round++) {
+			ffv2_recovery_rollback_view(test, f, txn, predecessor, index, key);
+			if (!round) {
+				nfsd_ffv2_store_test_close(f->store);
+				f->store = NULL;
+				f->events = 0;
+				error = nfsd_ffv2_store_test_recover(&f->input, &f->store,
+								     &f->state);
+				KUNIT_ASSERT_EQ(test, error, 0);
+				KUNIT_EXPECT_EQ(test, f->state.selected_slot, 0U);
+			}
+		}
+	}
+}
+
+static void ffv2_recovery_pending_rollback_test(struct kunit *test)
+{
+	struct ffv2_recovery_fixture *f;
+	u8 *write, *rollback, key[32];
+	u64 predecessor, txn;
+	u32 phase, round;
+	int error;
+
+	for (phase = NFSD_FFV2_PREPARED; phase <= NFSD_FFV2_FINALIZED; phase++) {
+		for (predecessor = 0; predecessor < 2; predecessor++) {
+			f = ffv2_recovery_fixture(test);
+			if (predecessor)
+				ffv2_recovery_entry(f, 0, 1, 1, NFSD_FFV2_COMMITTED, 0, 0, 1);
+			txn = predecessor + 1;
+			write = ffv2_recovery_entry(f, 0, 1, txn, NFSD_FFV2_PREPARED,
+						    predecessor, predecessor, txn);
+			if (phase == NFSD_FFV2_FINALIZED)
+				ffv2_recovery_lifecycle(f, write, phase);
+			KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+			KUNIT_EXPECT_EQ(test, f->state.wal_reserved,
+					phase == NFSD_FFV2_PREPARED ? 1080ULL : 540ULL);
+			KUNIT_EXPECT_EQ(test, f->state.payload_staged, 4096ULL);
+			KUNIT_EXPECT_EQ(test, nfsd_ffv2_store_test_phase(f->store, txn),
+					(int)phase);
+			nfsd_ffv2_store_test_close(f->store);
+			f->store = NULL;
+			f->events = 0;
+			rollback = ffv2_recovery_lifecycle(f, write, NFSD_FFV2_ROLLED_BACK);
+			memcpy(key, rollback + 172, 32);
+			KUNIT_ASSERT_EQ(test, ffv2_recovery_run(test, f), 0);
+			for (round = 0; round < 2; round++) {
+				ffv2_recovery_rollback_view(test, f, txn, predecessor,
+							    predecessor, key);
+				if (!round) {
+					nfsd_ffv2_store_test_close(f->store);
+					f->store = NULL;
+					f->events = 0;
+					error = nfsd_ffv2_store_test_recover(&f->input, &f->store,
+									     &f->state);
+					KUNIT_ASSERT_EQ(test, error, 0);
+				}
+			}
+		}
+	}
+}
+
 static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_super_vector_test),
 	KUNIT_CASE(ffv2_start_vector_test),
@@ -614,6 +1682,28 @@ static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_payload_checksum_vectors_test),
 	KUNIT_CASE(ffv2_payload_multipage_test),
 	KUNIT_CASE(ffv2_replay_boundaries_test),
+	KUNIT_CASE(ffv2_recovery_floor_test),
+	KUNIT_CASE(ffv2_recovery_committed_rollback_test),
+	KUNIT_CASE(ffv2_recovery_pending_rollback_test),
+	KUNIT_CASE(ffv2_recovery_complete_test),
+	KUNIT_CASE(ffv2_recovery_slots_test),
+	KUNIT_CASE(ffv2_recovery_identity_test),
+	KUNIT_CASE(ffv2_recovery_binding_test),
+	KUNIT_CASE(ffv2_recovery_owner_test),
+	KUNIT_CASE(ffv2_recovery_pending_test),
+	KUNIT_CASE(ffv2_recovery_semantics_test),
+	KUNIT_CASE(ffv2_recovery_metadata_test),
+	KUNIT_CASE(ffv2_recovery_damaged_test),
+	KUNIT_CASE(ffv2_recovery_tails_test),
+	KUNIT_CASE(ffv2_recovery_chain_test),
+	KUNIT_CASE(ffv2_recovery_authorization_test),
+	KUNIT_CASE(ffv2_recovery_order_test),
+	KUNIT_CASE(ffv2_recovery_checkpoint_test),
+	KUNIT_CASE(ffv2_recovery_cursor_test),
+	KUNIT_CASE(ffv2_recovery_headroom_test),
+	KUNIT_CASE(ffv2_recovery_exhaustion_test),
+	KUNIT_CASE(ffv2_recovery_truncation_test),
+	KUNIT_CASE(ffv2_recovery_finalized_test),
 	{},
 };
 
