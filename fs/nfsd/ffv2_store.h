@@ -288,6 +288,65 @@ bool nfsd_ffv2_payload_geometry_valid(u64 chunk_index, u32 content_len,
 				      u32 chunk_bytes, u64 max_chunks);
 
 #ifdef CONFIG_NFSD_FFV2_KUNIT_TEST
+#define NFSD_FFV2_PAYLOAD_SEQUENCE_MASK GENMASK_ULL(39, 0)
+#define NFSD_FFV2_TRUST_STATEID_RECORD_SIZE 296
+#define NFSD_FFV2_AUTHORITY_ADMIT_RECORD_SIZE 256
+
+struct nfsd_ffv2_store_operation {
+	u8 session[16];
+	u32 slot;
+	u32 sequence;
+	u32 ordinal;
+	u8 request_digest[32];
+};
+
+struct nfsd_ffv2_store_write {
+	struct nfsd_ffv2_store_operation operation;
+	u32 admission_id;
+	u64 chunk_index;
+	u32 stability;
+	u64 owner_cohort;
+	u32 owner_client_id;
+	u32 owner_co_id;
+	u32 writer_payload_id;
+	bool guard_check;
+	bool guard_never_written;
+	u32 guard_generation;
+	u32 guard_writer;
+	bool activate_if_empty;
+	u32 checksum_algorithm;
+	u32 checksum_len;
+	u8 checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
+	const u8 *content;
+	u32 content_len;
+};
+
+struct nfsd_ffv2_store_lifecycle {
+	struct nfsd_ffv2_store_operation operation;
+	u32 admission_id;
+	u64 chunk_index;
+	u64 owner_cohort;
+	u32 owner_client_id;
+	u32 owner_co_id;
+};
+
+struct nfsd_ffv2_store_mutation_result {
+	u32 status;
+	u32 stability;
+	bool activated;
+	u8 verifier[8];
+	struct {
+		u64 cohort;
+		u32 client_id;
+		u32 co_id;
+	} owner;
+};
+
+struct nfsd_ffv2_store_admission {
+	u32 id;
+	u8 stateid[16];
+};
+
 struct file;
 struct nfsd_ffv2_store;
 
@@ -301,6 +360,7 @@ enum nfsd_ffv2_recovery_op {
 	NFSD_FFV2_IO_SYNC,
 	NFSD_FFV2_IO_WRITE,
 	NFSD_FFV2_IO_TRUNCATE,
+	NFSD_FFV2_IO_REPLAY,
 };
 
 /* Synchronous observer; its data must outlive recovery and the returned store. */
@@ -366,6 +426,15 @@ int nfsd_ffv2_store_test_receipt(struct nfsd_ffv2_store *store,
 				 struct nfsd_ffv2_entry_record *entry);
 int nfsd_ffv2_store_test_checkpoint(struct nfsd_ffv2_store *store,
 				    const struct nfsd_ffv2_super_record *record);
+int nfsd_ffv2_store_test_admit(struct nfsd_ffv2_store *store, u32 writer, u32 count,
+			       struct nfsd_ffv2_store_admission *result);
+int nfsd_ffv2_store_test_write(struct nfsd_ffv2_store *store, const u8 file_key[32],
+			       const struct nfsd_ffv2_store_write *request,
+			       struct nfsd_ffv2_store_mutation_result *result);
+int nfsd_ffv2_store_test_lifecycle(struct nfsd_ffv2_store *store, const u8 file_key[32],
+				   const struct nfsd_ffv2_store_lifecycle *request,
+				   struct nfsd_ffv2_store_mutation_result *result, u32 phase);
+int nfsd_ffv2_store_test_authorized(struct nfsd_ffv2_store *store, u64 admission_id);
 int nfsd_ffv2_store_test_phase(struct nfsd_ffv2_store *store, u64 txn_id);
 #endif
 
