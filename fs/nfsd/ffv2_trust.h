@@ -56,7 +56,7 @@ __be32 nfsd_ffv2_validate_operation(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				    const struct nfsd_ffv2_actor_id *actor,
 				    struct nfsd_ffv2_admission *admission);
 
-#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) || IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
 #define NFSD_FFV2_TRUST_PRINCIPAL_MAX 1024
 #define NFSD_FFV2_TRUST_ENTRIES_MAX 4096
 #define NFSD_FFV2_TRUST_BYTES_MAX (4U * 1024U * 1024U)
@@ -73,6 +73,12 @@ struct nfsd_ffv2_trust_request {
 	const char *principal;
 };
 
+#endif
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+__be32 nfsd_ffv2_trust_install_active(struct nfsd_net *nn,
+				      const struct nfsd_ffv2_trust_request *request);
+#endif
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 __be32 nfsd_ffv2_test_trust_update(struct nfsd_net *nn, const struct nfsd_ffv2_trust_request *req,
 				   bool revoke);
 struct nfsd_ffv2_trust_stats {

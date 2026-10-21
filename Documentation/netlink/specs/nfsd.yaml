@@ -466,6 +466,113 @@ attribute-sets:
         checks:
           exact-len: 16
 
+  -
+    name: ffv2-prototype
+    attributes:
+      -
+        name: nonce
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: expires
+        type: u64
+      -
+        name: auth-domain
+        type: string
+      -
+        name: handle
+        type: binary
+        checks:
+          max-len: 128
+      -
+        name: chunk-size
+        type: u32
+      -
+        name: data-count
+        type: u32
+      -
+        name: parity-count
+        type: u32
+      -
+        name: source-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: service-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: replay-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: generation
+        type: u64
+      -
+        name: stateid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: mapped-handle
+        type: binary
+        checks:
+          max-len: 128
+      -
+        name: store-uuid
+        type: binary
+        checks:
+          exact-len: 16
+      -
+        name: binding-token
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: persisted-handle
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: writer-id
+        type: u32
+      -
+        name: pnfs-clientid
+        type: u64
+      -
+        name: objects
+        type: indexed-array
+        sub-type: nest
+        nested-attributes: ffv2-prototype-object
+
+  -
+    name: ffv2-prototype-object
+    attributes:
+      -
+        name: ordinary-handle
+        type: binary
+        checks:
+          max-len: 128
+      -
+        name: persisted-handle
+        type: binary
+        checks:
+          exact-len: 32
+      -
+        name: mapped-handle
+        type: binary
+        checks:
+          max-len: 128
+      -
+        name: stateid
+        type: binary
+        checks:
+          exact-len: 16
+
 operations:
   list:
     -
@@ -707,6 +814,67 @@ operations:
         request:
           attributes:
             - object-uuid
+            - generation
+
+    -
+      name: ffv2-prototype-enable
+      doc: >-
+        Open this network namespace's Flex Files v2 prototype authority
+        gate.  The caller becomes its owner; no other administrator may
+        register against it, close it, or unregister from it.
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do: {}
+    -
+      name: ffv2-prototype-disable
+      doc: close this network namespace's prototype authority gate
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do: {}
+    -
+      name: ffv2-prototype-challenge
+      doc: issue one nonce a prototype registration must present
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do:
+        reply:
+          attributes:
+            - nonce
+            - expires
+    -
+      name: ffv2-prototype-register
+      doc: publish the object set a prototype authority gate serves
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - nonce
+            - auth-domain
+            - chunk-size
+            - data-count
+            - parity-count
+            - store-uuid
+            - binding-token
+            - writer-id
+            - pnfs-clientid
+            - objects
+        reply:
+          attributes:
+            - source-uuid
+            - service-uuid
+            - replay-uuid
+            - generation
+            - objects
+    -
+      name: ffv2-prototype-unregister
+      doc: retire the object a prototype authority gate published
+      attribute-set: ffv2-prototype
+      flags: [admin-perm]
+      do:
+        request:
+          attributes:
+            - source-uuid
             - generation
 
 mcast-groups:

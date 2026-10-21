@@ -11,6 +11,12 @@
 #include <linux/unaligned.h>
 #include <crypto/sha2.h>
 
+#include <linux/namei.h>
+#include <linux/mount.h>
+#include <linux/magic.h>
+#include "ffv2.h"
+#include "nfsd.h"
+#include "netns.h"
 #include "ffv2_store.h"
 
 #define FFV2_SUPER_MAGIC	0x44325342
@@ -965,9 +971,8 @@ size_t nfsd_ffv2_payload_record_size(u32 content_len)
 	return ALIGN(total, NFSD_FFV2_PAYLOAD_ALIGN);
 }
 
-static bool ffv2_store_checksum_valid(u32 algorithm, const u8 *checksum,
-				      u32 checksum_len, const u8 *content,
-				      u32 content_len)
+bool nfsd_ffv2_store_checksum_valid(u32 algorithm, const u8 *checksum, u32 checksum_len,
+				    const u8 *content, u32 content_len)
 {
 	u8 computed[NFSD_FFV2_STORE_CHECKSUM_SIZE] = {};
 	u32 expected_len;
@@ -1016,10 +1021,8 @@ static bool ffv2_store_checksum_valid(u32 algorithm, const u8 *checksum,
 static bool
 ffv2_payload_checksum_valid(const struct nfsd_ffv2_payload_record *record)
 {
-	return ffv2_store_checksum_valid(record->checksum_algorithm,
-					      record->checksum,
-					      record->checksum_len,
-					      record->content,
+	return nfsd_ffv2_store_checksum_valid(record->checksum_algorithm, record->checksum,
+					      record->checksum_len, record->content,
 					      record->content_len);
 }
 
@@ -1146,6 +1149,7 @@ bool nfsd_ffv2_restart_fits(u64 valid_bytes, u64 live_wal_reserved,
 }
 
 struct nfsd_ffv2_store {
+	struct nfsd_ffv2_reservation *reservation;
 	struct file *super_file;
 	struct file *wal_file;
 	struct file *payload_file;
@@ -2950,9 +2954,10 @@ out_free:
 	return error;
 }
 
-static int ffv2_store_write_locked(struct nfsd_ffv2_store *store, const u8 file_key[32],
-				   const struct nfsd_ffv2_store_write *request,
-				   struct nfsd_ffv2_store_mutation_result *result)
+static int __maybe_unused ffv2_store_write_locked(struct nfsd_ffv2_store *store,
+						  const u8 file_key[32],
+						  const struct nfsd_ffv2_store_write *request,
+						  struct nfsd_ffv2_store_mutation_result *result)
 {
 	struct nfsd_ffv2_payload_record payload = {};
 	struct nfsd_ffv2_entry_record entry = {
@@ -2986,9 +2991,9 @@ static int ffv2_store_write_locked(struct nfsd_ffv2_store *store, const u8 file_
 					      registration->chunk_bytes,
 					      registration->max_chunks) ||
 	    request->stability > 2 || request->checksum_len > NFSD_FFV2_STORE_CHECKSUM_SIZE ||
-	    !ffv2_store_checksum_valid(request->checksum_algorithm, request->checksum,
-				       request->checksum_len, request->content,
-				       request->content_len)) {
+	    !nfsd_ffv2_store_checksum_valid(request->checksum_algorithm, request->checksum,
+					    request->checksum_len, request->content,
+					    request->content_len)) {
 		error = -EINVAL;
 		return error;
 	}
@@ -3119,10 +3124,10 @@ out_free:
 	return error;
 }
 
-static int ffv2_store_lifecycle_locked(struct nfsd_ffv2_store *store, const u8 file_key[32],
-				       const struct nfsd_ffv2_store_lifecycle *request,
-				       struct nfsd_ffv2_store_mutation_result *result,
-				       u32 transition)
+static int __maybe_unused
+ffv2_store_lifecycle_locked(struct nfsd_ffv2_store *store, const u8 file_key[32],
+			    const struct nfsd_ffv2_store_lifecycle *request,
+			    struct nfsd_ffv2_store_mutation_result *result, u32 transition)
 {
 	struct nfsd_ffv2_entry_record entry = {
 		.status = 1,
@@ -3210,17 +3215,317 @@ out_free_receipt:
 	return error;
 }
 
-#ifdef CONFIG_NFSD_FFV2_KUNIT_TEST
-void nfsd_ffv2_store_test_close(struct nfsd_ffv2_store *store)
+static void ffv2_store_init(struct nfsd_ffv2_store *store)
+{
+	mutex_init(&store->lock);
+	INIT_LIST_HEAD(&store->registrations);
+	INIT_LIST_HEAD(&store->transactions);
+	INIT_LIST_HEAD(&store->owners);
+	INIT_LIST_HEAD(&store->admissions);
+	INIT_LIST_HEAD(&store->receipts);
+}
+
+static struct file *ffv2_store_open_file(const struct path *root, const char *name)
+{
+	struct file *file;
+	struct dentry *dentry;
+	struct path path;
+	struct qstr q = QSTR_LEN(name, strlen(name));
+
+	/* Resolve one fixed direct child and reject special files before open. */
+	inode_lock(d_inode(root->dentry));
+	dentry = lookup_one(mnt_idmap(root->mnt), &q, root->dentry);
+	if (IS_ERR(dentry)) {
+		inode_unlock(d_inode(root->dentry));
+		return ERR_CAST(dentry);
+	}
+	if (!d_is_reg(dentry) || !d_inode(dentry)->i_nlink || dentry->d_parent != root->dentry) {
+		dput(dentry);
+		inode_unlock(d_inode(root->dentry));
+		return ERR_PTR(-EINVAL);
+	}
+	path.mnt = mntget(root->mnt);
+	path.dentry = dentry;
+	inode_unlock(d_inode(root->dentry));
+	file = dentry_open(&path, O_RDWR | O_LARGEFILE | O_NOFOLLOW, current_cred());
+	path_put(&path);
+	if (IS_ERR(file))
+		return file;
+	if (file_inode(file)->i_sb != root->mnt->mnt_sb) {
+		fput(file);
+		return ERR_PTR(-EXDEV);
+	}
+	return file;
+}
+
+int nfsd_ffv2_store_open(struct nfsd_net *nn, struct nfsd_ffv2_reservation *reservation,
+			 struct nfsd_ffv2_store **result)
+{
+	struct nfsd_ffv2_store *store;
+	struct path root;
+	u8 uuid[16], export_uuid[16], token[32];
+	const u8 *fs_uuid;
+	int error;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) && IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+	const struct nfsd_ffv2_prototype_test *test = READ_ONCE(nn->ffv2.test_prototype);
+	const struct nfsd_ffv2_recovery_input *input = test ? test->input : NULL;
+	u32 i;
+#endif
+
+	*result = NULL;
+	error = nfsd_ffv2_reservation_store_root(reservation, &root, uuid, export_uuid, token);
+	if (error)
+		return error;
+	error = nfsd_ffv2_reservation_store_begin(reservation);
+	if (error)
+		goto out_ref;
+	store = nfsd_ffv2_prototype_test_event(nn, NFSD_FFV2_TEST_PROTO_STORE_ALLOC) ?
+			NULL :
+			kzalloc_obj(*store, GFP_KERNEL);
+	if (!store) {
+		error = -ENOMEM;
+		goto out_end;
+	}
+	ffv2_store_init(store);
+	store->reservation = reservation;
+	fs_uuid = root.mnt->mnt_sb->s_uuid.b;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) && IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+	if (input) {
+		struct file **files[] = { &store->super_file, &store->wal_file,
+					  &store->payload_file };
+
+		for (i = 0; i < ARRAY_SIZE(files); i++) {
+			*files[i] = get_file(input->files[i]);
+			error = nfsd_ffv2_prototype_test_event(nn,
+							       NFSD_FFV2_TEST_PROTO_SUPER_FILE + i);
+			if (error)
+				goto out_store;
+		}
+		fs_uuid = input->fs_uuid;
+		store->test_io = input->io;
+		goto recover;
+	}
+#endif
+	{
+		if (root.mnt->mnt_sb->s_magic != XFS_SUPER_MAGIC) {
+			error = -EOPNOTSUPP;
+			goto out_store;
+		}
+		store->super_file = ffv2_store_open_file(&root, "super");
+		if (IS_ERR(store->super_file)) {
+			error = PTR_ERR(store->super_file);
+			store->super_file = NULL;
+			goto out_store;
+		}
+		store->wal_file = ffv2_store_open_file(&root, "wal");
+		if (IS_ERR(store->wal_file)) {
+			error = PTR_ERR(store->wal_file);
+			store->wal_file = NULL;
+			goto out_store;
+		}
+		store->payload_file = ffv2_store_open_file(&root, "payload");
+		if (IS_ERR(store->payload_file)) {
+			error = PTR_ERR(store->payload_file);
+			store->payload_file = NULL;
+			goto out_store;
+		}
+	}
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) && IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+recover:
+#endif
+	error = ffv2_store_recover(store, uuid, fs_uuid, export_uuid, token);
+	if (error)
+		goto out_store;
+	nfsd_ffv2_reservation_store_end(reservation);
+	path_put(&root);
+	memzero_explicit(token, sizeof(token));
+	*result = store;
+	return 0;
+out_store:
+	nfsd_ffv2_reservation_store_end(reservation);
+	nfsd_ffv2_store_close(store);
+	path_put(&root);
+	memzero_explicit(token, sizeof(token));
+	return error;
+out_end:
+	nfsd_ffv2_reservation_store_end(reservation);
+out_ref:
+	nfsd_ffv2_reservation_store_put(reservation);
+	path_put(&root);
+	memzero_explicit(token, sizeof(token));
+	return error;
+}
+
+void nfsd_ffv2_store_close(struct nfsd_ffv2_store *store)
 {
 	if (!store)
 		return;
-	fput(store->payload_file);
-	fput(store->wal_file);
-	fput(store->super_file);
+	if (store->payload_file)
+		fput(store->payload_file);
+	if (store->wal_file)
+		fput(store->wal_file);
+	if (store->super_file)
+		fput(store->super_file);
 	ffv2_store_replay_free(store);
 	mutex_destroy(&store->lock);
+	if (store->reservation)
+		nfsd_ffv2_reservation_store_put(store->reservation);
 	kfree(store);
+}
+
+static int ffv2_store_lookup_file_locked(struct nfsd_ffv2_store *store, const u8 handle[32],
+					 struct nfsd_ffv2_store_file *file)
+{
+	struct ffv2_registration *registration;
+	int error = -ENOENT;
+
+	lockdep_assert_held(&store->lock);
+	list_for_each_entry(registration, &store->registrations, node) {
+		if (memcmp(registration->handle, handle, sizeof(registration->handle)))
+			continue;
+		memcpy(file->file_key, registration->file_key, sizeof(file->file_key));
+		file->chunk_bytes = registration->chunk_bytes;
+		file->max_chunks = registration->max_chunks;
+		file->logical_eof = registration->logical_eof;
+		error = 0;
+		break;
+	}
+	return error;
+}
+
+int nfsd_ffv2_store_lookup_file(struct nfsd_ffv2_store *store, const u8 handle[32],
+				struct nfsd_ffv2_store_file *file)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = store->failed ? -EIO : ffv2_store_lookup_file_locked(store, handle, file);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_admit_writers(struct nfsd_ffv2_store *store, u32 writer, u32 count,
+				  struct nfsd_ffv2_store_admission *result)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_admit_writers_locked(store, writer, count, result);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+static void ffv2_store_copy_visible(struct ffv2_registration *registration,
+				    struct ffv2_transaction *version,
+				    struct nfsd_ffv2_visible_chunk *chunk)
+{
+	memset(chunk, 0, sizeof(*chunk));
+	chunk->version_object_id = version->version_object_id;
+	chunk->version_generation = version->version_generation;
+	chunk->payload_object_id = version->payload_object_id;
+	chunk->writer_payload_id = version->writer_payload_id;
+	chunk->payload_object_offset = version->payload_object_offset;
+	chunk->content_len = version->content_len;
+	chunk->content_crc32c = version->content_crc32c;
+	chunk->checksum_algorithm = version->checksum_algorithm;
+	chunk->checksum_len = version->checksum_len;
+	memcpy(chunk->checksum, version->checksum, sizeof(chunk->checksum));
+	chunk->file_eof = registration->logical_eof;
+	chunk->owner_cohort = version->owner_cohort;
+	chunk->owner_client_id = version->owner_client_id;
+	chunk->owner_co_id = version->owner_co_id;
+	chunk->guard_generation = version->guard_generation;
+	chunk->guard_writer = version->guard_writer;
+	chunk->guard_never_written = version->guard_never_written;
+}
+
+int nfsd_ffv2_store_read_snapshot(struct nfsd_ffv2_store *store, const u8 file_key[32], u64 offset,
+				  u32 capacity, struct nfsd_ffv2_visible_chunk *chunks, u64 *eof,
+				  u32 *count)
+{
+	struct ffv2_registration *registration;
+	u64 file_chunks;
+	u32 i;
+	bool reserved = true;
+	int error;
+
+	if (!store || !file_key || !eof || !count || (capacity && !chunks))
+		return -EINVAL;
+
+	if (reserved) {
+		error = nfsd_ffv2_reservation_store_begin(store->reservation);
+		if (error)
+			return error;
+	}
+	mutex_lock(&store->lock);
+	registration = ffv2_replay_file(store, file_key);
+	if (!registration || store->failed) {
+		error = -ENOENT;
+		goto out_unlock;
+	}
+	*eof = registration->logical_eof;
+	file_chunks = DIV_ROUND_UP_ULL(*eof, registration->chunk_bytes);
+	*count = offset >= file_chunks ? 0 : min_t(u64, capacity, file_chunks - offset);
+	for (i = 0; i < *count; i++) {
+		u64 index = offset + i;
+
+		memset(&chunks[i], 0, sizeof(chunks[i]));
+		if (index < ARRAY_SIZE(registration->visible) && registration->visible[index])
+			ffv2_store_copy_visible(registration, registration->visible[index],
+						&chunks[i]);
+	}
+	error = 0;
+out_unlock:
+	mutex_unlock(&store->lock);
+	if (reserved)
+		nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+static int ffv2_store_read_range_valid(struct file *file, size_t len, loff_t offset)
+{
+	loff_t end;
+
+	if (len > LLONG_MAX || offset < 0 || check_add_overflow(offset, (loff_t)len, &end) ||
+	    end > i_size_read(file_inode(file)))
+		return -EIO;
+	return 0;
+}
+
+int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data, size_t len,
+				 loff_t offset)
+{
+	bool reserved = true;
+	int error;
+
+	if (reserved) {
+		error = nfsd_ffv2_reservation_store_begin(store->reservation);
+		if (error)
+			return error;
+	}
+	mutex_lock(&store->lock);
+	error = store->failed ? -EIO :
+				ffv2_store_read_range_valid(store->payload_file, len, offset);
+	if (!error)
+		error = ffv2_store_read_all(store->payload_file, data, len, offset);
+	mutex_unlock(&store->lock);
+	if (reserved)
+		nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+#ifdef CONFIG_NFSD_FFV2_KUNIT_TEST
+void nfsd_ffv2_store_test_close(struct nfsd_ffv2_store *store)
+{
+	nfsd_ffv2_store_close(store);
 }
 
 void nfsd_ffv2_store_test_state(struct nfsd_ffv2_store *store,
