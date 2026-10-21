@@ -38,6 +38,7 @@
 #define _LINUX_NFSD_XDR4_H
 
 #include "state.h"
+#include "ffv2.h"
 #include "vfs.h"
 
 #define NFSD4_MAX_TAGLEN	128
@@ -877,16 +878,43 @@ struct nfsd4_ffv2 {
 	bool		target_present;
 };
 
+struct nfsd4_chunk_read_ent {
+	struct nfsd_ffv2_checksum cre_checksum;
+	u32 cre_effective_len;
+	struct nfsd_ffv2_chunk_owner cre_owner;
+	struct nfsd_ffv2_chunk_guard cre_guard;
+	u32 cre_payload_id;
+	u32 cre_locked;
+	__be32 cre_status;
+	u32 cre_payload_off;
+};
+
+struct nfsd4_chunk_header_ent {
+	__be32 che_status;
+	u32 che_locked;
+	struct nfsd_ffv2_chunk_owner che_owner;
+	struct nfsd_ffv2_chunk_guard che_guard;
+	struct nfsd_ffv2_retained che_predecessor;
+};
+
 struct nfsd4_chunk_read {
-	stateid_t	cra_stateid;
-	u64	cra_offset;
-	u32	cra_count;
+	stateid_t cra_stateid;
+	u64 cra_offset;
+	u32 cra_count;
+	bool cra_eof;
+	u32 cra_nchunks;
+	struct nfsd4_chunk_read_ent *cra_chunks;
+	void *cra_payload;
+	u32 cra_payload_len;
 };
 
 struct nfsd4_chunk_header_read {
-	stateid_t	chra_stateid;
-	u64	chra_offset;
-	u32	chra_count;
+	stateid_t chra_stateid;
+	u64 chra_offset;
+	u32 chra_count;
+	bool chrr_eof;
+	u32 chrr_nents;
+	struct nfsd4_chunk_header_ent *chrr_ents;
 };
 #endif
 
@@ -1060,6 +1088,7 @@ bool nfsd4_ffv2_replay_identity_match(const struct nfsd4_compoundargs *args,
 __be32 nfsd4_test_decode_op(struct svc_rqst *rqstp, u32 opnum, const void *buf,
 			    size_t len, union nfsd4_op_u *u, size_t *consumed);
 void nfsd4_test_dispatch_compound(struct svc_rqst *rqstp);
+void nfsd_ffv2_test_release_op(struct nfsd4_op *op);
 void nfsd4_test_record_ffv2_identity(struct nfsd4_slot *slot,
 				     const struct nfsd4_compoundargs *args);
 bool nfsd4_test_replay_matches_cache(struct svc_rqst *rqstp,

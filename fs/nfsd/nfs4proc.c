@@ -3835,6 +3835,330 @@ __be32 nfsd4_ffv2_compound_status(const struct svc_rqst *rqstp)
 	return nfserr_notsupp;
 }
 
+static bool nfsd4_ffv2_copy_fail(struct nfsd_net *nn, unsigned int stage)
+{
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (READ_ONCE(nn->ffv2.test_registration.read_copy_fault) == stage) {
+		WRITE_ONCE(nn->ffv2.test_registration.read_copy_fault, 0);
+		return true;
+	}
+#endif
+	return false;
+}
+
+#define NFSD4_FFV2_HEADER_FIXED_WORDS (2 + 1 + 5)
+#define NFSD4_FFV2_HEADER_ENT_MIN_WORDS 9
+#define NFSD4_FFV2_HEADER_ENT_MAX_WORDS 13
+
+static u32 nfsd4_ffv2_bytes(u64 words)
+{
+	if (words > U32_MAX / sizeof(__be32))
+		return U32_MAX;
+	return (u32)words * sizeof(__be32);
+}
+
+static u32 nfsd4_ffv2_read_max_bytes(u32 count)
+{
+	u64 total = nfsd4_ffv2_bytes(NFSD4_FFV2_READ_FIXED_WORDS +
+				     (u64)count * NFSD4_FFV2_READ_ENT_WORDS);
+	if (count) {
+		total += NFSD_FFV2_MAX_PAYLOAD_BYTES;
+		total += (u64)count * (XDR_UNIT - 1);
+	}
+	return total > U32_MAX ? U32_MAX : (u32)total;
+}
+
+static u32 nfsd4_ffv2_available(struct svc_rqst *rqstp)
+{
+	struct nfsd4_compoundres *resp = rqstp->rq_resp;
+	struct xdr_buf *buf = &resp->rqstp->rq_res;
+	u32 slack = 0;
+	u32 room;
+
+	if (!nfsd4_last_compound_op(rqstp))
+		slack = COMPOUND_ERR_SLACK_SPACE;
+	if (buf->len >= buf->buflen)
+		return 0;
+	room = buf->buflen - buf->len;
+	if (room <= slack)
+		return 0;
+	return room - slack;
+}
+
+static __be32 nfsd4_ffv2_capacity_status(struct svc_rqst *rqstp, __be32 dflt)
+{
+	struct nfsd4_compoundres *resp = rqstp->rq_resp;
+
+	if (!nfsd4_has_session(&resp->cstate))
+		return nfserr_resource;
+	if (resp->cstate.slot &&
+	    (resp->cstate.slot->sl_flags & NFSD4_SLOT_CACHETHIS))
+		return nfserr_rep_too_big_to_cache;
+	return dflt;
+}
+
+static __be32 nfsd4_ffv2_admit(struct svc_rqst *rqstp,
+			       struct nfsd4_compound_state *cstate, u32 opnum,
+			       const stateid_t *stateid,
+			       struct nfsd_ffv2_admission *admission)
+{
+	__be32 status;
+
+	status = nfsd4_ffv2_compound_status(rqstp);
+	if (status)
+		return status;
+	if (!cstate->current_fh.fh_ffv2_binding)
+		return nfserr_notsupp;
+	status = check_nfsd_access(cstate->current_fh.fh_export, rqstp, false);
+	if (status)
+		return status;
+	return nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh,
+					    cstate->session, opnum, stateid,
+					    NULL, admission);
+}
+
+static void nfsd4_chunk_read_release(union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_read *cr = &u->chunk_read;
+
+	kfree(cr->cra_chunks);
+	cr->cra_chunks = NULL;
+	kvfree(cr->cra_payload);
+	cr->cra_payload = NULL;
+	cr->cra_nchunks = 0;
+	cr->cra_payload_len = 0;
+}
+
+static void nfsd4_chunk_header_read_release(union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_header_read *hr = &u->chunk_header_read;
+
+	kfree(hr->chrr_ents);
+	hr->chrr_ents = NULL;
+	hr->chrr_nents = 0;
+}
+
+static __be32 nfsd4_ffv2_copy_read(struct nfsd_net *nn,
+				   struct nfsd4_chunk_read *cr,
+				   const struct nfsd_ffv2_chunk_result *result)
+{
+	u32 off = 0;
+	u64 total = 0;
+	u32 i;
+
+	cr->cra_eof = result->eof;
+	if (!result->count)
+		return nfs_ok;
+
+	cr->cra_chunks = nfsd4_ffv2_copy_fail(nn, 1) ?
+				 NULL :
+				 kcalloc(result->count, sizeof(*cr->cra_chunks),
+					 GFP_KERNEL);
+	if (!cr->cra_chunks)
+		return nfserr_jukebox;
+
+	for (i = 0; i < result->count; i++)
+		total += result->read.chunks[i].cr_effective_len;
+	if (total) {
+		cr->cra_payload = nfsd4_ffv2_copy_fail(nn, 2) ?
+					  NULL :
+					  kvmalloc(total, GFP_KERNEL);
+		if (!cr->cra_payload)
+			return nfserr_jukebox;
+	}
+	cr->cra_payload_len = total;
+
+	for (i = 0; i < result->count; i++) {
+		const struct nfsd_ffv2_read_chunk *src =
+			&result->read.chunks[i];
+		struct nfsd4_chunk_read_ent *ent = &cr->cra_chunks[i];
+
+		ent->cre_checksum = src->cr_checksum;
+		ent->cre_effective_len = src->cr_effective_len;
+		ent->cre_owner = src->cr_owner;
+		ent->cre_guard = src->cr_guard;
+		ent->cre_payload_id = src->cr_payload_id;
+		ent->cre_locked = src->cr_locked;
+		ent->cre_status = src->cr_status;
+		ent->cre_payload_off = off;
+		if (src->cr_effective_len) {
+			memcpy(cr->cra_payload + off, src->cr_chunk,
+			       src->cr_effective_len);
+			off += src->cr_effective_len;
+		}
+	}
+	cr->cra_nchunks = result->count;
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_ffv2_copy_header(struct nfsd_net *nn, struct nfsd4_chunk_header_read *hr,
+		       const struct nfsd_ffv2_chunk_result *result)
+{
+	u32 i;
+
+	hr->chrr_eof = result->eof;
+	if (!result->count)
+		return nfs_ok;
+
+	hr->chrr_ents = nfsd4_ffv2_copy_fail(nn, 1) ?
+				NULL :
+				kcalloc(result->count, sizeof(*hr->chrr_ents),
+					GFP_KERNEL);
+	if (!hr->chrr_ents)
+		return nfserr_jukebox;
+
+	for (i = 0; i < result->count; i++) {
+		struct nfsd4_chunk_header_ent *ent = &hr->chrr_ents[i];
+
+		ent->che_status = result->header.status[i];
+		ent->che_locked = result->header.locked[i];
+		ent->che_owner = result->header.owners[i];
+		ent->che_guard = result->header.guards[i];
+		ent->che_predecessor = result->header.predecessors[i];
+	}
+	hr->chrr_nents = result->count;
+	return nfs_ok;
+}
+
+static u32 nfsd4_ffv2_header_ent_words(const struct nfsd4_chunk_header_ent *ent)
+{
+	if (ent->che_predecessor.disposition == NFSD_FFV2_RETAINED_ABSENT)
+		return NFSD4_FFV2_HEADER_ENT_MIN_WORDS;
+	return NFSD4_FFV2_HEADER_ENT_MAX_WORDS;
+}
+
+static __be32 nfsd4_ffv2_chunk_read_op(struct svc_rqst *rqstp,
+				       struct nfsd4_compound_state *cstate,
+				       union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_read *cr = &u->chunk_read;
+	const struct nfsd_ffv2_chunk_request request = {
+		.offset = cr->cra_offset,
+		.count = cr->cra_count,
+	};
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_chunk_result result = {};
+	u32 available, i;
+	__be32 status;
+
+	u64 total;
+
+	cr->cra_chunks = NULL;
+	cr->cra_payload = NULL;
+	cr->cra_nchunks = 0;
+	cr->cra_payload_len = 0;
+	status = nfsd4_ffv2_admit(rqstp, cstate, OP_CHUNK_READ,
+				  &cr->cra_stateid, &admission);
+	if (status)
+		return status;
+	available = nfsd4_ffv2_available(rqstp);
+	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh,
+					  OP_CHUNK_READ, &request, &result,
+					  available, &admission);
+	if (status == nfserr_toosmall)
+		status = nfsd4_ffv2_capacity_status(rqstp, nfserr_toosmall);
+	if (status == nfs_ok)
+		status = nfsd4_ffv2_copy_read(net_generic(SVC_NET(rqstp), nfsd_net_id),
+					      cr, &result);
+	nfsd_ffv2_complete(&admission);
+	if (status) {
+		nfsd4_chunk_read_release(u);
+		return status;
+	}
+	total = nfsd4_ffv2_bytes(NFSD4_FFV2_READ_FIXED_WORDS +
+				 (u64)cr->cra_nchunks *
+					 NFSD4_FFV2_READ_ENT_WORDS);
+	for (i = 0; i < cr->cra_nchunks; i++)
+		total += xdr_align_size(cr->cra_chunks[i].cre_effective_len);
+	if (total > available) {
+		nfsd4_chunk_read_release(u);
+		return nfsd4_ffv2_capacity_status(rqstp, nfserr_toosmall);
+	}
+	return nfs_ok;
+}
+
+static __be32
+nfsd4_ffv2_chunk_header_read_op(struct svc_rqst *rqstp,
+				struct nfsd4_compound_state *cstate,
+				union nfsd4_op_u *u)
+{
+	struct nfsd4_chunk_header_read *hr = &u->chunk_header_read;
+	struct nfsd_ffv2_admission admission = {};
+	struct nfsd_ffv2_chunk_result result = {};
+	struct nfsd_ffv2_chunk_request request;
+	u32 available, fixed, kept, used, count;
+	bool shortened;
+	__be32 status;
+
+	hr->chrr_ents = NULL;
+	hr->chrr_nents = 0;
+	status = nfsd4_ffv2_admit(rqstp, cstate, OP_CHUNK_HEADER_READ,
+				  &hr->chra_stateid, &admission);
+	if (status)
+		return status;
+
+	available = nfsd4_ffv2_available(rqstp);
+	fixed = nfsd4_ffv2_bytes(NFSD4_FFV2_HEADER_FIXED_WORDS);
+	count = 0;
+	if (fixed <= available)
+		count = (available - fixed) /
+			nfsd4_ffv2_bytes(NFSD4_FFV2_HEADER_ENT_MIN_WORDS);
+	if (fixed > available || (hr->chra_count && !count)) {
+		nfsd_ffv2_complete(&admission);
+		return nfsd4_ffv2_capacity_status(rqstp, nfserr_rep_too_big);
+	}
+	count = min(hr->chra_count, count);
+
+	request.offset = hr->chra_offset;
+	request.count = count;
+	status = nfsd_ffv2_provider_probe(rqstp, &cstate->current_fh,
+					  OP_CHUNK_HEADER_READ, &request,
+					  &result, available, &admission);
+	if (status == nfs_ok)
+		status = nfsd4_ffv2_copy_header(net_generic(SVC_NET(rqstp), nfsd_net_id),
+						hr, &result);
+	nfsd_ffv2_complete(&admission);
+	if (status) {
+		nfsd4_chunk_header_read_release(u);
+		return status;
+	}
+	used = fixed;
+	for (kept = 0; kept < hr->chrr_nents; kept++) {
+		u32 cost = nfsd4_ffv2_bytes(nfsd4_ffv2_header_ent_words(&hr->chrr_ents[kept]));
+
+		if (used + cost > available)
+			break;
+		used += cost;
+	}
+	shortened = kept < hr->chrr_nents;
+	if (!kept && hr->chrr_nents) {
+		nfsd4_chunk_header_read_release(u);
+		return nfsd4_ffv2_capacity_status(rqstp, nfserr_rep_too_big);
+	}
+	hr->chrr_nents = kept;
+	if (shortened)
+		hr->chrr_eof = false;
+	return nfs_ok;
+}
+
+static u32 nfsd4_chunk_read_rsize(const struct svc_rqst *rqstp,
+				  const struct nfsd4_op *op)
+{
+	return min_t(u32, nfsd4_ffv2_read_max_bytes(op->u.chunk_read.cra_count),
+		     nfsd4_max_payload(rqstp));
+}
+
+static u32 nfsd4_chunk_header_read_rsize(const struct svc_rqst *rqstp,
+					 const struct nfsd4_op *op)
+{
+	u64 words = op_encode_hdr_size + 1 + 5 +
+		    (u64)op->u.chunk_header_read.chra_count *
+			    NFSD4_FFV2_HEADER_ENT_MAX_WORDS;
+
+	return min_t(u32, nfsd4_ffv2_bytes(words), nfsd4_max_payload(rqstp));
+}
+
 static __be32 nfsd4_ffv2_terminal(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 				  union nfsd4_op_u *u, u32 opnum)
 {
@@ -3878,7 +4202,7 @@ static __be32 nfsd4_ffv2_chunk_finalize(struct svc_rqst *rqstp, struct nfsd4_com
 static __be32 nfsd4_ffv2_chunk_header_read(struct svc_rqst *rqstp,
 					   struct nfsd4_compound_state *cstate, union nfsd4_op_u *u)
 {
-	return nfsd4_ffv2_terminal(rqstp, cstate, u, OP_CHUNK_HEADER_READ);
+	return nfsd4_ffv2_chunk_header_read_op(rqstp, cstate, u);
 }
 
 static __be32 nfsd4_ffv2_chunk_lock(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
@@ -3890,7 +4214,7 @@ static __be32 nfsd4_ffv2_chunk_lock(struct svc_rqst *rqstp, struct nfsd4_compoun
 static __be32 nfsd4_ffv2_chunk_read(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 				    union nfsd4_op_u *u)
 {
-	return nfsd4_ffv2_terminal(rqstp, cstate, u, OP_CHUNK_READ);
+	return nfsd4_ffv2_chunk_read_op(rqstp, cstate, u);
 }
 
 static __be32 nfsd4_ffv2_chunk_repaired(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
@@ -4388,7 +4712,8 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_func = nfsd4_ffv2_chunk_header_read,
 		.op_flags = 0,
 		.op_name = "OP_CHUNK_HEADER_READ",
-		.op_rsize_bop = nfsd4_only_status_rsize,
+		.op_rsize_bop = nfsd4_chunk_header_read_rsize,
+		.op_release = nfsd4_chunk_header_read_release,
 	},
 	[OP_CHUNK_LOCK] = {
 		.op_func = nfsd4_ffv2_chunk_lock,
@@ -4400,7 +4725,8 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 		.op_func = nfsd4_ffv2_chunk_read,
 		.op_flags = 0,
 		.op_name = "OP_CHUNK_READ",
-		.op_rsize_bop = nfsd4_only_status_rsize,
+		.op_rsize_bop = nfsd4_chunk_read_rsize,
+		.op_release = nfsd4_chunk_read_release,
 	},
 	[OP_CHUNK_REPAIRED] = {
 		.op_func = nfsd4_ffv2_chunk_repaired,
@@ -4455,14 +4781,35 @@ static const struct nfsd4_operation nfsd4_ops[] = {
 };
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_test_release_op(struct nfsd4_op *op)
+{
+	if (op->opdesc && op->opdesc->op_release)
+		op->opdesc->op_release(&op->u);
+}
+
 __be32 nfsd_ffv2_test_dispatch_op(struct svc_rqst *rqstp,
 				  struct nfsd4_compound_state *cstate,
 				  struct nfsd4_op *op)
 {
+	struct nfsd4_compoundres response = { .rqstp = rqstp };
+	struct xdr_buf saved = rqstp->rq_res;
+	bool temporary = !rqstp->rq_resp;
+	__be32 status;
+
 	if (op->opnum >= ARRAY_SIZE(nfsd4_ops) || !nfsd4_ops[op->opnum].op_func)
 		return nfserr_op_illegal;
 	op->opdesc = &nfsd4_ops[op->opnum];
-	return nfsd4_call_op(rqstp, cstate, op);
+	if (temporary) {
+		response.cstate.session = cstate->session;
+		rqstp->rq_resp = &response;
+		rqstp->rq_res.buflen = U32_MAX;
+	}
+	status = nfsd4_call_op(rqstp, cstate, op);
+	if (temporary) {
+		rqstp->rq_resp = NULL;
+		rqstp->rq_res = saved;
+	}
+	return status;
 }
 
 __be32 nfsd4_test_ffv2_run_op(struct svc_rqst *rqstp,

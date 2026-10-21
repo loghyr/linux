@@ -5,6 +5,7 @@
 #include <linux/sunrpc/auth_gss.h>
 #include <net/sock.h>
 #include <linux/cred.h>
+#include <linux/crc32.h>
 #include <linux/lockd/bind.h>
 #include <linux/mount.h>
 #include <linux/fs_struct.h>
@@ -5559,7 +5560,844 @@ static void nfsd_ffv2_trust_budget_test(struct kunit *test)
 			   nfs_ok);
 }
 
+struct ffv2_read_fixture {
+	struct nfsd_ffv2_mapping_fixture *mapping;
+	struct nfsd_ffv2_trust_request trust;
+	struct nfsd4_session session;
+	struct nfsd4_slot *slot;
+	struct nfsd4_compoundres response;
+	struct nfsd_ffv2_admission admission;
+	struct nfsd_ffv2_admission *release_probe;
+	bool released_with_provider;
+	struct nfsd4_op op;
+	struct nfsd_ffv2_read_chunk chunks[4];
+	__be32 status[4];
+	u32 locked[4];
+	struct nfsd_ffv2_chunk_owner owners[4];
+	struct nfsd_ffv2_chunk_guard guards[4];
+	struct nfsd_ffv2_retained predecessors[4];
+	u8 bytes[16];
+	atomic_t calls;
+	atomic_t releases;
+	u32 count;
+	bool eof;
+	unsigned int cleanup;
+	unsigned int missing_header;
+	__be32 error;
+	struct completion *entered;
+	struct completion **drain_wait;
+};
+
+static void ffv2_read_owner_release(void *data)
+{
+	struct ffv2_read_fixture *f = data;
+
+	atomic_inc(&f->releases);
+	if (f->release_probe)
+		f->released_with_provider = !!f->release_probe->provider;
+	memset(f->bytes, 0xa5, sizeof(f->bytes));
+	memset(f->chunks, 0, sizeof(f->chunks));
+	memset(f->status, 0xa5, sizeof(f->status));
+	memset(f->owners, 0xa5, sizeof(f->owners));
+}
+
+/* The retained admission protects the completion while this predicate runs. */
+static bool ffv2_provider_wait_queued(struct completion **waiting)
+{
+	/* Pairs with the drain observer publication while a ref is held. */
+	struct completion *gone = smp_load_acquire(waiting);
+	unsigned long flags;
+	bool queued;
+
+	if (!gone)
+		return false;
+	raw_spin_lock_irqsave(&gone->wait.lock, flags);
+	queued = swait_active(&gone->wait);
+	raw_spin_unlock_irqrestore(&gone->wait.lock, flags);
+	return queued;
+}
+
+static __be32 ffv2_read_callback(void *data,
+				 const struct nfsd_ffv2_object *object,
+				 const struct nfsd_ffv2_chunk_request *request,
+				 struct nfsd_ffv2_chunk_result *result)
+{
+	struct ffv2_read_fixture *f = data;
+
+	atomic_inc(&f->calls);
+	if (f->entered) {
+		bool queued;
+
+		complete(f->entered);
+
+		if (read_poll_timeout(ffv2_provider_wait_queued, queued, queued,
+				      1000, 5000000, false, f->drain_wait))
+			return nfserr_io;
+	}
+	result->count = f->count;
+	result->eof = f->eof;
+	result->read.chunks = f->chunks;
+	if (f->cleanup == 1 || f->cleanup == 2)
+		result->private = f;
+	if (f->cleanup == 1 || f->cleanup == 3)
+		result->release = ffv2_read_owner_release;
+	return f->error;
+}
+
+static __be32
+ffv2_header_callback(void *data, const struct nfsd_ffv2_object *object,
+		     const struct nfsd_ffv2_chunk_request *request,
+		     struct nfsd_ffv2_chunk_result *result)
+{
+	struct ffv2_read_fixture *f = data;
+	__be32 status = ffv2_read_callback(data, object, request, result);
+
+	result->header.status = f->status;
+	result->header.locked = f->locked;
+	result->header.owners = f->owners;
+	result->header.guards = f->guards;
+	result->header.predecessors = f->predecessors;
+	switch (f->missing_header) {
+	case 1:
+		result->header.status = NULL;
+		break;
+	case 2:
+		result->header.locked = NULL;
+		break;
+	case 3:
+		result->header.owners = NULL;
+		break;
+	case 4:
+		result->header.guards = NULL;
+		break;
+	case 5:
+		result->header.predecessors = NULL;
+		break;
+	}
+	return status;
+}
+
+static const struct nfsd_ffv2_provider_ops ffv2_read_ops = {
+	.chunk_read = ffv2_read_callback,
+	.chunk_header_read = ffv2_header_callback,
+};
+
+static void ffv2_read_reset(struct ffv2_read_fixture *f)
+{
+	u32 i;
+
+	memset(f->chunks, 0, sizeof(f->chunks));
+	memset(f->status, 0, sizeof(f->status));
+	memset(f->owners, 0, sizeof(f->owners));
+	memset(f->bytes, 0, sizeof(f->bytes));
+	f->count = 1;
+	f->eof = true;
+	f->error = nfs_ok;
+	f->cleanup = 0;
+	for (i = 0; i < ARRAY_SIZE(f->chunks); i++) {
+		f->chunks[i].cr_chunk = f->bytes + 4 * i;
+		f->chunks[i].cr_effective_len = 4;
+		f->chunks[i].cr_checksum.cs_algorithm =
+			NFSD_FFV2_CHECKSUM_ALG_CRC32;
+		f->chunks[i].cr_checksum.cs_len = NFSD_FFV2_CHECKSUM_CRC32_LEN;
+	}
+}
+
+static void ffv2_read_exit(void *data)
+{
+	struct ffv2_read_fixture *f = data;
+	struct nfsd_net *nn = f->mapping->registration->nn;
+
+	nfsd_ffv2_complete(&f->admission);
+	nfsd_ffv2_test_release_op(&f->op);
+	nfsd_ffv2_test_provider_drain_hook(nn, NULL);
+	nfsd_ffv2_provider_remove(nn);
+}
+
+static struct ffv2_read_fixture *ffv2_read_fixture(struct kunit *test)
+{
+	struct ffv2_read_fixture *f;
+	struct nfs4_client *writer;
+
+	f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	if (!f)
+		return NULL;
+	f->mapping = nfsd_ffv2_mapping_fixture(test);
+	if (!f->mapping)
+		return NULL;
+	writer = kunit_kzalloc(test, sizeof(*writer), GFP_KERNEL);
+	if (!writer)
+		return NULL;
+	nfsd_ffv2_trust_request_init(f->mapping, &f->trust);
+	writer->cl_clientid = f->trust.pnfs_clientid;
+	f->session.se_client = writer;
+	f->mapping->cstate.session = &f->session;
+	f->response.rqstp = &f->mapping->rqst;
+	f->response.cstate.session = &f->session;
+	f->slot = kunit_kzalloc(test, sizeof(*f->slot), GFP_KERNEL);
+	if (!f->slot)
+		return NULL;
+	f->response.cstate.slot = f->slot;
+	f->response.cstate.minorversion = 2;
+	f->mapping->rqst.rq_resp = &f->response;
+	f->mapping->rqst.rq_res.buflen = 8192;
+	f->mapping->args.opcnt = 1;
+	f->response.opcnt = 1;
+	if (kunit_add_action_or_reset(test, ffv2_read_exit, f))
+		return NULL;
+	FFV2_EXPECT_STATUS(test,
+			   nfsd_ffv2_mapping_putfh(f->mapping,
+						   &f->mapping->registration->outer),
+		nfs_ok);
+	FFV2_EXPECT_STATUS(test,
+			   nfsd_ffv2_test_trust_update(f->mapping->registration->nn,
+						       &f->trust, false),
+		nfs_ok);
+	ffv2_read_reset(f);
+	return f;
+}
+
+static __be32 ffv2_read_admit(struct ffv2_read_fixture *f)
+{
+	struct nfsd_ffv2_mapping_fixture *m = f->mapping;
+
+	return nfsd_ffv2_validate_operation(&m->rqst, &m->cstate.current_fh,
+					    m->cstate.session, OP_CHUNK_READ,
+					    &f->trust.stateid, NULL,
+					    &f->admission);
+}
+
+static __be32 ffv2_read_probe(struct ffv2_read_fixture *f, u32 opcode,
+			      u64 offset, u32 count, u32 available,
+			      struct nfsd_ffv2_chunk_result *result)
+{
+	struct nfsd_ffv2_chunk_request request = { .offset = offset,
+						   .count = count };
+	struct nfsd_ffv2_mapping_fixture *m = f->mapping;
+
+	return nfsd_ffv2_provider_probe(&m->rqst, &m->cstate.current_fh, opcode,
+					&request, result, available,
+					&f->admission);
+}
+
+static void ffv2_read_bounds_test(struct kunit *test)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	FFV2_EXPECT_STATUS(test, ffv2_read_admit(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 4096, &result),
+			   nfserr_toosmall);
+	KUNIT_EXPECT_EQ_MSG(test, atomic_read(&f->calls), 0,
+			    "size before callback");
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_READ, 0, 4097, U32_MAX,
+					   &result),
+			   nfserr_inval);
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_READ, U64_MAX, 1,
+					   U32_MAX, &result),
+			   nfserr_inval);
+	nfsd_ffv2_test_object_geometry(&f->mapping->cstate.current_fh, 8192);
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 16384, &result),
+			   nfserr_serverfault);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->calls), 0);
+	nfsd_ffv2_test_object_geometry(&f->mapping->cstate.current_fh, 4096);
+	f->count = 0;
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_READ, 0, 0, 15, &result),
+			   nfserr_toosmall);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->calls), 0);
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_READ, 0, 0, 16, &result),
+			   nfs_ok);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->calls), 1);
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_HEADER_READ, 0, 0, 31,
+					   &result),
+			   nfserr_toosmall);
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_HEADER_READ, 0, 0, 32,
+					   &result),
+			   nfs_ok);
+	f->count = 1;
+	f->chunks[0].cr_effective_len = 4097;
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfserr_serverfault);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->calls), 3);
+}
+
+static void ffv2_read_ownership_test(struct kunit *test)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_provider *pinned;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	FFV2_EXPECT_STATUS(test, ffv2_read_admit(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfs_ok);
+	pinned = f->admission.provider;
+	KUNIT_EXPECT_NOT_NULL(test, pinned);
+	f->cleanup = 2;
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfserr_serverfault);
+	KUNIT_EXPECT_PTR_EQ_MSG(test, f->admission.provider, pinned,
+				"prior provider retention");
+	/* Preserve the known outstanding ref if the retention assertion fails. */
+	if (!f->admission.provider)
+		f->admission.provider = pinned;
+	f->cleanup = 3;
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfserr_serverfault);
+	f->cleanup = 0;
+	f->error = nfserr_io;
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfserr_io);
+	KUNIT_EXPECT_PTR_EQ(test, f->admission.provider, pinned);
+	f->error = nfs_ok;
+	f->cleanup = 1;
+	f->release_probe = &f->admission;
+	f->count = 2;
+	/* Valid cleanup is adopted before a count/EOF rejection. */
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfserr_serverfault);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
+	KUNIT_EXPECT_PTR_EQ(test, f->admission.provider_result, f);
+	f->count = 1;
+	f->error = nfserr_io;
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfserr_serverfault);
+	KUNIT_EXPECT_PTR_EQ(test, f->admission.provider, pinned);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 0);
+	nfsd_ffv2_complete(&f->admission);
+	nfsd_ffv2_complete(&f->admission);
+	KUNIT_EXPECT_EQ_MSG(test, atomic_read(&f->releases), 1,
+			    "single result cleanup");
+	KUNIT_EXPECT_TRUE_MSG(test, f->released_with_provider,
+			      "result release before provider put");
+	ffv2_read_reset(f);
+	f->cleanup = 1;
+	f->error = nfserr_io;
+	FFV2_EXPECT_STATUS(test, ffv2_read_admit(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfserr_io);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	nfsd_ffv2_complete(&f->admission);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 2);
+}
+
+static __be32 ffv2_read_handle(struct ffv2_read_fixture *f, u32 opcode,
+			       u32 count)
+{
+	memset(&f->op, 0, sizeof(f->op));
+	f->op.opnum = opcode;
+	/* Both request structures have the same prefix. */
+	f->op.u.chunk_read.cra_stateid = f->trust.stateid;
+	f->op.u.chunk_read.cra_count = count;
+	return nfsd_ffv2_test_dispatch_op(&f->mapping->rqst,
+					  &f->mapping->cstate, &f->op);
+}
+
+static void ffv2_read_encode(struct ffv2_read_fixture *f, void *bytes,
+			     size_t size)
+{
+	struct svc_rqst *rqstp = &f->mapping->rqst;
+	struct xdr_stream xdr = {};
+
+	memset(&rqstp->rq_res, 0, sizeof(rqstp->rq_res));
+	rqstp->rq_res.head[0].iov_base = bytes;
+	rqstp->rq_res.head[0].iov_len = 0;
+	rqstp->rq_res.buflen = size;
+	xdr_init_encode(&xdr, &rqstp->rq_res, NULL, NULL);
+	f->response.xdr = &xdr;
+	f->response.cstate.session = NULL;
+	f->response.cstate.slot = NULL;
+	nfsd4_encode_operation(&f->response, &f->op);
+	nfsd_ffv2_test_release_op(&f->op);
+}
+
+static void ffv2_read_copy_encode_test(struct kunit *test)
+{
+	static const __be32 statuses[] = { nfs_ok, nfserr_noent,
+					   nfserr_payload_not_atomic,
+					   nfserr_payload_lost };
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	__be32 wire[128];
+	u32 index, i;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	f->count = 4;
+	f->cleanup = 1;
+	for (i = 0; i < 4; i++) {
+		f->chunks[i].cr_status = statuses[i];
+		if (i > 1)
+			f->chunks[i].cr_effective_len = 0;
+	}
+	memset(f->bytes, 0x37, 4);
+	put_unaligned_be32(crc32_le(~0U, f->bytes + 4, 4) ^ ~0U,
+			   f->chunks[1].cr_checksum.cs_value);
+	/* Budget covers provider geometry, not just this tiny synthetic payload. */
+	f->mapping->rqst.rq_res.buflen = 32768;
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_READ, 4), nfs_ok);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	if (f->op.u.chunk_read.cra_nchunks != 4)
+		return;
+	KUNIT_EXPECT_EQ_MSG(test, ((u8 *)f->op.u.chunk_read.cra_payload)[0],
+			    (u8)0x37,
+			    "private payload independent of released result");
+	FFV2_EXPECT_STATUS(test, f->op.u.chunk_read.cra_chunks[3].cre_status,
+			   nfserr_payload_lost);
+	ffv2_read_encode(f, wire, sizeof(wire));
+	FFV2_EXPECT_STATUS(test, f->op.status, nfs_ok);
+	KUNIT_EXPECT_EQ(test, be32_to_cpu(wire[3]), 4U);
+	index = 4;
+	for (i = 0; i < 4; i++) {
+		FFV2_EXPECT_STATUS_MSG(test, wire[index + 12], statuses[i],
+				       "wire status byte order");
+		index += 14 + (i < 2 ? 1 : 0);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_read.cra_chunks, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_read.cra_payload, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+}
+
+static void ffv2_header_copy_encode_test(struct kunit *test)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	__be32 wire[128];
+	u32 i;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	f->count = 4;
+	f->cleanup = 1;
+	f->status[1] = nfserr_noent;
+	f->status[2] = nfserr_payload_not_atomic;
+	f->status[3] = nfserr_payload_lost;
+	f->owners[0].co_id = 77;
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_HEADER_READ, 4),
+			   nfs_ok);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	if (f->op.u.chunk_header_read.chrr_nents != 4)
+		return;
+	KUNIT_EXPECT_EQ_MSG(test, f->op.u.chunk_header_read.chrr_ents[0].che_owner.co_id,
+			    77U, "private header independent of released result");
+	ffv2_read_encode(f, wire, sizeof(wire));
+	FFV2_EXPECT_STATUS(test, f->op.status, nfs_ok);
+	FFV2_EXPECT_STATUS(test, wire[4], nfs_ok);
+	FFV2_EXPECT_STATUS(test, wire[5], nfserr_noent);
+	FFV2_EXPECT_STATUS(test, wire[6], nfserr_payload_not_atomic);
+	FFV2_EXPECT_STATUS(test, wire[7], nfserr_payload_lost);
+	/* Five arrays have the same count. */
+	for (i = 0; i < 5; i++) {
+		static const unsigned int counts[] = { 3, 8, 13, 30, 39 };
+
+		KUNIT_EXPECT_EQ(test, be32_to_cpu(wire[counts[i]]), 4U);
+	}
+	KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_header_read.chrr_ents, NULL);
+}
+
+static void ffv2_read_failures_test(struct kunit *test)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	struct nfsd_net *nn;
+	__be32 wire[16];
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	for (i = 1; i <= 2; i++) {
+		ffv2_read_reset(f);
+		f->cleanup = 1;
+		nfsd_ffv2_test_read_copy_fault(nn, i);
+		FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_READ, 1),
+				   nfserr_jukebox);
+		KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_read.cra_chunks, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_read.cra_payload, NULL);
+		KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), (int)i);
+	}
+	ffv2_read_reset(f);
+	f->cleanup = 1;
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_READ, 1), nfs_ok);
+	ffv2_read_encode(f, wire, sizeof(wire));
+	FFV2_EXPECT_STATUS(test, f->op.status, nfserr_resource);
+	KUNIT_EXPECT_EQ(test, f->mapping->rqst.rq_res.len, 8U);
+	KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_read.cra_chunks, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_read.cra_payload, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 3);
+	ffv2_read_reset(f);
+	f->cleanup = 1;
+	f->mapping->rqst.rq_res.len = 0;
+	f->mapping->rqst.rq_res.buflen = 8192;
+	nfsd_ffv2_test_read_copy_fault(nn, 1);
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_HEADER_READ, 1),
+			   nfserr_jukebox);
+	KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_header_read.chrr_ents, NULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 4);
+	ffv2_read_reset(f);
+	f->cleanup = 1;
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_HEADER_READ, 1),
+			   nfs_ok);
+	ffv2_read_encode(f, wire, sizeof(wire));
+	FFV2_EXPECT_STATUS(test, f->op.status, nfserr_resource);
+	KUNIT_EXPECT_EQ(test, f->mapping->rqst.rq_res.len, 8U);
+	KUNIT_EXPECT_PTR_EQ(test, f->op.u.chunk_header_read.chrr_ents, NULL);
+}
+
+static void ffv2_read_validation_test(struct kunit *test)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_net *nn;
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	FFV2_EXPECT_STATUS(test, ffv2_read_admit(f), nfs_ok);
+	for (i = 0; i < 6; i++) {
+		ffv2_read_reset(f);
+		switch (i) {
+		case 0:
+			f->chunks[0].cr_status = nfserr_io;
+			f->chunks[0].cr_effective_len = 0;
+			break;
+		case 1:
+			f->chunks[0].cr_checksum.cs_len = 3;
+			break;
+		case 2:
+			f->chunks[0].cr_checksum.cs_algorithm =
+				NFSD_FFV2_CHECKSUM_ALG_NONE;
+			break;
+		case 3:
+			f->count = 0;
+			f->eof = false;
+			break;
+		case 4:
+			f->chunks[0].cr_status = nfserr_payload_lost;
+			break;
+		case 5:
+			f->chunks[0].cr_status = nfserr_noent;
+			f->bytes[0] = 1;
+			break;
+		}
+		FFV2_EXPECT_STATUS(test,
+				   ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192,
+						   &result),
+				   nfserr_serverfault);
+	}
+	for (i = 1; i <= 5; i++) {
+		ffv2_read_reset(f);
+		f->missing_header = i;
+		FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_HEADER_READ,
+							 0, 1, 8192, &result), nfserr_serverfault);
+	}
+	f->missing_header = 0;
+	ffv2_read_reset(f);
+	f->status[0] = nfserr_io;
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_HEADER_READ, 0, 1, 8192,
+					   &result),
+			   nfserr_serverfault);
+	f->status[0] = nfserr_noent;
+	f->guards[0].cg_gen_id = 1;
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_HEADER_READ, 0, 1, 8192,
+					   &result),
+			   nfserr_serverfault);
+	f->guards[0].cg_gen_id = 0;
+	f->predecessors[0].disposition = 99;
+	FFV2_EXPECT_STATUS(test,
+			   ffv2_read_probe(f, OP_CHUNK_HEADER_READ, 0, 1, 8192,
+					   &result),
+			   nfserr_serverfault);
+}
+
+/* The worker owns its namespace and context through its last instruction. */
+struct ffv2_provider_drain {
+	struct net *net;
+	struct nfsd_net *nn;
+	refcount_t refs;
+	struct completion go;
+	struct completion *waiting;
+	struct completion done;
+	bool net_exit;
+};
+
+static void ffv2_provider_drain_put(struct ffv2_provider_drain *d)
+{
+	if (refcount_dec_and_test(&d->refs)) {
+		put_net(d->net);
+		kfree(d);
+	}
+}
+
+static int ffv2_provider_drain_thread(void *data)
+{
+	struct ffv2_provider_drain *d = data;
+
+	if (wait_for_completion_timeout(&d->go, 5 * HZ)) {
+		if (d->net_exit)
+			nfsd_ffv2_net_pre_exit(d->nn);
+		else
+			nfsd_ffv2_provider_remove(d->nn);
+	}
+	complete(&d->done);
+	ffv2_provider_drain_put(d);
+	return 0;
+}
+
+static void ffv2_provider_drain_check(struct kunit *test, bool callback,
+				      bool net_exit)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	struct nfsd_ffv2_chunk_result result;
+	struct ffv2_provider_drain *d;
+	struct task_struct *task;
+	unsigned long finished;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	d = kzalloc_obj(*d);
+	KUNIT_ASSERT_NOT_NULL(test, d);
+	d->net = get_net(f->mapping->registration->net);
+	d->nn = f->mapping->registration->nn;
+	d->net_exit = net_exit;
+	refcount_set(&d->refs, 1);
+	init_completion(&d->go);
+	init_completion(&d->done);
+	if (nfsd_ffv2_provider_install(d->nn, &ffv2_read_ops, f, 4096)) {
+		KUNIT_FAIL(test, "install drain provider");
+		goto out;
+	}
+	f->cleanup = 1;
+	FFV2_EXPECT_STATUS(test, ffv2_read_admit(f), nfs_ok);
+	if (!callback)
+		FFV2_EXPECT_STATUS(test,
+				   ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192,
+						   &result),
+				   nfs_ok);
+	task = kthread_create(ffv2_provider_drain_thread, d,
+			      "ffv2-provider-drain");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "create drain worker");
+		goto out;
+	}
+	get_task_struct(task);
+	refcount_inc(&d->refs);
+	nfsd_ffv2_test_provider_drain_hook(d->nn, &d->waiting);
+	wake_up_process(task);
+	if (callback) {
+		f->entered = &d->go;
+		f->drain_wait = &d->waiting;
+		/* The callback resumes only after the remover has queued a waiter. */
+		FFV2_EXPECT_STATUS(test,
+				   ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192,
+						   &result),
+				   nfs_ok);
+		f->entered = NULL;
+		f->drain_wait = NULL;
+	} else {
+		complete(&d->go);
+		bool queued;
+
+		KUNIT_EXPECT_EQ_MSG(test,
+				    read_poll_timeout(ffv2_provider_wait_queued,
+						      queued, queued, 1000,
+						      5000000, false,
+						      &d->waiting),
+				    0, "remover reached provider owner wait");
+	}
+	KUNIT_EXPECT_FALSE_MSG(test, completion_done(&d->done),
+			       "result holds provider drain");
+	nfsd_ffv2_complete(&f->admission);
+	if (net_exit) {
+		fh_put(&f->mapping->cstate.current_fh);
+		fh_put(&f->mapping->cstate.save_fh);
+	}
+	finished = wait_for_completion_timeout(&d->done, 5 * HZ);
+	KUNIT_EXPECT_NE_MSG(test, finished, 0UL,
+			    "owners released before drain returns");
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->releases), 1);
+	nfsd_ffv2_test_provider_drain_hook(d->nn, NULL);
+	put_task_struct(task);
+out:
+	ffv2_provider_drain_put(d);
+}
+
+static void ffv2_provider_callback_remove_test(struct kunit *test)
+{
+	ffv2_provider_drain_check(test, true, false);
+}
+
+static void ffv2_provider_result_remove_test(struct kunit *test)
+{
+	ffv2_provider_drain_check(test, false, false);
+}
+
+static void ffv2_provider_callback_net_exit_test(struct kunit *test)
+{
+	ffv2_provider_drain_check(test, true, true);
+}
+
+static void ffv2_provider_result_net_exit_test(struct kunit *test)
+{
+	ffv2_provider_drain_check(test, false, true);
+}
+
+static void ffv2_provider_replacement_test(struct kunit *test)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	struct ffv2_read_fixture *other;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	other = kunit_kzalloc(test, sizeof(*other), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	ffv2_read_reset(other);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	KUNIT_EXPECT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, other,
+						   4096),
+			-EBUSY);
+	FFV2_EXPECT_STATUS(test, ffv2_read_admit(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfs_ok);
+	nfsd_ffv2_complete(&f->admission);
+	nfsd_ffv2_provider_remove(nn);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, other, 4096), 0);
+	FFV2_EXPECT_STATUS(test, ffv2_read_admit(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfs_ok);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->calls), 1);
+	KUNIT_EXPECT_EQ(test, atomic_read(&other->calls), 1);
+	nfsd_ffv2_complete(&f->admission);
+	/* The synthetic provider has no adapter-owned allocation to retire. */
+	nfsd_ffv2_provider_remove(nn);
+	other = ffv2_read_fixture(test);
+	KUNIT_ASSERT_NOT_NULL(test, other);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(other->mapping->registration->nn,
+						   &ffv2_read_ops, other, 4096),
+		0);
+	FFV2_EXPECT_STATUS(test, ffv2_read_admit(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, ffv2_read_probe(f, OP_CHUNK_READ, 0, 1, 8192, &result),
+			   nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test, atomic_read(&other->calls), 0);
+}
+
+static void ffv2_header_bounds_test(struct kunit *test)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	struct nfsd_net *nn;
+	__be32 wire[64];
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	f->count = 2;
+	f->predecessors[0].disposition = NFSD_FFV2_RETAINED_PRESENT;
+	f->predecessors[0].rp_owner.co_id = 19;
+	f->predecessors[1].disposition = NFSD_FFV2_RETAINED_ERRORED;
+	f->mapping->rqst.rq_res.buflen = 120;
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_HEADER_READ, 2),
+			   nfs_ok);
+	KUNIT_EXPECT_EQ(test, f->op.u.chunk_header_read.chrr_nents, 1U);
+	KUNIT_EXPECT_FALSE(test, f->op.u.chunk_header_read.chrr_eof);
+	KUNIT_EXPECT_EQ(test,
+			f->op.u.chunk_header_read.chrr_ents[0]
+				.che_predecessor.rp_owner.co_id,
+			19U);
+	ffv2_read_encode(f, wire, sizeof(wire));
+	FFV2_EXPECT_STATUS(test, f->op.status, nfs_ok);
+	KUNIT_EXPECT_EQ(test, be32_to_cpu(wire[3]), 1U);
+	f->response.cstate.slot = f->slot;
+	f->slot->sl_flags = NFSD4_SLOT_CACHETHIS;
+	f->mapping->rqst.rq_res.len = 0;
+	f->mapping->rqst.rq_res.buflen = 31;
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_HEADER_READ, 0),
+			   nfserr_rep_too_big_to_cache);
+	KUNIT_EXPECT_EQ_MSG(test, atomic_read(&f->calls), 1,
+			    "header size before callback");
+}
+
+static void ffv2_read_authority_test(struct kunit *test)
+{
+	struct ffv2_read_fixture *f = ffv2_read_fixture(test);
+	struct nfsd_net *nn;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->mapping->registration->nn;
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(nn, &ffv2_read_ops, f, 4096),
+			0);
+	f->mapping->args.ffv2_digest_valid = false;
+	f->mapping->args.ffv2_decode_class = NFSD4_FFV2_DECODE_BADXDR;
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_READ, 1),
+			   nfserr_bad_xdr);
+	f->mapping->args.ffv2_digest_valid = true;
+	f->trust.stateid.si_generation++;
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_READ, 1),
+			   nfserr_bad_stateid);
+	f->trust.stateid.si_generation--;
+	f->mapping->rqst.rq_cred.cr_principal = "other@KUNIT";
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_READ, 1),
+			   nfserr_acces);
+	f->mapping->rqst.rq_cred.cr_principal = (char *)f->trust.principal;
+	KUNIT_EXPECT_EQ_MSG(test, atomic_read(&f->calls), 0,
+			    "authority before provider dispatch");
+	FFV2_EXPECT_STATUS(test, ffv2_read_handle(f, OP_CHUNK_READ, 1), nfs_ok);
+	KUNIT_EXPECT_EQ(test, atomic_read(&f->calls), 1);
+}
+
 static struct kunit_case nfsd_ffv2_test_cases[] = {
+	KUNIT_CASE(ffv2_header_bounds_test),
+	KUNIT_CASE(ffv2_read_authority_test),
+	KUNIT_CASE(ffv2_provider_callback_remove_test),
+	KUNIT_CASE(ffv2_provider_result_remove_test),
+	KUNIT_CASE(ffv2_provider_callback_net_exit_test),
+	KUNIT_CASE(ffv2_provider_result_net_exit_test),
+	KUNIT_CASE_SLOW(ffv2_provider_replacement_test),
+
+	KUNIT_CASE(ffv2_read_bounds_test),
+	KUNIT_CASE(ffv2_read_ownership_test),
+	KUNIT_CASE(ffv2_read_copy_encode_test),
+	KUNIT_CASE(ffv2_header_copy_encode_test),
+	KUNIT_CASE(ffv2_read_failures_test),
+	KUNIT_CASE(ffv2_read_validation_test),
+
 	KUNIT_CASE(nfsd_ffv2_trust_drain_test),
 	KUNIT_CASE_SLOW(nfsd_ffv2_trust_budget_test),
 	KUNIT_CASE(nfsd_ffv2_trust_policy_test),
