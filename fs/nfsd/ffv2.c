@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/cred.h>
+#include <linux/crc32.h>
 #include <linux/namei.h>
 #include <linux/rhashtable.h>
 #include <linux/workqueue.h>
@@ -89,6 +90,23 @@ int nfsd_ffv2_fh_encode(struct knfsd_fh *fh,
 	fh->fh_size = total_len;
 	return 0;
 }
+
+struct nfsd_ffv2_provider {
+	const struct nfsd_ffv2_provider_ops *ops;
+	void *data;
+	u32 chunk_size;
+	refcount_t ref;
+	struct completion gone;
+};
+
+/* Drop a callback's reference, releasing a removal waiting on the last. */
+static void nfsd_ffv2_provider_put(struct nfsd_ffv2_provider *provider)
+{
+	if (refcount_dec_and_test(&provider->ref))
+		complete(&provider->gone);
+}
+
+static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn);
 
 enum nfsd_ffv2_unregister_kind {
 	NFSD_FFV2_UNREGISTER_NONE,
@@ -1043,6 +1061,7 @@ void nfsd_ffv2_net_init(struct nfsd_net *nn)
 {
 	struct nfsd_ffv2_anchor *anchor = &nn->ffv2;
 
+	RCU_INIT_POINTER(anchor->provider, NULL);
 	refcount_set(&anchor->ref, 1);
 	init_completion(&anchor->released);
 	mutex_init(&anchor->lock);
@@ -1367,6 +1386,7 @@ void nfsd_ffv2_net_pre_exit(struct nfsd_net *nn)
 	generation = nfsd_ffv2_retire_begin_locked(anchor);
 	mutex_unlock(&anchor->lock);
 
+	nfsd_ffv2_provider_shutdown(nn);
 	nfsd_ffv2_retire_finish(anchor, generation);
 	wait_event(anchor->authority_wait, nfsd_ffv2_authority_work_idle(anchor));
 	nfsd_ffv2_anchor_put(anchor);
@@ -1599,6 +1619,9 @@ nfsd_ffv2_admit_generation(struct nfsd_net *nn,
 	admission->anchor = NULL;
 	admission->generation = NULL;
 	admission->task = NULL;
+	admission->provider = NULL;
+	admission->provider_result = NULL;
+	admission->provider_result_release = NULL;
 	if (!nfsd_ffv2_anchor_get(anchor))
 		return -ESHUTDOWN;
 	/* EXITING is published before the owner reference is released. */
@@ -1656,7 +1679,9 @@ int nfsd_ffv2_admit(struct svc_rqst *rqstp,
  * nfsd_ffv2_complete - consume an admission once
  * @admission: admitted record or an already completed record
  *
- * Context: Does not sleep. Serial or concurrent repeat completion is harmless.
+ * Context: May sleep when releasing a provider result. Call without spinlocks.
+ * Call after the last callback. Concurrent completion consumes ownership
+ * once; keep the admission allocated until the completing task returns.
  */
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 {
@@ -1668,6 +1693,15 @@ void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission)
 		return;
 	anchor = admission->anchor;
 
+	if (admission->provider_result_release) {
+		admission->provider_result_release(admission->provider_result);
+		admission->provider_result_release = NULL;
+		admission->provider_result = NULL;
+	}
+	if (admission->provider) {
+		nfsd_ffv2_provider_put(admission->provider);
+		admission->provider = NULL;
+	}
 	spin_lock(&generation->admissions_lock);
 	list_del_init(&admission->node);
 	spin_unlock(&generation->admissions_lock);
@@ -3186,6 +3220,9 @@ static int nfsd_ffv2_binding_admit(struct nfsd_net *nn,
 	int error = -ESTALE;
 
 	INIT_LIST_HEAD(&binding->admission.node);
+	binding->admission.provider = NULL;
+	binding->admission.provider_result = NULL;
+	binding->admission.provider_result_release = NULL;
 	if (!nfsd_ffv2_anchor_get(anchor))
 		return -ESHUTDOWN;
 	mutex_lock(&anchor->lock);
@@ -3246,6 +3283,398 @@ static bool nfsd_ffv2_binding_current(struct nfsd_net *nn,
 		binding->object->visible;
 	mutex_unlock(&anchor->lock);
 	return valid;
+}
+
+static bool nfsd_ffv2_read_status_valid(__be32 status)
+{
+	return status == nfs_ok || status == nfserr_payload_not_atomic ||
+	       status == nfserr_noent || status == nfserr_payload_lost;
+}
+
+static bool nfsd_ffv2_checksum_valid(const struct nfsd_ffv2_checksum *checksum)
+{
+	return checksum->cs_algorithm == NFSD_FFV2_CHECKSUM_ALG_CRC32 &&
+	       checksum->cs_len == NFSD_FFV2_CHECKSUM_CRC32_LEN;
+}
+
+static bool
+nfsd_ffv2_read_chunks_valid(u32 count, u32 chunk_size,
+			    const struct nfsd_ffv2_read_chunk *chunks)
+{
+	u64 total = 0;
+	u32 i;
+
+	for (i = 0; i < count; i++) {
+		const struct nfsd_ffv2_read_chunk *chunk = &chunks[i];
+
+		if (!nfsd_ffv2_read_status_valid(chunk->cr_status))
+			return false;
+		if (!nfsd_ffv2_checksum_valid(&chunk->cr_checksum))
+			return false;
+		if (chunk->cr_status == nfserr_noent) {
+			u32 crc;
+
+			if (!chunk->cr_effective_len ||
+			    chunk->cr_effective_len > chunk_size ||
+			    !chunk->cr_chunk ||
+			    memchr_inv(chunk->cr_chunk, 0,
+				       chunk->cr_effective_len) ||
+			    chunk->cr_owner.co_cohort_id ||
+			    chunk->cr_owner.co_client_id ||
+			    chunk->cr_owner.co_id ||
+			    chunk->cr_guard.cg_gen_id ||
+			    chunk->cr_guard.cg_client_id !=
+				    NFSD_FFV2_GUARD_CLIENT_ID_NONE ||
+			    chunk->cr_payload_id || chunk->cr_locked)
+				return false;
+			crc = crc32_le(~0U, chunk->cr_chunk,
+				       chunk->cr_effective_len) ^
+			      ~0U;
+			if (get_unaligned_be32(chunk->cr_checksum.cs_value) !=
+			    crc)
+				return false;
+			total += chunk->cr_effective_len;
+			if (total > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+				return false;
+			continue;
+		}
+		if (chunk->cr_status != nfs_ok) {
+			if (chunk->cr_effective_len)
+				return false;
+			continue;
+		}
+		if (chunk->cr_effective_len > chunk_size ||
+		    chunk->cr_effective_len > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+			return false;
+		if (chunk->cr_effective_len && !chunk->cr_chunk)
+			return false;
+		total += chunk->cr_effective_len;
+	}
+	return total <= NFSD_FFV2_MAX_PAYLOAD_BYTES;
+}
+
+static bool
+nfsd_ffv2_header_entries_valid(u32 count,
+			       const struct nfsd_ffv2_chunk_result *result)
+{
+	u32 i;
+
+	for (i = 0; i < count; i++) {
+		const struct nfsd_ffv2_chunk_guard *guard;
+		const struct nfsd_ffv2_retained *pred;
+
+		if (!nfsd_ffv2_read_status_valid(result->header.status[i]))
+			return false;
+		pred = &result->header.predecessors[i];
+		switch (pred->disposition) {
+		case NFSD_FFV2_RETAINED_ABSENT:
+		case NFSD_FFV2_RETAINED_PRESENT:
+		case NFSD_FFV2_RETAINED_ERRORED:
+			break;
+		default:
+			return false;
+		}
+
+		if (result->header.status[i] != nfserr_noent)
+			continue;
+		guard = &result->header.guards[i];
+		if (guard->cg_gen_id ||
+		    guard->cg_client_id != NFSD_FFV2_GUARD_CLIENT_ID_NONE)
+			return false;
+		if (pred->disposition != NFSD_FFV2_RETAINED_ABSENT)
+			return false;
+	}
+	return true;
+}
+
+static bool
+nfsd_ffv2_result_valid(u32 opnum, u32 chunk_size,
+		       const struct nfsd_ffv2_chunk_request *request,
+		       const struct nfsd_ffv2_chunk_result *result)
+{
+	if (result->count > request->count)
+		return false;
+	if (result->count < request->count && !result->eof)
+		return false;
+	if (!result->count)
+		return true;
+	if (opnum == OP_CHUNK_READ)
+		return result->read.chunks &&
+		       nfsd_ffv2_read_chunks_valid(result->count, chunk_size,
+						   result->read.chunks);
+	if (!result->header.status || !result->header.locked ||
+	    !result->header.owners || !result->header.guards ||
+	    !result->header.predecessors)
+		return false;
+	return nfsd_ffv2_header_entries_valid(result->count, result);
+}
+
+static u32 nfsd_ffv2_read_bound(u32 count, u32 chunk_size)
+{
+	u64 payload, padding, total;
+
+	if (check_mul_overflow((u64)count, (u64)NFSD4_FFV2_READ_ENT_WORDS,
+			       &total))
+		return U32_MAX;
+	if (check_add_overflow(total, (u64)NFSD4_FFV2_READ_FIXED_WORDS, &total))
+		return U32_MAX;
+	if (check_mul_overflow(total, (u64)XDR_UNIT, &total))
+		return U32_MAX;
+	if (check_mul_overflow((u64)count, (u64)chunk_size, &payload))
+		return U32_MAX;
+	payload = min_t(u64, payload, NFSD_FFV2_MAX_PAYLOAD_BYTES);
+	if (check_mul_overflow((u64)count, (u64)(XDR_UNIT - 1), &padding))
+		return U32_MAX;
+
+	if (check_add_overflow(total, payload, &total) ||
+	    check_add_overflow(total, padding, &total))
+		return U32_MAX;
+	return total > U32_MAX ? U32_MAX : (u32)total;
+}
+
+/* Unpublish before waiting for RCU readers and admitted result owners. */
+static struct nfsd_ffv2_provider *
+nfsd_ffv2_provider_unpublish(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_provider *provider;
+
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	provider = rcu_dereference_protected(nn->ffv2.provider,
+					     lockdep_is_held(&nfsd_ffv2_registry_lock));
+	rcu_assign_pointer(nn->ffv2.provider, NULL);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	return provider;
+}
+
+static void nfsd_ffv2_provider_drain(struct nfsd_net *nn,
+				     struct nfsd_ffv2_provider *provider)
+{
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	struct completion **waiting =
+		READ_ONCE(nn->ffv2.test_registration.provider_drain_wait);
+#endif
+
+	synchronize_rcu();
+	nfsd_ffv2_provider_put(provider);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (waiting) {
+		/* Pairs with the observer's acquire while it holds a provider ref. */
+		smp_store_release(waiting, &provider->gone);
+	}
+#endif
+	wait_for_completion(&provider->gone);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	if (waiting) {
+		/* The observer cannot dereference the completion after withdrawal. */
+		smp_store_release(waiting, NULL);
+	}
+#endif
+	kfree(provider);
+}
+
+static bool nfsd_ffv2_provider_shutdown(struct nfsd_net *nn)
+{
+	struct nfsd_ffv2_provider *provider = nfsd_ffv2_provider_unpublish(nn);
+
+	if (!provider)
+		return false;
+	nfsd_ffv2_provider_drain(nn, provider);
+	return true;
+}
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_test_provider_drain_hook(struct nfsd_net *nn,
+					struct completion **waiting)
+{
+	WRITE_ONCE(nn->ffv2.test_registration.provider_drain_wait, waiting);
+}
+
+void nfsd_ffv2_test_read_copy_fault(struct nfsd_net *nn, unsigned int stage)
+{
+	WRITE_ONCE(nn->ffv2.test_registration.read_copy_fault, stage);
+}
+
+void nfsd_ffv2_test_object_geometry(struct svc_fh *fhp, u32 chunk_size)
+{
+	fhp->fh_ffv2_binding->object->chunk_size = chunk_size;
+}
+
+int nfsd_ffv2_provider_install(struct nfsd_net *nn,
+			       const struct nfsd_ffv2_provider_ops *ops,
+			       void *data, u32 chunk_size)
+{
+	struct nfsd_ffv2_provider *provider;
+	struct nfsd_ffv2_anchor *anchor;
+
+	if (!nn || !ops || !ops->chunk_read || !ops->chunk_header_read)
+		return -EINVAL;
+	if (!chunk_size || chunk_size > NFSD_FFV2_MAX_PAYLOAD_BYTES)
+		return -EINVAL;
+	anchor = &nn->ffv2;
+	provider = kzalloc_obj(*provider, GFP_KERNEL);
+	if (!provider)
+		return -ENOMEM;
+	provider->ops = ops;
+	provider->data = data;
+	provider->chunk_size = chunk_size;
+	refcount_set(&provider->ref, 1);
+	init_completion(&provider->gone);
+	mutex_lock(&anchor->lock);
+	if (anchor->net_state != NFSD_FFV2_NET_LIVE) {
+		mutex_unlock(&anchor->lock);
+		kfree(provider);
+		return -ESHUTDOWN;
+	}
+	mutex_lock(&nfsd_ffv2_registry_lock);
+	if (rcu_dereference_protected(nn->ffv2.provider,
+				      lockdep_is_held(&nfsd_ffv2_registry_lock))) {
+		mutex_unlock(&nfsd_ffv2_registry_lock);
+		mutex_unlock(&anchor->lock);
+		kfree(provider);
+		return -EBUSY;
+	}
+	rcu_assign_pointer(nn->ffv2.provider, provider);
+	mutex_unlock(&nfsd_ffv2_registry_lock);
+	mutex_unlock(&anchor->lock);
+	return 0;
+}
+
+/**
+ * nfsd_ffv2_provider_remove - remove @nn's provider
+ * @nn: the namespace whose boundary is being closed
+ *
+ * Takes the provider out of the registry, then waits for the callbacks and
+ * admissions still holding it, so no request can be running in provider
+ * code once this returns and the caller may free its operations vector and
+ * state.  A caller that must keep an admission alive across the removal
+ * cannot use this, because the wait is for that admission.
+ *
+ * Context: Sleeps. Caller holds no admission that would prevent drain.
+ */
+void nfsd_ffv2_provider_remove(struct nfsd_net *nn)
+{
+	nfsd_ffv2_provider_shutdown(nn);
+}
+#endif
+
+static __be32
+nfsd_ffv2_provider_dispatch(struct nfsd_net *nn, u32 opnum,
+			    const struct nfsd_ffv2_object *object,
+			    const struct nfsd_ffv2_chunk_request *request,
+			    struct nfsd_ffv2_chunk_result *result, u32 available,
+			    struct nfsd_ffv2_admission *admission)
+{
+	struct nfsd_ffv2_provider *provider;
+	bool pinned = admission->provider;
+	__be32 status;
+
+	if (pinned) {
+		provider = admission->provider;
+	} else {
+		rcu_read_lock();
+		provider = rcu_dereference(nn->ffv2.provider);
+		if (!provider || !refcount_inc_not_zero(&provider->ref)) {
+			rcu_read_unlock();
+			return nfserr_notsupp;
+		}
+		rcu_read_unlock();
+	}
+	if (request->count > (opnum == OP_CHUNK_READ ?
+				      4096 :
+				      NFSD_FFV2_CHUNK_HEADER_READ_MAX) ||
+	    request->offset > U64_MAX - request->count) {
+		if (!pinned)
+			nfsd_ffv2_provider_put(provider);
+		return nfserr_inval;
+	}
+	if (opnum == OP_CHUNK_HEADER_READ &&
+	    (u64)(8 + (u64)request->count * 9) * XDR_UNIT > available) {
+		if (!pinned)
+			nfsd_ffv2_provider_put(provider);
+		return nfserr_toosmall;
+	}
+	if (object->chunk_size && object->chunk_size != provider->chunk_size) {
+		if (!pinned)
+			nfsd_ffv2_provider_put(provider);
+		return nfserr_serverfault;
+	}
+	if (opnum == OP_CHUNK_READ &&
+	    nfsd_ffv2_read_bound(request->count, provider->chunk_size) >
+		    available) {
+		if (!pinned)
+			nfsd_ffv2_provider_put(provider);
+		return nfserr_toosmall;
+	}
+
+	memset(result, 0, sizeof(*result));
+	if (opnum == OP_CHUNK_READ)
+		status = provider->ops->chunk_read(provider->data, object,
+						   request, result);
+	else
+		status = provider->ops->chunk_header_read(provider->data, object, request, result);
+	/* The admission pins borrowed data even after a callback error. */
+	if (!pinned)
+		admission->provider = provider;
+	if (!!result->private != !!result->release) {
+		status = nfserr_serverfault;
+	} else if (result->release) {
+		if (!admission->provider_result) {
+			admission->provider_result = result->private;
+			admission->provider_result_release = result->release;
+		} else {
+			/* A later callback cannot replace an outstanding owner. */
+			if (result->private != admission->provider_result)
+				result->release(result->private);
+			status = nfserr_serverfault;
+		}
+	}
+
+	return status;
+}
+
+/**
+ * nfsd_ffv2_provider_probe - borrow one namespace's provider result
+ * @rqstp: current request
+ * @fhp: mapped filehandle already authorized for this operation
+ * @opnum: CHUNK_READ or CHUNK_HEADER_READ
+ * @request: chunk range
+ * @result: borrowed data, valid until admission completion
+ * @available: encoded response capacity in bytes
+ * @admission: execution admission held by the current task
+ *
+ * Context: Sleeps. Call after ordered validation, without spinlocks.
+ * Return: NFS status. No provider returns NFS4ERR_NOTSUPP.
+ */
+__be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				u32 opnum,
+				const struct nfsd_ffv2_chunk_request *request,
+				struct nfsd_ffv2_chunk_result *result,
+				u32 available,
+				struct nfsd_ffv2_admission *admission)
+{
+	struct nfsd_ffv2_binding *binding = fhp->fh_ffv2_binding;
+	struct nfsd_net *nn;
+	__be32 status;
+
+	if (!admission || !admission->generation || admission->task != current)
+		return nfserr_serverfault;
+	if (opnum != OP_CHUNK_READ && opnum != OP_CHUNK_HEADER_READ)
+		return nfserr_notsupp;
+	if (!binding || binding->net != SVC_NET(rqstp) ||
+	    binding->admission.generation != admission->generation)
+		return nfserr_stale;
+	nn = net_generic(binding->net, nfsd_net_id);
+	if (!nfsd_ffv2_binding_current(nn, binding))
+		return nfserr_stale;
+	status = nfsd_ffv2_provider_dispatch(nn, opnum, binding->object,
+					     request, result, available,
+					     admission);
+	/* Adopt cleanup ownership before rejecting malformed returned fields. */
+	if (status == nfs_ok &&
+	    !nfsd_ffv2_result_valid(opnum, admission->provider->chunk_size,
+				    request, result))
+		return nfserr_serverfault;
+	return status;
 }
 
 static bool nfsd_ffv2_mapped_target_valid(struct svc_fh *fhp,

@@ -153,6 +153,8 @@ xdrgen_decode_nfsstat4(struct xdr_stream *xdr, nfsstat4 *ptr)
 	case NFS4ERR_OFFLOAD_NO_REQS:
 	case NFS4ERR_NOXATTR:
 	case NFS4ERR_XATTR2BIG:
+	case NFS4ERR_PAYLOAD_NOT_ATOMIC:
+	case NFS4ERR_PAYLOAD_LOST:
 		break;
 	default:
 		return false;

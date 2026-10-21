@@ -313,6 +313,8 @@ void		nfsd_lockd_shutdown(void);
 #define nfserr_file_open		cpu_to_be32(NFS4ERR_FILE_OPEN)
 #define nfserr_xattr2big		cpu_to_be32(NFS4ERR_XATTR2BIG)
 #define nfserr_noxattr			cpu_to_be32(NFS4ERR_NOXATTR)
+#define nfserr_payload_not_atomic	cpu_to_be32(NFS4ERR_PAYLOAD_NOT_ATOMIC)
+#define nfserr_payload_lost		cpu_to_be32(NFS4ERR_PAYLOAD_LOST)
 
 /*
  * Error codes for internal use.  These are based at an impossible

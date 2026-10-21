@@ -113,6 +113,8 @@ struct nfsd_ffv2_registration_test {
 	atomic_t reply_consumed;
 	atomic_t bindings;
 	atomic_t dispatch_calls;
+	unsigned int read_copy_fault;
+	struct completion **provider_drain_wait;
 	struct completion *validation_entered;
 	struct completion *validation_continue;
 	struct completion *execute_entered;
@@ -130,9 +132,115 @@ bool nfsd_ffv2_test_registration_fault(struct nfsd_net *nn,
 				       enum nfsd_ffv2_test_registration_fault fault);
 #endif
 
+struct nfsd_ffv2_provider;
+struct nfsd_ffv2_admission;
+
+#define NFSD_FFV2_CHUNK_HEADER_READ_MAX 1024
+#define NFSD_FFV2_CHECKSUM_VALUE_MAX 64
+
+#define NFSD_FFV2_CHECKSUM_ALG_NONE 0
+#define NFSD_FFV2_CHECKSUM_ALG_CRC32 1
+
+#define NFSD_FFV2_CHECKSUM_CRC32_LEN 4
+
+#define NFSD_FFV2_MAX_PAYLOAD_BYTES 4194304U
+
+#define NFSD_FFV2_GUARD_CLIENT_ID_NONE 0U
+
+#define NFSD4_FFV2_READ_FIXED_WORDS (2 + 1 + 1)
+#define NFSD4_FFV2_READ_ENT_WORDS 14
+
+struct nfsd_ffv2_chunk_owner {
+	u64 co_cohort_id;
+	u32 co_client_id;
+	u32 co_id;
+};
+
+struct nfsd_ffv2_chunk_guard {
+	u32 cg_gen_id;
+	u32 cg_client_id;
+};
+
+struct nfsd_ffv2_checksum {
+	u32 cs_algorithm;
+	u32 cs_len;
+	u8 cs_value[NFSD_FFV2_CHECKSUM_VALUE_MAX];
+};
+
+enum nfsd_ffv2_retained_disposition {
+	NFSD_FFV2_RETAINED_ABSENT,
+	NFSD_FFV2_RETAINED_PRESENT,
+	NFSD_FFV2_RETAINED_ERRORED,
+};
+
+struct nfsd_ffv2_retained {
+	enum nfsd_ffv2_retained_disposition disposition;
+	struct nfsd_ffv2_chunk_owner rp_owner;
+};
+
+struct nfsd_ffv2_read_chunk {
+	struct nfsd_ffv2_checksum cr_checksum;
+	u32 cr_effective_len;
+	struct nfsd_ffv2_chunk_owner cr_owner;
+	struct nfsd_ffv2_chunk_guard cr_guard;
+	u32 cr_payload_id;
+	u32 cr_locked;
+	__be32 cr_status;
+	const u8 *cr_chunk;
+};
+
+struct nfsd_ffv2_chunk_request {
+	u64 offset;
+	u32 count;
+};
+
+struct nfsd_ffv2_chunk_result {
+	bool eof;
+	u32 count;
+	void *private;
+	void (*release)(void *private);
+	union {
+		struct {
+			const struct nfsd_ffv2_read_chunk *chunks;
+		} read;
+		struct {
+			const __be32 *status;
+			const u32 *locked;
+			const struct nfsd_ffv2_chunk_owner *owners;
+			const struct nfsd_ffv2_chunk_guard *guards;
+			const struct nfsd_ffv2_retained *predecessors;
+		} header;
+	};
+};
+
+/*
+ * Callbacks and result release may sleep. Borrowed arrays and payload stay
+ * immutable until admission completion. A non-NULL private/release pair
+ * transfers cleanup ownership even when the callback returns an error.
+ * One admission may retain only one such owner; further callbacks must not
+ * replace it. The operations vector and data outlive provider removal.
+ */
+struct nfsd_ffv2_provider_ops {
+	__be32 (*chunk_read)(void *provider,
+			     const struct nfsd_ffv2_object *object,
+			     const struct nfsd_ffv2_chunk_request *request,
+			     struct nfsd_ffv2_chunk_result *result);
+	__be32 (*chunk_header_read)(void *provider, const struct nfsd_ffv2_object *object,
+				    const struct nfsd_ffv2_chunk_request *request,
+		struct nfsd_ffv2_chunk_result *result);
+};
+
+__be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
+				u32 opnum,
+				const struct nfsd_ffv2_chunk_request *request,
+				struct nfsd_ffv2_chunk_result *result,
+				u32 available,
+				struct nfsd_ffv2_admission *admission);
+
 struct nfsd_ffv2_anchor {
 	/* Keeps the embedded anchor alive across admitted callbacks. */
 	refcount_t			ref;
+	struct nfsd_ffv2_provider __rcu *provider;
 	struct completion		released;
 	/* Serializes service state, generation publication, and admission. */
 	struct mutex			lock;
@@ -277,6 +385,9 @@ struct nfsd_ffv2_admission {
 	struct nfsd_ffv2_anchor		*anchor;
 	struct nfsd_ffv2_generation	*generation;
 	struct task_struct		*task;
+	struct nfsd_ffv2_provider *provider;
+	void *provider_result;
+	void (*provider_result_release)(void *result);
 };
 
 int nfsd_ffv2_admit(struct svc_rqst *rqstp,
@@ -284,6 +395,14 @@ int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission);
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+int nfsd_ffv2_provider_install(struct nfsd_net *nn,
+			       const struct nfsd_ffv2_provider_ops *ops,
+			       void *data, u32 chunk_size);
+void nfsd_ffv2_provider_remove(struct nfsd_net *nn);
+void nfsd_ffv2_test_provider_drain_hook(struct nfsd_net *nn,
+					struct completion **waiting);
+void nfsd_ffv2_test_read_copy_fault(struct nfsd_net *nn, unsigned int stage);
+void nfsd_ffv2_test_object_geometry(struct svc_fh *fhp, u32 chunk_size);
 struct nfsd4_compound_state;
 struct nfsd4_op;
 __be32 nfsd_ffv2_test_dispatch_op(struct svc_rqst *rqstp,

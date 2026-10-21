@@ -6977,6 +6977,200 @@ typedef __be32(*nfsd4_enc)(struct nfsd4_compoundres *, __be32, union nfsd4_op_u 
  * since we don't need to filter out obsolete ops as this is
  * done in the decoding phase.
  */
+
+#ifdef CONFIG_NFSD_FFV2
+static __be32
+nfsd4_encode_chunk_owner4(struct xdr_stream *xdr,
+			  const struct nfsd_ffv2_chunk_owner *owner)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_uint64_t(xdr, owner->co_cohort_id);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, owner->co_client_id);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	return nfsd4_encode_uint32_t(xdr, owner->co_id);
+}
+
+static __be32
+nfsd4_encode_chunk_guard4(struct xdr_stream *xdr,
+			  const struct nfsd_ffv2_chunk_guard *guard)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_uint32_t(xdr, guard->cg_gen_id);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	return nfsd4_encode_uint32_t(xdr, guard->cg_client_id);
+}
+
+static __be32 nfsd4_encode_checksum4(struct xdr_stream *xdr,
+				     const struct nfsd_ffv2_checksum *checksum)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_uint32_t(xdr, checksum->cs_algorithm);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	return nfsd4_encode_opaque(xdr, checksum->cs_value, checksum->cs_len);
+}
+
+static __be32
+nfsd4_encode_optional_retained4(struct xdr_stream *xdr,
+				const struct nfsd_ffv2_retained *pred)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_uint32_t(xdr, pred->disposition);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	if (pred->disposition == NFSD_FFV2_RETAINED_ABSENT)
+		return nfs_ok;
+	return nfsd4_encode_chunk_owner4(xdr, &pred->rp_owner);
+}
+
+static __be32 nfsd4_encode_chunk_payload(struct xdr_stream *xdr, const u8 *buf,
+					 u32 len)
+{
+	u32 pad = xdr_pad_size(len);
+	__be32 nfserr;
+	u32 this;
+	__be32 *p;
+
+	nfserr = nfsd4_encode_uint32_t(xdr, len);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	if (!len)
+		return nfs_ok;
+
+	this = min_t(u32, len, (u32)((char *)xdr->end - (char *)xdr->p));
+	while (len) {
+		if (!this)
+			this = min_t(u32, len, PAGE_SIZE);
+		p = xdr_reserve_space(xdr, this);
+		if (!p)
+			return nfserr_resource;
+		memcpy(p, buf, this);
+		buf += this;
+		len -= this;
+		if (!len && pad)
+			memset((char *)p + this, 0, pad);
+		this = min_t(u32, len, PAGE_SIZE);
+	}
+	return nfs_ok;
+}
+
+static __be32 nfsd4_encode_read_chunk4(struct xdr_stream *xdr,
+				       const struct nfsd4_chunk_read *cr,
+				       const struct nfsd4_chunk_read_ent *ent)
+{
+	__be32 nfserr;
+
+	nfserr = nfsd4_encode_checksum4(xdr, &ent->cre_checksum);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, ent->cre_effective_len);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_chunk_owner4(xdr, &ent->cre_owner);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_chunk_guard4(xdr, &ent->cre_guard);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, ent->cre_payload_id);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, ent->cre_locked);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	if (xdr_stream_encode_be32(xdr, ent->cre_status) != XDR_UNIT)
+		return nfserr_resource;
+	return nfsd4_encode_chunk_payload(xdr,
+		cr->cra_payload ? cr->cra_payload + ent->cre_payload_off : NULL,
+		ent->cre_effective_len);
+}
+
+static __be32 nfsd4_encode_chunk_read(struct nfsd4_compoundres *resp,
+				      __be32 nfserr, union nfsd4_op_u *u)
+{
+	const struct nfsd4_chunk_read *cr = &u->chunk_read;
+	struct xdr_stream *xdr = resp->xdr;
+	u32 i;
+
+	nfserr = nfsd4_encode_bool(xdr, cr->cra_eof);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, cr->cra_nchunks);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < cr->cra_nchunks; i++) {
+		nfserr = nfsd4_encode_read_chunk4(xdr, cr, &cr->cra_chunks[i]);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+	return nfs_ok;
+}
+
+static __be32 nfsd4_encode_chunk_header_read(struct nfsd4_compoundres *resp,
+					     __be32 nfserr, union nfsd4_op_u *u)
+{
+	const struct nfsd4_chunk_header_read *hr = &u->chunk_header_read;
+	struct xdr_stream *xdr = resp->xdr;
+	u32 i;
+
+	nfserr = nfsd4_encode_bool(xdr, hr->chrr_eof);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++)
+		if (xdr_stream_encode_be32(xdr, hr->chrr_ents[i].che_status) !=
+		    XDR_UNIT)
+			return nfserr_resource;
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++) {
+		nfserr =
+			nfsd4_encode_uint32_t(xdr, hr->chrr_ents[i].che_locked);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++) {
+		nfserr = nfsd4_encode_chunk_owner4(xdr,
+						   &hr->chrr_ents[i].che_owner);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++) {
+		nfserr = nfsd4_encode_chunk_guard4(xdr,
+						   &hr->chrr_ents[i].che_guard);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+	nfserr = nfsd4_encode_uint32_t(xdr, hr->chrr_nents);
+	if (nfserr != nfs_ok)
+		return nfserr;
+	for (i = 0; i < hr->chrr_nents; i++) {
+		nfserr = nfsd4_encode_optional_retained4(xdr, &hr->chrr_ents[i].che_predecessor);
+		if (nfserr != nfs_ok)
+			return nfserr;
+	}
+	return nfs_ok;
+}
+
+#endif
+
 static const nfsd4_enc nfsd4_enc_ops[] = {
 	[OP_ACCESS]		= nfsd4_encode_access,
 	[OP_CLOSE]		= nfsd4_encode_close,
@@ -7069,9 +7263,9 @@ static const nfsd4_enc nfsd4_enc_ops[] = {
 	[OP_CHUNK_COMMIT] = nfsd4_encode_noop,
 	[OP_CHUNK_ERROR] = nfsd4_encode_noop,
 	[OP_CHUNK_FINALIZE] = nfsd4_encode_noop,
-	[OP_CHUNK_HEADER_READ] = nfsd4_encode_noop,
+	[OP_CHUNK_HEADER_READ] = nfsd4_encode_chunk_header_read,
 	[OP_CHUNK_LOCK] = nfsd4_encode_noop,
-	[OP_CHUNK_READ] = nfsd4_encode_noop,
+	[OP_CHUNK_READ] = nfsd4_encode_chunk_read,
 	[OP_CHUNK_REPAIRED] = nfsd4_encode_noop,
 	[OP_CHUNK_ROLLBACK] = nfsd4_encode_noop,
 	[OP_CHUNK_UNLOCK] = nfsd4_encode_noop,
