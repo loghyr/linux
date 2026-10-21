@@ -4275,14 +4275,26 @@ nfsd4_replay_cache_entry(struct nfsd4_compoundres *resp,
 /*
  * Set the exchange_id flags returned by the server.
  */
-static void
-nfsd4_set_ex_flags(struct nfs4_client *new, struct nfsd4_exchange_id *clid)
+static u32 nfsd4_ffv2_roles(u32 flags, bool ffv2_ds)
 {
+	flags &= ~EXCHGID4_FLAG_MASK_PNFS;
+	if (ffv2_ds) {
+		flags |= EXCHGID4_FLAG_USE_NON_PNFS | EXCHGID4_FLAG_USE_PNFS_DS;
+	} else {
 #ifdef CONFIG_NFSD_PNFS
-	new->cl_exchange_flags |= EXCHGID4_FLAG_USE_PNFS_MDS;
+		flags |= EXCHGID4_FLAG_USE_PNFS_MDS;
 #else
-	new->cl_exchange_flags |= EXCHGID4_FLAG_USE_NON_PNFS;
+		flags |= EXCHGID4_FLAG_USE_NON_PNFS;
 #endif
+	}
+
+	return flags;
+}
+
+static void nfsd4_set_ex_flags(struct nfs4_client *new, struct nfsd4_exchange_id *clid,
+			       bool ffv2_ds)
+{
+	new->cl_exchange_flags = nfsd4_ffv2_roles(new->cl_exchange_flags, ffv2_ds);
 
 	/* Referrals are supported, Migration is not. */
 	new->cl_exchange_flags |= EXCHGID4_FLAG_SUPP_MOVED_REFER;
@@ -4290,6 +4302,13 @@ nfsd4_set_ex_flags(struct nfs4_client *new, struct nfsd4_exchange_id *clid)
 	/* set the wire flags to return to client. */
 	clid->flags = new->cl_exchange_flags;
 }
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) && IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+u32 nfsd4_test_ffv2_roles(struct nfsd_net *nn, u32 flags)
+{
+	return nfsd4_ffv2_roles(flags, nfsd_ffv2_prototype_ds_role(nn));
+}
+#endif
 
 static bool client_has_openowners(struct nfs4_client *clp)
 {
@@ -4489,7 +4508,7 @@ out_copy:
 	exid->clientid.cl_id = conf->cl_clientid.cl_id;
 
 	exid->seqid = conf->cl_cs_slot.sl_seqid + 1;
-	nfsd4_set_ex_flags(conf, exid);
+	nfsd4_set_ex_flags(conf, exid, nfsd_ffv2_prototype_ds_role(nn));
 
 	exid->nii_domain.len = sizeof("kernel.org") - 1;
 	exid->nii_domain.data = "kernel.org";

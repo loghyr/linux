@@ -7,6 +7,8 @@
 #include <linux/refcount.h>
 #include <linux/completion.h>
 
+#include "ffv2_prototype.h"
+
 struct knfsd_fh;
 struct net;
 struct nfsd_net;
@@ -237,6 +239,12 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				u32 available,
 				struct nfsd_ffv2_admission *admission);
 
+enum nfsd_ffv2_source {
+	NFSD_FFV2_SOURCE_NONE,
+	NFSD_FFV2_SOURCE_MDS,
+	NFSD_FFV2_SOURCE_PROTOTYPE,
+};
+
 struct nfsd_ffv2_anchor {
 	/* Keeps the embedded anchor alive across admitted callbacks. */
 	refcount_t			ref;
@@ -253,9 +261,15 @@ struct nfsd_ffv2_anchor {
 	u64				next_generation;
 	struct nfsd_ffv2_generation *pending;
 	bool registration_pending;
-	/* Serializes the source claim and its final release. */
-	spinlock_t source_lock;
-	bool source_claimed;
+	/* Serializes source ownership and prototype gate transitions. */
+	spinlock_t prototype_gate_lock;
+	enum nfsd_ffv2_source source;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+	struct nfsd_ffv2_prototype prototype;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	const struct nfsd_ffv2_prototype_test *test_prototype;
+#endif
+#endif
 	/* Serializes epoch allocation and retirement-work admission. */
 	spinlock_t authority_lock;
 	wait_queue_head_t authority_wait;
@@ -394,11 +408,14 @@ int nfsd_ffv2_admit(struct svc_rqst *rqstp,
 		    struct nfsd_ffv2_admission *admission);
 void nfsd_ffv2_complete(struct nfsd_ffv2_admission *admission);
 
-#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST) || IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
 int nfsd_ffv2_provider_install(struct nfsd_net *nn,
 			       const struct nfsd_ffv2_provider_ops *ops,
 			       void *data, u32 chunk_size);
 void nfsd_ffv2_provider_remove(struct nfsd_net *nn);
+#endif
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
 void nfsd_ffv2_test_provider_drain_hook(struct nfsd_net *nn,
 					struct completion **waiting);
 void nfsd_ffv2_test_read_copy_fault(struct nfsd_net *nn, unsigned int stage);
@@ -493,4 +510,35 @@ nfsd_ffv2_requested_zero_threads(int n, const int *nthreads,
 }
 #endif
 
+#ifdef CONFIG_NFSD_FFV2
+int nfsd_ffv2_source_claim_gated(struct nfsd_ffv2_anchor *anchor, enum nfsd_ffv2_source source);
+void nfsd_ffv2_source_release_gated(struct nfsd_ffv2_anchor *anchor, enum nfsd_ffv2_source source);
+enum nfsd_ffv2_source nfsd_ffv2_source_get(struct nfsd_net *nn);
+bool nfsd_ffv2_anchor_hold(struct nfsd_net *nn);
+void nfsd_ffv2_anchor_release(struct nfsd_net *nn);
+int nfsd_ffv2_service_generation_retire(struct nfsd_net *nn, u64 generation);
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+struct nfsd_ffv2_store;
+int nfsd_ffv2_registration_begin_prototype(struct nfsd_net *nn,
+					   struct nfsd_ffv2_export_update *registration);
+int nfsd_ffv2_authority_prototype_create(struct nfsd_net *nn, struct nfsd_ffv2_authority **result);
+int nfsd_ffv2_object_register_fhs(struct nfsd_net *nn, struct nfsd_ffv2_export_update *registration,
+				  struct svc_fh *fhps, const u8 persisted[][32], u32 count,
+				  u32 chunk_size, const u8 store_uuid[16], const u8 token[32],
+				  const struct cred *cred, bool validate_backend,
+				  const u8 unregister_uuid[16], u8 object_uuids[][16],
+				  struct knfsd_fh *outer_fhs, u64 *generation);
+/* Caller holds nn->ffv2.lock across the READY decision. */
+bool nfsd_ffv2_prototype_generation_matches(struct nfsd_net *nn, const u8 uuid[16], u64 generation);
+int nfsd_ffv2_store_open_generation(struct nfsd_net *nn, u64 generation,
+				    struct nfsd_ffv2_store **result);
+const u8 *nfsd_ffv2_object_uuid(const struct nfsd_ffv2_object *object);
+#endif
+int nfsd_ffv2_reservation_store_root(struct nfsd_ffv2_reservation *reservation, struct path *root,
+				     u8 store_uuid[16], u8 export_uuid[16], u8 token[32]);
+int nfsd_ffv2_reservation_store_begin(struct nfsd_ffv2_reservation *reservation);
+void nfsd_ffv2_reservation_store_end(struct nfsd_ffv2_reservation *reservation);
+void nfsd_ffv2_reservation_store_put(struct nfsd_ffv2_reservation *reservation);
+
+#endif
 #endif /* _NFSD_FFV2_H */

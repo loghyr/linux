@@ -287,10 +287,36 @@ bool nfsd_ffv2_restart_fits(u64 valid_bytes, u64 live_wal_reserved,
 bool nfsd_ffv2_payload_geometry_valid(u64 chunk_index, u32 content_len,
 				      u32 chunk_bytes, u64 max_chunks);
 
-#ifdef CONFIG_NFSD_FFV2_KUNIT_TEST
 #define NFSD_FFV2_PAYLOAD_SEQUENCE_MASK GENMASK_ULL(39, 0)
 #define NFSD_FFV2_TRUST_STATEID_RECORD_SIZE 296
 #define NFSD_FFV2_AUTHORITY_ADMIT_RECORD_SIZE 256
+
+struct nfsd_ffv2_visible_chunk {
+	u64 version_object_id;
+	u32 version_generation;
+	u64 payload_object_id;
+	u32 writer_payload_id;
+	u64 payload_object_offset;
+	u32 content_len;
+	u32 content_crc32c;
+	u32 checksum_algorithm;
+	u32 checksum_len;
+	u8 checksum[NFSD_FFV2_STORE_CHECKSUM_SIZE];
+	u64 file_eof;
+	u64 owner_cohort;
+	u32 owner_client_id;
+	u32 owner_co_id;
+	u32 guard_generation;
+	u32 guard_writer;
+	bool guard_never_written;
+};
+
+struct nfsd_ffv2_store_file {
+	u8 file_key[32];
+	u32 chunk_bytes;
+	u64 max_chunks;
+	u64 logical_eof;
+};
 
 struct nfsd_ffv2_store_operation {
 	u8 session[16];
@@ -363,6 +389,7 @@ enum nfsd_ffv2_recovery_op {
 	NFSD_FFV2_IO_REPLAY,
 };
 
+#ifdef CONFIG_NFSD_FFV2_KUNIT_TEST
 /* Synchronous observer; its data must outlive recovery and the returned store. */
 struct nfsd_ffv2_recovery_io {
 	int (*before)(void *data, enum nfsd_ffv2_recovery_file file,
@@ -379,6 +406,10 @@ struct nfsd_ffv2_recovery_input {
 	u8 binding_token[32];
 	const struct nfsd_ffv2_recovery_io *io;
 };
+
+struct kunit;
+void nfsd_ffv2_store_test_provision(struct kunit *test, struct nfsd_ffv2_recovery_input *input,
+				    u8 handles[][32], const u8 export_uuid[16], const u8 token[32]);
 
 struct nfsd_ffv2_recovery_state {
 	struct nfsd_ffv2_super_record super;
@@ -437,5 +468,25 @@ int nfsd_ffv2_store_test_lifecycle(struct nfsd_ffv2_store *store, const u8 file_
 int nfsd_ffv2_store_test_authorized(struct nfsd_ffv2_store *store, u64 admission_id);
 int nfsd_ffv2_store_test_phase(struct nfsd_ffv2_store *store, u64 txn_id);
 #endif
+
+struct nfsd_ffv2_reservation;
+struct nfsd_net;
+struct nfsd_ffv2_store;
+struct nfsd_ffv2_store_file;
+struct nfsd_ffv2_visible_chunk;
+int nfsd_ffv2_store_open(struct nfsd_net *nn, struct nfsd_ffv2_reservation *reservation,
+			 struct nfsd_ffv2_store **result);
+void nfsd_ffv2_store_close(struct nfsd_ffv2_store *store);
+int nfsd_ffv2_store_lookup_file(struct nfsd_ffv2_store *store, const u8 handle[32],
+				struct nfsd_ffv2_store_file *file);
+int nfsd_ffv2_store_admit_writers(struct nfsd_ffv2_store *store, u32 writer, u32 count,
+				  struct nfsd_ffv2_store_admission *result);
+int nfsd_ffv2_store_read_snapshot(struct nfsd_ffv2_store *store, const u8 key[32], u64 offset,
+				  u32 capacity, struct nfsd_ffv2_visible_chunk *chunks, u64 *eof,
+				  u32 *count);
+int nfsd_ffv2_store_read_payload(struct nfsd_ffv2_store *store, void *data, size_t len,
+				 loff_t offset);
+bool nfsd_ffv2_store_checksum_valid(u32 algorithm, const u8 *checksum, u32 len, const u8 *data,
+				    u32 data_len);
 
 #endif /* _NFSD_FFV2_STORE_H */

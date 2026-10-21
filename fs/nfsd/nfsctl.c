@@ -2877,6 +2877,278 @@ static struct pernet_operations nfsd_net_ops = {
 	.size = sizeof(struct nfsd_net),
 };
 
+#ifdef CONFIG_NFSD_FFV2
+static int nfsd_ffv2_nla_string(const struct nlattr *attr, size_t maxlen, bool absolute)
+{
+	const char *string = nla_data(attr);
+	size_t len = nla_len(attr);
+
+	if (len < 2 || len > maxlen + 1 || string[len - 1] || strnlen(string, len) != len - 1 ||
+	    (absolute && string[0] != '/'))
+		return -EINVAL;
+	return 0;
+}
+#endif
+
+#if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+int nfsd_nl_ffv2_prototype_enable_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	struct net *net = genl_info_net(info);
+
+	(void)skb;
+	return nfsd_ffv2_prototype_enable(net_generic(net, nfsd_net_id), net);
+}
+
+int nfsd_nl_ffv2_prototype_disable_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	struct net *net = genl_info_net(info);
+
+	(void)skb;
+	return nfsd_ffv2_prototype_disable(net_generic(net, nfsd_net_id), net);
+}
+
+int nfsd_nl_ffv2_prototype_challenge_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	u8 nonce[NFSD_FFV2_PROTOTYPE_NONCE_LEN];
+	struct net *net = genl_info_net(info);
+	u64 expires = 0;
+	void *hdr;
+	int error;
+
+	error = nfsd_ffv2_prototype_challenge(net_generic(net, nfsd_net_id), net, nonce, &expires);
+	if (error)
+		return error;
+	skb = genlmsg_new(nla_total_size(sizeof(nonce)) + nla_total_size_64bit(sizeof(expires)),
+			  GFP_KERNEL);
+	if (!skb) {
+		error = -ENOMEM;
+		goto out_zero;
+	}
+	hdr = genlmsg_iput(skb, info);
+	if (!hdr) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+	if (nla_put(skb, NFSD_A_FFV2_PROTOTYPE_NONCE, sizeof(nonce), nonce) ||
+	    nla_put_u64_64bit(skb, NFSD_A_FFV2_PROTOTYPE_EXPIRES, expires, 0)) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+	genlmsg_end(skb, hdr);
+	memzero_explicit(nonce, sizeof(nonce));
+	return genlmsg_reply(skb, info);
+
+out_free:
+	nlmsg_free(skb);
+out_zero:
+	/*
+	 * The challenge was issued and its reply was lost.  Nothing here can
+	 * take it back, and nothing has to: it expires on its own, and this
+	 * copy of it does not outlive the failure.
+	 */
+	memzero_explicit(nonce, sizeof(nonce));
+	return error;
+}
+
+static int nfsd_ffv2_prototype_objects_parse(struct nlattr *objects,
+					     struct nfsd_ffv2_prototype_request *request)
+{
+	struct nlattr *child;
+	int remaining;
+	u32 expected = 0;
+
+	nla_for_each_nested(child, objects, remaining) {
+		struct nlattr *attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_MAX + 1];
+		struct nlattr *ordinary, *persisted;
+		int error;
+
+		if (!(child->nla_type & NLA_F_NESTED) || nla_type(child) != expected ||
+		    expected == NFSD_FFV2_PROTOTYPE_OBJECT_MAX)
+			return -EINVAL;
+		error = nla_parse_nested(attrs, NFSD_A_FFV2_PROTOTYPE_OBJECT_MAX, child,
+					 nfsd_ffv2_prototype_object_nl_policy, NULL);
+		if (error || !attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE] ||
+		    !attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE] ||
+		    attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE] ||
+		    attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID])
+			return -EINVAL;
+		ordinary = attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_ORDINARY_HANDLE];
+		persisted = attrs[NFSD_A_FFV2_PROTOTYPE_OBJECT_PERSISTED_HANDLE];
+		request->objects[expected].handle = nla_data(ordinary);
+		request->objects[expected].handle_len = nla_len(ordinary);
+		request->objects[expected].persisted_handle = nla_data(persisted);
+		expected++;
+	}
+	if (remaining || !expected)
+		return -EINVAL;
+	request->object_count = expected;
+	return 0;
+}
+
+int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nfsd_ffv2_prototype_request request = {};
+	struct nfsd_ffv2_prototype_bundle *bundle;
+	struct nlattr **attrs = info->attrs;
+	struct nlattr *objects;
+	struct net *net = genl_info_net(info);
+	void *hdr;
+	int error;
+
+	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_NONCE) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_DATA_COUNT) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_STORE_UUID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_WRITER_ID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_OBJECTS))
+		return -EINVAL;
+	if (attrs[NFSD_A_FFV2_PROTOTYPE_HANDLE] || attrs[NFSD_A_FFV2_PROTOTYPE_PERSISTED_HANDLE] ||
+	    attrs[NFSD_A_FFV2_PROTOTYPE_MAPPED_HANDLE] || attrs[NFSD_A_FFV2_PROTOTYPE_STATEID])
+		return -EINVAL;
+	error = nfsd_ffv2_nla_string(attrs[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN], NAME_MAX, false);
+	if (error)
+		return error;
+
+	request.nonce = nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_NONCE]);
+	request.auth_domain = nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_AUTH_DOMAIN]);
+	request.chunk_size = nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_CHUNK_SIZE]);
+	request.data_count = nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_DATA_COUNT]);
+	request.parity_count = nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_PARITY_COUNT]);
+	request.store_uuid = nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_STORE_UUID]);
+	request.binding_token = nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_BINDING_TOKEN]);
+	request.writer_id = nla_get_u32(attrs[NFSD_A_FFV2_PROTOTYPE_WRITER_ID]);
+	request.pnfs_clientid = nla_get_u64(attrs[NFSD_A_FFV2_PROTOTYPE_PNFS_CLIENTID]);
+	objects = attrs[NFSD_A_FFV2_PROTOTYPE_OBJECTS];
+	error = nfsd_ffv2_prototype_objects_parse(objects, &request);
+	if (error)
+		return error;
+	bundle = kzalloc_obj(*bundle, GFP_KERNEL);
+	if (!bundle)
+		return -ENOMEM;
+
+	error = nfsd_ffv2_prototype_register(net_generic(net, nfsd_net_id), net, &request, bundle);
+	if (error)
+		goto out_bundle;
+
+	skb = nfsd_ffv2_test_registration_fault(net_generic(net, nfsd_net_id),
+						NFSD_FFV2_TEST_REPLY_ALLOC) ?
+		      NULL :
+		      genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	if (!skb) {
+		error = -ENOMEM;
+		goto out_bundle;
+	}
+	hdr = genlmsg_iput(skb, info);
+	if (!hdr) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+	if (nla_put(skb, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID, sizeof(bundle->source_uuid),
+		    bundle->source_uuid) ||
+	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_SERVICE_UUID, sizeof(bundle->service_uuid),
+		    bundle->service_uuid) ||
+	    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_REPLAY_UUID, sizeof(bundle->replay_uuid),
+		    bundle->replay_uuid) ||
+	    nla_put_u64_64bit(skb, NFSD_A_FFV2_PROTOTYPE_GENERATION, bundle->generation, 0)) {
+		error = -EMSGSIZE;
+		goto out_free;
+	}
+	{
+		struct nlattr *objects;
+		u32 i;
+
+		objects = nla_nest_start(skb, NFSD_A_FFV2_PROTOTYPE_OBJECTS);
+		if (!objects) {
+			error = -EMSGSIZE;
+			goto out_free;
+		}
+		for (i = 0; i < bundle->object_count; i++) {
+			struct nlattr *child = nla_nest_start(skb, i);
+
+			if (!child ||
+			    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_OBJECT_MAPPED_HANDLE,
+				    bundle->objects[i].handle_len, bundle->objects[i].handle) ||
+			    nla_put(skb, NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID,
+				    sizeof(bundle->objects[i].stateid),
+				    bundle->objects[i].stateid)) {
+				error = -EMSGSIZE;
+				goto out_free;
+			}
+			nla_nest_end(skb, child);
+		}
+		nla_nest_end(skb, objects);
+	}
+	genlmsg_end(skb, hdr);
+	/*
+	 * A lost reply does not retire the registration: the nonce that
+	 * named it is committed, so the administrator repeats the same
+	 * request and is handed the same bundle.
+	 */
+	if (nfsd_ffv2_test_registration_fault(net_generic(net, nfsd_net_id),
+					      NFSD_FFV2_TEST_REPLY_SEND)) {
+		nlmsg_free(skb);
+		error = -ECONNREFUSED;
+	} else {
+		error = genlmsg_reply(skb, info);
+	}
+	kfree_sensitive(bundle);
+	return error;
+
+out_free:
+	nlmsg_free(skb);
+out_bundle:
+	kfree_sensitive(bundle);
+	return error;
+}
+
+int nfsd_nl_ffv2_prototype_unregister_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	struct nlattr **attrs = info->attrs;
+	struct net *net = genl_info_net(info);
+	u64 generation;
+
+	(void)skb;
+	if (GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID) ||
+	    GENL_REQ_ATTR_CHECK(info, NFSD_A_FFV2_PROTOTYPE_GENERATION))
+		return -EINVAL;
+	generation = nla_get_u64(attrs[NFSD_A_FFV2_PROTOTYPE_GENERATION]);
+	if (!generation)
+		return -EINVAL;
+	return nfsd_ffv2_prototype_unregister(net_generic(net, nfsd_net_id), net,
+					      nla_data(attrs[NFSD_A_FFV2_PROTOTYPE_SOURCE_UUID]),
+					      generation);
+}
+#else
+int nfsd_nl_ffv2_prototype_enable_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	return -EOPNOTSUPP;
+}
+
+int nfsd_nl_ffv2_prototype_disable_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	return -EOPNOTSUPP;
+}
+
+int nfsd_nl_ffv2_prototype_challenge_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	return -EOPNOTSUPP;
+}
+
+int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	return -EOPNOTSUPP;
+}
+
+int nfsd_nl_ffv2_prototype_unregister_doit(struct sk_buff *skb, struct genl_info *info)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+
 static int __init init_nfsd(void)
 {
 	int retval;
@@ -2959,16 +3231,7 @@ module_init(init_nfsd)
 module_exit(exit_nfsd)
 
 #ifdef CONFIG_NFSD_FFV2
-static int nfsd_ffv2_nla_string(const struct nlattr *attr, size_t maxlen, bool absolute)
-{
-	const char *string = nla_data(attr);
-	size_t len = nla_len(attr);
 
-	if (len < 2 || len > maxlen + 1 || string[len - 1] || strnlen(string, len) != len - 1 ||
-	    (absolute && string[0] != '/'))
-		return -EINVAL;
-	return 0;
-}
 
 static void
 nfsd_ffv2_retire_failed_reply(struct nfsd_net *nn, u64 generation_id, const u8 object_uuid[16])

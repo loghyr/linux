@@ -957,6 +957,38 @@ static void ffv2_recovery_install(struct kunit *test, struct ffv2_recovery_fixtu
 	}
 }
 
+/* Supply real files with independently encoded START and FILE_REGISTER bytes. */
+void nfsd_ffv2_store_test_provision(struct kunit *test, struct nfsd_ffv2_recovery_input *input,
+				    u8 handles[][32], const u8 export_uuid[16], const u8 token[32])
+{
+	struct ffv2_recovery_fixture *f = ffv2_recovery_fixture(test);
+	u32 i;
+
+	if (!f)
+		return;
+	memcpy(f->input.export_uuid, export_uuid, 16);
+	memcpy(f->input.binding_token, token, 32);
+	ffv2_recovery_super(f, 0, 1, NFSD_FFV2_SUPER_CLEAN);
+	f->wal_bytes = 0;
+	f->lsn = 0;
+	ffv2_recovery_start(f);
+	for (i = 0; i < 2; i++) {
+		u8 *b = f->wal + f->wal_bytes;
+
+		memset(handles[i], 0, 32);
+		memcpy(handles[i], f->input.export_uuid, 16);
+		handles[i][16] = 0x80 + i;
+		ffv2_recovery_registration(f, i);
+		ffv2_test_file_key(handles[i], f->keys[i]);
+		memcpy(b + 208, f->keys[i], 32);
+		memcpy(b + 244, handles[i], 32);
+		ffv2_test_crc("FFV2-D2-WAL-v1", b, 396);
+	}
+	f->input.io = NULL;
+	ffv2_recovery_install(test, f);
+	*input = f->input;
+}
+
 static int ffv2_recovery_run(struct kunit *test, struct ffv2_recovery_fixture *f)
 {
 	unsigned long refs[3];

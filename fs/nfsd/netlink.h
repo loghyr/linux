@@ -15,6 +15,7 @@
 /* Common nested types */
 extern const struct nla_policy nfsd_auth_flavor_nl_policy[NFSD_A_AUTH_FLAVOR_FLAGS + 1];
 extern const struct nla_policy nfsd_expkey_nl_policy[NFSD_A_EXPKEY_PATH + 1];
+extern const struct nla_policy nfsd_ffv2_prototype_object_nl_policy[NFSD_A_FFV2_PROTOTYPE_OBJECT_STATEID + 1];
 extern const struct nla_policy nfsd_fslocation_nl_policy[NFSD_A_FSLOCATION_PATH + 1];
 extern const struct nla_policy nfsd_fslocations_nl_policy[NFSD_A_FSLOCATIONS_LOCATION + 1];
 extern const struct nla_policy nfsd_sock_nl_policy[NFSD_A_SOCK_TRANSPORT_NAME + 1];
@@ -48,6 +49,16 @@ int nfsd_nl_ffv2_object_register_doit(struct sk_buff *skb,
 				      struct genl_info *info);
 int nfsd_nl_ffv2_object_unregister_doit(struct sk_buff *skb,
 					struct genl_info *info);
+int nfsd_nl_ffv2_prototype_enable_doit(struct sk_buff *skb,
+				       struct genl_info *info);
+int nfsd_nl_ffv2_prototype_disable_doit(struct sk_buff *skb,
+					struct genl_info *info);
+int nfsd_nl_ffv2_prototype_challenge_doit(struct sk_buff *skb,
+					  struct genl_info *info);
+int nfsd_nl_ffv2_prototype_register_doit(struct sk_buff *skb,
+					 struct genl_info *info);
+int nfsd_nl_ffv2_prototype_unregister_doit(struct sk_buff *skb,
+					   struct genl_info *info);
 
 enum {
 	NFSD_NLGRP_NONE,

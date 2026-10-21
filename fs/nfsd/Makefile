@@ -14,8 +14,9 @@ nfsd-y 			+= nfssvc.o nfsctl.o nfsfh.o vfs.o \
 			   export.o auth.o lockd.o nfscache.o \
 			   stats.o filecache.o nfs3proc.o nfs3xdr.o \
 			   netlink.o
-nfsd-$(CONFIG_NFSD_FFV2) += ffv2.o
-nfsd-$(CONFIG_NFSD_FFV2_KUNIT_TEST) += ffv2_test.o ffv2_store.o ffv2_store_test.o
+nfsd-$(CONFIG_NFSD_FFV2) += ffv2.o ffv2_store.o
+nfsd-$(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH) += ffv2_prototype.o
+nfsd-$(CONFIG_NFSD_FFV2_KUNIT_TEST) += ffv2_test.o ffv2_store_test.o
 nfsd-$(CONFIG_NFSD_V2) += nfsproc.o nfsxdr.o
 nfsd-$(CONFIG_NFSD_V2_ACL) += nfs2acl.o
 nfsd-$(CONFIG_NFSD_V3_ACL) += nfs3acl.o
