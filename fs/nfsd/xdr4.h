@@ -873,6 +873,15 @@ struct nfsd4_ffv2 {
 	u32		payload_len;
 	struct xdr_buf	payload;
 
+	u32 result_count;
+	u32 result_bytes;
+	u32 result_stability;
+	nfs4_verifier result_verifier;
+	__be32 result_status;
+	bool result_activated;
+	u64 result_owner_cohort_id;
+	u32 result_owner_client_id;
+	u32 result_owner_id;
 	/* BULK_REVOKE_STATEID4args: the clientid whose state is revoked. */
 	clientid_t	target_clientid;
 	bool		target_present;
@@ -1085,6 +1094,7 @@ bool nfsd4_ffv2_replay_identity_match(const struct nfsd4_compoundargs *args,
 				      const struct nfsd4_slot *slot);
 #endif
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+__be32 nfsd4_test_encode_ffv2_mutation(struct xdr_stream *xdr, u32 op, union nfsd4_op_u *u);
 __be32 nfsd4_test_decode_op(struct svc_rqst *rqstp, u32 opnum, const void *buf,
 			    size_t len, union nfsd4_op_u *u, size_t *consumed);
 void nfsd4_test_dispatch_compound(struct svc_rqst *rqstp);

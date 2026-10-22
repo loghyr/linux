@@ -23,6 +23,8 @@ struct task_struct;
 struct nfsd_ffv2_authority;
 struct nfsd_ffv2_object;
 struct nfsd4_session;
+struct nfs4_client;
+struct nfs4_sessionid;
 struct svc_cred;
 
 #if !IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
@@ -115,6 +117,11 @@ struct nfsd_ffv2_registration_test {
 	atomic_t reply_consumed;
 	atomic_t bindings;
 	atomic_t dispatch_calls;
+	atomic_t mutation_fence_refusals;
+	atomic_t mutation_fence_bindings;
+	atomic_t mutation_validations;
+	atomic_t mutation_provider_admissions;
+	atomic_t mutation_dispatch_calls;
 	unsigned int read_copy_fault;
 	struct completion **provider_drain_wait;
 	struct completion *validation_entered;
@@ -133,6 +140,8 @@ struct nfsd_ffv2_registration_test {
 bool nfsd_ffv2_test_registration_fault(struct nfsd_net *nn,
 				       enum nfsd_ffv2_test_registration_fault fault);
 #endif
+
+bool nfsd_ffv2_session_mutations_fenced(struct nfsd4_session *session);
 
 struct nfsd_ffv2_provider;
 struct nfsd_ffv2_admission;
@@ -215,6 +224,49 @@ struct nfsd_ffv2_chunk_result {
 	};
 };
 
+struct nfsd_ffv2_mutation_operation {
+	u8 session[16];
+	u32 slot;
+	u32 sequence;
+	u32 ordinal;
+	u8 request_digest[32];
+};
+
+struct nfsd_ffv2_write_request {
+	struct nfsd_ffv2_mutation_operation operation;
+	u64 chunk_index;
+	u32 stability;
+	struct nfsd_ffv2_chunk_owner owner;
+	u32 payload_id;
+	bool guard_check;
+	bool guard_never_written;
+	u32 guard_generation;
+	u32 guard_writer;
+	bool activate_if_empty;
+	u32 chunk_size;
+	struct nfsd_ffv2_checksum checksum;
+	const u8 *payload;
+	u32 payload_len;
+};
+
+struct nfsd_ffv2_lifecycle_request {
+	struct nfsd_ffv2_mutation_operation operation;
+	u64 chunk_index;
+	struct nfsd_ffv2_chunk_owner owner;
+};
+
+struct nfsd_ffv2_mutation_result {
+	void *private;
+	void (*release)(void *private);
+	u32 count;
+	u32 bytes;
+	u32 stability;
+	u8 verifier[8];
+	__be32 status;
+	bool activated;
+	struct nfsd_ffv2_chunk_owner owner;
+};
+
 /*
  * Callbacks and result release may sleep. Borrowed arrays and payload stay
  * immutable until admission completion. A non-NULL private/release pair
@@ -230,6 +282,15 @@ struct nfsd_ffv2_provider_ops {
 	__be32 (*chunk_header_read)(void *provider, const struct nfsd_ffv2_object *object,
 				    const struct nfsd_ffv2_chunk_request *request,
 		struct nfsd_ffv2_chunk_result *result);
+	__be32 (*chunk_write)(void *provider, const struct nfsd_ffv2_object *object,
+			      const struct nfsd_ffv2_write_request *request,
+			      struct nfsd_ffv2_mutation_result *result);
+	__be32 (*chunk_finalize)(void *provider, const struct nfsd_ffv2_object *object,
+				 const struct nfsd_ffv2_lifecycle_request *request,
+				 struct nfsd_ffv2_mutation_result *result);
+	__be32 (*chunk_commit)(void *provider, const struct nfsd_ffv2_object *object,
+			       const struct nfsd_ffv2_lifecycle_request *request,
+			       struct nfsd_ffv2_mutation_result *result);
 };
 
 __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
@@ -238,6 +299,12 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				struct nfsd_ffv2_chunk_result *result,
 				u32 available,
 				struct nfsd_ffv2_admission *admission);
+
+__be32 nfsd_ffv2_provider_admit_mutation(struct svc_rqst *rqstp, u32 opnum,
+					 struct nfsd_ffv2_admission *admission);
+__be32 nfsd_ffv2_provider_mutate(struct svc_rqst *rqstp, struct svc_fh *fhp, u32 opnum,
+				 const void *request, struct nfsd_ffv2_mutation_result *result,
+				 struct nfsd_ffv2_admission *admission);
 
 enum nfsd_ffv2_source {
 	NFSD_FFV2_SOURCE_NONE,
@@ -427,6 +494,12 @@ __be32 nfsd_ffv2_test_dispatch_op(struct svc_rqst *rqstp,
 				  struct nfsd4_op *op);
 unsigned int nfsd_ffv2_test_binding_refs(struct nfsd_ffv2_binding *binding);
 bool nfsd_ffv2_test_binding_waiting(struct nfsd_ffv2_binding *binding);
+struct nfsd4_session *nfsd_ffv2_test_data_session(struct svc_rqst *rqstp,
+						  struct nfs4_client *client,
+						  const struct nfs4_sessionid *id);
+void nfsd_ffv2_test_data_session_destroy(struct nfsd4_session *session);
+u32 nfsd_ffv2_test_slot_capacity(struct nfsd4_session *session);
+unsigned int nfsd_ffv2_test_reduce_session(struct nfsd4_session *session);
 void nfsd_ffv2_test_session_hash(struct nfsd_net *nn, struct nfsd4_session *session);
 void nfsd_ffv2_test_session_unhash(struct nfsd_net *nn, struct nfsd4_session *session,
 				   bool client_expiry);

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
+#include <crypto/sha2.h>
 #include <linux/completion.h>
 #include <linux/sunrpc/gss_api.h>
 #include <linux/sunrpc/auth_gss.h>
@@ -5011,6 +5012,7 @@ static void nfsd_ffv2_trust_policy_test(struct kunit *test)
 	writer = kunit_kzalloc(test, sizeof(*writer), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, writer);
 	writer->cl_clientid = req.pnfs_clientid;
+	writer->net = m->registration->net;
 	session.se_client = writer;
 	m->cstate.session = &session;
 	FFV2_EXPECT_STATUS(test, nfsd_ffv2_mapping_putfh(m, &m->registration->outer), nfs_ok);
@@ -5731,6 +5733,7 @@ static struct ffv2_read_fixture *ffv2_read_fixture(struct kunit *test)
 		return NULL;
 	nfsd_ffv2_trust_request_init(f->mapping, &f->trust);
 	writer->cl_clientid = f->trust.pnfs_clientid;
+	writer->net = f->mapping->registration->net;
 	f->session.se_client = writer;
 	f->mapping->cstate.session = &f->session;
 	f->response.rqstp = &f->mapping->rqst;
@@ -7408,10 +7411,1432 @@ static void ffv2_proto_setup_failure_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_prototype_enable(f->ordinary->nn, f->ordinary->net), 0);
 }
 
+/* Synthetic authority and shmem files feed the production mutation path. */
+struct ffv2_mutation_fixture {
+	struct ffv2_proto_fixture *proto;
+	struct nfsd4_compoundres response;
+	struct nfsd4_slot *slot;
+	struct nfsd4_op op;
+	u8 *wire;
+	u32 len;
+};
+
+static struct ffv2_mutation_fixture *ffv2_mutation_fixture(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	struct nfsd_ffv2_mapping_fixture *m;
+	u32 i;
+
+	if (!f)
+		return NULL;
+	f->proto = ffv2_proto_fixture(test);
+	f->slot = kunit_kzalloc(test, sizeof(*f->slot), GFP_KERNEL);
+	f->wire = kunit_kzalloc(test, 2 * (4096 + 256), GFP_KERNEL);
+	if (!f->proto || !f->slot || !f->wire || ffv2_proto_register(f->proto))
+		return NULL;
+	for (i = 0; i < 2; i++)
+		if (nfsd_ffv2_mapping_key_inner(f->proto->ordinary, &f->proto->inner[i]))
+			return NULL;
+	m = ffv2_proto_mapping(test, f->proto);
+	if (!m)
+		return NULL;
+	memcpy(&f->proto->ordinary->client.cl_clientid, &f->proto->request.pnfs_clientid,
+	       sizeof(clientid_t));
+	memset(&m->cstate.session->se_sessionid, 0x57, 16);
+	m->cstate.slot = f->slot;
+	f->slot->sl_index = 3;
+	f->slot->sl_seqid = 1;
+	m->rqst.rq_resp = &f->response;
+	m->rqst.rq_res.buflen = 65536;
+	f->response.rqstp = &m->rqst;
+	f->response.opcnt = 1;
+	return f;
+}
+
+static int ffv2_mutation_map(struct ffv2_mutation_fixture *f, u32 member)
+{
+	struct knfsd_fh fh = {};
+
+	fh.fh_size = f->proto->bundle.objects[member].handle_len;
+	memcpy(fh.fh_raw, f->proto->bundle.objects[member].handle, fh.fh_size);
+	return nfsd_ffv2_mapping_putfh(f->proto->mapping, &fh) == nfs_ok ? 0 : -ESTALE;
+}
+
+static __be32 *ffv2_mutation_wire(struct ffv2_mutation_fixture *f, __be32 *p, u32 member, u32 op,
+				  u64 index, u32 len, u32 stable, u32 owner)
+{
+	*p++ = cpu_to_be32(op);
+	memcpy(p, f->proto->bundle.objects[member].stateid, sizeof(stateid_t));
+	*p = cpu_to_be32(((stateid_t *)f->proto->bundle.objects[member].stateid)->si_generation);
+	p += 4;
+	*p++ = cpu_to_be32(index >> 32);
+	*p++ = cpu_to_be32(index);
+	if (op == OP_CHUNK_WRITE) {
+		*p++ = cpu_to_be32(stable);
+	} else {
+		*p++ = cpu_to_be32(1);
+		*p++ = cpu_to_be32(1);
+	}
+	*p++ = 0;
+	*p++ = 0;
+	*p++ = cpu_to_be32(17);
+	if (op == OP_CHUNK_WRITE)
+		*p++ = cpu_to_be32(1);
+	*p++ = cpu_to_be32(owner);
+	if (op != OP_CHUNK_WRITE)
+		return p;
+	*p++ = cpu_to_be32(700 + owner);
+	*p++ = cpu_to_be32(1);
+	*p++ = cpu_to_be32(1);
+	*p++ = 0;
+	*p++ = 0;
+	*p++ = cpu_to_be32(4096);
+	*p++ = cpu_to_be32(1);
+	*p++ = 0;
+	*p++ = 0;
+	*p++ = cpu_to_be32(len);
+	memset(p, 0x30 + member, len);
+	return p + XDR_QUADLEN(len);
+}
+
+static bool ffv2_mutation_decode(struct kunit *test, struct ffv2_mutation_fixture *f, u32 member,
+				 u32 op, u32 sequence, u64 index, u32 len, u32 stable, u32 owner)
+{
+	struct nfsd_ffv2_mapping_fixture *m = f->proto->mapping;
+	__be32 *p = (__be32 *)f->wire;
+
+	if (ffv2_mutation_map(f, member))
+		return false;
+	*p++ = 0;
+	*p++ = cpu_to_be32(2);
+	*p++ = cpu_to_be32(1);
+	p = ffv2_mutation_wire(f, p, member, op, index, len, stable, owner);
+	f->len = (u8 *)p - f->wire;
+	if (!nfsd_ffv2_test_compound_decode(test, &m->args, f->wire, f->len, f->len, 0))
+		return false;
+	f->slot->sl_seqid = sequence;
+	f->response.opcnt = 1;
+	f->op = m->args.ops[0];
+	return f->op.status == nfs_ok && m->args.ffv2_digest_valid;
+}
+
+static __be32 ffv2_mutation_handle(struct ffv2_mutation_fixture *f)
+{
+	struct nfsd_ffv2_mapping_fixture *m = f->proto->mapping;
+
+	f->op.status = nfsd4_test_ffv2_run_op(&m->rqst, &m->cstate, f->op.opnum, &f->op.u);
+	return f->op.status;
+}
+
+static void ffv2_mutation_encode(struct ffv2_mutation_fixture *f, void *wire, u32 size)
+{
+	struct svc_rqst *rqstp = &f->proto->mapping->rqst;
+	struct xdr_stream xdr;
+
+	memset(&rqstp->rq_res, 0, sizeof(rqstp->rq_res));
+	rqstp->rq_res.head[0].iov_base = wire;
+	rqstp->rq_res.buflen = size;
+	xdr_init_encode(&xdr, &rqstp->rq_res, NULL, NULL);
+	f->response.xdr = &xdr;
+	if (size < 13 * XDR_UNIT)
+		f->op.status = nfsd4_test_encode_ffv2_mutation(&xdr, f->op.opnum, &f->op.u);
+	else
+		nfsd4_encode_operation(&f->response, &f->op);
+	nfsd_ffv2_test_release_op(&f->op);
+	rqstp->rq_res.buflen = 65536;
+}
+
+static void
+ffv2_mutation_state(struct ffv2_mutation_fixture *f, struct nfsd_ffv2_recovery_state *state)
+{
+	nfsd_ffv2_prototype_test_store_state(f->proto->ordinary->nn, state);
+}
+
+static void ffv2_mutation_members_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state state, before, after;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_admission admission = {};
+	__be32 wire[32];
+	u32 member, op, sequence = 1;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	/* Bind the higher admission first, then the lower admission. */
+	for (member = 2; member-- > 0;) {
+		KUNIT_ASSERT_TRUE(test,
+				  ffv2_mutation_decode(test, f, member, OP_CHUNK_WRITE, sequence++,
+						       0, 32, NFS_UNSTABLE, member + 1));
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfs_ok);
+		KUNIT_EXPECT_FALSE(test, f->op.u.ffv2.result_activated);
+		KUNIT_EXPECT_EQ(test, f->op.u.ffv2.result_bytes, 32U);
+		ffv2_mutation_encode(f, wire, sizeof(wire));
+		KUNIT_EXPECT_EQ_MSG(test, be32_to_cpu(wire[2]), 1U, "accepted chunks, not bytes");
+		for (op = OP_CHUNK_FINALIZE;; op = OP_CHUNK_COMMIT) {
+			KUNIT_ASSERT_TRUE(test,
+					  ffv2_mutation_decode(test, f, member, op, sequence++, 0,
+							       0, 0, member + 1));
+			FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+			FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfs_ok);
+			ffv2_mutation_state(f, &before);
+			FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+			ffv2_mutation_state(f, &after);
+			KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+			ffv2_mutation_encode(f, wire, sizeof(wire));
+			KUNIT_EXPECT_EQ(test, be32_to_cpu(wire[4]), 1U);
+			FFV2_EXPECT_STATUS(test, wire[5], nfs_ok);
+			if (op == OP_CHUNK_COMMIT)
+				break;
+		}
+		FFV2_EXPECT_STATUS(test,
+				   ffv2_proto_probe(f->proto, member, 0, 1, &result, &admission),
+				   nfs_ok);
+		if (result.count == 1 && result.read.chunks) {
+			KUNIT_EXPECT_EQ(test, result.read.chunks[0].cr_effective_len, 32U);
+			KUNIT_EXPECT_EQ(test, result.read.chunks[0].cr_payload_id, 701U + member);
+			KUNIT_EXPECT_EQ(test, result.read.chunks[0].cr_chunk[0],
+					(u8)(0x30 + member));
+		} else {
+			KUNIT_FAIL(test, "missing committed member data");
+		}
+		nfsd_ffv2_complete(&admission);
+	}
+	ffv2_mutation_state(f, &state);
+	KUNIT_EXPECT_EQ(test, state.transactions, 2U);
+	KUNIT_EXPECT_EQ(test, state.receipts, 6U);
+}
+
+static void ffv2_mutation_replay_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	struct nfsd4_ffv2 frozen;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, OP_CHUNK_WRITE, 9, 0, 32,
+						     NFS_FILE_SYNC, 8));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	frozen = f->op.u.ffv2;
+	KUNIT_EXPECT_TRUE(test, frozen.result_activated);
+	ffv2_mutation_state(f, &before);
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	KUNIT_EXPECT_MEMEQ(test, f->op.u.ffv2.result_verifier.data, frozen.result_verifier.data, 8);
+	KUNIT_EXPECT_EQ(test, f->op.u.ffv2.result_activated, frozen.result_activated);
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+	/* Change a tag byte through the complete compound decoder. */
+	put_unaligned_be32(1, f->wire);
+	memmove(f->wire + 8, f->wire + 4, f->len - 4);
+	memset(f->wire + 4, 0, 4);
+	f->wire[4] = 'x';
+	f->len += 4;
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_test_compound_decode(test, &f->proto->mapping->args,
+							       f->wire, f->len, f->len, 0));
+	f->op = f->proto->mapping->args.ops[0];
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS_MSG(test, f->op.u.ffv2.result_status, nfserr_seq_false_retry,
+			       "full transcript participates in durable receipt identity");
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+}
+
+static void ffv2_mutation_ordinal_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state state;
+	struct nfsd_ffv2_mapping_fixture *m;
+	__be32 *p;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	m = f->proto->mapping;
+	KUNIT_ASSERT_EQ(test, ffv2_mutation_map(f, 0), 0);
+	p = (__be32 *)f->wire;
+	*p++ = 0;
+	*p++ = cpu_to_be32(2);
+	*p++ = cpu_to_be32(2);
+	p = ffv2_mutation_wire(f, p, 0, OP_CHUNK_WRITE, 0, 4096, NFS_FILE_SYNC, 20);
+	p = ffv2_mutation_wire(f, p, 0, OP_CHUNK_WRITE, 1, 32, NFS_FILE_SYNC, 21);
+	f->len = (u8 *)p - f->wire;
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_test_compound_decode(test, &m->args, f->wire, f->len,
+							       f->len, 0));
+	for (i = 0; i < 2; i++) {
+		f->op = m->args.ops[i];
+		f->response.opcnt = i + 1;
+		FFV2_EXPECT_STATUS_MSG(test, ffv2_mutation_handle(f), nfs_ok,
+				       "distinct compound ordinal reaches its own mutation");
+		KUNIT_EXPECT_EQ(test, f->op.u.ffv2.result_owner_id, 20U + i);
+	}
+	ffv2_mutation_state(f, &state);
+	KUNIT_EXPECT_EQ_MSG(test, state.transactions, 2U, "two durable operations in one compound");
+}
+
+static void ffv2_mutation_guards_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	__be32 wire[32];
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	ffv2_mutation_state(f, &before);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 2, 0, 32,
+						     NFS_UNSTABLE, 2));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS_MSG(test, f->op.u.ffv2.result_status, nfserr_chunk_guarded,
+			       "occupied chunk refuses the never-written guard");
+	KUNIT_EXPECT_FALSE(test, f->op.u.ffv2.result_activated);
+	ffv2_mutation_encode(f, wire, sizeof(wire));
+	KUNIT_EXPECT_EQ_MSG(test, be32_to_cpu(wire[2]), 0U, "rejected block accepts zero chunks");
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+	f->op.u.ffv2.guard_never_written = false;
+	f->op.u.ffv2.guard_generation = 0;
+	f->op.u.ffv2.guard_writer = 17;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfs_ok);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 3, 0, 32,
+						     NFS_UNSTABLE, 3));
+	f->op.u.ffv2.guard_check = false;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfserr_chunk_guarded);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_COMMIT, 4, 0, 0, 0, 2));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfserr_inval);
+}
+
+static void ffv2_mutation_identity_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	struct nfsd_ffv2_mapping_fixture *m;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	m = f->proto->mapping;
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	ffv2_mutation_state(f, &before);
+	memcpy(&f->op.u.ffv2.stateid, f->proto->bundle.objects[0].stateid, sizeof(stateid_t));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_bad_stateid);
+	m->args.ffv2_decode_status = nfserr_bad_xdr;
+	m->args.ffv2_digest_valid = false;
+	m->args.ffv2_decode_class = NFSD4_FFV2_DECODE_BADXDR;
+	FFV2_EXPECT_STATUS_MSG(test, ffv2_mutation_handle(f), nfserr_bad_xdr,
+			       "saved decode error precedes identity and provider");
+	m->args.ffv2_decode_status = nfs_ok;
+	m->args.ffv2_digest_valid = true;
+	m->args.ffv2_decode_class = NFSD4_FFV2_DECODE_NONE;
+	memcpy(&f->op.u.ffv2.stateid, f->proto->bundle.objects[1].stateid, sizeof(stateid_t));
+	f->op.u.ffv2.owner_client_id = 18;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_bad_stateid);
+	f->op.u.ffv2.owner_client_id = 17;
+	m->args.ffv2_digest_valid = false;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_notsupp);
+	m->args.ffv2_digest_valid = true;
+	m->cstate.slot = NULL;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_serverfault);
+	m->cstate.slot = f->slot;
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+}
+
+static void ffv2_mutation_copy_encode_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	struct nfsd_net *nn;
+	__be32 wire[32];
+	u32 stage;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->proto->ordinary->nn;
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	ffv2_mutation_state(f, &before);
+	for (stage = 3; stage <= 4; stage++) {
+		nn->ffv2.test_registration.read_copy_fault = stage;
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f),
+				   stage == 3 ? nfserr_jukebox : nfserr_bad_xdr);
+		ffv2_mutation_state(f, &after);
+		KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+	}
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	ffv2_mutation_state(f, &before);
+	ffv2_mutation_encode(f, wire, 5 * XDR_UNIT);
+	FFV2_EXPECT_STATUS(test, f->op.status, nfserr_resource);
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ_MSG(test, &before, &after, sizeof(before),
+			       "failed reply preserves exact successful receipt");
+	ffv2_mutation_encode(f, wire, sizeof(wire));
+	FFV2_EXPECT_STATUS(test, f->op.status, nfs_ok);
+	KUNIT_EXPECT_EQ(test, be32_to_cpu(wire[2]), 1U);
+}
+
+static void ffv2_mutation_store_failure_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	u8 byte = 1;
+	loff_t pos;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	ffv2_mutation_state(f, &before);
+	pos = before.wal_cursor;
+	KUNIT_ASSERT_EQ(test, kernel_write(f->proto->input.files[NFSD_FFV2_IO_WAL], &byte, 1, &pos),
+			(ssize_t)1);
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfserr_io);
+	KUNIT_EXPECT_FALSE(test, f->op.u.ffv2.result_activated);
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_TRUE(test, after.failed);
+	KUNIT_EXPECT_EQ(test, after.transactions, before.transactions);
+	KUNIT_EXPECT_EQ(test, after.receipts, before.receipts);
+}
+
+/* This provider only tests malformed results and callback/result ownership. */
+struct ffv2_mutation_provider {
+	struct ffv2_mutation_fixture *fixture;
+	struct nfsd_ffv2_admission admission;
+	struct ffv2_provider_drain *drain;
+	u32 mode;
+	u32 releases;
+	bool pinned_at_release;
+};
+
+static void ffv2_mutation_result_release(void *data)
+{
+	struct ffv2_mutation_provider *p = data;
+
+	p->releases++;
+	p->pinned_at_release = !!p->admission.provider;
+}
+
+static __be32 ffv2_mutation_provider_read(void *data, const struct nfsd_ffv2_object *object,
+					  const struct nfsd_ffv2_chunk_request *request,
+					  struct nfsd_ffv2_chunk_result *result)
+{
+	return nfserr_notsupp;
+}
+
+static __be32 ffv2_mutation_provider_write(void *data, const struct nfsd_ffv2_object *object,
+					   const struct nfsd_ffv2_write_request *request,
+					   struct nfsd_ffv2_mutation_result *result)
+{
+	struct ffv2_mutation_provider *p = data;
+	bool queued;
+
+	result->count = 1;
+	result->bytes = request->payload_len;
+	result->stability = request->stability;
+	result->owner = request->owner;
+	result->private = p;
+	result->release = ffv2_mutation_result_release;
+	if (p->drain) {
+		complete(&p->drain->go);
+		if (read_poll_timeout(ffv2_provider_wait_queued, queued, queued, 1000, 5000000,
+				      false, &p->drain->waiting))
+			return nfserr_io;
+	}
+	switch (p->mode) {
+	case 1:
+		result->count = 2;
+		break;
+	case 2:
+		result->bytes--;
+		break;
+	case 3:
+		result->stability = 3;
+		break;
+	case 4:
+		result->owner.co_id++;
+		break;
+	case 5:
+		result->status = cpu_to_be32(0x7fffffff);
+		break;
+	case 6:
+		result->status = nfserr_io;
+		result->activated = true;
+		break;
+	case 7:
+		return nfserr_io;
+	case 8:
+		result->release = NULL;
+		break;
+	}
+	return nfs_ok;
+}
+
+static const struct nfsd_ffv2_provider_ops ffv2_mutation_test_ops = {
+	.chunk_read = ffv2_mutation_provider_read,
+	.chunk_header_read = ffv2_mutation_provider_read,
+	.chunk_write = ffv2_mutation_provider_write,
+};
+
+static __be32 ffv2_mutation_provider_call(struct ffv2_mutation_provider *p,
+					  struct nfsd_ffv2_mutation_result *result)
+{
+	struct nfsd_ffv2_mapping_fixture *m = p->fixture->proto->mapping;
+	struct nfsd_ffv2_write_request request = {
+		.payload_len = 32,
+		.stability = NFS_FILE_SYNC,
+		.owner = { .co_client_id = 17, .co_id = 1 },
+	};
+
+	return nfsd_ffv2_provider_mutate(&m->rqst, &m->cstate.current_fh, OP_CHUNK_WRITE, &request,
+					 result, &p->admission);
+}
+
+static bool ffv2_mutation_provider_admit(struct ffv2_mutation_provider *p)
+{
+	struct nfsd_ffv2_mapping_fixture *m = p->fixture->proto->mapping;
+	struct nfsd_ffv2_actor_id actor = { .client_id = 17, .present = true };
+
+	return nfsd_ffv2_validate_operation(&m->rqst, &m->cstate.current_fh, m->cstate.session,
+					    OP_CHUNK_WRITE, &p->fixture->op.u.ffv2.stateid, &actor,
+					    &p->admission) == nfs_ok;
+}
+
+static void ffv2_mutation_results_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct ffv2_mutation_provider *p;
+	struct nfsd_ffv2_mutation_result result;
+	u32 mode;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	p->fixture = f;
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	nfsd_ffv2_provider_remove(f->proto->ordinary->nn);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(f->proto->ordinary->nn, &ffv2_mutation_test_ops,
+						   p, 4096),
+			0);
+	for (mode = 0; mode <= 8; mode++) {
+		p->mode = mode;
+		KUNIT_ASSERT_TRUE(test, ffv2_mutation_provider_admit(p));
+		FFV2_EXPECT_STATUS_MSG(test, ffv2_mutation_provider_call(p, &result),
+				       mode == 0 ? nfs_ok :
+				       mode == 7 ? nfserr_io :
+						   nfserr_serverfault,
+				       "malformed result mode %u", mode);
+		KUNIT_EXPECT_NOT_NULL_MSG(test, p->admission.provider,
+					  "refused results retain their provider");
+		nfsd_ffv2_complete(&p->admission);
+		KUNIT_EXPECT_EQ(test, p->releases, min(mode + 1, 8U));
+	}
+	KUNIT_EXPECT_TRUE(test, p->pinned_at_release);
+}
+
+static void ffv2_mutation_drain_check(struct kunit *test, bool callback)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct ffv2_mutation_provider *p;
+	struct nfsd_ffv2_mutation_result result;
+	struct ffv2_provider_drain *d;
+	struct task_struct *task;
+	bool queued;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	p->fixture = f;
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	nfsd_ffv2_provider_remove(f->proto->ordinary->nn);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(f->proto->ordinary->nn, &ffv2_mutation_test_ops,
+						   p, 4096),
+			0);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_provider_admit(p));
+	if (!callback) {
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_provider_call(p, &result), nfs_ok);
+		p->mode = 1;
+		FFV2_EXPECT_STATUS_MSG(test, ffv2_mutation_provider_call(p, &result),
+				       nfserr_serverfault, "earlier owner survives");
+	}
+	d = kzalloc_obj(*d, GFP_KERNEL);
+	if (!d) {
+		nfsd_ffv2_complete(&p->admission);
+		KUNIT_FAIL(test, "allocate drain observer");
+		return;
+	}
+	d->net = get_net(f->proto->ordinary->net);
+	d->nn = f->proto->ordinary->nn;
+	refcount_set(&d->refs, 1);
+	init_completion(&d->go);
+	init_completion(&d->done);
+	task = kthread_create(ffv2_provider_drain_thread, d, "ffv2-mutation-drain");
+	if (IS_ERR(task)) {
+		nfsd_ffv2_complete(&p->admission);
+		ffv2_provider_drain_put(d);
+		KUNIT_FAIL(test, "start mutation drain");
+		return;
+	}
+	get_task_struct(task);
+	refcount_inc(&d->refs);
+	nfsd_ffv2_test_provider_drain_hook(d->nn, &d->waiting);
+	wake_up_process(task);
+	if (callback) {
+		p->drain = d;
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_provider_call(p, &result), nfs_ok);
+		p->drain = NULL;
+	} else {
+		complete(&d->go);
+	}
+	KUNIT_EXPECT_EQ_MSG(test,
+			    read_poll_timeout(ffv2_provider_wait_queued, queued, queued, 1000,
+					      5000000, false, &d->waiting),
+			    0, "mutation result holds actual provider drain wait");
+	KUNIT_EXPECT_FALSE(test, completion_done(&d->done));
+	nfsd_ffv2_complete(&p->admission);
+	KUNIT_EXPECT_EQ(test, p->releases, 1U);
+	KUNIT_EXPECT_TRUE(test, p->pinned_at_release);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&d->done, 5 * HZ), 0UL);
+	nfsd_ffv2_test_provider_drain_hook(d->nn, NULL);
+	put_task_struct(task);
+	ffv2_provider_drain_put(d);
+}
+
+static void ffv2_mutation_result_drain_test(struct kunit *test)
+{
+	ffv2_mutation_drain_check(test, false);
+}
+
+static void ffv2_mutation_callback_drain_test(struct kunit *test)
+{
+	ffv2_mutation_drain_check(test, true);
+}
+
+static void ffv2_mutation_geometry_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	u32 op;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ffv2_mutation_state(f, &before);
+	for (op = OP_CHUNK_COMMIT; op <= OP_CHUNK_WRITE; op++) {
+		if (op != OP_CHUNK_COMMIT && op != OP_CHUNK_FINALIZE && op != OP_CHUNK_WRITE)
+			continue;
+		KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, op, op, U64_MAX, 32,
+							     NFS_FILE_SYNC, op));
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		FFV2_EXPECT_STATUS_MSG(test, f->op.u.ffv2.result_status, nfserr_inval,
+				       "member geometry rejects before indexing store state");
+	}
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	f->proto->mapping->rqst.rq_res.buflen = 0;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_resource);
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+}
+
+static void ffv2_mutation_session_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state state;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	for (i = 0; i < 3; i++) {
+		KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, OP_CHUNK_WRITE, 1, i, 4096,
+							     NFS_FILE_SYNC, i + 1));
+		if (i == 1)
+			f->slot->sl_index++;
+		if (i == 2)
+			((u8 *)&f->proto->mapping->cstate.session->se_sessionid)[0]++;
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		FFV2_EXPECT_STATUS_MSG(test, f->op.u.ffv2.result_status, nfs_ok,
+				       "session and slot distinguish equal sequence numbers");
+	}
+	ffv2_mutation_state(f, &state);
+	KUNIT_EXPECT_EQ(test, state.receipts, 3U);
+}
+
+static void ffv2_mutation_read_handler_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd4_chunk_read *read;
+	u32 member;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	for (member = 0; member < 2; member++) {
+		KUNIT_ASSERT_TRUE(test,
+				  ffv2_mutation_decode(test, f, member, OP_CHUNK_WRITE, member + 1,
+						       2, 32, NFS_FILE_SYNC, member + 1));
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		memset(&f->op, 0, sizeof(f->op));
+		f->op.opnum = OP_CHUNK_READ;
+		read = &f->op.u.chunk_read;
+		memcpy(&read->cra_stateid, f->proto->bundle.objects[member].stateid,
+		       sizeof(stateid_t));
+		read->cra_count = 3;
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		if (read->cra_nchunks == 3 && read->cra_chunks && read->cra_payload) {
+			KUNIT_EXPECT_TRUE(test, read->cra_eof);
+			FFV2_EXPECT_STATUS(test, read->cra_chunks[0].cre_status, nfserr_noent);
+			FFV2_EXPECT_STATUS(test, read->cra_chunks[2].cre_status, nfs_ok);
+			KUNIT_EXPECT_EQ(test, read->cra_chunks[2].cre_effective_len, 32U);
+			KUNIT_EXPECT_EQ(test, read->cra_chunks[2].cre_payload_id, 701U + member);
+			KUNIT_EXPECT_EQ(test, ((u8 *)read->cra_payload)[8192], (u8)(0x30 + member));
+		} else {
+			KUNIT_FAIL(test, "missing sparse or partial handler data");
+		}
+		nfsd_ffv2_test_release_op(&f->op);
+	}
+}
+
+/* Real SEQUENCE/PUTFH compounds retain their own decode and reply owners. */
+struct ffv2_sequence_request {
+	struct svc_rqst rqst;
+	struct nfsd_thread_local_info ntli;
+	struct nfsd4_compoundargs args;
+	struct nfsd4_compoundres resp;
+	struct auth_ops auth;
+	struct page *pages[4];
+	u8 wire[8192];
+	u8 reply[8192];
+	u8 flat[8192];
+	u8 scratch[PAGE_SIZE];
+	u32 len;
+	bool decoded;
+};
+
+struct ffv2_sequence_fixture {
+	struct ffv2_proto_fixture *proto;
+	struct nfsd4_session *session;
+	struct svc_xprt *xprt;
+	struct svc_xprt *foreign_xprt;
+	struct nfsd_ffv2_recovery_io io;
+	atomic_t io_events;
+	u32 slot_capacity;
+	bool laundry_paused;
+};
+
+struct ffv2_sequence_snapshot {
+	struct nfsd_ffv2_recovery_state state;
+	u64 size[3];
+	u8 digest[3][SHA256_DIGEST_SIZE];
+	int io_events;
+};
+
+static int ffv2_sequence_io(void *data, enum nfsd_ffv2_recovery_file file,
+			    enum nfsd_ffv2_recovery_op op)
+{
+	struct ffv2_sequence_fixture *f = data;
+
+	atomic_inc(&f->io_events);
+	return 0;
+}
+
+static void ffv2_sequence_fixture_exit(void *data)
+{
+	struct ffv2_sequence_fixture *f = data;
+	struct nfsd_ffv2_registration_fixture *o = f->proto->ordinary;
+
+	if (f->session) {
+		WARN_ON(atomic_read(&f->session->se_ref) != 1);
+		nfsd_ffv2_test_data_session_destroy(f->session);
+		nfsd_ffv2_test_work_drain(o->nn);
+	}
+	if (f->foreign_xprt)
+		svc_xprt_put(f->foreign_xprt);
+	if (f->xprt)
+		svc_xprt_put(f->xprt);
+	spin_lock(&o->nn->client_lock);
+	list_del_init(&o->client.cl_lru);
+	spin_unlock(&o->nn->client_lock);
+	if (f->laundry_paused)
+		enable_delayed_work(&o->nn->laundromat_work);
+	rcu_barrier();
+}
+
+static struct ffv2_sequence_fixture *ffv2_sequence_fixture(struct kunit *test)
+{
+	struct ffv2_sequence_fixture *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	struct nfsd_ffv2_registration_fixture *o;
+	struct nfs4_sessionid id;
+	struct svc_rqst *rqstp;
+	int threads = 2, error;
+
+	if (!f)
+		return NULL;
+	f->proto = ffv2_proto_fixture(test);
+	if (!f->proto)
+		return NULL;
+	o = f->proto->ordinary;
+	if (kunit_add_action_or_reset(test, ffv2_sequence_fixture_exit, f))
+		return NULL;
+	disable_delayed_work_sync(&o->nn->laundromat_work);
+	f->laundry_paused = true;
+	mutex_lock(&nfsd_mutex);
+	error = nfsd_svc(1, &threads, o->net, current_cred(), NULL);
+	mutex_unlock(&nfsd_mutex);
+	if (error != 2 || svc_serv_maxthreads(o->nn->nfsd_serv) != 2)
+		goto fail;
+	f->io.before = ffv2_sequence_io;
+	f->io.data = f;
+	f->proto->input.io = &f->io;
+	if (ffv2_proto_register(f->proto) ||
+	    nfsd_ffv2_mapping_key_inner(o, &f->proto->inner[0]))
+		goto fail;
+	memcpy(&o->client.cl_clientid, &f->proto->request.pnfs_clientid, sizeof(clientid_t));
+	f->xprt = svc_find_xprt(o->nn->nfsd_serv, "tcp", o->net, PF_INET, 0);
+	if (!f->xprt)
+		goto fail;
+	rqstp = kunit_kzalloc(test, sizeof(*rqstp), GFP_KERNEL);
+	if (!rqstp)
+		goto fail;
+	rqstp->rq_xprt = f->xprt;
+	id = o->session.se_sessionid;
+	id.data[0] ^= 1;
+	f->session = nfsd_ffv2_test_data_session(rqstp, &o->client, &id);
+	if (!f->session || f->session->se_fchannel.maxreqs != 2)
+		goto fail;
+	f->slot_capacity = nfsd_ffv2_test_slot_capacity(f->session);
+	return f;
+fail:
+	KUNIT_FAIL(test, "sequence fixture setup");
+	return NULL;
+}
+
+static void ffv2_sequence_request_exit(void *data)
+{
+	struct ffv2_sequence_request *q = data;
+	u32 i;
+
+	if (q->decoded)
+		nfsd4_release_compoundargs(&q->rqst);
+	for (i = 0; i < ARRAY_SIZE(q->pages); i++)
+		if (q->pages[i])
+			__free_page(q->pages[i]);
+}
+
+static struct ffv2_sequence_request *
+ffv2_sequence_request(struct kunit *test, struct ffv2_sequence_fixture *f, u32 slot,
+		      u32 seq, u32 highest, bool cache, u32 op, u64 index, u32 owner)
+{
+	struct nfsd_ffv2_registration_fixture *o = f->proto->ordinary;
+	struct ffv2_sequence_request *q = kunit_kzalloc(test, sizeof(*q), GFP_KERNEL);
+	struct ffv2_mutation_fixture writer = { .proto = f->proto };
+	struct svc_rqst *rqstp;
+	__be32 *p;
+	u32 i;
+
+	if (!q)
+		return NULL;
+	if (kunit_add_action_or_reset(test, ffv2_sequence_request_exit, q))
+		return NULL;
+	for (i = 0; i < ARRAY_SIZE(q->pages); i++) {
+		q->pages[i] = alloc_page(GFP_KERNEL);
+		if (!q->pages[i])
+			return NULL;
+	}
+	rqstp = &q->rqst;
+	rqstp->rq_xprt = f->xprt;
+	rqstp->rq_server = o->nn->nfsd_serv;
+	rqstp->rq_client = o->domain;
+	rqstp->rq_cred.cr_flavor = RPC_AUTH_UNIX;
+	rqstp->rq_cred.cr_uid = GLOBAL_ROOT_UID;
+	rqstp->rq_cred.cr_gid = GLOBAL_ROOT_GID;
+	rqstp->rq_cred.cr_group_info = o->client.cl_cred.cr_group_info;
+	rqstp->rq_argp = &q->args;
+	rqstp->rq_resp = &q->resp;
+	rqstp->rq_private = &q->ntli;
+	rqstp->rq_vers = 4;
+	rqstp->rq_prot = IPPROTO_TCP;
+	rqstp->rq_pages = q->pages;
+	rqstp->rq_next_page = q->pages + 1;
+	rqstp->rq_page_end = q->pages + ARRAY_SIZE(q->pages);
+	q->auth.flavour = RPC_AUTH_NULL;
+	rqstp->rq_authop = &q->auth;
+	set_bit(RQ_SECURE, &rqstp->rq_flags);
+	p = (__be32 *)q->wire;
+	*p++ = cpu_to_be32(4);
+	*p++ = cpu_to_be32(0x61626364);
+	*p++ = cpu_to_be32(2);
+	*p++ = cpu_to_be32(op ? 3 : 1);
+	*p++ = cpu_to_be32(OP_SEQUENCE);
+	memcpy(p, f->session->se_sessionid.data, 16);
+	p += 4;
+	*p++ = cpu_to_be32(seq);
+	*p++ = cpu_to_be32(slot);
+	*p++ = cpu_to_be32(highest);
+	*p++ = cpu_to_be32(cache);
+	if (op) {
+		*p++ = cpu_to_be32(OP_PUTFH);
+		*p++ = cpu_to_be32(f->proto->bundle.objects[0].handle_len);
+		memcpy(p, f->proto->bundle.objects[0].handle,
+		       f->proto->bundle.objects[0].handle_len);
+		p += XDR_QUADLEN(f->proto->bundle.objects[0].handle_len);
+		if (op == OP_CHUNK_READ) {
+			*p++ = cpu_to_be32(op);
+			memcpy(p, f->proto->bundle.objects[0].stateid, sizeof(stateid_t));
+			*p = cpu_to_be32(((stateid_t *)
+				f->proto->bundle.objects[0].stateid)->si_generation);
+			p += 4;
+			*p++ = 0;
+			*p++ = cpu_to_be32(index);
+			*p++ = cpu_to_be32(1);
+		} else if (op == OP_GETFH) {
+			*p++ = cpu_to_be32(op);
+		} else {
+			p = ffv2_mutation_wire(&writer, p, 0, op, index, index ? 32 : 4096,
+					       owner == 1 && op == OP_CHUNK_WRITE ?
+					       NFS_FILE_SYNC : NFS_UNSTABLE, owner);
+		}
+	}
+	q->len = (u8 *)p - q->wire;
+	return q;
+}
+
+static bool ffv2_sequence_run(struct kunit *test, struct ffv2_sequence_fixture *f,
+			      struct ffv2_sequence_request *q)
+{
+	struct svc_rqst *rqstp = &q->rqst;
+	struct nfsd4_slot *slot;
+	const struct cred *saved;
+	struct xdr_stream decode;
+
+	xdr_buf_init(&rqstp->rq_arg, q->wire, q->len);
+	rqstp->rq_arg.len = q->len;
+	xdr_init_decode(&decode, &rqstp->rq_arg, (__be32 *)q->wire, NULL);
+	xdr_set_scratch_buffer(&decode, q->scratch, sizeof(q->scratch));
+	q->decoded = true;
+	if (!nfs4svc_decode_compoundargs(rqstp, &decode)) {
+		KUNIT_FAIL(test, "complete compound decode");
+		return false;
+	}
+	xdr_buf_init(&rqstp->rq_res, q->reply, sizeof(q->reply));
+	rqstp->rq_res.head[0].iov_len = 0;
+	rqstp->rq_res.pages = q->pages + 1;
+	xdr_init_encode(&rqstp->rq_res_stream, &rqstp->rq_res, NULL, NULL);
+	/* The slot allocation excludes the real minimum RPC reply header. */
+	if (!xdr_reserve_space(&rqstp->rq_res_stream, 24))
+		return false;
+	saved = get_current_cred();
+	nfsd4_test_dispatch_compound(rqstp);
+	put_cred(revert_creds(saved));
+	slot = q->resp.cstate.slot;
+	if (slot && (slot->sl_flags & NFSD4_SLOT_CACHETHIS)) {
+		KUNIT_EXPECT_GE(test, rqstp->rq_res.len, q->resp.cstate.data_offset);
+		KUNIT_EXPECT_LE(test, rqstp->rq_res.len - q->resp.cstate.data_offset,
+				f->slot_capacity);
+	}
+	if (!nfs4svc_encode_compoundres(rqstp, &rqstp->rq_res_stream))
+		return false;
+	KUNIT_EXPECT_EQ(test, read_bytes_from_xdr_buf(&rqstp->rq_res, 0, q->flat,
+						      rqstp->rq_res.len), 0);
+	{
+		struct nfsd_net *nn = f->proto->ordinary->nn;
+		unsigned int i, refs = 1;
+
+		spin_lock(&nn->client_lock);
+		for (i = 0; i < f->session->se_fchannel.maxreqs; i++) {
+			struct nfsd4_slot *active = xa_load(&f->session->se_slots, i);
+
+			refs += !!(active->sl_flags & NFSD4_SLOT_INUSE);
+		}
+		i = atomic_read(&f->session->se_ref);
+		spin_unlock(&nn->client_lock);
+		KUNIT_EXPECT_EQ(test, i, refs);
+	}
+	return true;
+}
+
+static bool ffv2_sequence_call(struct kunit *test, struct ffv2_sequence_fixture *f, u32 slot,
+			       u32 seq, u32 highest, u32 op, u64 index, u32 owner)
+{
+	struct ffv2_sequence_request *q;
+	u32 status;
+
+	q = ffv2_sequence_request(test, f, slot, seq, highest, true, op, index, owner);
+	if (!q || !ffv2_sequence_run(test, f, q))
+		return false;
+	status = be32_to_cpu(q->resp.cstate.status);
+	KUNIT_EXPECT_EQ_MSG(test, status, 0U,
+			    "compound op=%u slot=%u seq=%u completed=%u", op, slot, seq,
+			    q->resp.opcnt);
+	if (op && op != OP_GETFH && op != OP_CHUNK_READ) {
+		KUNIT_EXPECT_EQ(test, q->resp.opcnt, 3U);
+		FFV2_EXPECT_STATUS(test, q->args.ops[2].u.ffv2.result_status, nfs_ok);
+		FFV2_EXPECT_STATUS(test, *(__be32 *)(q->flat + (op == OP_CHUNK_WRITE ? 120 : 112)),
+				   nfs_ok);
+	}
+	if (op == OP_CHUNK_READ && !status) {
+		u32 len = q->rqst.rq_res.len;
+
+		KUNIT_EXPECT_EQ(test, get_unaligned_be32(q->flat + 104), 1U);
+		if (len < 148) {
+			KUNIT_FAIL(test, "missing read result body");
+			return false;
+		}
+		FFV2_EXPECT_STATUS(test, *(__be32 *)(q->flat + len - 40), nfs_ok);
+		KUNIT_EXPECT_EQ(test, get_unaligned_be32(q->flat + len - 36), 32U);
+		KUNIT_EXPECT_EQ(test, q->flat[len - 32], (u8)0x30);
+	}
+	return q->resp.cstate.status == nfs_ok;
+}
+
+static bool ffv2_sequence_snapshot(struct kunit *test, struct ffv2_sequence_fixture *f,
+				   struct ffv2_sequence_snapshot *s)
+{
+	u32 i;
+
+	memset(s, 0, sizeof(*s));
+	nfsd_ffv2_prototype_test_store_state(f->proto->ordinary->nn, &s->state);
+	for (i = 0; i < 3; i++) {
+		struct file *file = f->proto->input.files[i];
+		loff_t pos = 0;
+		u8 *bytes;
+
+		s->size[i] = i_size_read(file_inode(file));
+		bytes = kvmalloc(s->size[i], GFP_KERNEL);
+		if (!bytes)
+			return false;
+		KUNIT_EXPECT_EQ(test, kernel_read(file, bytes, s->size[i], &pos),
+				(ssize_t)s->size[i]);
+		sha256(bytes, s->size[i], s->digest[i]);
+		kvfree(bytes);
+	}
+	s->io_events = atomic_read(&f->io_events);
+	return true;
+}
+
+static void ffv2_sequence_seed(struct ffv2_sequence_fixture *f, u32 sequence)
+{
+	struct nfsd_net *nn = f->proto->ordinary->nn;
+	struct nfsd4_slot *slot;
+
+	spin_lock(&nn->client_lock);
+	slot = xa_load(&f->session->se_slots, 1);
+	WARN_ON(slot->sl_flags & NFSD4_SLOT_INUSE);
+	slot->sl_seqid = sequence;
+	spin_unlock(&nn->client_lock);
+}
+
+static bool ffv2_sequence_regrow(struct kunit *test, struct ffv2_sequence_fixture *f,
+				 u32 *seq0)
+{
+	struct nfsd4_slot *slot;
+	u16 generation = f->session->se_slot_gen;
+
+	/* Regrown slots must retain the original allocation geometry. */
+	KUNIT_EXPECT_EQ(test, f->session->se_fchannel.maxresp_cached, 8192U);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_slot_capacity(f->session), f->slot_capacity);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_reduce_session(f->session), 1U);
+	KUNIT_EXPECT_EQ(test, f->session->se_target_maxslots, 1U);
+	KUNIT_EXPECT_EQ(test, f->session->se_slot_gen, (u16)(generation + 1));
+	/* First acknowledge the new generation; the next request can free slot 1. */
+	if (!ffv2_sequence_call(test, f, 0, ++*seq0, 0, 0, 0, 0) ||
+	    !ffv2_sequence_call(test, f, 0, ++*seq0, 0, 0, 0, 0))
+		return false;
+	KUNIT_EXPECT_EQ(test, f->session->se_fchannel.maxreqs, 2U);
+	KUNIT_EXPECT_EQ(test, f->session->se_target_maxslots, 2U);
+	slot = xa_load(&f->session->se_slots, 1);
+	KUNIT_EXPECT_TRUE(test, slot->sl_flags & NFSD4_SLOT_REUSED);
+	KUNIT_EXPECT_FALSE(test, slot->sl_flags & NFSD4_SLOT_INITIALIZED);
+	return true;
+}
+
+static void ffv2_sequence_alias(struct kunit *test, u32 op, bool changed, bool reset)
+{
+	struct ffv2_sequence_fixture *f = ffv2_sequence_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	struct ffv2_sequence_request *old, *retry;
+	struct ffv2_sequence_snapshot *before, *after;
+	u32 seq0 = 0, dispatches, validations, admissions, mutations;
+	u32 refusals, bindings;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	trace = &f->proto->ordinary->nn->ffv2.test_registration;
+	before = kunit_kzalloc(test, sizeof(*before), GFP_KERNEL);
+	after = kunit_kzalloc(test, sizeof(*after), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, before);
+	KUNIT_ASSERT_NOT_NULL(test, after);
+	if (op != OP_CHUNK_WRITE) {
+		KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 0, ++seq0, 1,
+							   OP_CHUNK_WRITE, 0, 2));
+		if (op == OP_CHUNK_COMMIT)
+			KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 0, ++seq0, 1,
+								   OP_CHUNK_FINALIZE, 0, 2));
+	}
+	old = ffv2_sequence_request(test, f, 1, 1, 1, true, op, 0,
+				    op == OP_CHUNK_WRITE ? 1 : 2);
+	KUNIT_ASSERT_NOT_NULL(test, old);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, old));
+	FFV2_EXPECT_STATUS(test, old->resp.cstate.status, nfs_ok);
+	FFV2_EXPECT_STATUS(test, old->args.ops[2].u.ffv2.result_status, nfs_ok);
+	/* Independent committed controls prove the same live mapping and authority. */
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 0, ++seq0, 1,
+						   OP_CHUNK_WRITE, 1, 40));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 0, ++seq0, 1,
+						   OP_CHUNK_FINALIZE, 1, 40));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 0, ++seq0, 1,
+						   OP_CHUNK_COMMIT, 1, 40));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	KUNIT_EXPECT_GE(test, atomic_read(&trace->mutation_provider_admissions), 4);
+	if (reset) {
+		struct nfsd4_slot *slot;
+
+		KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 2, 1, 0, 0, 0));
+		KUNIT_ASSERT_TRUE(test, ffv2_sequence_regrow(test, f, &seq0));
+		slot = xa_load(&f->session->se_slots, 1);
+		KUNIT_EXPECT_EQ(test, slot->sl_seqid, 2U);
+	} else {
+		/* Compress only the idle history preceding the actual MAX/0 acceptances. */
+		ffv2_sequence_seed(f, U32_MAX - 1);
+		KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, U32_MAX, 1, 0, 0, 0));
+		KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+		KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 0, 1, 0, 0, 0));
+		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	}
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_snapshot(test, f, before));
+	dispatches = atomic_read(&trace->dispatch_calls);
+	validations = atomic_read(&trace->mutation_validations);
+	admissions = atomic_read(&trace->mutation_provider_admissions);
+	mutations = atomic_read(&trace->mutation_dispatch_calls);
+	KUNIT_EXPECT_GE(test, mutations, 4U);
+	refusals = atomic_read(&trace->mutation_fence_refusals);
+	bindings = atomic_read(&trace->mutation_fence_bindings);
+	retry = ffv2_sequence_request(test, f, 1, 1, 1, true, op, 0,
+				      op == OP_CHUNK_WRITE ? 1 : 2);
+	KUNIT_ASSERT_NOT_NULL(test, retry);
+	if (changed)
+		retry->wire[4] ^= 1;
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, retry));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	KUNIT_EXPECT_EQ(test, retry->resp.opcnt, 3U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be32(retry->flat + 36), 3U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be32(retry->flat + 92), op);
+	FFV2_EXPECT_STATUS(test, *(__be32 *)(retry->flat + 96), nfserr_notsupp);
+	FFV2_EXPECT_STATUS(test, retry->resp.cstate.status, nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls) - dispatches, 3U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_validations), validations);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_provider_admissions), admissions);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_dispatch_calls), mutations);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_fence_refusals) - refusals, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_fence_bindings) - bindings, 1U);
+	if (retry->resp.cstate.status == nfs_ok) {
+		/* Also discriminate disposable observer/gate removal controls. */
+		if (changed) {
+			FFV2_EXPECT_STATUS(test, retry->args.ops[2].u.ffv2.result_status,
+					   nfserr_seq_false_retry);
+		} else {
+			FFV2_EXPECT_STATUS(test, retry->args.ops[2].u.ffv2.result_status, nfs_ok);
+			KUNIT_EXPECT_EQ(test, retry->rqst.rq_res.len, old->rqst.rq_res.len);
+			KUNIT_EXPECT_MEMEQ(test, retry->flat + 92, old->flat + 92,
+					   old->rqst.rq_res.len - 92);
+		}
+		kunit_info(test, "unfenced retained receipt: op=%u changed=%u status=%u frozen=%u\n",
+			   op, changed, be32_to_cpu(retry->args.ops[2].u.ffv2.result_status),
+			   !memcmp(retry->flat + 92, old->flat + 92, old->rqst.rq_res.len - 92));
+	}
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_snapshot(test, f, after));
+	KUNIT_EXPECT_MEMEQ(test, before, after, sizeof(*before));
+	/* Ordinary traffic and reads do not consult the mutation-only fence. */
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 0, ++seq0, 1, 0, 0, 0));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 0, ++seq0, 1, OP_CHUNK_READ, 1, 0));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_regrow(test, f, &seq0));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+}
+
+#define FFV2_SEQUENCE_ALIAS_TEST(name, op, changed, reset) \
+static void name(struct kunit *test) \
+{ \
+	ffv2_sequence_alias(test, op, changed, reset); \
+}
+
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_write_wrap_test, OP_CHUNK_WRITE, false, false)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_write_wrap_digest_test, OP_CHUNK_WRITE, true, false)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_finalize_wrap_test, OP_CHUNK_FINALIZE, false, false)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_finalize_wrap_digest_test, OP_CHUNK_FINALIZE, true, false)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_commit_wrap_test, OP_CHUNK_COMMIT, false, false)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_commit_wrap_digest_test, OP_CHUNK_COMMIT, true, false)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_write_reset_test, OP_CHUNK_WRITE, false, true)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_write_reset_digest_test, OP_CHUNK_WRITE, true, true)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_finalize_reset_test, OP_CHUNK_FINALIZE, false, true)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_finalize_reset_digest_test, OP_CHUNK_FINALIZE, true, true)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_commit_reset_test, OP_CHUNK_COMMIT, false, true)
+FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_commit_reset_digest_test, OP_CHUNK_COMMIT, true, true)
+
+static void ffv2_sequence_acceptance_test(struct kunit *test)
+{
+	struct ffv2_sequence_fixture *f = ffv2_sequence_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
+	struct ffv2_sequence_request *q;
+	struct nfsd4_slot *slot;
+	u32 seq0 = 0, refusals, bindings, validations, admissions, mutations;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	trace = &f->proto->ordinary->nn->ffv2.test_registration;
+	KUNIT_EXPECT_EQ(test, f->slot_capacity, 8112U);
+	/* An unused saved zero can safely reset to one. */
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_regrow(test, f, &seq0));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 1, 1, 0, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 2, 1, 0, 0, 0));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_regrow(test, f, &seq0));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 3, 1, 0, 0, 0));
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	/* A size refusal after SEQUENCE still has bounded cached error bytes. */
+	f->session->se_fchannel.maxresp_cached = 128;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_slot_capacity(f->session), 48U);
+	KUNIT_EXPECT_EQ(test, f->slot_capacity, 8112U);
+	q = ffv2_sequence_request(test, f, 1, 4, 1, true, OP_CHUNK_READ, 0, 0);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, q));
+	FFV2_EXPECT_STATUS(test, q->resp.cstate.status, nfserr_rep_too_big_to_cache);
+	KUNIT_EXPECT_EQ(test, q->resp.opcnt, 3U);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	f->session->se_fchannel.maxresp_cached = 8192;
+	ffv2_sequence_seed(f, U32_MAX);
+	{
+		struct nfsd_ffv2_registration_fixture *o = f->proto->ordinary;
+		int error;
+
+		mutex_lock(&nfsd_mutex);
+		error = svc_xprt_create(o->nn->nfsd_serv, "udp", o->net, PF_INET, 0,
+					SVC_SOCK_ANONYMOUS, current_cred());
+		mutex_unlock(&nfsd_mutex);
+		KUNIT_ASSERT_GE(test, error, 0);
+		f->foreign_xprt = svc_find_xprt(o->nn->nfsd_serv, "udp", o->net, PF_INET, 0);
+		KUNIT_ASSERT_NOT_NULL(test, f->foreign_xprt);
+		q = ffv2_sequence_request(test, f, 1, 0, 1, true, 0, 0, 0);
+		KUNIT_ASSERT_NOT_NULL(test, q);
+		q->rqst.rq_xprt = f->foreign_xprt;
+		q->rqst.rq_prot = IPPROTO_UDP;
+		KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, q));
+		FFV2_EXPECT_STATUS(test, q->resp.cstate.status, nfserr_conn_not_bound_to_session);
+		KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	}
+	q = ffv2_sequence_request(test, f, 1, 5, 1, true, 0, 0, 0);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, q));
+	FFV2_EXPECT_STATUS(test, q->resp.cstate.status, nfserr_seq_misordered);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	f->session->se_fchannel.maxresp_cached = 32;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_slot_capacity(f->session), 0U);
+	KUNIT_EXPECT_EQ(test, f->slot_capacity, 8112U);
+	q = ffv2_sequence_request(test, f, 1, 0, 1, true, 0, 0, 0);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, q));
+	FFV2_EXPECT_STATUS(test, q->resp.cstate.status, nfserr_rep_too_big_to_cache);
+	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	f->session->se_fchannel.maxresp_cached = 8192;
+	slot = xa_load(&f->session->se_slots, 1);
+	KUNIT_EXPECT_EQ(test, slot->sl_seqid, U32_MAX);
+	/* An ordinary-only wrap before the first FFv2 mutation also fences it. */
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 0, 1, 0, 0, 0));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	KUNIT_ASSERT_EQ(test, ffv2_proto_register(f->proto), 0);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	q = ffv2_sequence_request(test, f, 0, ++seq0, 1, true, OP_CHUNK_WRITE, 0, 1);
+	KUNIT_ASSERT_NOT_NULL(test, q);
+	refusals = atomic_read(&trace->mutation_fence_refusals);
+	bindings = atomic_read(&trace->mutation_fence_bindings);
+	validations = atomic_read(&trace->mutation_validations);
+	admissions = atomic_read(&trace->mutation_provider_admissions);
+	mutations = atomic_read(&trace->mutation_dispatch_calls);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, q));
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_fence_refusals) - refusals, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_fence_bindings) - bindings, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_validations), validations);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_provider_admissions), admissions);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_dispatch_calls), mutations);
+	FFV2_EXPECT_STATUS(test, q->resp.cstate.status, nfserr_notsupp);
+	KUNIT_EXPECT_EQ(test, q->resp.opcnt, 3U);
+}
+
+static void ffv2_sequence_saved_one_test(struct kunit *test)
+{
+	struct ffv2_sequence_fixture *f = ffv2_sequence_fixture(test);
+	u32 seq0 = 0;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 1, 1, 0, 0, 0));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_regrow(test, f, &seq0));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 1, 1, 0, 0, 0));
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+}
+
+static void ffv2_sequence_drc(struct kunit *test, bool cached)
+{
+	struct ffv2_sequence_fixture *f = ffv2_sequence_fixture(test);
+	struct ffv2_sequence_request *old, *retry, *changed;
+	struct nfsd_ffv2_registration_test *trace;
+	struct ffv2_sequence_snapshot *before, *after;
+	u32 dispatches;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	trace = &f->proto->ordinary->nn->ffv2.test_registration;
+	before = kunit_kzalloc(test, sizeof(*before), GFP_KERNEL);
+	after = kunit_kzalloc(test, sizeof(*after), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, before);
+	KUNIT_ASSERT_NOT_NULL(test, after);
+	old = ffv2_sequence_request(test, f, 0, 1, 1, cached, OP_CHUNK_WRITE, 0, 1);
+	KUNIT_ASSERT_NOT_NULL(test, old);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, old));
+	FFV2_EXPECT_STATUS(test, old->resp.cstate.status, nfs_ok);
+	FFV2_EXPECT_STATUS(test, old->args.ops[2].u.ffv2.result_status, nfs_ok);
+	ffv2_sequence_seed(f, U32_MAX);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 0, 1, 0, 0, 0));
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_snapshot(test, f, before));
+	dispatches = atomic_read(&trace->dispatch_calls);
+	retry = ffv2_sequence_request(test, f, 0, 1, 1, cached, OP_CHUNK_WRITE, 0, 1);
+	KUNIT_ASSERT_NOT_NULL(test, retry);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, retry));
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls) - dispatches, 1U);
+	if (cached) {
+		FFV2_EXPECT_STATUS(test, retry->resp.cstate.status, nfs_ok);
+		KUNIT_EXPECT_EQ(test, retry->resp.opcnt, 3U);
+		KUNIT_EXPECT_EQ(test, retry->rqst.rq_res.len, old->rqst.rq_res.len);
+		KUNIT_EXPECT_MEMEQ(test, retry->flat + 84, old->flat + 84,
+				   old->rqst.rq_res.len - 84);
+	} else {
+		FFV2_EXPECT_STATUS(test, retry->resp.cstate.status, nfserr_retry_uncached_rep);
+		KUNIT_EXPECT_EQ(test, retry->resp.opcnt, 2U);
+		KUNIT_EXPECT_EQ(test, get_unaligned_be32(retry->flat + 84), (u32)OP_PUTFH);
+		FFV2_EXPECT_STATUS(test, *(__be32 *)(retry->flat + 88), nfserr_retry_uncached_rep);
+	}
+	dispatches = atomic_read(&trace->dispatch_calls);
+	changed = ffv2_sequence_request(test, f, 0, 1, 1, cached, OP_CHUNK_WRITE, 0, 1);
+	KUNIT_ASSERT_NOT_NULL(test, changed);
+	changed->wire[4] ^= 1;
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, changed));
+	FFV2_EXPECT_STATUS(test, changed->resp.cstate.status, nfserr_seq_false_retry);
+	KUNIT_EXPECT_EQ(test, changed->resp.opcnt, 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_be32(changed->flat + 40), (u32)OP_SEQUENCE);
+	FFV2_EXPECT_STATUS(test, *(__be32 *)(changed->flat + 44), nfserr_seq_false_retry);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->dispatch_calls) - dispatches, 1U);
+	KUNIT_ASSERT_TRUE(test, ffv2_sequence_snapshot(test, f, after));
+	KUNIT_EXPECT_MEMEQ(test, before, after, sizeof(*before));
+}
+
+static void ffv2_sequence_cached_test(struct kunit *test)
+{
+	ffv2_sequence_drc(test, true);
+}
+
+static void ffv2_sequence_uncached_test(struct kunit *test)
+{
+	ffv2_sequence_drc(test, false);
+}
+
+struct ffv2_sequence_worker {
+	struct kunit *test;
+	struct ffv2_sequence_fixture *fixture;
+	struct ffv2_sequence_request *request;
+	struct completion done;
+	bool success;
+};
+
+static int ffv2_sequence_thread(void *data)
+{
+	struct ffv2_sequence_worker *w = data;
+
+	w->success = ffv2_sequence_run(w->test, w->fixture, w->request);
+	complete(&w->done);
+	/* Keep the task referenced by kthread_stop until the fixture joins it. */
+	nfsd_ffv2_test_thread_park();
+	return 0;
+}
+
+static void ffv2_sequence_before_latch_test(struct kunit *test)
+{
+	struct ffv2_sequence_fixture *f = ffv2_sequence_fixture(test);
+	struct ffv2_sequence_request *inuse;
+	struct ffv2_sequence_worker w = { .test = test, .fixture = f };
+	struct nfsd_ffv2_registration_test *trace;
+	struct completion entered, resume;
+	struct task_struct *task;
+	unsigned long arrived;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	trace = &f->proto->ordinary->nn->ffv2.test_registration;
+	w.request = ffv2_sequence_request(test, f, 0, 1, 1, true, OP_CHUNK_WRITE, 0, 1);
+	KUNIT_ASSERT_NOT_NULL(test, w.request);
+	init_completion(&w.done);
+	init_completion(&entered);
+	init_completion(&resume);
+	trace->execute_entered = &entered;
+	trace->execute_continue = &resume;
+	task = kthread_run(ffv2_sequence_thread, &w, "ffv2-sequence-order");
+	if (IS_ERR(task)) {
+		KUNIT_FAIL(test, "create compound worker");
+		goto disarm;
+	}
+	arrived = wait_for_completion_timeout(&entered, 5 * HZ);
+	KUNIT_EXPECT_NE(test, arrived, 0UL);
+	if (arrived) {
+		/* The first query passed, but actual execution admission is still ahead. */
+		KUNIT_EXPECT_FALSE(test, completion_done(&w.done));
+		inuse = ffv2_sequence_request(test, f, 0, 1, 1, true, 0, 0, 0);
+		if (inuse && ffv2_sequence_run(test, f, inuse)) {
+			FFV2_EXPECT_STATUS(test, inuse->resp.cstate.status, nfserr_jukebox);
+			KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+		}
+		ffv2_sequence_seed(f, U32_MAX);
+		KUNIT_EXPECT_TRUE(test, ffv2_sequence_call(test, f, 1, 0, 1, 0, 0, 0));
+		KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+	}
+	complete_all(&resume);
+	wait_for_completion(&w.done);
+	kthread_stop(task);
+	KUNIT_EXPECT_TRUE(test, w.success);
+	FFV2_EXPECT_STATUS(test, w.request->resp.cstate.status, nfs_ok);
+	FFV2_EXPECT_STATUS(test, w.request->args.ops[2].u.ffv2.result_status, nfs_ok);
+	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
+disarm:
+	trace->execute_entered = NULL;
+	trace->execute_continue = NULL;
+}
+
 #endif
 
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+	KUNIT_CASE(ffv2_mutation_results_test),
+	KUNIT_CASE(ffv2_mutation_result_drain_test),
+	KUNIT_CASE(ffv2_mutation_callback_drain_test),
+	KUNIT_CASE(ffv2_mutation_geometry_test),
+	KUNIT_CASE(ffv2_mutation_session_test),
+	KUNIT_CASE(ffv2_mutation_read_handler_test),
+	KUNIT_CASE(ffv2_mutation_members_test),
+	KUNIT_CASE(ffv2_sequence_acceptance_test),
+	KUNIT_CASE(ffv2_sequence_saved_one_test),
+	KUNIT_CASE(ffv2_sequence_cached_test),
+	KUNIT_CASE(ffv2_sequence_uncached_test),
+	KUNIT_CASE(ffv2_sequence_before_latch_test),
+	KUNIT_CASE(ffv2_sequence_write_wrap_test),
+	KUNIT_CASE(ffv2_sequence_write_wrap_digest_test),
+	KUNIT_CASE(ffv2_sequence_finalize_wrap_test),
+	KUNIT_CASE(ffv2_sequence_finalize_wrap_digest_test),
+	KUNIT_CASE(ffv2_sequence_commit_wrap_test),
+	KUNIT_CASE(ffv2_sequence_commit_wrap_digest_test),
+	KUNIT_CASE(ffv2_sequence_write_reset_test),
+	KUNIT_CASE(ffv2_sequence_write_reset_digest_test),
+	KUNIT_CASE(ffv2_sequence_finalize_reset_test),
+	KUNIT_CASE(ffv2_sequence_finalize_reset_digest_test),
+	KUNIT_CASE(ffv2_sequence_commit_reset_test),
+	KUNIT_CASE(ffv2_sequence_commit_reset_digest_test),
+	KUNIT_CASE(ffv2_mutation_replay_test),
+	KUNIT_CASE(ffv2_mutation_ordinal_test),
+	KUNIT_CASE(ffv2_mutation_guards_test),
+	KUNIT_CASE(ffv2_mutation_identity_test),
+	KUNIT_CASE(ffv2_mutation_copy_encode_test),
+	KUNIT_CASE(ffv2_mutation_store_failure_test),
+
 	KUNIT_CASE(ffv2_proto_constructor_test),
 	KUNIT_CASE_SLOW(ffv2_proto_failure_test),
 	KUNIT_CASE(ffv2_proto_identity_test),

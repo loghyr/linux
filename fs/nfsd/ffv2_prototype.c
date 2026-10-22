@@ -840,9 +840,184 @@ static __be32 nfsd_ffv2_prototype_chunk_header_read(void *opaque,
 	return nfserr_notsupp;
 }
 
+static __be32 nfsd_ffv2_prototype_mutation_status(int error)
+{
+	switch (error) {
+	case 0:
+		return nfs_ok;
+	case -EAGAIN:
+		return nfserr_chunk_guarded;
+	case -ENOSPC:
+		return nfserr_nospc;
+	case -ENOMEM:
+		return nfserr_jukebox;
+	case -EEXIST:
+		return nfserr_seq_false_retry;
+	case -ESTALE:
+		return nfserr_stale_stateid;
+	case -EIO:
+	case -EBADMSG:
+		return nfserr_io;
+	default:
+		return nfserr_inval;
+	}
+}
+
+static int nfsd_ffv2_prototype_mutation_begin(struct nfsd_ffv2_prototype_provider *provider,
+					      const struct nfsd_ffv2_chunk_owner *owner,
+					      struct nfsd_ffv2_mutation_result *result)
+{
+	struct nfsd_ffv2_super_record super;
+	int error;
+
+	if (!provider->store)
+		return -EOPNOTSUPP;
+	error = nfsd_ffv2_store_get_super(provider->store, &super);
+	if (error)
+		return error;
+	result->count = 1;
+	result->owner = *owner;
+	memcpy(result->verifier, super.write_verifier, sizeof(result->verifier));
+	return 0;
+}
+
+static void nfsd_ffv2_prototype_operation(const struct nfsd_ffv2_mutation_operation *source,
+					  struct nfsd_ffv2_store_operation *target)
+{
+	memcpy(target->session, source->session, sizeof(target->session));
+	target->slot = source->slot;
+	target->sequence = source->sequence;
+	target->ordinal = source->ordinal;
+	memcpy(target->request_digest, source->request_digest, sizeof(target->request_digest));
+}
+
+static void nfsd_ffv2_prototype_result(const struct nfsd_ffv2_store_mutation_result *source,
+				       struct nfsd_ffv2_mutation_result *target)
+{
+	target->count = 1;
+	target->stability = source->stability;
+	target->activated = source->activated;
+	memcpy(target->verifier, source->verifier, sizeof(target->verifier));
+	target->owner.co_cohort_id = source->owner.cohort;
+	target->owner.co_client_id = source->owner.client_id;
+	target->owner.co_id = source->owner.co_id;
+	target->status = nfsd_ffv2_prototype_mutation_status(source->status == 1 ? 0 : -EINVAL);
+}
+
+static __be32 nfsd_ffv2_prototype_chunk_write(void *opaque, const struct nfsd_ffv2_object *object,
+					      const struct nfsd_ffv2_write_request *request,
+					      struct nfsd_ffv2_mutation_result *result)
+{
+	struct nfsd_ffv2_prototype_provider *provider = opaque;
+	struct nfsd_ffv2_prototype_member *member;
+	struct nfsd_ffv2_store_mutation_result stored = {};
+	struct nfsd_ffv2_store_write write = {};
+	int error;
+
+	error = nfsd_ffv2_prototype_mutation_begin(provider, &request->owner, result);
+	if (error)
+		return error == -EOPNOTSUPP ? nfserr_notsupp : nfserr_io;
+	member = nfsd_ffv2_prototype_member(provider, object);
+	if (!member) {
+		result->status = nfserr_serverfault;
+		return nfs_ok;
+	}
+	if (request->chunk_size != member->file.chunk_bytes ||
+	    request->chunk_index >= member->file.max_chunks) {
+		result->status = nfserr_inval;
+		return nfs_ok;
+	}
+	nfsd_ffv2_prototype_operation(&request->operation, &write.operation);
+	write.admission_id = member->admission_id;
+	write.chunk_index = request->chunk_index;
+	write.stability = request->stability;
+	write.owner_cohort = request->owner.co_cohort_id;
+	write.owner_client_id = request->owner.co_client_id;
+	write.owner_co_id = request->owner.co_id;
+	write.writer_payload_id = request->payload_id;
+	write.guard_check = request->guard_check;
+	write.guard_never_written = request->guard_never_written;
+	write.guard_generation = request->guard_generation;
+	write.guard_writer = request->guard_writer;
+	write.activate_if_empty = request->activate_if_empty;
+	write.checksum_algorithm = request->checksum.cs_algorithm;
+	write.checksum_len = request->checksum.cs_len;
+	memcpy(write.checksum, request->checksum.cs_value, sizeof(write.checksum));
+	write.content = request->payload;
+	write.content_len = request->payload_len;
+	error = nfsd_ffv2_store_write(provider->store, member->file.file_key, &write, &stored);
+	if (error) {
+		result->status = nfsd_ffv2_prototype_mutation_status(error);
+		return nfs_ok;
+	}
+	nfsd_ffv2_prototype_result(&stored, result);
+	result->bytes = request->payload_len;
+	return nfs_ok;
+}
+
+static __be32 nfsd_ffv2_prototype_lifecycle(void *opaque, const struct nfsd_ffv2_object *object,
+					    const struct nfsd_ffv2_lifecycle_request *request,
+					    struct nfsd_ffv2_mutation_result *result, bool commit)
+{
+	struct nfsd_ffv2_prototype_provider *provider = opaque;
+	struct nfsd_ffv2_prototype_member *member;
+	struct nfsd_ffv2_store_mutation_result stored = {};
+	struct nfsd_ffv2_store_lifecycle lifecycle = {};
+	int error;
+
+	error = nfsd_ffv2_prototype_mutation_begin(provider, &request->owner, result);
+	if (error)
+		return error == -EOPNOTSUPP ? nfserr_notsupp : nfserr_io;
+	member = nfsd_ffv2_prototype_member(provider, object);
+	if (!member) {
+		result->status = nfserr_serverfault;
+		return nfs_ok;
+	}
+	if (request->chunk_index >= member->file.max_chunks) {
+		result->status = nfserr_inval;
+		return nfs_ok;
+	}
+	nfsd_ffv2_prototype_operation(&request->operation, &lifecycle.operation);
+	lifecycle.admission_id = member->admission_id;
+	lifecycle.chunk_index = request->chunk_index;
+	lifecycle.owner_cohort = request->owner.co_cohort_id;
+	lifecycle.owner_client_id = request->owner.co_client_id;
+	lifecycle.owner_co_id = request->owner.co_id;
+	if (commit)
+		error = nfsd_ffv2_store_commit(provider->store, member->file.file_key, &lifecycle,
+					       &stored);
+	else
+		error = nfsd_ffv2_store_finalize(provider->store, member->file.file_key, &lifecycle,
+						 &stored);
+	if (error) {
+		result->status = nfsd_ffv2_prototype_mutation_status(error);
+		return nfs_ok;
+	}
+	nfsd_ffv2_prototype_result(&stored, result);
+	return nfs_ok;
+}
+
+static __be32
+nfsd_ffv2_prototype_chunk_finalize(void *opaque, const struct nfsd_ffv2_object *object,
+				   const struct nfsd_ffv2_lifecycle_request *request,
+				   struct nfsd_ffv2_mutation_result *result)
+{
+	return nfsd_ffv2_prototype_lifecycle(opaque, object, request, result, false);
+}
+
+static __be32 nfsd_ffv2_prototype_chunk_commit(void *opaque, const struct nfsd_ffv2_object *object,
+					       const struct nfsd_ffv2_lifecycle_request *request,
+					       struct nfsd_ffv2_mutation_result *result)
+{
+	return nfsd_ffv2_prototype_lifecycle(opaque, object, request, result, true);
+}
+
 static const struct nfsd_ffv2_provider_ops nfsd_ffv2_prototype_provider_ops = {
 	.chunk_read = nfsd_ffv2_prototype_store_chunk_read,
 	.chunk_header_read = nfsd_ffv2_prototype_chunk_header_read,
+	.chunk_write = nfsd_ffv2_prototype_chunk_write,
+	.chunk_finalize = nfsd_ffv2_prototype_chunk_finalize,
+	.chunk_commit = nfsd_ffv2_prototype_chunk_commit,
 };
 
 static bool nfsd_ffv2_prototype_file_geometry_valid(u64 max_chunks, u32 chunk_bytes,
@@ -1437,6 +1612,14 @@ void nfsd_ffv2_prototype_net_pre_exit(struct nfsd_net *nn)
 }
 
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+void nfsd_ffv2_prototype_test_store_state(struct nfsd_net *nn,
+					  struct nfsd_ffv2_recovery_state *state)
+{
+	struct nfsd_ffv2_prototype_provider *provider = nn->ffv2.prototype.provider;
+
+	nfsd_ffv2_store_test_state(provider->store, state);
+}
+
 int nfsd_ffv2_prototype_test_write(struct nfsd_net *nn, u32 member,
 				   struct nfsd_ffv2_store_write *request,
 				   struct nfsd_ffv2_store_mutation_result *result)

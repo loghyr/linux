@@ -5254,6 +5254,10 @@ nfsd4_sequence(struct svc_rqst *rqstp, struct nfsd4_compound_state *cstate,
 	status = nfs_ok;
 	/* Success! accept new slot seqid */
 #ifdef CONFIG_NFSD_FFV2
+	/* Durable receipts outlive the slot DRC and retain its sequence. */
+	if (!seq->seqid ||
+	    (seq->seqid == 1 && (slot->sl_flags & NFSD4_SLOT_REUSED) && slot->sl_seqid))
+		session->se_ffv2_mutations_fenced = true;
 	nfsd4_slot_record_ffv2_identity(slot, rqstp->rq_argp);
 #endif
 	slot->sl_seqid = seq->seqid;
@@ -10702,7 +10706,91 @@ nfsd_handle_dir_event(u32 mask, const struct inode *dir, const void *data,
 	return 0;
 }
 
+#ifdef CONFIG_NFSD_FFV2
+bool nfsd_ffv2_session_mutations_fenced(struct nfsd4_session *session)
+{
+	struct nfsd_net *nn;
+	bool fenced;
+
+	if (!session)
+		return false;
+	nn = net_generic(session->se_client->net, nfsd_net_id);
+	spin_lock(&nn->client_lock);
+	fenced = session->se_ffv2_mutations_fenced;
+	spin_unlock(&nn->client_lock);
+	return fenced;
+}
+#endif
+
 #if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+/* Heap-owned data sessions exercise the real DRC without global reclaim. */
+struct nfsd4_session *nfsd_ffv2_test_data_session(struct svc_rqst *rqstp,
+						  struct nfs4_client *client,
+						  const struct nfs4_sessionid *id)
+{
+	struct nfsd4_channel_attrs attrs = {
+		.maxreq_sz = 16384, .maxresp_sz = 8192,
+		.maxresp_cached = 8192, .maxops = 16, .maxreqs = 2,
+	};
+	struct nfsd4_channel_attrs back = { .maxreqs = 1 };
+	struct nfsd_net *nn = net_generic(client->net, nfsd_net_id);
+	struct nfsd4_session *session;
+	struct nfsd4_conn *conn;
+
+	conn = alloc_conn(rqstp, NFS4_CDFC4_FORE);
+	if (!conn)
+		return NULL;
+	session = alloc_session(&attrs, &back);
+	if (!session) {
+		free_conn(conn);
+		return NULL;
+	}
+	INIT_LIST_HEAD(&session->se_hash);
+	INIT_LIST_HEAD(&session->se_perclnt);
+	INIT_LIST_HEAD(&session->se_all_sessions);
+	INIT_LIST_HEAD(&session->se_conns);
+	session->se_sessionid = *id;
+	session->se_client = client;
+	atomic_set(&session->se_ref, 1);
+	nfsd4_hash_conn(conn, session);
+	if (nfsd4_register_conn(conn)) {
+		list_del(&conn->cn_persession);
+		free_conn(conn);
+		__free_session(session);
+		return NULL;
+	}
+	spin_lock(&nn->client_lock);
+	atomic_inc(&client->cl_rpc_users);
+	list_add(&session->se_hash,
+		 &nn->sessionid_hashtbl[hash_sessionid(&session->se_sessionid)]);
+	spin_lock(&client->cl_lock);
+	list_add(&session->se_perclnt, &client->cl_sessions);
+	spin_unlock(&client->cl_lock);
+	/* Count once, but leave this deterministic fixture off the shrinker list. */
+	atomic_inc(&nfsd_total_sessions);
+	spin_unlock(&nn->client_lock);
+	return session;
+}
+
+void nfsd_ffv2_test_data_session_destroy(struct nfsd4_session *session)
+{
+	struct nfsd_net *nn = net_generic(session->se_client->net, nfsd_net_id);
+
+	nfsd_ffv2_test_session_unhash(nn, session, false);
+	nfsd4_session_put_ref(session);
+}
+
+u32 nfsd_ffv2_test_slot_capacity(struct nfsd4_session *session)
+{
+	return session->se_fchannel.maxresp_cached < NFSD_MIN_HDR_SEQ_SZ ?
+		0 : session->se_fchannel.maxresp_cached - NFSD_MIN_HDR_SEQ_SZ;
+}
+
+unsigned int nfsd_ffv2_test_reduce_session(struct nfsd4_session *session)
+{
+	return reduce_session_slots(session, 1);
+}
+
 void nfsd_ffv2_test_session_hash(struct nfsd_net *nn, struct nfsd4_session *session)
 {
 	unsigned int bucket = hash_sessionid(&session->se_sessionid);

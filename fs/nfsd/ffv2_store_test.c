@@ -2115,12 +2115,74 @@ static void ffv2_mutation_receipt_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, error, 0);
 	KUNIT_EXPECT_MEMEQ(test, &result, &frozen, sizeof(result));
 	ffv2_mutation_unchanged(test, f, &before);
+	l.operation.request_digest[0]++;
+	error = nfsd_ffv2_store_test_lifecycle(f->store, f->keys[0], &l, &result,
+					       NFSD_FFV2_COMMITTED);
+	KUNIT_EXPECT_EQ_MSG(test, error, -EEXIST, "changed digest after real reopen");
+	ffv2_mutation_unchanged(test, f, &before);
+	l.operation.request_digest[0]--;
 	/* A different ordinal names new work and must pass current authority. */
 	l.operation.ordinal++;
 	error = nfsd_ffv2_store_test_lifecycle(f->store, f->keys[0], &l, &result,
 					       NFSD_FFV2_COMMITTED);
 	KUNIT_EXPECT_EQ(test, error, -EINVAL);
 	ffv2_mutation_unchanged(test, f, &before);
+}
+
+static void ffv2_mutation_zero_sequence_test(struct kunit *test)
+{
+	unsigned int transition;
+
+	for (transition = NFSD_FFV2_PREPARED; transition <= NFSD_FFV2_COMMITTED;
+	     transition++) {
+		struct ffv2_recovery_fixture *f = ffv2_recovery_fixture(test);
+		struct nfsd_ffv2_store_mutation_result result;
+		struct nfsd_ffv2_store_admission a[2];
+		struct nfsd_ffv2_store_lifecycle l;
+		struct ffv2_mutation_snapshot before;
+		struct nfsd_ffv2_store_write w;
+		unsigned int events;
+		int error;
+
+		ffv2_mutation_open(test, f, a);
+		w = ffv2_mutation_request(f, a[0].id, 1);
+		w.activate_if_empty = false;
+		w.stability = 0;
+		if (transition != NFSD_FFV2_PREPARED) {
+			error = nfsd_ffv2_store_test_write(f->store, f->keys[0], &w, &result);
+			KUNIT_ASSERT_EQ(test, error, 0);
+			l = ffv2_mutation_lifecycle(&w, 2);
+			if (transition == NFSD_FFV2_COMMITTED) {
+				error = nfsd_ffv2_store_test_lifecycle(f->store, f->keys[0],
+								       &l, &result,
+								       NFSD_FFV2_FINALIZED);
+				KUNIT_ASSERT_EQ(test, error, 0);
+			}
+			l.operation.sequence = 0;
+		} else {
+			w.operation.sequence = 0;
+		}
+		ffv2_mutation_snapshot(test, f, &before);
+		events = f->events;
+		if (transition == NFSD_FFV2_PREPARED)
+			error = nfsd_ffv2_store_test_write(f->store, f->keys[0], &w, &result);
+		else
+			error = nfsd_ffv2_store_test_lifecycle(f->store, f->keys[0], &l, &result,
+							       transition);
+		KUNIT_EXPECT_EQ_MSG(test, error, -EINVAL, "live zero sequence phase %u",
+				    transition);
+		KUNIT_EXPECT_EQ(test, f->events, events);
+		ffv2_mutation_unchanged(test, f, &before);
+		if (transition == NFSD_FFV2_PREPARED) {
+			w.operation.sequence = 1;
+			error = nfsd_ffv2_store_test_write(f->store, f->keys[0], &w, &result);
+		} else {
+			l.operation.sequence = 3;
+			error = nfsd_ffv2_store_test_lifecycle(f->store, f->keys[0], &l, &result,
+							       transition);
+		}
+		KUNIT_EXPECT_EQ_MSG(test, error, 0, "otherwise valid live phase %u", transition);
+	}
 }
 
 static void ffv2_mutation_binding_test(struct kunit *test)
@@ -2707,6 +2769,7 @@ static struct kunit_case ffv2_store_test_cases[] = {
 	KUNIT_CASE(ffv2_mutation_partial_admission_test),
 	KUNIT_CASE(ffv2_mutation_lifecycle_test),
 	KUNIT_CASE(ffv2_mutation_receipt_test),
+	KUNIT_CASE(ffv2_mutation_zero_sequence_test),
 	KUNIT_CASE(ffv2_mutation_binding_test),
 	KUNIT_CASE(ffv2_mutation_write_refusal_test),
 	KUNIT_CASE(ffv2_mutation_owner_pending_guard_test),
