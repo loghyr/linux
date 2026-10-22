@@ -7408,10 +7408,709 @@ static void ffv2_proto_setup_failure_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_prototype_enable(f->ordinary->nn, f->ordinary->net), 0);
 }
 
+/* Synthetic authority and shmem files feed the production mutation path. */
+struct ffv2_mutation_fixture {
+	struct ffv2_proto_fixture *proto;
+	struct nfsd4_compoundres response;
+	struct nfsd4_slot *slot;
+	struct nfsd4_op op;
+	u8 *wire;
+	u32 len;
+};
+
+static struct ffv2_mutation_fixture *ffv2_mutation_fixture(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = kunit_kzalloc(test, sizeof(*f), GFP_KERNEL);
+	struct nfsd_ffv2_mapping_fixture *m;
+	u32 i;
+
+	if (!f)
+		return NULL;
+	f->proto = ffv2_proto_fixture(test);
+	f->slot = kunit_kzalloc(test, sizeof(*f->slot), GFP_KERNEL);
+	f->wire = kunit_kzalloc(test, 2 * (4096 + 256), GFP_KERNEL);
+	if (!f->proto || !f->slot || !f->wire || ffv2_proto_register(f->proto))
+		return NULL;
+	for (i = 0; i < 2; i++)
+		if (nfsd_ffv2_mapping_key_inner(f->proto->ordinary, &f->proto->inner[i]))
+			return NULL;
+	m = ffv2_proto_mapping(test, f->proto);
+	if (!m)
+		return NULL;
+	memcpy(&f->proto->ordinary->client.cl_clientid, &f->proto->request.pnfs_clientid,
+	       sizeof(clientid_t));
+	memset(&m->cstate.session->se_sessionid, 0x57, 16);
+	m->cstate.slot = f->slot;
+	f->slot->sl_index = 3;
+	f->slot->sl_seqid = 1;
+	m->rqst.rq_resp = &f->response;
+	m->rqst.rq_res.buflen = 65536;
+	f->response.rqstp = &m->rqst;
+	f->response.opcnt = 1;
+	return f;
+}
+
+static int ffv2_mutation_map(struct ffv2_mutation_fixture *f, u32 member)
+{
+	struct knfsd_fh fh = {};
+
+	fh.fh_size = f->proto->bundle.objects[member].handle_len;
+	memcpy(fh.fh_raw, f->proto->bundle.objects[member].handle, fh.fh_size);
+	return nfsd_ffv2_mapping_putfh(f->proto->mapping, &fh) == nfs_ok ? 0 : -ESTALE;
+}
+
+static __be32 *ffv2_mutation_wire(struct ffv2_mutation_fixture *f, __be32 *p, u32 member, u32 op,
+				  u64 index, u32 len, u32 stable, u32 owner)
+{
+	*p++ = cpu_to_be32(op);
+	memcpy(p, f->proto->bundle.objects[member].stateid, sizeof(stateid_t));
+	*p = cpu_to_be32(((stateid_t *)f->proto->bundle.objects[member].stateid)->si_generation);
+	p += 4;
+	*p++ = cpu_to_be32(index >> 32);
+	*p++ = cpu_to_be32(index);
+	if (op == OP_CHUNK_WRITE) {
+		*p++ = cpu_to_be32(stable);
+	} else {
+		*p++ = cpu_to_be32(1);
+		*p++ = cpu_to_be32(1);
+	}
+	*p++ = 0;
+	*p++ = 0;
+	*p++ = cpu_to_be32(17);
+	if (op == OP_CHUNK_WRITE)
+		*p++ = cpu_to_be32(1);
+	*p++ = cpu_to_be32(owner);
+	if (op != OP_CHUNK_WRITE)
+		return p;
+	*p++ = cpu_to_be32(700 + owner);
+	*p++ = cpu_to_be32(1);
+	*p++ = cpu_to_be32(1);
+	*p++ = 0;
+	*p++ = 0;
+	*p++ = cpu_to_be32(4096);
+	*p++ = cpu_to_be32(1);
+	*p++ = 0;
+	*p++ = 0;
+	*p++ = cpu_to_be32(len);
+	memset(p, 0x30 + member, len);
+	return p + XDR_QUADLEN(len);
+}
+
+static bool ffv2_mutation_decode(struct kunit *test, struct ffv2_mutation_fixture *f, u32 member,
+				 u32 op, u32 sequence, u64 index, u32 len, u32 stable, u32 owner)
+{
+	struct nfsd_ffv2_mapping_fixture *m = f->proto->mapping;
+	__be32 *p = (__be32 *)f->wire;
+
+	if (ffv2_mutation_map(f, member))
+		return false;
+	*p++ = 0;
+	*p++ = cpu_to_be32(2);
+	*p++ = cpu_to_be32(1);
+	p = ffv2_mutation_wire(f, p, member, op, index, len, stable, owner);
+	f->len = (u8 *)p - f->wire;
+	if (!nfsd_ffv2_test_compound_decode(test, &m->args, f->wire, f->len, f->len, 0))
+		return false;
+	f->slot->sl_seqid = sequence;
+	f->response.opcnt = 1;
+	f->op = m->args.ops[0];
+	return f->op.status == nfs_ok && m->args.ffv2_digest_valid;
+}
+
+static __be32 ffv2_mutation_handle(struct ffv2_mutation_fixture *f)
+{
+	struct nfsd_ffv2_mapping_fixture *m = f->proto->mapping;
+
+	f->op.status = nfsd4_test_ffv2_run_op(&m->rqst, &m->cstate, f->op.opnum, &f->op.u);
+	return f->op.status;
+}
+
+static void ffv2_mutation_encode(struct ffv2_mutation_fixture *f, void *wire, u32 size)
+{
+	struct svc_rqst *rqstp = &f->proto->mapping->rqst;
+	struct xdr_stream xdr;
+
+	memset(&rqstp->rq_res, 0, sizeof(rqstp->rq_res));
+	rqstp->rq_res.head[0].iov_base = wire;
+	rqstp->rq_res.buflen = size;
+	xdr_init_encode(&xdr, &rqstp->rq_res, NULL, NULL);
+	f->response.xdr = &xdr;
+	if (size < 13 * XDR_UNIT)
+		f->op.status = nfsd4_test_encode_ffv2_mutation(&xdr, f->op.opnum, &f->op.u);
+	else
+		nfsd4_encode_operation(&f->response, &f->op);
+	nfsd_ffv2_test_release_op(&f->op);
+	rqstp->rq_res.buflen = 65536;
+}
+
+static void
+ffv2_mutation_state(struct ffv2_mutation_fixture *f, struct nfsd_ffv2_recovery_state *state)
+{
+	nfsd_ffv2_prototype_test_store_state(f->proto->ordinary->nn, state);
+}
+
+static void ffv2_mutation_members_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state state, before, after;
+	struct nfsd_ffv2_chunk_result result;
+	struct nfsd_ffv2_admission admission = {};
+	__be32 wire[32];
+	u32 member, op, sequence = 1;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	/* Bind the higher admission first, then the lower admission. */
+	for (member = 2; member-- > 0;) {
+		KUNIT_ASSERT_TRUE(test,
+				  ffv2_mutation_decode(test, f, member, OP_CHUNK_WRITE, sequence++,
+						       0, 32, NFS_UNSTABLE, member + 1));
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfs_ok);
+		KUNIT_EXPECT_FALSE(test, f->op.u.ffv2.result_activated);
+		KUNIT_EXPECT_EQ(test, f->op.u.ffv2.result_bytes, 32U);
+		ffv2_mutation_encode(f, wire, sizeof(wire));
+		KUNIT_EXPECT_EQ_MSG(test, be32_to_cpu(wire[2]), 1U, "accepted chunks, not bytes");
+		for (op = OP_CHUNK_FINALIZE;; op = OP_CHUNK_COMMIT) {
+			KUNIT_ASSERT_TRUE(test,
+					  ffv2_mutation_decode(test, f, member, op, sequence++, 0,
+							       0, 0, member + 1));
+			FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+			FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfs_ok);
+			ffv2_mutation_state(f, &before);
+			FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+			ffv2_mutation_state(f, &after);
+			KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+			ffv2_mutation_encode(f, wire, sizeof(wire));
+			KUNIT_EXPECT_EQ(test, be32_to_cpu(wire[4]), 1U);
+			FFV2_EXPECT_STATUS(test, wire[5], nfs_ok);
+			if (op == OP_CHUNK_COMMIT)
+				break;
+		}
+		FFV2_EXPECT_STATUS(test,
+				   ffv2_proto_probe(f->proto, member, 0, 1, &result, &admission),
+				   nfs_ok);
+		if (result.count == 1 && result.read.chunks) {
+			KUNIT_EXPECT_EQ(test, result.read.chunks[0].cr_effective_len, 32U);
+			KUNIT_EXPECT_EQ(test, result.read.chunks[0].cr_payload_id, 701U + member);
+			KUNIT_EXPECT_EQ(test, result.read.chunks[0].cr_chunk[0],
+					(u8)(0x30 + member));
+		} else {
+			KUNIT_FAIL(test, "missing committed member data");
+		}
+		nfsd_ffv2_complete(&admission);
+	}
+	ffv2_mutation_state(f, &state);
+	KUNIT_EXPECT_EQ(test, state.transactions, 2U);
+	KUNIT_EXPECT_EQ(test, state.receipts, 6U);
+}
+
+static void ffv2_mutation_replay_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	struct nfsd4_ffv2 frozen;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, OP_CHUNK_WRITE, 9, 0, 32,
+						     NFS_FILE_SYNC, 8));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	frozen = f->op.u.ffv2;
+	KUNIT_EXPECT_TRUE(test, frozen.result_activated);
+	ffv2_mutation_state(f, &before);
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	KUNIT_EXPECT_MEMEQ(test, f->op.u.ffv2.result_verifier.data, frozen.result_verifier.data, 8);
+	KUNIT_EXPECT_EQ(test, f->op.u.ffv2.result_activated, frozen.result_activated);
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+	/* Change a tag byte through the complete compound decoder. */
+	put_unaligned_be32(1, f->wire);
+	memmove(f->wire + 8, f->wire + 4, f->len - 4);
+	memset(f->wire + 4, 0, 4);
+	f->wire[4] = 'x';
+	f->len += 4;
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_test_compound_decode(test, &f->proto->mapping->args,
+							       f->wire, f->len, f->len, 0));
+	f->op = f->proto->mapping->args.ops[0];
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS_MSG(test, f->op.u.ffv2.result_status, nfserr_seq_false_retry,
+			       "full transcript participates in durable receipt identity");
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+}
+
+static void ffv2_mutation_ordinal_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state state;
+	struct nfsd_ffv2_mapping_fixture *m;
+	__be32 *p;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	m = f->proto->mapping;
+	KUNIT_ASSERT_EQ(test, ffv2_mutation_map(f, 0), 0);
+	p = (__be32 *)f->wire;
+	*p++ = 0;
+	*p++ = cpu_to_be32(2);
+	*p++ = cpu_to_be32(2);
+	p = ffv2_mutation_wire(f, p, 0, OP_CHUNK_WRITE, 0, 4096, NFS_FILE_SYNC, 20);
+	p = ffv2_mutation_wire(f, p, 0, OP_CHUNK_WRITE, 1, 32, NFS_FILE_SYNC, 21);
+	f->len = (u8 *)p - f->wire;
+	KUNIT_ASSERT_TRUE(test, nfsd_ffv2_test_compound_decode(test, &m->args, f->wire, f->len,
+							       f->len, 0));
+	for (i = 0; i < 2; i++) {
+		f->op = m->args.ops[i];
+		f->response.opcnt = i + 1;
+		FFV2_EXPECT_STATUS_MSG(test, ffv2_mutation_handle(f), nfs_ok,
+				       "distinct compound ordinal reaches its own mutation");
+		KUNIT_EXPECT_EQ(test, f->op.u.ffv2.result_owner_id, 20U + i);
+	}
+	ffv2_mutation_state(f, &state);
+	KUNIT_EXPECT_EQ_MSG(test, state.transactions, 2U, "two durable operations in one compound");
+}
+
+static void ffv2_mutation_guards_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	__be32 wire[32];
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	ffv2_mutation_state(f, &before);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 2, 0, 32,
+						     NFS_UNSTABLE, 2));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS_MSG(test, f->op.u.ffv2.result_status, nfserr_chunk_guarded,
+			       "occupied chunk refuses the never-written guard");
+	KUNIT_EXPECT_FALSE(test, f->op.u.ffv2.result_activated);
+	ffv2_mutation_encode(f, wire, sizeof(wire));
+	KUNIT_EXPECT_EQ_MSG(test, be32_to_cpu(wire[2]), 0U, "rejected block accepts zero chunks");
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+	f->op.u.ffv2.guard_never_written = false;
+	f->op.u.ffv2.guard_generation = 0;
+	f->op.u.ffv2.guard_writer = 17;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfs_ok);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 3, 0, 32,
+						     NFS_UNSTABLE, 3));
+	f->op.u.ffv2.guard_check = false;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfserr_chunk_guarded);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_COMMIT, 4, 0, 0, 0, 2));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfserr_inval);
+}
+
+static void ffv2_mutation_identity_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	struct nfsd_ffv2_mapping_fixture *m;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	m = f->proto->mapping;
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	ffv2_mutation_state(f, &before);
+	memcpy(&f->op.u.ffv2.stateid, f->proto->bundle.objects[0].stateid, sizeof(stateid_t));
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_bad_stateid);
+	m->args.ffv2_decode_status = nfserr_bad_xdr;
+	m->args.ffv2_digest_valid = false;
+	m->args.ffv2_decode_class = NFSD4_FFV2_DECODE_BADXDR;
+	FFV2_EXPECT_STATUS_MSG(test, ffv2_mutation_handle(f), nfserr_bad_xdr,
+			       "saved decode error precedes identity and provider");
+	m->args.ffv2_decode_status = nfs_ok;
+	m->args.ffv2_digest_valid = true;
+	m->args.ffv2_decode_class = NFSD4_FFV2_DECODE_NONE;
+	memcpy(&f->op.u.ffv2.stateid, f->proto->bundle.objects[1].stateid, sizeof(stateid_t));
+	f->op.u.ffv2.owner_client_id = 18;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_bad_stateid);
+	f->op.u.ffv2.owner_client_id = 17;
+	m->args.ffv2_digest_valid = false;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_notsupp);
+	m->args.ffv2_digest_valid = true;
+	m->cstate.slot = NULL;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_serverfault);
+	m->cstate.slot = f->slot;
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+}
+
+static void ffv2_mutation_copy_encode_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	struct nfsd_net *nn;
+	__be32 wire[32];
+	u32 stage;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	nn = f->proto->ordinary->nn;
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	ffv2_mutation_state(f, &before);
+	for (stage = 3; stage <= 4; stage++) {
+		nn->ffv2.test_registration.read_copy_fault = stage;
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f),
+				   stage == 3 ? nfserr_jukebox : nfserr_bad_xdr);
+		ffv2_mutation_state(f, &after);
+		KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+	}
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	ffv2_mutation_state(f, &before);
+	ffv2_mutation_encode(f, wire, 5 * XDR_UNIT);
+	FFV2_EXPECT_STATUS(test, f->op.status, nfserr_resource);
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ_MSG(test, &before, &after, sizeof(before),
+			       "failed reply preserves exact successful receipt");
+	ffv2_mutation_encode(f, wire, sizeof(wire));
+	FFV2_EXPECT_STATUS(test, f->op.status, nfs_ok);
+	KUNIT_EXPECT_EQ(test, be32_to_cpu(wire[2]), 1U);
+}
+
+static void ffv2_mutation_store_failure_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	u8 byte = 1;
+	loff_t pos;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	ffv2_mutation_state(f, &before);
+	pos = before.wal_cursor;
+	KUNIT_ASSERT_EQ(test, kernel_write(f->proto->input.files[NFSD_FFV2_IO_WAL], &byte, 1, &pos),
+			(ssize_t)1);
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+	FFV2_EXPECT_STATUS(test, f->op.u.ffv2.result_status, nfserr_io);
+	KUNIT_EXPECT_FALSE(test, f->op.u.ffv2.result_activated);
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_TRUE(test, after.failed);
+	KUNIT_EXPECT_EQ(test, after.transactions, before.transactions);
+	KUNIT_EXPECT_EQ(test, after.receipts, before.receipts);
+}
+
+/* This provider only tests malformed results and callback/result ownership. */
+struct ffv2_mutation_provider {
+	struct ffv2_mutation_fixture *fixture;
+	struct nfsd_ffv2_admission admission;
+	struct ffv2_provider_drain *drain;
+	u32 mode;
+	u32 releases;
+	bool pinned_at_release;
+};
+
+static void ffv2_mutation_result_release(void *data)
+{
+	struct ffv2_mutation_provider *p = data;
+
+	p->releases++;
+	p->pinned_at_release = !!p->admission.provider;
+}
+
+static __be32 ffv2_mutation_provider_read(void *data, const struct nfsd_ffv2_object *object,
+					  const struct nfsd_ffv2_chunk_request *request,
+					  struct nfsd_ffv2_chunk_result *result)
+{
+	return nfserr_notsupp;
+}
+
+static __be32 ffv2_mutation_provider_write(void *data, const struct nfsd_ffv2_object *object,
+					   const struct nfsd_ffv2_write_request *request,
+					   struct nfsd_ffv2_mutation_result *result)
+{
+	struct ffv2_mutation_provider *p = data;
+	bool queued;
+
+	result->count = 1;
+	result->bytes = request->payload_len;
+	result->stability = request->stability;
+	result->owner = request->owner;
+	result->private = p;
+	result->release = ffv2_mutation_result_release;
+	if (p->drain) {
+		complete(&p->drain->go);
+		if (read_poll_timeout(ffv2_provider_wait_queued, queued, queued, 1000, 5000000,
+				      false, &p->drain->waiting))
+			return nfserr_io;
+	}
+	switch (p->mode) {
+	case 1:
+		result->count = 2;
+		break;
+	case 2:
+		result->bytes--;
+		break;
+	case 3:
+		result->stability = 3;
+		break;
+	case 4:
+		result->owner.co_id++;
+		break;
+	case 5:
+		result->status = cpu_to_be32(0x7fffffff);
+		break;
+	case 6:
+		result->status = nfserr_io;
+		result->activated = true;
+		break;
+	case 7:
+		return nfserr_io;
+	case 8:
+		result->release = NULL;
+		break;
+	}
+	return nfs_ok;
+}
+
+static const struct nfsd_ffv2_provider_ops ffv2_mutation_test_ops = {
+	.chunk_read = ffv2_mutation_provider_read,
+	.chunk_header_read = ffv2_mutation_provider_read,
+	.chunk_write = ffv2_mutation_provider_write,
+};
+
+static __be32 ffv2_mutation_provider_call(struct ffv2_mutation_provider *p,
+					  struct nfsd_ffv2_mutation_result *result)
+{
+	struct nfsd_ffv2_mapping_fixture *m = p->fixture->proto->mapping;
+	struct nfsd_ffv2_write_request request = {
+		.payload_len = 32,
+		.stability = NFS_FILE_SYNC,
+		.owner = { .co_client_id = 17, .co_id = 1 },
+	};
+
+	return nfsd_ffv2_provider_mutate(&m->rqst, &m->cstate.current_fh, OP_CHUNK_WRITE, &request,
+					 result, &p->admission);
+}
+
+static bool ffv2_mutation_provider_admit(struct ffv2_mutation_provider *p)
+{
+	struct nfsd_ffv2_mapping_fixture *m = p->fixture->proto->mapping;
+	struct nfsd_ffv2_actor_id actor = { .client_id = 17, .present = true };
+
+	return nfsd_ffv2_validate_operation(&m->rqst, &m->cstate.current_fh, m->cstate.session,
+					    OP_CHUNK_WRITE, &p->fixture->op.u.ffv2.stateid, &actor,
+					    &p->admission) == nfs_ok;
+}
+
+static void ffv2_mutation_results_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct ffv2_mutation_provider *p;
+	struct nfsd_ffv2_mutation_result result;
+	u32 mode;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	p->fixture = f;
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	nfsd_ffv2_provider_remove(f->proto->ordinary->nn);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(f->proto->ordinary->nn, &ffv2_mutation_test_ops,
+						   p, 4096),
+			0);
+	for (mode = 0; mode <= 8; mode++) {
+		p->mode = mode;
+		KUNIT_ASSERT_TRUE(test, ffv2_mutation_provider_admit(p));
+		FFV2_EXPECT_STATUS_MSG(test, ffv2_mutation_provider_call(p, &result),
+				       mode == 0 ? nfs_ok :
+				       mode == 7 ? nfserr_io :
+						   nfserr_serverfault,
+				       "malformed result mode %u", mode);
+		KUNIT_EXPECT_NOT_NULL_MSG(test, p->admission.provider,
+					  "refused results retain their provider");
+		nfsd_ffv2_complete(&p->admission);
+		KUNIT_EXPECT_EQ(test, p->releases, min(mode + 1, 8U));
+	}
+	KUNIT_EXPECT_TRUE(test, p->pinned_at_release);
+}
+
+static void ffv2_mutation_drain_check(struct kunit *test, bool callback)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct ffv2_mutation_provider *p;
+	struct nfsd_ffv2_mutation_result result;
+	struct ffv2_provider_drain *d;
+	struct task_struct *task;
+	bool queued;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	p = kunit_kzalloc(test, sizeof(*p), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, p);
+	p->fixture = f;
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 0, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	nfsd_ffv2_provider_remove(f->proto->ordinary->nn);
+	KUNIT_ASSERT_EQ(test,
+			nfsd_ffv2_provider_install(f->proto->ordinary->nn, &ffv2_mutation_test_ops,
+						   p, 4096),
+			0);
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_provider_admit(p));
+	if (!callback) {
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_provider_call(p, &result), nfs_ok);
+		p->mode = 1;
+		FFV2_EXPECT_STATUS_MSG(test, ffv2_mutation_provider_call(p, &result),
+				       nfserr_serverfault, "earlier owner survives");
+	}
+	d = kzalloc_obj(*d, GFP_KERNEL);
+	if (!d) {
+		nfsd_ffv2_complete(&p->admission);
+		KUNIT_FAIL(test, "allocate drain observer");
+		return;
+	}
+	d->net = get_net(f->proto->ordinary->net);
+	d->nn = f->proto->ordinary->nn;
+	refcount_set(&d->refs, 1);
+	init_completion(&d->go);
+	init_completion(&d->done);
+	task = kthread_create(ffv2_provider_drain_thread, d, "ffv2-mutation-drain");
+	if (IS_ERR(task)) {
+		nfsd_ffv2_complete(&p->admission);
+		ffv2_provider_drain_put(d);
+		KUNIT_FAIL(test, "start mutation drain");
+		return;
+	}
+	get_task_struct(task);
+	refcount_inc(&d->refs);
+	nfsd_ffv2_test_provider_drain_hook(d->nn, &d->waiting);
+	wake_up_process(task);
+	if (callback) {
+		p->drain = d;
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_provider_call(p, &result), nfs_ok);
+		p->drain = NULL;
+	} else {
+		complete(&d->go);
+	}
+	KUNIT_EXPECT_EQ_MSG(test,
+			    read_poll_timeout(ffv2_provider_wait_queued, queued, queued, 1000,
+					      5000000, false, &d->waiting),
+			    0, "mutation result holds actual provider drain wait");
+	KUNIT_EXPECT_FALSE(test, completion_done(&d->done));
+	nfsd_ffv2_complete(&p->admission);
+	KUNIT_EXPECT_EQ(test, p->releases, 1U);
+	KUNIT_EXPECT_TRUE(test, p->pinned_at_release);
+	KUNIT_EXPECT_NE(test, wait_for_completion_timeout(&d->done, 5 * HZ), 0UL);
+	nfsd_ffv2_test_provider_drain_hook(d->nn, NULL);
+	put_task_struct(task);
+	ffv2_provider_drain_put(d);
+}
+
+static void ffv2_mutation_result_drain_test(struct kunit *test)
+{
+	ffv2_mutation_drain_check(test, false);
+}
+
+static void ffv2_mutation_callback_drain_test(struct kunit *test)
+{
+	ffv2_mutation_drain_check(test, true);
+}
+
+static void ffv2_mutation_geometry_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state before, after;
+	u32 op;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	ffv2_mutation_state(f, &before);
+	for (op = OP_CHUNK_COMMIT; op <= OP_CHUNK_WRITE; op++) {
+		if (op != OP_CHUNK_COMMIT && op != OP_CHUNK_FINALIZE && op != OP_CHUNK_WRITE)
+			continue;
+		KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, op, op, U64_MAX, 32,
+							     NFS_FILE_SYNC, op));
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		FFV2_EXPECT_STATUS_MSG(test, f->op.u.ffv2.result_status, nfserr_inval,
+				       "member geometry rejects before indexing store state");
+	}
+	KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, OP_CHUNK_WRITE, 1, 0, 32,
+						     NFS_FILE_SYNC, 1));
+	f->proto->mapping->rqst.rq_res.buflen = 0;
+	FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfserr_resource);
+	ffv2_mutation_state(f, &after);
+	KUNIT_EXPECT_MEMEQ(test, &before, &after, sizeof(before));
+}
+
+static void ffv2_mutation_session_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd_ffv2_recovery_state state;
+	u32 i;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	for (i = 0; i < 3; i++) {
+		KUNIT_ASSERT_TRUE(test, ffv2_mutation_decode(test, f, 1, OP_CHUNK_WRITE, 1, i, 4096,
+							     NFS_FILE_SYNC, i + 1));
+		if (i == 1)
+			f->slot->sl_index++;
+		if (i == 2)
+			((u8 *)&f->proto->mapping->cstate.session->se_sessionid)[0]++;
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		FFV2_EXPECT_STATUS_MSG(test, f->op.u.ffv2.result_status, nfs_ok,
+				       "session and slot distinguish equal sequence numbers");
+	}
+	ffv2_mutation_state(f, &state);
+	KUNIT_EXPECT_EQ(test, state.receipts, 3U);
+}
+
+static void ffv2_mutation_read_handler_test(struct kunit *test)
+{
+	struct ffv2_mutation_fixture *f = ffv2_mutation_fixture(test);
+	struct nfsd4_chunk_read *read;
+	u32 member;
+
+	KUNIT_ASSERT_NOT_NULL(test, f);
+	for (member = 0; member < 2; member++) {
+		KUNIT_ASSERT_TRUE(test,
+				  ffv2_mutation_decode(test, f, member, OP_CHUNK_WRITE, member + 1,
+						       2, 32, NFS_FILE_SYNC, member + 1));
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		memset(&f->op, 0, sizeof(f->op));
+		f->op.opnum = OP_CHUNK_READ;
+		read = &f->op.u.chunk_read;
+		memcpy(&read->cra_stateid, f->proto->bundle.objects[member].stateid,
+		       sizeof(stateid_t));
+		read->cra_count = 3;
+		FFV2_EXPECT_STATUS(test, ffv2_mutation_handle(f), nfs_ok);
+		if (read->cra_nchunks == 3 && read->cra_chunks && read->cra_payload) {
+			KUNIT_EXPECT_TRUE(test, read->cra_eof);
+			FFV2_EXPECT_STATUS(test, read->cra_chunks[0].cre_status, nfserr_noent);
+			FFV2_EXPECT_STATUS(test, read->cra_chunks[2].cre_status, nfs_ok);
+			KUNIT_EXPECT_EQ(test, read->cra_chunks[2].cre_effective_len, 32U);
+			KUNIT_EXPECT_EQ(test, read->cra_chunks[2].cre_payload_id, 701U + member);
+			KUNIT_EXPECT_EQ(test, ((u8 *)read->cra_payload)[8192], (u8)(0x30 + member));
+		} else {
+			KUNIT_FAIL(test, "missing sparse or partial handler data");
+		}
+		nfsd_ffv2_test_release_op(&f->op);
+	}
+}
+
 #endif
 
 static struct kunit_case nfsd_ffv2_test_cases[] = {
 #if IS_ENABLED(CONFIG_NFSD_FFV2_PROTOTYPE_AUTH)
+	KUNIT_CASE(ffv2_mutation_results_test),
+	KUNIT_CASE(ffv2_mutation_result_drain_test),
+	KUNIT_CASE(ffv2_mutation_callback_drain_test),
+	KUNIT_CASE(ffv2_mutation_geometry_test),
+	KUNIT_CASE(ffv2_mutation_session_test),
+	KUNIT_CASE(ffv2_mutation_read_handler_test),
+	KUNIT_CASE(ffv2_mutation_members_test),
+	KUNIT_CASE(ffv2_mutation_replay_test),
+	KUNIT_CASE(ffv2_mutation_ordinal_test),
+	KUNIT_CASE(ffv2_mutation_guards_test),
+	KUNIT_CASE(ffv2_mutation_identity_test),
+	KUNIT_CASE(ffv2_mutation_copy_encode_test),
+	KUNIT_CASE(ffv2_mutation_store_failure_test),
+
 	KUNIT_CASE(ffv2_proto_constructor_test),
 	KUNIT_CASE_SLOW(ffv2_proto_failure_test),
 	KUNIT_CASE(ffv2_proto_identity_test),

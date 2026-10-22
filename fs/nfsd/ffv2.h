@@ -215,6 +215,49 @@ struct nfsd_ffv2_chunk_result {
 	};
 };
 
+struct nfsd_ffv2_mutation_operation {
+	u8 session[16];
+	u32 slot;
+	u32 sequence;
+	u32 ordinal;
+	u8 request_digest[32];
+};
+
+struct nfsd_ffv2_write_request {
+	struct nfsd_ffv2_mutation_operation operation;
+	u64 chunk_index;
+	u32 stability;
+	struct nfsd_ffv2_chunk_owner owner;
+	u32 payload_id;
+	bool guard_check;
+	bool guard_never_written;
+	u32 guard_generation;
+	u32 guard_writer;
+	bool activate_if_empty;
+	u32 chunk_size;
+	struct nfsd_ffv2_checksum checksum;
+	const u8 *payload;
+	u32 payload_len;
+};
+
+struct nfsd_ffv2_lifecycle_request {
+	struct nfsd_ffv2_mutation_operation operation;
+	u64 chunk_index;
+	struct nfsd_ffv2_chunk_owner owner;
+};
+
+struct nfsd_ffv2_mutation_result {
+	void *private;
+	void (*release)(void *private);
+	u32 count;
+	u32 bytes;
+	u32 stability;
+	u8 verifier[8];
+	__be32 status;
+	bool activated;
+	struct nfsd_ffv2_chunk_owner owner;
+};
+
 /*
  * Callbacks and result release may sleep. Borrowed arrays and payload stay
  * immutable until admission completion. A non-NULL private/release pair
@@ -230,6 +273,15 @@ struct nfsd_ffv2_provider_ops {
 	__be32 (*chunk_header_read)(void *provider, const struct nfsd_ffv2_object *object,
 				    const struct nfsd_ffv2_chunk_request *request,
 		struct nfsd_ffv2_chunk_result *result);
+	__be32 (*chunk_write)(void *provider, const struct nfsd_ffv2_object *object,
+			      const struct nfsd_ffv2_write_request *request,
+			      struct nfsd_ffv2_mutation_result *result);
+	__be32 (*chunk_finalize)(void *provider, const struct nfsd_ffv2_object *object,
+				 const struct nfsd_ffv2_lifecycle_request *request,
+				 struct nfsd_ffv2_mutation_result *result);
+	__be32 (*chunk_commit)(void *provider, const struct nfsd_ffv2_object *object,
+			       const struct nfsd_ffv2_lifecycle_request *request,
+			       struct nfsd_ffv2_mutation_result *result);
 };
 
 __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
@@ -238,6 +290,12 @@ __be32 nfsd_ffv2_provider_probe(struct svc_rqst *rqstp, struct svc_fh *fhp,
 				struct nfsd_ffv2_chunk_result *result,
 				u32 available,
 				struct nfsd_ffv2_admission *admission);
+
+__be32 nfsd_ffv2_provider_admit_mutation(struct svc_rqst *rqstp, u32 opnum,
+					 struct nfsd_ffv2_admission *admission);
+__be32 nfsd_ffv2_provider_mutate(struct svc_rqst *rqstp, struct svc_fh *fhp, u32 opnum,
+				 const void *request, struct nfsd_ffv2_mutation_result *result,
+				 struct nfsd_ffv2_admission *admission);
 
 enum nfsd_ffv2_source {
 	NFSD_FFV2_SOURCE_NONE,

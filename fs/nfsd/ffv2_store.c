@@ -2954,10 +2954,9 @@ out_free:
 	return error;
 }
 
-static int __maybe_unused ffv2_store_write_locked(struct nfsd_ffv2_store *store,
-						  const u8 file_key[32],
-						  const struct nfsd_ffv2_store_write *request,
-						  struct nfsd_ffv2_store_mutation_result *result)
+static int ffv2_store_write_locked(struct nfsd_ffv2_store *store, const u8 file_key[32],
+				   const struct nfsd_ffv2_store_write *request,
+				   struct nfsd_ffv2_store_mutation_result *result)
 {
 	struct nfsd_ffv2_payload_record payload = {};
 	struct nfsd_ffv2_entry_record entry = {
@@ -3124,7 +3123,7 @@ out_free:
 	return error;
 }
 
-static int __maybe_unused
+static int
 ffv2_store_lifecycle_locked(struct nfsd_ffv2_store *store, const u8 file_key[32],
 			    const struct nfsd_ffv2_store_lifecycle *request,
 			    struct nfsd_ffv2_store_mutation_result *result, u32 transition)
@@ -3371,6 +3370,70 @@ void nfsd_ffv2_store_close(struct nfsd_ffv2_store *store)
 	if (store->reservation)
 		nfsd_ffv2_reservation_store_put(store->reservation);
 	kfree(store);
+}
+
+int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store, struct nfsd_ffv2_super_record *record)
+{
+	int error;
+
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	*record = store->super;
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return 0;
+}
+
+int nfsd_ffv2_store_write(struct nfsd_ffv2_store *store, const u8 file_key[32],
+			  const struct nfsd_ffv2_store_write *request,
+			  struct nfsd_ffv2_store_mutation_result *result)
+{
+	int error;
+
+	if (!store || !file_key || !request || !result || !request->content)
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_write_locked(store, file_key, request, result);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+static int ffv2_store_lifecycle(struct nfsd_ffv2_store *store, const u8 file_key[32],
+				const struct nfsd_ffv2_store_lifecycle *request,
+				struct nfsd_ffv2_store_mutation_result *result, u32 transition)
+{
+	int error;
+
+	if (!store || !file_key || !request || !result)
+		return -EINVAL;
+	error = nfsd_ffv2_reservation_store_begin(store->reservation);
+	if (error)
+		return error;
+	mutex_lock(&store->lock);
+	error = ffv2_store_lifecycle_locked(store, file_key, request, result, transition);
+	mutex_unlock(&store->lock);
+	nfsd_ffv2_reservation_store_end(store->reservation);
+	return error;
+}
+
+int nfsd_ffv2_store_finalize(struct nfsd_ffv2_store *store, const u8 file_key[32],
+			     const struct nfsd_ffv2_store_lifecycle *request,
+			     struct nfsd_ffv2_store_mutation_result *result)
+{
+	return ffv2_store_lifecycle(store, file_key, request, result, NFSD_FFV2_FINALIZED);
+}
+
+int nfsd_ffv2_store_commit(struct nfsd_ffv2_store *store, const u8 file_key[32],
+			   const struct nfsd_ffv2_store_lifecycle *request,
+			   struct nfsd_ffv2_store_mutation_result *result)
+{
+	return ffv2_store_lifecycle(store, file_key, request, result, NFSD_FFV2_COMMITTED);
 }
 
 static int ffv2_store_lookup_file_locked(struct nfsd_ffv2_store *store, const u8 handle[32],

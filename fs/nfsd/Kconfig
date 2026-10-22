@@ -98,8 +98,10 @@ config NFSD_FFV2
 	default n
 	help
 	  Build the Flex Files v2 data server lifecycle, registration and
-	  bounded read support into nfsd. The prototype authority profile
-	  requires a separate option.
+	  ordinary CHUNK_READ, CHUNK_WRITE, CHUNK_FINALIZE and CHUNK_COMMIT
+	  support into nfsd. The default-off prototype authority option adds
+	  a bounded file-backed demonstration service. File-backed HEADER_READ,
+	  repair, rollback, lock and trust/revoke RPCs are unsupported.
 
 	  If unsure, say N.
 
@@ -115,15 +117,15 @@ config NFSD_FFV2_PROTOTYPE_AUTH
 	  If unsure, say N.
 
 config NFSD_FFV2_KUNIT_TEST
-	bool "KUnit tests for the nfsd Flex Files v2 lifecycle" if !KUNIT_ALL_TESTS
+	bool "KUnit tests for the nfsd Flex Files v2 data server" if !KUNIT_ALL_TESTS
 	depends on KUNIT=y && NFSD=y && NFSD_FFV2
 	default KUNIT_ALL_TESTS
 	help
-	  Run tests for the fail-closed nfsd Flex Files v2 service lifecycle.
-	  The tests cover state-machine races, a real nfsd worker and service
-	  drain, service restart, and registered network-namespace teardown.
-	  Synthetic providers exercise read result ownership. With prototype
-	  authority enabled, fixtures also exercise its file-backed adapter.
+	  Test Flex Files v2 lifecycle, export reservation, registration,
+	  authorization, protocol dispatch and provider ownership. Store tests
+	  cover codecs, replay and durable mutations. With prototype authority
+	  enabled, fixtures also exercise its file-backed adapter. Synthetic
+	  providers and shmem stores do not qualify live RPC or crash recovery.
 
 	  If unsure, say N.
 

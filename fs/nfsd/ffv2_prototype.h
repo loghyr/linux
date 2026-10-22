@@ -192,6 +192,9 @@ unsigned int nfsd_ffv2_test_active_admissions(struct nfsd_net *nn);
 int nfsd_ffv2_prototype_test_write(struct nfsd_net *nn, u32 member,
 				   struct nfsd_ffv2_store_write *request,
 				   struct nfsd_ffv2_store_mutation_result *result);
+struct nfsd_ffv2_recovery_state;
+void nfsd_ffv2_prototype_test_store_state(struct nfsd_net *nn,
+					  struct nfsd_ffv2_recovery_state *state);
 struct nfsd_ffv2_recovery_input;
 /* Installed before workers start, withdrawn after all workers have joined. */
 struct nfsd_ffv2_prototype_test {

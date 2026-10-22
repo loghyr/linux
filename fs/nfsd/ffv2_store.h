@@ -477,6 +477,17 @@ struct nfsd_ffv2_visible_chunk;
 int nfsd_ffv2_store_open(struct nfsd_net *nn, struct nfsd_ffv2_reservation *reservation,
 			 struct nfsd_ffv2_store **result);
 void nfsd_ffv2_store_close(struct nfsd_ffv2_store *store);
+int nfsd_ffv2_store_get_super(struct nfsd_ffv2_store *store, struct nfsd_ffv2_super_record *record);
+int nfsd_ffv2_store_write(struct nfsd_ffv2_store *store, const u8 file_key[32],
+			  const struct nfsd_ffv2_store_write *request,
+			  struct nfsd_ffv2_store_mutation_result *result);
+int nfsd_ffv2_store_finalize(struct nfsd_ffv2_store *store, const u8 file_key[32],
+			     const struct nfsd_ffv2_store_lifecycle *request,
+			     struct nfsd_ffv2_store_mutation_result *result);
+int nfsd_ffv2_store_commit(struct nfsd_ffv2_store *store, const u8 file_key[32],
+			   const struct nfsd_ffv2_store_lifecycle *request,
+			   struct nfsd_ffv2_store_mutation_result *result);
+
 int nfsd_ffv2_store_lookup_file(struct nfsd_ffv2_store *store, const u8 handle[32],
 				struct nfsd_ffv2_store_file *file);
 int nfsd_ffv2_store_admit_writers(struct nfsd_ffv2_store *store, u32 writer, u32 count,
