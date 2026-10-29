@@ -103,8 +103,9 @@ config NFSD_FFV2
 	  a bounded file-backed demonstration service. File-backed HEADER_READ,
 	  repair, rollback, lock and trust/revoke RPCs are unsupported.
 
-	  This experimental data server requires 64-bit slot sequence storage
-	  to prevent durable mutation receipt identity reuse.
+	  This experimental data server requires a 64-bit kernel so saved slot
+	  sequence values are preserved exactly, preventing durable mutation
+	  receipt identity reuse.
 
 	  If unsure, say N.
 

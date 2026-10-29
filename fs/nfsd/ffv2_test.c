@@ -8119,6 +8119,7 @@ struct ffv2_sequence_fixture {
 	struct svc_xprt *foreign_xprt;
 	struct nfsd_ffv2_recovery_io io;
 	atomic_t io_events;
+	u32 slot_capacity;
 	bool laundry_paused;
 };
 
@@ -8202,6 +8203,7 @@ static struct ffv2_sequence_fixture *ffv2_sequence_fixture(struct kunit *test)
 	f->session = nfsd_ffv2_test_data_session(rqstp, &o->client, &id);
 	if (!f->session || f->session->se_fchannel.maxreqs != 2)
 		goto fail;
+	f->slot_capacity = nfsd_ffv2_test_slot_capacity(f->session);
 	return f;
 fail:
 	KUNIT_FAIL(test, "sequence fixture setup");
@@ -8305,7 +8307,6 @@ static bool ffv2_sequence_run(struct kunit *test, struct ffv2_sequence_fixture *
 	struct nfsd4_slot *slot;
 	const struct cred *saved;
 	struct xdr_stream decode;
-	u32 capacity;
 
 	xdr_buf_init(&rqstp->rq_arg, q->wire, q->len);
 	rqstp->rq_arg.len = q->len;
@@ -8328,9 +8329,9 @@ static bool ffv2_sequence_run(struct kunit *test, struct ffv2_sequence_fixture *
 	put_cred(revert_creds(saved));
 	slot = q->resp.cstate.slot;
 	if (slot && (slot->sl_flags & NFSD4_SLOT_CACHETHIS)) {
-		capacity = nfsd_ffv2_test_slot_capacity(f->session);
 		KUNIT_EXPECT_GE(test, rqstp->rq_res.len, q->resp.cstate.data_offset);
-		KUNIT_EXPECT_LE(test, rqstp->rq_res.len - q->resp.cstate.data_offset, capacity);
+		KUNIT_EXPECT_LE(test, rqstp->rq_res.len - q->resp.cstate.data_offset,
+				f->slot_capacity);
 	}
 	if (!nfs4svc_encode_compoundres(rqstp, &rqstp->rq_res_stream))
 		return false;
@@ -8430,6 +8431,9 @@ static bool ffv2_sequence_regrow(struct kunit *test, struct ffv2_sequence_fixtur
 	struct nfsd4_slot *slot;
 	u16 generation = f->session->se_slot_gen;
 
+	/* Regrown slots must retain the original allocation geometry. */
+	KUNIT_EXPECT_EQ(test, f->session->se_fchannel.maxresp_cached, 8192U);
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_slot_capacity(f->session), f->slot_capacity);
 	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_reduce_session(f->session), 1U);
 	KUNIT_EXPECT_EQ(test, f->session->se_target_maxslots, 1U);
 	KUNIT_EXPECT_EQ(test, f->session->se_slot_gen, (u16)(generation + 1));
@@ -8569,11 +8573,14 @@ FFV2_SEQUENCE_ALIAS_TEST(ffv2_sequence_commit_reset_digest_test, OP_CHUNK_COMMIT
 static void ffv2_sequence_acceptance_test(struct kunit *test)
 {
 	struct ffv2_sequence_fixture *f = ffv2_sequence_fixture(test);
+	struct nfsd_ffv2_registration_test *trace;
 	struct ffv2_sequence_request *q;
 	struct nfsd4_slot *slot;
-	u32 seq0 = 0;
+	u32 seq0 = 0, refusals, bindings, validations, admissions, mutations;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
+	trace = &f->proto->ordinary->nn->ffv2.test_registration;
+	KUNIT_EXPECT_EQ(test, f->slot_capacity, 8112U);
 	/* An unused saved zero can safely reset to one. */
 	KUNIT_ASSERT_TRUE(test, ffv2_sequence_regrow(test, f, &seq0));
 	KUNIT_ASSERT_TRUE(test, ffv2_sequence_call(test, f, 1, 1, 1, 0, 0, 0));
@@ -8584,6 +8591,8 @@ static void ffv2_sequence_acceptance_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
 	/* A size refusal after SEQUENCE still has bounded cached error bytes. */
 	f->session->se_fchannel.maxresp_cached = 128;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_slot_capacity(f->session), 48U);
+	KUNIT_EXPECT_EQ(test, f->slot_capacity, 8112U);
 	q = ffv2_sequence_request(test, f, 1, 4, 1, true, OP_CHUNK_READ, 0, 0);
 	KUNIT_ASSERT_NOT_NULL(test, q);
 	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, q));
@@ -8617,6 +8626,8 @@ static void ffv2_sequence_acceptance_test(struct kunit *test)
 	FFV2_EXPECT_STATUS(test, q->resp.cstate.status, nfserr_seq_misordered);
 	KUNIT_EXPECT_FALSE(test, nfsd_ffv2_session_mutations_fenced(f->session));
 	f->session->se_fchannel.maxresp_cached = 32;
+	KUNIT_EXPECT_EQ(test, nfsd_ffv2_test_slot_capacity(f->session), 0U);
+	KUNIT_EXPECT_EQ(test, f->slot_capacity, 8112U);
 	q = ffv2_sequence_request(test, f, 1, 0, 1, true, 0, 0, 0);
 	KUNIT_ASSERT_NOT_NULL(test, q);
 	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, q));
@@ -8632,7 +8643,17 @@ static void ffv2_sequence_acceptance_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, nfsd_ffv2_session_mutations_fenced(f->session));
 	q = ffv2_sequence_request(test, f, 0, ++seq0, 1, true, OP_CHUNK_WRITE, 0, 1);
 	KUNIT_ASSERT_NOT_NULL(test, q);
+	refusals = atomic_read(&trace->mutation_fence_refusals);
+	bindings = atomic_read(&trace->mutation_fence_bindings);
+	validations = atomic_read(&trace->mutation_validations);
+	admissions = atomic_read(&trace->mutation_provider_admissions);
+	mutations = atomic_read(&trace->mutation_dispatch_calls);
 	KUNIT_ASSERT_TRUE(test, ffv2_sequence_run(test, f, q));
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_fence_refusals) - refusals, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_fence_bindings) - bindings, 1U);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_validations), validations);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_provider_admissions), admissions);
+	KUNIT_EXPECT_EQ(test, atomic_read(&trace->mutation_dispatch_calls), mutations);
 	FFV2_EXPECT_STATUS(test, q->resp.cstate.status, nfserr_notsupp);
 	KUNIT_EXPECT_EQ(test, q->resp.opcnt, 3U);
 }

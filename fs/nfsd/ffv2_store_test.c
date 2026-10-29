@@ -2177,7 +2177,7 @@ static void ffv2_mutation_zero_sequence_test(struct kunit *test)
 			w.operation.sequence = 1;
 			error = nfsd_ffv2_store_test_write(f->store, f->keys[0], &w, &result);
 		} else {
-			l.operation.sequence = transition;
+			l.operation.sequence = 3;
 			error = nfsd_ffv2_store_test_lifecycle(f->store, f->keys[0], &l, &result,
 							       transition);
 		}

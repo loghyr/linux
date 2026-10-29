@@ -10782,7 +10782,8 @@ void nfsd_ffv2_test_data_session_destroy(struct nfsd4_session *session)
 
 u32 nfsd_ffv2_test_slot_capacity(struct nfsd4_session *session)
 {
-	return session->se_fchannel.maxresp_cached - NFSD_MIN_HDR_SEQ_SZ;
+	return session->se_fchannel.maxresp_cached < NFSD_MIN_HDR_SEQ_SZ ?
+		0 : session->se_fchannel.maxresp_cached - NFSD_MIN_HDR_SEQ_SZ;
 }
 
 unsigned int nfsd_ffv2_test_reduce_session(struct nfsd4_session *session)
