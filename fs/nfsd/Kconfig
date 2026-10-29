@@ -93,7 +93,7 @@ config NFSD_V4
 
 config NFSD_FFV2
 	bool "NFS server Flex Files v2 data server support"
-	depends on NFSD_V4
+	depends on NFSD_V4 && 64BIT
 	select CRYPTO_LIB_SHA256
 	default n
 	help
@@ -102,6 +102,9 @@ config NFSD_FFV2
 	  support into nfsd. The default-off prototype authority option adds
 	  a bounded file-backed demonstration service. File-backed HEADER_READ,
 	  repair, rollback, lock and trust/revoke RPCs are unsupported.
+
+	  This experimental data server requires 64-bit slot sequence storage
+	  to prevent durable mutation receipt identity reuse.
 
 	  If unsure, say N.
 

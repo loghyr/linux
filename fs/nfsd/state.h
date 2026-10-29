@@ -448,6 +448,8 @@ struct nfsd4_conn {
 struct nfsd4_session {
 #ifdef CONFIG_NFSD_FFV2
 	struct list_head se_ffv2_authorities;
+	/* Protected by client_lock; sticky until the session is destroyed. */
+	bool se_ffv2_mutations_fenced;
 #endif
 	atomic_t		se_ref;
 	spinlock_t		se_lock;

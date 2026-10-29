@@ -4175,12 +4175,36 @@ nfsd4_ffv2_admit_mutation(struct svc_rqst *rqstp, struct nfsd4_compound_state *c
 
 	if (status)
 		return status;
+	if (nfsd_ffv2_session_mutations_fenced(cstate->session)) {
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+		struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+
+		atomic_inc(&nn->ffv2.test_registration.mutation_fence_refusals);
+		if (cstate->current_fh.fh_ffv2_binding)
+			atomic_inc(&nn->ffv2.test_registration.mutation_fence_bindings);
+#endif
+		return nfserr_notsupp;
+	}
 	if (!cstate->current_fh.fh_ffv2_binding)
 		return nfserr_notsupp;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	{
+		struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+
+		atomic_inc(&nn->ffv2.test_registration.mutation_validations);
+	}
+#endif
 	status = nfsd_ffv2_validate_operation(rqstp, &cstate->current_fh, cstate->session, opnum,
 					      stateid, actor, admission);
 	if (status)
 		return status;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	{
+		struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+
+		atomic_inc(&nn->ffv2.test_registration.mutation_provider_admissions);
+	}
+#endif
 	status = nfsd_ffv2_provider_admit_mutation(rqstp, opnum, admission);
 	if (status)
 		nfsd_ffv2_complete(admission);
@@ -4283,6 +4307,13 @@ static __be32 nfsd4_ffv2_chunk_write(struct svc_rqst *rqstp, struct nfsd4_compou
 		goto out_payload;
 	}
 	request.payload = payload;
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	{
+		struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+
+		atomic_inc(&nn->ffv2.test_registration.mutation_dispatch_calls);
+	}
+#endif
 	status = nfsd_ffv2_provider_mutate(rqstp, &cstate->current_fh, OP_CHUNK_WRITE, &request,
 					   &result, &admission);
 	if (status == nfs_ok)
@@ -4330,6 +4361,13 @@ static __be32 nfsd4_ffv2_lifecycle(struct svc_rqst *rqstp, struct nfsd4_compound
 		status = nfserr_serverfault;
 		goto out_complete;
 	}
+#if IS_ENABLED(CONFIG_NFSD_FFV2_KUNIT_TEST)
+	{
+		struct nfsd_net *nn = net_generic(SVC_NET(rqstp), nfsd_net_id);
+
+		atomic_inc(&nn->ffv2.test_registration.mutation_dispatch_calls);
+	}
+#endif
 	status = nfsd_ffv2_provider_mutate(rqstp, &cstate->current_fh, opnum, &request, &result,
 					   &admission);
 	if (status == nfs_ok)
